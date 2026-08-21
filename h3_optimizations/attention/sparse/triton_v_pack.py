@@ -11,13 +11,12 @@ except ImportError:  # pragma: no cover
     tl = None
     TRITON_AVAILABLE = False
 
+from . import triton_qkv_fast as _qkv
 from .fused_qkv import HEAD_DIM
 from .router import KV_TILE
-from .triton_qkv_fast import (
-    TritonSparseQKVError,
-    _pack_v_int8_grouped_chunk_kernel,
-    normalize_v_scale_group_size,
-)
+
+TritonSparseQKVError = _qkv.TritonSparseQKVError
+normalize_v_scale_group_size = _qkv.normalize_v_scale_group_size
 
 
 if TRITON_AVAILABLE:
@@ -136,7 +135,7 @@ def pack_triton_v_chunk_into(
             block_size=block_size,
         )
     else:
-        _pack_v_int8_grouped_chunk_kernel[(blocks, heads, batch * groups)](
+        _qkv._pack_v_int8_grouped_chunk_kernel[(blocks, heads, batch * groups)](
             *common,
             groups=groups,
             chunk_sequence=chunk_sequence,
