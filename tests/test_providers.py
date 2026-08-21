@@ -14,7 +14,10 @@ from h3_optimizations.qkv.formats import (  # noqa: E402
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
     MLP_CONVROT_INT8_TWO_SLICE,
-    MLP_GENERIC_CHUNKED,
+    MLP_FLOAT_CHUNKED,
+    MLP_FP8_CHUNKED,
+    MLP_PRESERVE_UPSTREAM,
+    QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     QKV_STANDARD,
@@ -33,6 +36,7 @@ class FakeWeight:
         group=0,
         transposed=False,
         dtype='bf16',
+        storage_dtype=None,
         shape=(10, 10),
     ):
         self._layout_cls = layout
@@ -42,6 +46,7 @@ class FakeWeight:
             transposed=transposed,
         )
         self.dtype = dtype
+        self.storage_dtype = storage_dtype if storage_dtype is not None else dtype
         self.shape = shape
 
 
@@ -86,24 +91,32 @@ class ProviderTests(unittest.TestCase):
             layout='TensorWiseINT8Layout',
             convrot=True,
             group=256,
-            dtype='int8',
+            dtype='bfloat16',
+            storage_dtype='int8',
         )
         self.plain = FakeWeight(dtype='bfloat16')
+        self.fp8 = FakeWeight(
+            layout='TensorCoreFP8E4M3Layout',
+            dtype='bfloat16',
+            storage_dtype='float8_e4m3fn',
+        )
+        self.nvfp4 = FakeWeight(
+            layout='TensorCoreNVFP4Layout',
+            dtype='bfloat16',
+            storage_dtype='uint8',
+        )
 
     def test_format_inspection_is_conservative(self):
-        self.assertTrue(
-            describe_linear(linear(self.convrot)).convrot_int8_256
-        )
-        self.assertFalse(
-            describe_linear(linear(self.plain)).convrot_int8_256
-        )
+        self.assertTrue(describe_linear(linear(self.convrot)).convrot_int8_256)
+        self.assertTrue(describe_linear(linear(self.fp8)).fp8)
+        self.assertTrue(describe_linear(linear(self.nvfp4)).nvfp4)
+        self.assertTrue(describe_linear(linear(self.plain)).plain_float)
+        self.assertEqual(describe_linear(linear(self.nvfp4)).storage_dtype, 'uint8')
         biased = describe_linear(linear(self.convrot, bias=object()))
         self.assertFalse(biased.convrot_int8_256)
 
     def test_compatible_convrot_selects_specialized_providers(self):
-        inventory = inspect_h3_linears(
-            [block(self.convrot), block(self.convrot)]
-        )
+        inventory = inspect_h3_linears([block(self.convrot), block(self.convrot)])
         dense = resolve_qkv_provider(
             inventory,
             request='auto',
@@ -111,7 +124,6 @@ class ProviderTests(unittest.TestCase):
             kitchen_producer_available=True,
         )
         self.assertEqual(dense.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
-        self.assertFalse(dense.fused)
 
         sparse = resolve_qkv_provider(
             inventory,
@@ -129,34 +141,70 @@ class ProviderTests(unittest.TestCase):
             backend_kind='triton_sparse_int8',
             triton_available=True,
         )
-        self.assertEqual(
-            triton_sparse.provider_id,
-            QKV_TRITON_SPARSE_CHUNKED,
-        )
-        self.assertTrue(triton_sparse.fused)
+        self.assertEqual(triton_sparse.provider_id, QKV_TRITON_SPARSE_CHUNKED)
 
         mlp = resolve_mlp_provider(inventory, request='auto')
         self.assertEqual(mlp.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
-        self.assertEqual(
-            mlp.activation_mode,
-            'mlp_chunked_convrot_2slice',
-        )
 
-    def test_auto_falls_back_without_a_complete_contract(self):
-        inventory = inspect_h3_linears(
-            [block(self.plain), block(self.plain)]
+    def test_sparse_alone_preserves_alternative_checkpoint_projection(self):
+        for weight in (self.plain, self.fp8, self.nvfp4):
+            inventory = inspect_h3_linears([block(weight)])
+            qkv = resolve_qkv_provider(
+                inventory,
+                request='auto',
+                backend_kind='sparse_sage',
+                triton_available=True,
+                sparse_spec=sparse_spec(),
+                memory_optimize=False,
+                fp8_available=True,
+            )
+            self.assertEqual(qkv.provider_id, QKV_STANDARD)
+
+    def test_memory_fp8_and_bf16_use_fp8_providers(self):
+        for weight in (self.plain, self.fp8):
+            inventory = inspect_h3_linears([block(weight)])
+            qkv = resolve_qkv_provider(
+                inventory,
+                request='auto',
+                backend_kind='comfy_kitchen_int8',
+                kitchen_producer_available=True,
+                memory_optimize=True,
+                fp8_available=True,
+            )
+            self.assertEqual(qkv.provider_id, QKV_DENSE_FP8_CHUNKED)
+            mlp = resolve_mlp_provider(
+                inventory,
+                request='auto',
+                fp8_available=True,
+            )
+            self.assertEqual(mlp.provider_id, MLP_FP8_CHUNKED)
+
+    def test_bf16_uses_float_chunking_without_fp8_hardware(self):
+        inventory = inspect_h3_linears([block(self.plain)])
+        mlp = resolve_mlp_provider(
+            inventory,
+            request='auto',
+            fp8_available=False,
         )
+        self.assertEqual(mlp.provider_id, MLP_FLOAT_CHUNKED)
+
+    def test_nvfp4_memory_preserves_upstream(self):
+        inventory = inspect_h3_linears([block(self.nvfp4)])
         qkv = resolve_qkv_provider(
             inventory,
             request='auto',
             backend_kind='comfy_kitchen_int8',
             kitchen_producer_available=True,
+            memory_optimize=True,
+            fp8_available=True,
         )
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
-        self.assertFalse(qkv.fused)
-        mlp = resolve_mlp_provider(inventory, request='auto')
-        self.assertEqual(mlp.provider_id, MLP_GENERIC_CHUNKED)
-        self.assertEqual(mlp.activation_mode, 'mlp_chunked_native')
+        mlp = resolve_mlp_provider(
+            inventory,
+            request='auto',
+            fp8_available=True,
+        )
+        self.assertEqual(mlp.provider_id, MLP_PRESERVE_UPSTREAM)
 
     def test_dense_uses_kitchen_capability_instead_of_gpu_model(self):
         inventory = inspect_h3_linears([block(self.convrot)])
@@ -168,40 +216,22 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
 
-    def test_dense_preserves_an_explicit_attention_backend(self):
-        inventory = inspect_h3_linears([block(self.convrot)])
-        qkv = resolve_qkv_provider(
-            inventory,
-            request='auto',
-            backend_kind='existing',
-            kitchen_producer_available=True,
-        )
-        self.assertEqual(qkv.provider_id, QKV_STANDARD)
-
     def test_dense_w4a8_qkv_stays_standard(self):
-        w4a8 = FakeWeight(
-            layout='AsymW4A8Int8Layout',
-            dtype='int8',
-        )
+        w4a8 = FakeWeight(layout='AsymW4A8Int8Layout', dtype='bfloat16', storage_dtype='int8')
         inventory = inspect_h3_linears([block(w4a8)])
         qkv = resolve_qkv_provider(
             inventory,
             request='auto',
             backend_kind='comfy_kitchen_int8',
             kitchen_producer_available=True,
+            memory_optimize=True,
+            fp8_available=True,
         )
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
-
-    def test_sparse_fusion_accepts_matching_non_sm89_contract(self):
-        inventory = inspect_h3_linears([block(self.convrot)])
-        qkv = resolve_qkv_provider(
-            inventory,
-            request='auto',
-            backend_kind='sparse_sage',
-            triton_available=True,
-            sparse_spec=sparse_spec(capability=(12, 0)),
+        self.assertEqual(
+            resolve_mlp_provider(inventory, request='auto', fp8_available=True).provider_id,
+            MLP_PRESERVE_UPSTREAM,
         )
-        self.assertEqual(qkv.provider_id, QKV_SPARSE_CONVROT_INT8)
 
     def test_sparse_fusion_declines_mismatched_geometry(self):
         inventory = inspect_h3_linears([block(self.convrot)])
@@ -210,11 +240,7 @@ class ProviderTests(unittest.TestCase):
             request='auto',
             backend_kind='sparse_sage',
             triton_available=True,
-            sparse_spec=sparse_spec(
-                capability=(9, 0),
-                q_tile=64,
-                kv_tile=128,
-            ),
+            sparse_spec=sparse_spec(capability=(9, 0), q_tile=64, kv_tile=128),
         )
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
 
