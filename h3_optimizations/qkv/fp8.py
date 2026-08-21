@@ -127,6 +127,34 @@ class HeldFP8Linear:
         return out
 
 
+class HeldFP8QKV:
+    """Hold an FP8 QKV projection weight across all sequence chunks."""
+
+    def __init__(self, attention, sample, *, allow_float_conversion=False):
+        self.attention = attention
+        self.binding = HeldFP8Linear(
+            attention.qkv_proj,
+            sample,
+            allow_float_conversion=allow_float_conversion,
+        )
+
+    def __enter__(self):
+        self.binding.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self.binding.__exit__(exc_type, exc, tb)
+
+    def project_hnd(self, x, rope_freqs, start, end):
+        from ..attention_forward import finish_qkv_projection, to_hnd
+
+        chunk_rope = None if rope_freqs is None else rope_freqs[:, start:end]
+        projected = self.binding.linear(x[start:end])
+        return to_hnd(
+            *finish_qkv_projection(self.attention, projected, chunk_rope)
+        )
+
+
 class HeldFP8MLP:
     """Hold fc1/fc2 FP8 bindings across all bounded token slabs."""
 
