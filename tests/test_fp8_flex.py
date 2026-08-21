@@ -32,6 +32,7 @@ from h3_optimizations.attention.sparse.fp8_flex import (  # noqa: E402
     FP8FlexError,
     FP8FlexSpec,
     block_mask_from_delta_lut,
+    load_fp8_flex_spec,
     preflight_fp8_flex,
 )
 from h3_optimizations.plan import (  # noqa: E402
@@ -130,6 +131,21 @@ class FP8FlexTests(unittest.TestCase):
                 loader=lambda: spec,
             ),
             spec,
+        )
+
+    def test_loader_compiles_flex_attention_for_sparse_execution(self):
+        compiled_attention = object()
+        with mock.patch.object(
+            torch,
+            'compile',
+            return_value=compiled_attention,
+        ) as compile_attention:
+            spec = load_fp8_flex_spec()
+
+        self.assertIs(spec.attention, compiled_attention)
+        compile_attention.assert_called_once_with(
+            mock.ANY,
+            fullgraph=True,
         )
 
     def test_delta_lut_becomes_compact_flex_block_indices(self):

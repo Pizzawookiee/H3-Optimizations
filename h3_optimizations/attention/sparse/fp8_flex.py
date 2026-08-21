@@ -61,9 +61,15 @@ def load_fp8_flex_spec():
         raise FP8FlexError(
             'PyTorch FlexAttention BlockMask API is too old'
         )
+    try:
+        attention = torch.compile(flex_attention, fullgraph=True)
+    except Exception as exc:
+        raise FP8FlexError(
+            'PyTorch FlexAttention compilation is unavailable'
+        ) from exc
     return FP8FlexSpec(
         version=str(torch.__version__),
-        attention=flex_attention,
+        attention=attention,
         block_mask_type=BlockMask,
     )
 
