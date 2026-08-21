@@ -23,8 +23,10 @@ Both nodes are order-independent. Unsupported model families pass through
 unchanged. Auto modes retain the existing implementation when a specialized
 provider cannot satisfy its complete format and runtime contract. A saved
 workflow containing H3 Sparse Attention also remains runnable when Sparse Sage
-is unavailable: the node keeps the resolved dense H3 path and reports the
-reason in its status text.
+is unavailable: FP8-capable NVIDIA GPUs use the same fixed-density router
+through PyTorch FlexAttention, and other unsupported combinations keep the
+resolved dense H3 path. The selected fallback and reason appear in the node
+status text.
 
 ## Install
 
@@ -56,10 +58,11 @@ with Torch 2.9 or newer. The Linux build requires Torch 2.3 or newer and CUDA
 
 ROCm, MPS, XPU, CPU, future GPU architectures, NVIDIA installations without a
 matching wheel/build toolchain, and failed Sparse Sage builds are left
-untouched. The nodes still load and H3 Sparse Attention falls back to the
-resolved dense H3 attention path. A manual `spas_sage_attn` build is needed
-only to obtain sparse acceleration on an otherwise unsupported NVIDIA
-combination; it is not required to run workflows containing these nodes.
+untouched. The nodes still load and H3 Sparse Attention uses FP8 FlexAttention
+when the active NVIDIA GPU supports it, then the resolved dense H3 attention
+path otherwise. A manual `spas_sage_attn` build is needed only to obtain Sparse
+Sage acceleration on an otherwise unsupported NVIDIA combination; it is not
+required to run workflows containing these nodes.
 
 Dense execution uses ComfyUI's public `comfy_kitchen_int8` attention backend.
 Chunked dense QKV additionally requires a Comfy Kitchen release exposing its
@@ -69,9 +72,13 @@ native-carrier 4K chunked QKV and the ConvRot MLP path additionally require
 Triton.
 Missing dense capabilities return to upstream H3 QKV and normal Comfy
 attention. Missing Sparse Sage dependency, device, architecture, or compiled
-ABI capabilities do the same while producing a concise status reason. Errors
-raised after a validated Sparse Sage kernel begins execution remain hard errors
-instead of silently changing attention behavior mid-run.
+ABI capabilities select PyTorch FlexAttention on an FP8-capable NVIDIA GPU.
+Flex retains Q in its normal floating dtype, stores K/V as per-head-scaled
+E4M3, and consumes the router's 128Q x 64KV block route directly. If that API,
+Dynamo, CUDA, or FP8 compute is unavailable, the resolved dense H3 path remains
+the final fallback. Errors raised after a validated sparse backend begins
+execution remain hard errors instead of silently changing attention behavior
+mid-run.
 
 spas_sage_attn is not a normal package dependency because its compiled backend
 must match Torch, CUDA, and the GPU architecture. The guarded pre-startup
@@ -82,8 +89,10 @@ when a verified replacement is available.
 
 - Current ComfyUI with MiniMax H3 support
 - Python 3.10 or newer
-- Any backend supported by ComfyUI's MiniMax H3 implementation for the dense
-  fallback
+- Any backend supported by ComfyUI's MiniMax H3 implementation for the final
+  dense fallback
+- NVIDIA SM89 or newer with PyTorch FlexAttention and FP8 compute for the
+  sparse fallback when Sparse Sage is unavailable
 - NVIDIA CUDA SM80, SM86, SM87, SM89, SM90, or SM120 for Sparse Sage
 
 Dense QKV eligibility follows the complete producer specification returned by

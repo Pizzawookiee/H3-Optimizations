@@ -122,8 +122,9 @@ class H3SparseAttention(io.ComfyNode):
                 'Fixed-density Sparse Sage attention for MiniMax H3. Other '
                 'models pass through unchanged. Text, reference conditioning, '
                 'audio, non-video queries, and mixed boundary tiles remain dense. '
-                'If Sparse Sage is unavailable, H3 keeps its resolved dense '
-                'attention path and the node reports why.'
+                'If Sparse Sage is unavailable, supported NVIDIA GPUs use '
+                'FP8 FlexAttention before falling back to resolved dense '
+                'attention.'
             ),
             search_aliases=[
                 'H3 sparse',

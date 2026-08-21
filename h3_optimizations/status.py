@@ -72,6 +72,8 @@ def format_sparse_status(model):
     reason = str(attention.get('reason') or '').strip()
     if selected == 'sparse_sage':
         attention_line = 'Attention: Sparse Sage'
+    elif selected == 'flex_attention_fp8':
+        attention_line = 'Attention: FP8 FlexAttention'
     else:
         attention_line = 'Attention: %s' % selected
 

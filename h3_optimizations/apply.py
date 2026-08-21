@@ -6,11 +6,14 @@ from dataclasses import dataclass
 import logging
 
 from .attention.sparse import (
+    FP8FlexBackend,
+    FP8FlexError,
     HybridSparseBackend,
     HybridSparseConfig,
     MODE_SAGE128,
     MODE_SAGE128_FUSED_QKV,
     SparseSageError,
+    preflight_fp8_flex,
     preflight_sparse_sage,
 )
 from .attention.sparse.fused_qkv import (
@@ -59,6 +62,7 @@ from .v_layout_compat import (
 
 LOG_PREFIX = '[H3 Optimizations]'
 ATTENTION_SPARSE = 'sparse_sage'
+ATTENTION_FP8_FLEX = 'flex_attention_fp8'
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,40 @@ def _resolve_sparse(plan, environment, inventory):
     )
 
 
+def _resolve_fp8_flex(plan, environment, inventory, sparse_error):
+    spec = preflight_fp8_flex(
+        cuda_available=lambda: environment.cuda_available,
+        capability_getter=lambda: environment.capability,
+        device=getattr(environment, 'device_index', None),
+    )
+    qkv = resolve_qkv_provider(
+        inventory,
+        request=_fused_request(plan),
+        backend_kind=ATTENTION_FP8_FLEX,
+    )
+    config = HybridSparseConfig(
+        mode=MODE_SAGE128,
+        video_budget=float(plan.sparse.video_budget),
+        density_mode=DENSITY_FIXED,
+        denser_early_late_steps=bool(plan.sparse.denser_early_late_steps),
+        strict=True,
+    )
+    backend = FP8FlexBackend(config, spec=spec)
+    return (
+        ResolvedAttention(
+            requested=ATTENTION_SPARSE,
+            selected=ATTENTION_FP8_FLEX,
+            backend=backend,
+            reason=(
+                'Sparse Sage unavailable: %s; using FP8 FlexAttention'
+                % sparse_error
+            ),
+            backend_kind=ATTENTION_FP8_FLEX,
+        ),
+        qkv,
+    )
+
+
 def _resolve_attention(plan, model, inventory, environment):
     dense_attention, dense_qkv = _resolve_dense(
         plan,
@@ -167,22 +205,31 @@ def _resolve_attention(plan, model, inventory, environment):
         return dense_attention, dense_qkv
     try:
         return _resolve_sparse(plan, environment, inventory)
-    except SparseSageError as exc:
-        return (
-            ResolvedAttention(
-                requested=ATTENTION_SPARSE,
-                selected=dense_attention.selected,
-                backend=dense_attention.backend,
-                reason=(
-                    'Sparse Sage unavailable: %s; %s'
-                    % (exc, dense_attention.reason)
+    except SparseSageError as sparse_exc:
+        try:
+            return _resolve_fp8_flex(
+                plan,
+                environment,
+                inventory,
+                sparse_exc,
+            )
+        except FP8FlexError as flex_exc:
+            return (
+                ResolvedAttention(
+                    requested=ATTENTION_SPARSE,
+                    selected=dense_attention.selected,
+                    backend=dense_attention.backend,
+                    reason=(
+                        'Sparse Sage unavailable: %s; FP8 FlexAttention '
+                        'unavailable: %s; %s'
+                        % (sparse_exc, flex_exc, dense_attention.reason)
+                    ),
+                    backend_kind=dense_attention.backend_kind,
+                    projector=dense_attention.projector,
+                    dense_resolution=dense_attention.dense_resolution,
                 ),
-                backend_kind=dense_attention.backend_kind,
-                projector=dense_attention.projector,
-                dense_resolution=dense_attention.dense_resolution,
-            ),
-            dense_qkv,
-        )
+                dense_qkv,
+            )
 
 
 def _install_mlp(model_patcher, plan, inventory):
@@ -328,15 +375,18 @@ def apply_plan(model, plan: H3OptimizationPlan):
 
     patched = model.clone()
     attention_blocks = 0
-    sparse_selected = attention.backend_kind == ATTENTION_SPARSE
-    if sparse_selected:
+    sparse_execution_selected = attention.backend_kind in (
+        ATTENTION_SPARSE,
+        ATTENTION_FP8_FLEX,
+    )
+    if sparse_execution_selected:
         _backend, attention_blocks = configure_backend(
             patched,
             attention.backend,
             projector=attention.projector,
         )
         v_layout = not_applicable_v_layout(
-            'sparse attention owns the main H3 forward'
+            '%s owns the main H3 forward' % attention.selected
         )
     elif plan.memory is not None:
         if qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED:
@@ -360,7 +410,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
 
     mlp, mlp_blocks = _install_mlp(patched, plan, inventory)
     runtime_installed = False
-    if sparse_selected:
+    if sparse_execution_selected:
         _session, _created = _ensure_sparse_runtime(patched)
         runtime_installed = True
 
