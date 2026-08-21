@@ -83,15 +83,18 @@ class TritonSparseQKVProjector:
         self,
         required=False,
         chunk_rows=4096,
-        v_scale_group_size=1,
+        v_scale_group_size=None,
     ):
         from ..attention.sparse.triton_qkv import (
             ChunkedTritonSparseQKVProjector as Implementation,
+            normalize_v_scale_group_size,
         )
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
-        self.v_scale_group_size = int(v_scale_group_size)
+        self.v_scale_group_size = normalize_v_scale_group_size(
+            v_scale_group_size
+        )
         self._implementation = Implementation(
             chunk_rows=self.chunk_rows,
             v_scale_group_size=self.v_scale_group_size,
