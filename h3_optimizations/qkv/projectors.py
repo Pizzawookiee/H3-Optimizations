@@ -78,16 +78,28 @@ class TritonSparseQKVProjector:
 
     name = "chunked_triton_sparse_qkv"
     qk_format = "block_int8"
-    v_format = "per_kv_tile_channel_int8"
 
-    def __init__(self, required=False, chunk_rows=4096):
+    def __init__(
+        self,
+        required=False,
+        chunk_rows=4096,
+        v_scale_group_size=1,
+    ):
         from ..attention.sparse.triton_qkv import (
             ChunkedTritonSparseQKVProjector as Implementation,
         )
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
-        self._implementation = Implementation(chunk_rows=self.chunk_rows)
+        self.v_scale_group_size = int(v_scale_group_size)
+        self._implementation = Implementation(
+            chunk_rows=self.chunk_rows,
+            v_scale_group_size=self.v_scale_group_size,
+        )
+
+    @property
+    def v_format(self):
+        return self._implementation.v_format
 
     @property
     def installation_signature(self):
@@ -95,6 +107,7 @@ class TritonSparseQKVProjector:
             self.name,
             self.qk_format,
             self.v_format,
+            self.v_scale_group_size,
             bool(self.required),
             self._implementation.installation_signature,
         )
