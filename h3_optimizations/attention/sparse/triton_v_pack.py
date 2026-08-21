@@ -1,4 +1,4 @@
-'''Fast V packing overrides for Triton sparse carriers.'''
+'''Fast grouped V packing for Triton sparse carriers.'''
 
 import torch
 
@@ -21,7 +21,7 @@ normalize_v_scale_group_size = _qkv.normalize_v_scale_group_size
 
 if TRITON_AVAILABLE:
     @triton.jit
-    def _pack_v_int8_channel_chunk_kernel(
+    def _pack_v_int8_tile_kernel(
         x_ptr, output_ptr, scale_ptr, sum_ptr,
         x_b, x_h, x_n,
         output_b, output_h, output_n,
@@ -31,6 +31,8 @@ if TRITON_AVAILABLE:
         chunk_sequence: tl.constexpr,
         head_dim: tl.constexpr,
         block_size: tl.constexpr,
+        group_size: tl.constexpr,
+        groups: tl.constexpr,
     ):
         block = tl.program_id(0).to(tl.int64)
         head = tl.program_id(1).to(tl.int64)
@@ -43,13 +45,18 @@ if TRITON_AVAILABLE:
             + rows[:, None] * x_n + columns[None, :]
         )
         value = tl.load(source, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        scale = (
-            tl.max(tl.where(row_mask[:, None], tl.abs(value), 0.0), axis=0)
-            / 127.0 + 1e-7
+        abs_value = tl.where(row_mask[:, None], tl.abs(value), 0.0)
+        grouped = tl.reshape(abs_value, (block_size, groups, group_size))
+        group_max = tl.max(tl.max(grouped, axis=2), axis=0)
+        group_scale = group_max / 127.0 + 1e-7
+        scale_matrix = tl.broadcast_to(
+            group_scale[:, None], (groups, group_size)
         )
+        scale = tl.reshape(scale_matrix, (head_dim,))
         quantized_f = value / scale[None, :]
         quantized_f += 0.5 * tl.where(quantized_f >= 0, 1.0, -1.0)
         quantized = quantized_f.to(tl.int8)
+
         destination_rows = row_start + rows
         destination = (
             output_ptr + batch * output_b + head * output_h
@@ -57,10 +64,11 @@ if TRITON_AVAILABLE:
         )
         tl.store(destination, quantized, mask=row_mask[:, None])
         destination_block = block_start + block
+        group_ids = tl.arange(0, groups).to(tl.int64)
         tl.store(
             scale_ptr + batch * scale_b + head * scale_h
-            + destination_block * scale_n + columns,
-            scale,
+            + destination_block * scale_n + group_ids,
+            group_scale,
         )
         channel_sum = tl.sum(
             tl.where(row_mask[:, None], quantized.to(tl.int32), 0), axis=0
@@ -119,27 +127,16 @@ def pack_triton_v_chunk_into(
         )
 
     blocks = (chunk_sequence + block_size - 1) // block_size
-    common = (
+    _pack_v_int8_tile_kernel[(blocks, heads, batch)](
         x, output, scales, sums,
         x.stride(0), x.stride(1), x.stride(2),
         output.stride(0), output.stride(1), output.stride(2),
         scales.stride(0), scales.stride(1), scales.stride(2),
         sums.stride(0), sums.stride(1), sums.stride(2),
         row_start, row_start // block_size,
+        chunk_sequence=chunk_sequence,
+        head_dim=head_dim,
+        block_size=block_size,
+        group_size=group,
+        groups=groups,
     )
-    if group == 1:
-        _pack_v_int8_channel_chunk_kernel[(blocks, heads, batch)](
-            *common,
-            chunk_sequence=chunk_sequence,
-            head_dim=head_dim,
-            block_size=block_size,
-        )
-    else:
-        _qkv._pack_v_int8_grouped_chunk_kernel[(blocks, heads, batch * groups)](
-            *common,
-            groups=groups,
-            chunk_sequence=chunk_sequence,
-            head_dim=head_dim,
-            block_size=block_size,
-            group_size=group,
-        )
