@@ -5,6 +5,8 @@ import sys
 from types import SimpleNamespace
 import unittest
 
+import torch
+
 PACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK))
 
@@ -106,6 +108,56 @@ class AlternativeCheckpointCompatibilityTests(unittest.TestCase):
                 ).provider_id,
                 MLP_FP8_CHUNKED,
             )
+
+    def test_raw_torch_fp8_uses_fp8_memory_providers(self):
+        dtypes = [
+            getattr(torch, 'float8_e4m3fn', None),
+            getattr(torch, 'float8_e5m2', None),
+        ]
+        dtypes = [dtype for dtype in dtypes if dtype is not None]
+        if not dtypes:
+            self.skipTest('this PyTorch build has no float8 dtypes')
+
+        for dtype in dtypes:
+            with self.subTest(dtype=dtype):
+                raw_fp8 = FakeWeight(dtype=dtype)
+                inventory = inspect_h3_linears([block(raw_fp8)])
+                self.assertTrue(inventory.qkv[0].raw_fp8)
+                self.assertTrue(inventory.qkv[0].fp8)
+                self.assertFalse(inventory.qkv[0].plain_float)
+
+                sparse_only = resolve_qkv_provider(
+                    inventory,
+                    request='auto',
+                    backend_kind='sparse_sage',
+                    triton_available=True,
+                    sparse_spec=sparse_spec(),
+                    memory_optimize=False,
+                    fp8_available=True,
+                )
+                self.assertEqual(sparse_only.provider_id, QKV_STANDARD)
+
+                memory_sparse = resolve_qkv_provider(
+                    inventory,
+                    request='auto',
+                    backend_kind='sparse_sage',
+                    triton_available=True,
+                    sparse_spec=sparse_spec(),
+                    memory_optimize=True,
+                    fp8_available=True,
+                )
+                self.assertEqual(
+                    memory_sparse.provider_id,
+                    QKV_SPARSE_FP8_CHUNKED,
+                )
+                self.assertEqual(
+                    resolve_mlp_provider(
+                        inventory,
+                        request='auto',
+                        fp8_available=True,
+                    ).provider_id,
+                    MLP_FP8_CHUNKED,
+                )
 
     def test_nvfp4_memory_preserves_upstream(self):
         inventory = inspect_h3_linears([block(self.nvfp4)])
