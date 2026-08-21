@@ -16,6 +16,9 @@ from h3_optimizations.plan import (  # noqa: E402
 
 
 class PlanTests(unittest.TestCase):
+    def test_sparse_request_defaults_to_thirty_percent_video_budget(self):
+        self.assertEqual(SparseRequest().video_budget, 0.3)
+
     def test_node_order_does_not_change_the_plan(self):
         memory = MemoryRequest()
         sparse = SparseRequest(video_budget=0.5)

@@ -14,8 +14,9 @@ does not import or depend on ComfyUI-H3-Extended.
   activation memory with token chunking.
 - H3 Sparse Attention enables fixed-density Sparse Sage attention while
   keeping text, reference conditioning, audio, non-video queries, and mixed
-  boundary tiles dense. Its optional early/late policy adds 30 percentage
-  points to the first two and last two sampler steps, capped at 100 percent.
+  boundary tiles dense. Its default video KV budget is 30 percent. The optional
+  early/late policy adds 30 percentage points to the first two and last two
+  sampler steps, capped at 100 percent.
 
 Both nodes are grouped under H3-Optimizations > Model Patches.
 

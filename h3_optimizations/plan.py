@@ -21,6 +21,7 @@ MIN_CHUNK_ROWS = 256
 MAX_CHUNK_ROWS = 65_536
 CHUNK_ALIGNMENT = 256
 DENSITY_FIXED = 'fixed'
+DEFAULT_VIDEO_BUDGET = 0.3
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,7 @@ class MemoryRequest:
 class SparseRequest:
     '''Fixed-density Sparse Sage attention request.'''
 
-    video_budget: float = 0.5
+    video_budget: float = DEFAULT_VIDEO_BUDGET
     denser_early_late_steps: bool = False
 
     def __post_init__(self):

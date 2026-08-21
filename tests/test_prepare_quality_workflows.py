@@ -81,7 +81,7 @@ class PrepareQualityWorkflowTests(unittest.TestCase):
         self.assertEqual(MODULE._single_node(full, 'H3SparseAttention')['mode'], 4)
         self.assertEqual(
             MODULE._single_node(full, 'H3SparseAttention')['widgets_values'],
-            [0.5, False],
+            [0.3, False],
         )
         connected = [
             item for item in full['nodes']

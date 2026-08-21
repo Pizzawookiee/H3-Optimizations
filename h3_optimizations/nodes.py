@@ -4,6 +4,7 @@ from comfy_api.latest import ComfyExtension, io, ui
 
 from .apply import apply_plan
 from .plan import (
+    DEFAULT_VIDEO_BUDGET,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     MAX_CHUNK_ROWS,
@@ -139,7 +140,7 @@ class H3SparseAttention(io.ComfyNode):
                 io.Float.Input(
                     'video_budget',
                     display_name='Video KV budget',
-                    default=0.5,
+                    default=DEFAULT_VIDEO_BUDGET,
                     min=0.01,
                     max=1.0,
                     step=0.01,
@@ -168,7 +169,7 @@ class H3SparseAttention(io.ComfyNode):
     def execute(
         cls,
         model,
-        video_budget=0.5,
+        video_budget=DEFAULT_VIDEO_BUDGET,
         denser_early_late_steps=False,
     ):
         plan = read_plan(model).with_sparse(

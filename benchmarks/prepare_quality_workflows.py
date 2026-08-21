@@ -46,7 +46,7 @@ def _normalize_h3_nodes(workflow, fused_qkv):
     if missing:
         raise ValueError('H3SparseAttention is missing inputs: %s' % ', '.join(missing))
     sparse['inputs'] = [sparse_inputs[name] for name in required_sparse]
-    sparse['widgets_values'] = [0.5, False]
+    sparse['widgets_values'] = [0.3, False]
     sparse['mode'] = 4
 
 

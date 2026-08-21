@@ -81,6 +81,7 @@ class NodeTests(unittest.TestCase):
                 'denser_early_late_steps',
             ],
         )
+        self.assertEqual(input_by_id(sparse, 'video_budget').default, 0.3)
         self.assertFalse(
             input_by_id(sparse, 'denser_early_late_steps').default
         )
