@@ -121,7 +121,9 @@ class H3SparseAttention(io.ComfyNode):
             description=(
                 'Fixed-density Sparse Sage attention for MiniMax H3. Other '
                 'models pass through unchanged. Text, reference conditioning, '
-                'audio, non-video queries, and mixed boundary tiles remain dense.'
+                'audio, non-video queries, and mixed boundary tiles remain dense. '
+                'If Sparse Sage is unavailable, H3 keeps its resolved dense '
+                'attention path and the node reports why.'
             ),
             search_aliases=[
                 'H3 sparse',

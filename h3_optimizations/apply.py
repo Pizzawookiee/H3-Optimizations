@@ -10,6 +10,7 @@ from .attention.sparse import (
     HybridSparseConfig,
     MODE_SAGE128,
     MODE_SAGE128_FUSED_QKV,
+    SparseSageError,
     preflight_sparse_sage,
 )
 from .attention.sparse.fused_qkv import (
@@ -152,6 +153,35 @@ def _resolve_sparse(plan, environment, inventory):
     )
 
 
+def _resolve_attention(plan, model, inventory, environment):
+    dense_attention, dense_qkv = _resolve_dense(
+        plan,
+        model,
+        inventory,
+        environment,
+    )
+    if plan.sparse is None:
+        return dense_attention, dense_qkv
+    try:
+        return _resolve_sparse(plan, environment, inventory)
+    except SparseSageError as exc:
+        return (
+            ResolvedAttention(
+                requested=ATTENTION_SPARSE,
+                selected=dense_attention.selected,
+                backend=dense_attention.backend,
+                reason=(
+                    'Sparse Sage unavailable: %s; %s'
+                    % (exc, dense_attention.reason)
+                ),
+                backend_kind=dense_attention.backend_kind,
+                projector=dense_attention.projector,
+                dense_resolution=dense_attention.dense_resolution,
+            ),
+            dense_qkv,
+        )
+
+
 def _install_mlp(model_patcher, plan, inventory):
     memory = plan.memory
     if memory is None:
@@ -263,6 +293,7 @@ def _status(
         'runtime_installed': bool(runtime_installed),
         'device': {
             'name': environment.device_name,
+            'backend': environment.backend,
             'architecture': environment.architecture,
             'capability': (
                 None
@@ -285,14 +316,17 @@ def apply_plan(model, plan: H3OptimizationPlan):
     inventory = inspect_h3_linears(blocks)
     environment = RuntimeEnvironment.detect()
 
-    if plan.sparse is not None:
-        attention, qkv = _resolve_sparse(plan, environment, inventory)
-    else:
-        attention, qkv = _resolve_dense(plan, model, inventory, environment)
+    attention, qkv = _resolve_attention(
+        plan,
+        model,
+        inventory,
+        environment,
+    )
 
     patched = model.clone()
     attention_blocks = 0
-    if plan.sparse is not None:
+    sparse_selected = attention.backend_kind == ATTENTION_SPARSE
+    if sparse_selected:
         _backend, attention_blocks = configure_backend(
             patched,
             attention.backend,
@@ -323,7 +357,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
 
     mlp, mlp_blocks = _install_mlp(patched, plan, inventory)
     runtime_installed = False
-    if plan.sparse is not None:
+    if sparse_selected:
         _session, _created = _ensure_sparse_runtime(patched)
         runtime_installed = True
 

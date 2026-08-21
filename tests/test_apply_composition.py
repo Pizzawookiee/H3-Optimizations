@@ -33,6 +33,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     MLPProviderResolution,
     QKVProviderResolution,
 )
+from h3_optimizations.status import format_sparse_status  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -121,6 +122,7 @@ class ApplyCompositionTests(unittest.TestCase):
                 cuda_available=True,
                 capability=(12, 0),
                 device_name='fake SM120',
+                backend='nvidia_cuda',
                 architecture='sm120',
             ),
         ), mock.patch.object(
@@ -176,6 +178,166 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertTrue(
             left_status['sparse']['denser_early_late_steps']
         )
+
+    def test_missing_sparse_backend_preserves_dense_h3(self):
+        inventory = SimpleNamespace(labels=lambda _name: ())
+        qkv = QKVProviderResolution(
+            'standard_h3_qkv',
+            False,
+            'standard projection',
+        )
+        mlp = MLPProviderResolution('off', 'off', 'disabled')
+        dense = apply_module.ResolvedAttention(
+            requested='existing',
+            selected='existing',
+            backend=None,
+            reason='normal Comfy attention',
+            backend_kind='existing',
+            dense_resolution=SimpleNamespace(backend=None),
+        )
+        environment = SimpleNamespace(
+            cuda_available=False,
+            capability=None,
+            device_name='cpu',
+            backend='cpu',
+            architecture='cpu',
+        )
+        plan = H3OptimizationPlan().with_sparse(SparseRequest())
+
+        with mock.patch.object(
+            apply_module,
+            'is_minimax_h3',
+            return_value=True,
+        ), mock.patch.object(
+            apply_module,
+            'get_h3_blocks',
+            return_value=(object(),),
+        ), mock.patch.object(
+            apply_module,
+            'inspect_h3_linears',
+            return_value=inventory,
+        ), mock.patch.object(
+            apply_module.RuntimeEnvironment,
+            'detect',
+            return_value=environment,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+            return_value=(dense, qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_sparse',
+            side_effect=apply_module.SparseSageError(
+                'requires NVIDIA CUDA'
+            ),
+        ), mock.patch.object(
+            apply_module,
+            '_install_mlp',
+            return_value=(mlp, 0),
+        ), mock.patch.object(
+            apply_module,
+            'configure_backend',
+        ) as configure, mock.patch.object(
+            apply_module,
+            '_ensure_sparse_runtime',
+        ) as sparse_runtime:
+            patched = apply_module.apply_plan(FakeModel(), plan)
+
+        status = patched.model_options['transformer_options'][STATUS_KEY]
+        self.assertEqual(status['attention']['requested'], 'sparse_sage')
+        self.assertEqual(status['attention']['selected'], 'existing')
+        self.assertIn('requires NVIDIA CUDA', status['attention']['reason'])
+        self.assertEqual(status['device']['backend'], 'cpu')
+        self.assertFalse(status['runtime_installed'])
+        self.assertIn('Attention: existing', format_sparse_status(patched))
+        self.assertIn('Sparse fallback:', format_sparse_status(patched))
+        configure.assert_not_called()
+        sparse_runtime.assert_not_called()
+
+    def test_sparse_failure_uses_resolved_memory_dense_path(self):
+        inventory = SimpleNamespace(labels=lambda _name: ())
+        qkv = QKVProviderResolution(
+            'standard_h3_qkv',
+            False,
+            'standard projection',
+        )
+        mlp = MLPProviderResolution('off', 'off', 'disabled')
+        dense_resolution = SimpleNamespace(backend=object())
+        dense = apply_module.ResolvedAttention(
+            requested='auto',
+            selected='comfy_kitchen_int8',
+            backend=None,
+            reason='selected dense provider',
+            backend_kind='comfy_kitchen_int8',
+            dense_resolution=dense_resolution,
+        )
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(10, 0),
+            device_name='future NVIDIA',
+            backend='nvidia_cuda',
+            architecture='sm100',
+        )
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(),
+            sparse=SparseRequest(),
+        )
+
+        with mock.patch.object(
+            apply_module,
+            'is_minimax_h3',
+            return_value=True,
+        ), mock.patch.object(
+            apply_module,
+            'get_h3_blocks',
+            return_value=(object(),),
+        ), mock.patch.object(
+            apply_module,
+            'inspect_h3_linears',
+            return_value=inventory,
+        ), mock.patch.object(
+            apply_module.RuntimeEnvironment,
+            'detect',
+            return_value=environment,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+            return_value=(dense, qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_sparse',
+            side_effect=apply_module.SparseSageError(
+                'does not support device capability 10.0'
+            ),
+        ), mock.patch.object(
+            apply_module,
+            'install_v_layout_compat',
+            return_value=SimpleNamespace(
+                state='installed',
+                reason='synthetic',
+                patched_blocks=50,
+            ),
+        ), mock.patch.object(
+            apply_module,
+            'install_dense_attention',
+            return_value=True,
+        ) as install_dense, mock.patch.object(
+            apply_module,
+            '_install_mlp',
+            return_value=(mlp, 0),
+        ), mock.patch.object(
+            apply_module,
+            '_ensure_sparse_runtime',
+        ) as sparse_runtime:
+            patched = apply_module.apply_plan(FakeModel(), plan)
+
+        status = patched.model_options['transformer_options'][STATUS_KEY]
+        self.assertEqual(
+            status['attention']['selected'],
+            'comfy_kitchen_int8',
+        )
+        install_dense.assert_called_once_with(patched, dense_resolution)
+        sparse_runtime.assert_not_called()
 
 
 if __name__ == '__main__':

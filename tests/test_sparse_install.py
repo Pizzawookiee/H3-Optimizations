@@ -14,7 +14,41 @@ sys.path.insert(0, str(PACK))
 from h3_optimizations import sparse_install  # noqa: E402
 
 
+def nvidia_runtime(**overrides):
+    runtime = {
+        'ok': True,
+        'torch_version': '2.14.0.dev20260809+cu130',
+        'cuda_version': '13.0',
+        'hip_version': None,
+        'backend': 'nvidia_cuda',
+        'accelerator_available': True,
+        'capability': [12, 0],
+        'device_name': 'fake SM120',
+        'sparse_compatible': False,
+        'sparse_error': None,
+    }
+    runtime.update(overrides)
+    return runtime
+
+
 class SparseInstallTests(unittest.TestCase):
+    def test_sparse_abi_module_imports_without_comfyui(self):
+        if sparse_install.importlib.util.find_spec('torch') is None:
+            self.skipTest('Torch is not installed in this test interpreter')
+        code = (
+            'import sys; '
+            'sys.path.insert(0, sys.argv[1]); '
+            'import h3_optimizations.attention.sparse.sparse_sage'
+        )
+        result = subprocess.run(
+            [sys.executable, '-I', '-c', code, str(PACK)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_every_verified_wheel_is_hash_locked(self):
         cases = (
             (
@@ -135,22 +169,42 @@ class SparseInstallTests(unittest.TestCase):
             )
         )
 
-    def test_runtime_metadata_does_not_import_torch(self):
-        with patch.object(
-            sparse_install.importlib.metadata,
-            'version',
-            return_value='2.14.0.dev20260809+cu130',
-        ), patch.dict('sys.modules', {'torch': None}):
-            self.assertEqual(
-                sparse_install._torch_runtime(),
-                ('2.14.0.dev20260809+cu130', '13.0'),
-            )
+    @patch.object(sparse_install.subprocess, 'run')
+    def test_runtime_probe_does_not_import_torch_in_parent(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                sparse_install.PROBE_RESULT_PREFIX
+                + '{"ok": true, "backend": "nvidia_cuda"}'
+            ),
+        )
+        with patch.dict('sys.modules', {'torch': None}):
+            result = sparse_install._runtime_probe(validate_sparse=False)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['backend'], 'nvidia_cuda')
+        self.assertNotIn('--validate-sparse', run.call_args.args[0])
 
     @patch.object(sparse_install, '_is_installed', return_value=True)
-    @patch.object(sparse_install.subprocess, 'run')
-    def test_existing_install_is_untouched(self, run, _installed):
+    @patch.object(
+        sparse_install,
+        '_runtime_probe',
+        return_value=nvidia_runtime(
+            sparse_compatible=True,
+            sparse_version='0.1.0',
+            sparse_architecture='sm120',
+        ),
+    )
+    @patch.object(sparse_install, '_run_pip')
+    def test_compatible_existing_install_is_untouched(
+        self,
+        run_pip,
+        probe,
+        _installed,
+    ):
         self.assertTrue(sparse_install.ensure_sparse_sage())
-        run.assert_not_called()
+        probe.assert_called_once_with(validate_sparse=True)
+        run_pip.assert_not_called()
 
     @patch.object(sparse_install, '_is_installed', return_value=False)
     @patch.object(sparse_install.subprocess, 'run')
@@ -168,25 +222,85 @@ class SparseInstallTests(unittest.TestCase):
     @patch.object(sparse_install.platform, 'machine', return_value='AMD64')
     @patch.object(
         sparse_install,
-        '_torch_runtime',
-        return_value=('2.14.0.dev20260809+cu130', '13.0'),
+        '_runtime_probe',
+        side_effect=[
+            nvidia_runtime(),
+            nvidia_runtime(
+                sparse_compatible=True,
+                sparse_version='0.1.0',
+                sparse_architecture='sm120',
+            ),
+        ],
     )
-    @patch.object(sparse_install.subprocess, 'run')
+    @patch.object(sparse_install, '_run_pip', return_value=True)
     def test_installer_uses_pinned_wheel_without_dependencies(
         self,
-        run,
-        _runtime,
+        run_pip,
+        _probe,
         _machine,
         _system,
         _installed,
     ):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout='installed')
         self.assertTrue(sparse_install.ensure_sparse_sage())
-        command = run.call_args.args[0]
-        self.assertIn('--no-deps', command)
-        self.assertIn('--only-binary=:all:', command)
-        self.assertTrue(command[-1].startswith('https://github.com/woct0rdho/'))
-        self.assertIn('#sha256=', command[-1])
+        arguments = run_pip.call_args.args[0]
+        self.assertIn('--no-deps', arguments)
+        self.assertIn('--only-binary=:all:', arguments)
+        self.assertNotIn('--force-reinstall', arguments)
+        self.assertTrue(arguments[-1].startswith('https://github.com/woct0rdho/'))
+        self.assertIn('#sha256=', arguments[-1])
+
+    @patch.object(sparse_install, '_is_installed', side_effect=[True, True])
+    @patch.object(sparse_install.platform, 'system', return_value='Windows')
+    @patch.object(sparse_install.platform, 'machine', return_value='AMD64')
+    @patch.object(
+        sparse_install,
+        '_runtime_probe',
+        side_effect=[
+            nvidia_runtime(sparse_error='compiled extension ABI mismatch'),
+            nvidia_runtime(
+                sparse_compatible=True,
+                sparse_version='0.1.0',
+                sparse_architecture='sm120',
+            ),
+        ],
+    )
+    @patch.object(sparse_install, '_run_pip', return_value=True)
+    def test_stale_install_is_replaced_only_with_verified_match(
+        self,
+        run_pip,
+        _probe,
+        _machine,
+        _system,
+        _installed,
+    ):
+        with self.assertLogs(level='WARNING'):
+            self.assertTrue(sparse_install.ensure_sparse_sage())
+        self.assertIn('--force-reinstall', run_pip.call_args.args[0])
+        self.assertIn('--no-deps', run_pip.call_args.args[0])
+
+    @patch.object(sparse_install, '_is_installed', return_value=False)
+    @patch.object(
+        sparse_install,
+        '_runtime_probe',
+        return_value={
+            'ok': True,
+            'backend': 'rocm',
+            'accelerator_available': True,
+            'capability': None,
+            'sparse_compatible': False,
+            'sparse_error': 'Sparse Sage requires NVIDIA CUDA, not ROCm',
+        },
+    )
+    @patch.object(sparse_install, '_run_pip')
+    def test_rocm_is_left_on_dense_without_install(
+        self,
+        run_pip,
+        _probe,
+        _installed,
+    ):
+        with self.assertLogs(level='INFO'):
+            self.assertFalse(sparse_install.ensure_sparse_sage())
+        run_pip.assert_not_called()
 
     @patch.object(sparse_install.shutil, 'which', return_value='/usr/bin/git')
     @patch.object(sparse_install, '_linux_nvcc', return_value='/usr/local/cuda/bin/nvcc')
