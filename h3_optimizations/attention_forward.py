@@ -114,6 +114,7 @@ def make_forward(
     backend=None,
     attention=None,
     projector=None,
+    fallback_forward=None,
 ):
     if backend is not None and attention is not None:
         raise ValueError('pass either backend or attention, not both')
@@ -147,6 +148,12 @@ def make_forward(
                     return _finish_projected(module, backend, prepared)
                 finally:
                     del prepared
+            if fallback_forward is not None:
+                return fallback_forward(
+                    x,
+                    rope_freqs=rope_freqs,
+                    transformer_options=transformer_options,
+                )
 
         q, k, v = project_qkv(module, x, rope_freqs)
         q, k, v = to_hnd(q, k, v)

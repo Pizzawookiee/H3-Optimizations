@@ -49,7 +49,7 @@ class FakeModel:
 
 
 def resolved_attention(plan):
-    selected = 'sparse_sage' if plan.sparse else 'dense_sage_sm89'
+    selected = 'sparse_sage' if plan.sparse else 'comfy_kitchen_int8'
     return apply_module.ResolvedAttention(
         requested=selected,
         selected=selected,
@@ -99,7 +99,7 @@ class ApplyCompositionTests(unittest.TestCase):
             'synthetic',
         )
 
-        def resolve(plan, _environment, _inventory):
+        def resolve(plan, *_args):
             return resolved_attention(plan), qkv
 
         with mock.patch.object(
@@ -119,9 +119,9 @@ class ApplyCompositionTests(unittest.TestCase):
             'detect',
             return_value=SimpleNamespace(
                 cuda_available=True,
-                capability=(8, 9),
-                device_name='fake SM89',
-                architecture='sm89',
+                capability=(12, 0),
+                device_name='fake SM120',
+                architecture='sm120',
             ),
         ), mock.patch.object(
             apply_module,
@@ -135,6 +135,18 @@ class ApplyCompositionTests(unittest.TestCase):
             apply_module,
             'configure_backend',
             return_value=(object(), 50),
+        ), mock.patch.object(
+            apply_module,
+            'install_v_layout_compat',
+            return_value=SimpleNamespace(
+                state='installed',
+                reason='synthetic',
+                patched_blocks=50,
+            ),
+        ), mock.patch.object(
+            apply_module,
+            'install_dense_attention',
+            return_value=True,
         ), mock.patch.object(
             apply_module,
             '_install_mlp',

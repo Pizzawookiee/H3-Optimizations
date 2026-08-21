@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from ..plan import FUSED_QKV_OFF, MLP_MEMORY_AUTO, MLP_MEMORY_OFF
 
 QKV_STANDARD = 'standard_h3_qkv'
-QKV_DENSE_CONVROT_INT8 = 'convrot_int8_dense_sage'
+QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_SPARSE_CONVROT_INT8 = 'convrot_int8_sparse_sage'
 
 MLP_OFF = 'off'
@@ -36,9 +36,9 @@ def resolve_qkv_provider(
     *,
     request,
     backend_kind,
-    capability,
-    triton_available,
+    triton_available=False,
     sparse_spec=None,
+    kitchen_producer_available=False,
 ):
     if request == FUSED_QKV_OFF:
         return _standard_qkv('fused QKV was disabled')
@@ -52,32 +52,33 @@ def resolve_qkv_provider(
             'no fused provider supports QKV format %s'
             % (labels or 'unknown')
         )
-    if tuple(capability or ()) != (8, 9):
-        return _standard_qkv('the current fused QKV providers require SM89')
-    if not triton_available:
-        return _standard_qkv('Triton is unavailable')
-
-    if backend_kind == 'dense_sage_sm89':
+    if backend_kind == 'comfy_kitchen_int8':
+        if not kitchen_producer_available:
+            return _standard_qkv(
+                'Comfy Kitchen external producer API is unavailable'
+            )
         return QKVProviderResolution(
-            QKV_DENSE_CONVROT_INT8,
-            True,
-            'ConvRot-256 TensorWise INT8 QKV into dense Sage carriers',
+            QKV_DENSE_KITCHEN_CHUNKED,
+            False,
+            '4K ConvRot QKV chunks into Comfy Kitchen INT8 carriers',
         )
     if backend_kind == 'sparse_sage':
-        if sparse_spec is None:
-            return _standard_qkv('Sparse Sage ABI was not resolved')
-        if (
-            tuple(getattr(sparse_spec, 'capability', ())) != (8, 9)
-            or int(getattr(sparse_spec, 'q_tile', 0)) != 128
-            or int(getattr(sparse_spec, 'kv_tile', 0)) != 64
-        ):
+        if not triton_available:
+            return _standard_qkv('Triton is unavailable')
+        from ..attention.sparse.fused_qkv import (
+            sparse_fused_qkv_contract_mismatch,
+        )
+
+        mismatch = sparse_fused_qkv_contract_mismatch(sparse_spec)
+        if mismatch is not None:
             return _standard_qkv(
-                'the selected Sparse Sage ABI is not SM89 128Q x 64KV'
+                'the selected Sparse Sage ABI cannot consume fused QKV: %s'
+                % mismatch
             )
         return QKVProviderResolution(
             QKV_SPARSE_CONVROT_INT8,
             True,
-            'ConvRot-256 TensorWise INT8 QKV into Sparse Sage carriers',
+            'ConvRot-256 TensorWise INT8 QKV matches the complete Sparse Sage carrier contract',
         )
     return _standard_qkv(
         'the resolved attention backend has no fused-QKV consumer'

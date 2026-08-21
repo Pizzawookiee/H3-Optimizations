@@ -15,8 +15,18 @@ from .attention.sparse import (
 from .attention.sparse.fused_qkv import (
     TRITON_AVAILABLE as SPARSE_TRITON_AVAILABLE,
 )
-from .dense_resolver import preserve_dense_attention, resolve_dense_attention
+from .dense_resolver import (
+    install_dense_attention,
+    preserve_dense_attention,
+    resolve_dense_attention,
+)
 from .environment import RuntimeEnvironment
+from .kitchen_qkv import (
+    PRODUCER_ABI as KITCHEN_PRODUCER_ABI,
+    ChunkedKitchenAttentionBackend,
+    ChunkedKitchenQKVProjector,
+    producer_api_available,
+)
 from .memory.config import ActivationMemoryConfig
 from .memory.patch import install as install_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
@@ -31,7 +41,7 @@ from .plan import (
 from .qkv.formats import inspect_h3_linears
 from .qkv.providers import (
     MLP_OFF,
-    QKV_DENSE_CONVROT_INT8,
+    QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     resolve_mlp_provider,
     resolve_qkv_provider,
@@ -40,6 +50,10 @@ from .runtime.context import (
     H3RuntimeSession,
     RUNTIME_SESSION_KEY,
     install_runtime_wrapper,
+)
+from .v_layout_compat import (
+    install_v_layout_compat,
+    not_applicable_v_layout,
 )
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -54,42 +68,33 @@ class ResolvedAttention:
     reason: str
     backend_kind: str
     projector: object | None = None
+    dense_resolution: object | None = None
 
 
 def _fused_request(plan):
     return FUSED_QKV_OFF if plan.memory is None else plan.memory.fused_qkv
 
 
-def _dense_triton_available():
-    try:
-        from .dense_fused_qkv import TRITON_AVAILABLE
-    except Exception:
-        return False
-    return bool(TRITON_AVAILABLE)
-
-
-def _resolve_dense(plan, environment, inventory):
+def _resolve_dense(plan, model, inventory, environment=None):
     memory = plan.memory
     dense = (
         preserve_dense_attention('no memory optimization requested')
         if memory is None
-        else resolve_dense_attention(environment)
+        else resolve_dense_attention(model)
     )
     qkv = resolve_qkv_provider(
         inventory,
         request=_fused_request(plan),
         backend_kind=dense.backend_kind,
-        capability=environment.capability,
-        triton_available=_dense_triton_available(),
+        kitchen_producer_available=producer_api_available(
+            device=getattr(environment, 'device_index', None)
+        ),
     )
-    backend = dense.backend
+    backend = None
     projector = None
-    if qkv.provider_id == QKV_DENSE_CONVROT_INT8:
-        from .dense_backend import ProjectedSM89SageBackend
-        from .qkv.projectors import DenseFusedQKVProjector
-
-        backend = ProjectedSM89SageBackend(backend)
-        projector = DenseFusedQKVProjector()
+    if qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED:
+        backend = ChunkedKitchenAttentionBackend()
+        projector = ChunkedKitchenQKVProjector()
     return (
         ResolvedAttention(
             requested=dense.requested,
@@ -98,6 +103,7 @@ def _resolve_dense(plan, environment, inventory):
             reason=dense.reason,
             backend_kind=dense.backend_kind,
             projector=projector,
+            dense_resolution=dense,
         ),
         qkv,
     )
@@ -112,7 +118,6 @@ def _resolve_sparse(plan, environment, inventory):
         inventory,
         request=_fused_request(plan),
         backend_kind=ATTENTION_SPARSE,
-        capability=environment.capability,
         triton_available=bool(SPARSE_TRITON_AVAILABLE),
         sparse_spec=kernel_spec,
     )
@@ -205,6 +210,7 @@ def _status(
     mlp_blocks,
     runtime_installed,
     inventory,
+    v_layout,
 ):
     return {
         'plan_version': int(plan.version),
@@ -214,6 +220,11 @@ def _status(
             'selected': attention.selected,
             'reason': attention.reason,
             'patched_blocks': int(attention_blocks),
+        },
+        'v_layout': {
+            'state': v_layout.state,
+            'reason': v_layout.reason,
+            'patched_blocks': int(v_layout.patched_blocks),
         },
         'sparse': (
             None
@@ -231,6 +242,12 @@ def _status(
             'fused': bool(qkv.fused),
             'reason': qkv.reason,
             'projector': getattr(attention.projector, 'name', None),
+            'chunk_rows': getattr(attention.projector, 'chunk_rows', None),
+            'producer_abi': (
+                KITCHEN_PRODUCER_ABI
+                if qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED
+                else None
+            ),
         },
         'mlp': {
             'requested': 'off' if plan.memory is None else plan.memory.mlp_memory,
@@ -271,15 +288,37 @@ def apply_plan(model, plan: H3OptimizationPlan):
     if plan.sparse is not None:
         attention, qkv = _resolve_sparse(plan, environment, inventory)
     else:
-        attention, qkv = _resolve_dense(plan, environment, inventory)
+        attention, qkv = _resolve_dense(plan, model, inventory, environment)
 
     patched = model.clone()
     attention_blocks = 0
-    if attention.backend is not None:
+    if plan.sparse is not None:
         _backend, attention_blocks = configure_backend(
             patched,
             attention.backend,
             projector=attention.projector,
+        )
+        v_layout = not_applicable_v_layout(
+            'sparse attention owns the main H3 forward'
+        )
+    elif plan.memory is not None:
+        if qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED:
+            _backend, attention_blocks = configure_backend(
+                patched,
+                attention.backend,
+                projector=attention.projector,
+                projector_fallback_to_original=True,
+            )
+            v_layout = not_applicable_v_layout(
+                'chunked Kitchen QKV owns the main H3 forward'
+            )
+        else:
+            v_layout = install_v_layout_compat(patched)
+            attention_blocks = int(v_layout.patched_blocks)
+        install_dense_attention(patched, attention.dense_resolution)
+    else:
+        v_layout = not_applicable_v_layout(
+            'no H3 Memory Optimization request'
         )
 
     mlp, mlp_blocks = _install_mlp(patched, plan, inventory)
@@ -302,11 +341,13 @@ def apply_plan(model, plan: H3OptimizationPlan):
         mlp_blocks=mlp_blocks,
         runtime_installed=runtime_installed,
         inventory=inventory,
+        v_layout=v_layout,
     )
     logging.info(
-        '%s armed: attention=%s qkv=%s mlp=%s device=%s',
+        '%s armed: attention=%s v_layout=%s qkv=%s mlp=%s device=%s',
         LOG_PREFIX,
         attention.selected,
+        v_layout.state,
         qkv.provider_id,
         mlp.provider_id,
         environment.device_name,

@@ -31,13 +31,23 @@ def format_memory_status(model):
         return 'Skipped: input model is not MiniMax H3.'
 
     attention = status.get('attention', {})
+    v_layout = status.get('v_layout', {})
     qkv = status.get('fused_qkv', {})
     mlp = status.get('mlp', {})
+    v_layout_state = v_layout.get('state') or 'not reported'
+    if v_layout_state == 'unavailable':
+        v_layout_state = 'could not be probed'
     lines = [
         'Attention: %s' % (attention.get('selected') or 'preserve incoming'),
+        'V layout shim: %s' % v_layout_state,
         'QKV: %s' % _provider_text(qkv, 'standard_h3_qkv'),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
+    if qkv.get('provider') == 'chunked_kitchen_qkv':
+        lines[2] += ' (%d-row chunks, Kitchen %s)' % (
+            int(qkv.get('chunk_rows') or 4096),
+            qkv.get('producer_abi') or 'producer ABI unavailable',
+        )
     chunk_rows = mlp.get('chunk_rows')
     if chunk_rows is not None and mlp.get('provider') != 'off':
         lines[-1] += ' (%d-row chunks)' % int(chunk_rows)

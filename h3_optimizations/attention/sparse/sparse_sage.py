@@ -29,6 +29,11 @@ class SparseSageKernelSpec:
     extension_layout: str = "monolithic"
     fused_v_ops: object = None
     kernel_name: str = ""
+    qk_format: str = "block_int8"
+    q_scale_layout: str = "per_q_tile_float32"
+    k_scale_layout: str = "per_kv_tile_float32"
+    projected_v_format: str = "floating_hnd"
+    summary_format: str = "tile_mean"
 
     @property
     def signature(self):
@@ -36,7 +41,10 @@ class SparseSageKernelSpec:
             str(self.version), str(self.architecture), tuple(self.capability), int(self.q_tile),
             int(self.kv_tile), str(self.v_format), str(self.accumulator),
             float(self.v_quant_bound), str(self.extension_layout),
-            str(self.kernel_name), id(self.kernel), id(self.fused_v_ops),
+            str(self.kernel_name), str(self.qk_format),
+            str(self.q_scale_layout), str(self.k_scale_layout),
+            str(self.projected_v_format), str(self.summary_format),
+            id(self.kernel), id(self.fused_v_ops),
         )
 
     @property
@@ -532,11 +540,17 @@ class SparseSageExecutor:
         )
 
     def prepare_projected(self, projected, lut, valid_block_num, *, metadata):
-        from .fused_qkv import validate_prepared_fused_qkv
+        from .fused_qkv import (
+            sparse_fused_qkv_contract_mismatch,
+            validate_prepared_fused_qkv,
+        )
         validate_prepared_fused_qkv(projected)
-        if (self.spec.capability != (8, 9)
-                or self.spec.q_tile != Q_TILE or self.spec.kv_tile != KV_TILE):
-            raise SparseSageError("sage128_fused_qkv requires SM89 and the 128Q x 64KV Sparse Sage ABI")
+        mismatch = sparse_fused_qkv_contract_mismatch(self.spec)
+        if mismatch is not None:
+            raise SparseSageError(
+                "fused QKV does not match the Sparse Sage carrier contract: %s"
+                % mismatch
+            )
         heads, sequence = int(projected.heads), int(projected.sequence)
         self.spec.validate_lut(lut, valid_block_num, batch=1, heads=heads, sequence=sequence)
         if lut.device != projected.q_int8.device:

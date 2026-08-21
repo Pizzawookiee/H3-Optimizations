@@ -45,6 +45,29 @@ class SourceIsolationTests(unittest.TestCase):
             metadata,
         )
 
+    def test_dense_kitchen_integration_uses_only_public_carrier_apis(self):
+        source = (SOURCE / 'kitchen_qkv.py').read_text(encoding='utf-8')
+        self.assertNotIn('._C', source)
+        self.assertNotIn('PrequantizedInt8Attention(', source)
+
+    def test_legacy_dense_stack_is_not_exported_to_production(self):
+        production_boundaries = (
+            SOURCE / 'attention' / '__init__.py',
+            SOURCE / 'qkv' / '__init__.py',
+            SOURCE / 'qkv' / 'projectors.py',
+            SOURCE / 'apply.py',
+        )
+        banned = (
+            'SM89SageMemoryEfficientBackend',
+            'DenseFusedQKVProjector',
+            'sage_mem_eff',
+            'dense_fused_qkv',
+        )
+        for path in production_boundaries:
+            text = path.read_text(encoding='utf-8')
+            for fragment in banned:
+                self.assertNotIn(fragment, text, '%s exports %s' % (path, fragment))
+
 
 if __name__ == '__main__':
     unittest.main()

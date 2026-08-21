@@ -22,6 +22,8 @@ import torch
 from . import sage_mem_eff as impl
 from . import stats
 
+_execute_prepared = impl.SM89SageMemoryEfficientBackend.execute
+
 
 def _independent_contiguous_v(v):
     snapshot = v.contiguous()
@@ -80,6 +82,9 @@ def _prepare(self, q, k, v, *, layer_index, transformer_options):
 
 
 def _execute(self, prepared):
+    if prepared.v_scale is not None:
+        return _execute_prepared(self, prepared)
+
     # ``forward.py`` has deleted the original q/k/v views before entering here,
     # so Sage's large transpose/pad temporary no longer overlaps fused QKV.
     v_source = prepared.v_fp8

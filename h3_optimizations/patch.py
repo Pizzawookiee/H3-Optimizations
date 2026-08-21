@@ -2,7 +2,6 @@
 
 import logging
 
-from comfy.ldm.modules.attention import get_attention_function
 import comfy.quant_ops
 
 from .model import get_h3_blocks, is_minimax_h3
@@ -89,39 +88,25 @@ def validate(model_patcher):
     return tuple(modules)
 
 
-def _pin_token_refiner_to_sage(model_patcher):
-    sage = get_attention_function('sage', default=None)
-    if sage is None:
-        raise H3AttentionPatchError(
-            'H3 Sage attention requires ComfyUI registered SageAttention'
-        )
-    sage_impl = getattr(sage, '__wrapped__', sage)
-
-    def override(_original, *args, **kwargs):
-        return sage_impl(*args, **kwargs)
-
-    override._h3_optimizations_backend = 'sage'
-    options = model_patcher.model_options['transformer_options'] = (
-        model_patcher.model_options.get('transformer_options', {}).copy()
-    )
-    options['optimized_attention_override'] = override
-
-
-def configure_backend(model_patcher, backend, projector=None):
+def configure_backend(
+    model_patcher,
+    backend,
+    projector=None,
+    *,
+    projector_fallback_to_original=False,
+):
     '''Install or replace the package-owned H3 attention transaction.'''
 
     if backend is None:
         raise TypeError('backend must not be None')
     from .attention_forward import make_forward
 
-    if bool(getattr(backend, 'requires_registered_sage', True)):
-        _pin_token_refiner_to_sage(model_patcher)
-
     modules = validate(model_patcher)
     existing = getattr(model_patcher, 'object_patches', {})
     desired = (
         installation_signature(backend),
         installation_signature(projector),
+        bool(projector_fallback_to_original),
     )
     owned = [
         index
@@ -168,6 +153,11 @@ def configure_backend(model_patcher, backend, projector=None):
             index,
             backend=backend,
             projector=projector,
+            fallback_forward=(
+                originals[index]
+                if projector_fallback_to_original
+                else None
+            ),
         )
         setattr(forward, OWNER_MARKER, True)
         setattr(forward, SIGNATURE_MARKER, desired)

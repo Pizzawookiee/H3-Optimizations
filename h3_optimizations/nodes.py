@@ -24,7 +24,7 @@ NODE_CATEGORY = 'H3-Optimizations/Model Patches'
 
 
 class H3MemoryOptimization(io.ComfyNode):
-    '''Format-aware dense Sage, fused QKV, and bounded MLP execution.'''
+    '''Chunked Kitchen QKV, sparse fused QKV, and bounded MLP execution.'''
 
     @classmethod
     def define_schema(cls):
@@ -54,9 +54,9 @@ class H3MemoryOptimization(io.ComfyNode):
                     options=[FUSED_QKV_AUTO, FUSED_QKV_OFF],
                     default=FUSED_QKV_AUTO,
                     tooltip=(
-                        'auto uses a fused provider only when the H3 QKV '
-                        'weight format, GPU, Triton, and selected attention ABI '
-                        'are compatible. Otherwise standard H3 QKV is retained.'
+                        'auto uses 4K chunked Comfy Kitchen QKV for compatible '
+                        'dense H3 and native-carrier fused QKV for compatible '
+                        'Sparse Sage. off uses standard H3 QKV.'
                     ),
                 ),
                 io.Combo.Input(

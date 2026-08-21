@@ -59,6 +59,10 @@ class NodeTests(unittest.TestCase):
             input_by_id(memory, 'fused_qkv').options,
             ['auto', 'off'],
         )
+        self.assertIn(
+            'chunked Comfy Kitchen QKV',
+            input_by_id(memory, 'fused_qkv').tooltip,
+        )
         self.assertEqual(
             input_by_id(memory, 'mlp_memory').options,
             ['auto', 'off'],

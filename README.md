@@ -2,14 +2,15 @@
 
 Standalone production optimization nodes for MiniMax H3 in ComfyUI.
 
-This pack owns its attention kernels, Sparse Sage routing, packed-layout
-runtime, QKV providers, and bounded MLP implementation. It does not import or
-depend on ComfyUI-H3-Extended.
+This pack owns Sparse Sage routing, its sparse native-carrier QKV path, the H3
+adapter for Comfy Kitchen's dense INT8 carriers, and bounded MLP execution. It
+does not import or depend on ComfyUI-H3-Extended.
 
 ## Nodes
 
-- H3 Memory Optimization selects a compatible dense Sage backend, uses fused
-  QKV projection when the checkpoint and runtime support it, and bounds MLP
+- H3 Memory Optimization selects Comfy Kitchen dense INT8 attention and, when
+  Kitchen exposes a compatible producer contract, projects ConvRot INT8 QKV in
+  4K token chunks directly into Kitchen-owned carriers. It also bounds MLP
   activation memory with token chunking.
 - H3 Sparse Attention enables fixed-density Sparse Sage attention while
   keeping text, reference conditioning, audio, non-video queries, and mixed
@@ -28,19 +29,33 @@ From the ComfyUI custom-nodes directory:
 
     git clone https://github.com/Zironic/H3-Optimizations
 
-Then install the attention backends appropriate for your Python, Torch, CUDA,
-and GPU combination and restart ComfyUI.
+The first ComfyUI startup automatically installs Sparse Sage before loading the
+nodes. Supported Windows installations use matching upstream wheels with pinned
+hashes. Linux x86-64 installations build a pinned SpargeAttention revision from
+source when `git` and the CUDA `nvcc` compiler are available. Both paths use
+`--no-deps`, so they cannot replace Torch or other ComfyUI packages. Set
+`H3_OPTIMIZATIONS_SKIP_SPARSE_INSTALL=1` to disable this behavior.
+The first Linux source build may add several minutes to startup.
 
-Dense Sage execution uses the SageAttention package selected by ComfyUI.
-Sparse Attention additionally requires a compatible spas_sage_attn build.
-Fused QKV and ConvRot MLP paths require Triton, comfy-kitchen ConvRot-256
-TensorWise INT8 weights, and the supported GPU architecture. Missing optional
-capabilities either keep the existing dense path or produce a clear error when
-Sparse Attention was explicitly requested.
+Verified automatic wheels cover CUDA 12.4 with Torch 2.5.1, CUDA 12.6 with
+Torch 2.6.0, CUDA 12.8 with Torch 2.7.1, 2.8.0, or 2.9 and newer, and CUDA 13.0
+with Torch 2.9 or newer. The Linux build requires Torch 2.3 or newer and CUDA
+12.0 or newer. Other platforms and combinations require a compatible manual
+`spas_sage_attn` build.
 
-SageAttention and spas_sage_attn are intentionally not declared as automatic
-package dependencies. They contain architecture-specific compiled code, and an
-incompatible wheel can replace or break the Torch installation used by ComfyUI.
+Dense execution uses ComfyUI's public `comfy_kitchen_int8` attention backend.
+Chunked dense QKV additionally requires a Comfy Kitchen release exposing its
+external INT8-attention producer contract and ConvRot-256 TensorWise INT8 QKV
+weights. Sparse Attention requires a compatible spas_sage_attn build; its
+native-carrier fused QKV and the ConvRot MLP path additionally require Triton.
+Missing dense capabilities return to upstream H3 QKV and normal Comfy
+attention. Missing capabilities for explicitly requested Sparse Attention
+produce a clear error.
+
+spas_sage_attn is not a normal package dependency because its compiled backend
+must match Torch and CUDA. The guarded pre-startup installer acts only when the
+package is absent and either an exact verified wheel or the pinned Linux source
+build is available.
 
 ## Compatibility
 
@@ -48,20 +63,23 @@ incompatible wheel can replace or break the Torch installation used by ComfyUI.
 - Python 3.10 or newer
 - NVIDIA CUDA for optimized attention
 
-Prepared dense Sage backends cover SM80, SM86, SM89, SM90, SM120, and SM121.
-Sparse Sage accepts the exact ABI exported by compatible spas_sage_attn builds
-for SM80/86/87, SM89, SM90, and SM120. Fused QKV is selected only for SM89,
-Triton, ConvRot-256 TensorWise INT8 weights, and the 128Q x 64KV sparse ABI.
+Dense QKV eligibility follows the complete producer specification returned by
+Comfy Kitchen; it is not gated on a particular compute capability. Sparse Sage
+accepts the exact ABI exported by a compatible spas_sage_attn build. Its fused
+QKV producer is selected only when the active kernel's Q/K tiles, scale layouts,
+V carrier, accumulator, summaries, and callables all match. A mismatched
+architecture uses standard sparse QKV.
 
 Node IDs are H3MemoryOptimization and H3SparseAttention. H3-Extended is not
 required.
 
 ## Validation
 
-CPU tests cover node schemas, plan composition, non-H3 no-op behavior, sparse
-route geometry, early/late budget resolution, runtime step/layout publication,
-and source isolation. GPU kernel validation is intentionally separate because
-it requires the matching hardware and compiled backend packages.
+CPU tests cover node schemas, plan composition, dense capability fallback,
+chunk boundaries and RoPE slices, non-H3 no-op behavior, sparse contract and
+route geometry, runtime step/layout publication, and source isolation. GPU
+kernel validation is intentionally separate because it requires the matching
+hardware and compiled backend packages.
 
 Run the CPU suite from the ComfyUI root:
 

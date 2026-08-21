@@ -13,7 +13,6 @@ from .providers import (
     resolve_qkv_provider,
 )
 from .projectors import (
-    DenseFusedQKVProjector,
     SparseFusedQKVProjector,
 )
 
@@ -26,6 +25,5 @@ __all__ = [
     "QKVProviderResolution",
     "resolve_mlp_provider",
     "resolve_qkv_provider",
-    "DenseFusedQKVProjector",
     "SparseFusedQKVProjector",
 ]

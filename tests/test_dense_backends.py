@@ -2,9 +2,7 @@
 
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
 
 import torch
 
@@ -24,11 +22,10 @@ from h3_optimizations.attention.sage_arch import (  # noqa: E402
     SageSM86MemoryEfficientBackend,
     SageSM90MemoryEfficientBackend,
 )
-from h3_optimizations.dense_resolver import (  # noqa: E402
-    ATTENTION_AUTO,
-    ATTENTION_EXISTING,
-    preserve_dense_attention,
-    resolve_dense_attention,
+from h3_optimizations.attention.sage_mem_eff import (  # noqa: E402
+    PreparedSM89,
+    SageSM89API,
+    SM89SageMemoryEfficientBackend,
 )
 
 
@@ -113,47 +110,46 @@ class FakeFP8:
         )
 
 
-class DenseResolverTests(unittest.TestCase):
-    def test_memory_policy_automatically_selects_supported_backend(self):
-        backend = object()
-        environment = SimpleNamespace(
-            cuda_available=True,
-            capability=(8, 9),
-            device_name='fake SM89',
-            architecture='sm89',
-        )
-        with patch(
-            'h3_optimizations.dense_resolver._backend_class',
-            return_value=lambda: backend,
-        ):
-            resolution = resolve_dense_attention(environment)
-        self.assertEqual(resolution.requested, ATTENTION_AUTO)
-        self.assertEqual(resolution.selected, 'dense_sage_sm89')
-        self.assertIs(resolution.backend, backend)
-
-    def test_automatic_policy_falls_back_to_existing_attention(self):
-        resolution = resolve_dense_attention(
-            SimpleNamespace(
-                cuda_available=False,
-                capability=None,
-                device_name='cpu',
-                architecture='cpu',
-            )
-        )
-        self.assertEqual(resolution.requested, ATTENTION_AUTO)
-        self.assertEqual(resolution.selected, ATTENTION_EXISTING)
-        self.assertIsNone(resolution.backend)
-
-    def test_empty_plan_preserves_existing_attention(self):
-        resolution = preserve_dense_attention(
-            'no memory optimization requested'
-        )
-        self.assertEqual(resolution.requested, ATTENTION_EXISTING)
-        self.assertEqual(resolution.selected, ATTENTION_EXISTING)
-        self.assertIsNone(resolution.backend)
-
-
 class DenseBackendTests(unittest.TestCase):
+    def test_sm89_execute_does_not_requantize_prepared_v(self):
+        kernel = FakeKernel(expected_granularity=3)
+
+        def reject_fp8(_v, **_kwargs):
+            raise AssertionError('prepared FP8 V must not be quantized again')
+
+        backend = SM89SageMemoryEfficientBackend(
+            api=SageSM89API(
+                version='2.2.test',
+                per_channel_fp8=reject_fp8,
+                kernel=kernel,
+                kernel_name='fake_sm89',
+            ),
+            quantizer=fake_thread_quantizer,
+            allow_cpu_for_tests=True,
+        )
+        shape = (1, 2, 65, 128)
+        prepared = PreparedSM89(
+            q_int8=torch.zeros(shape, dtype=torch.int8),
+            q_scale=torch.ones((1, 2, 64), dtype=torch.float32),
+            k_int8=torch.zeros(shape, dtype=torch.int8),
+            k_scale=torch.ones((1, 2, 8), dtype=torch.float32),
+            v_fp8=torch.zeros(shape, dtype=torch.int8),
+            v_scale=torch.ones((1, 2, 128), dtype=torch.float32),
+            output_dtype=torch.bfloat16,
+            layer_index=0,
+            sequence=65,
+            heads=2,
+            head_dim=128,
+            softmax_scale=128**-0.5,
+            kernel=kernel,
+            kernel_name='fake_sm89',
+        )
+
+        output = backend.execute(prepared)
+
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertEqual(kernel.v_dtype, torch.int8)
+
     def test_sm80_uses_independent_fp16_v(self):
         kernel = FakeKernel(expected_granularity=3)
         backend = SageSM80MemoryEfficientBackend(

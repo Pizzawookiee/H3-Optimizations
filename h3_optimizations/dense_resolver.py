@@ -1,12 +1,16 @@
-'''Architecture-aware dense Sage selection for H3 Memory Optimization.'''
+'''Dense H3 attention selection through ComfyUI's public backend API.'''
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from comfy.ldm.modules.attention import get_attention_function
+
 
 ATTENTION_AUTO = 'auto'
+ATTENTION_COMFY_KITCHEN_INT8 = 'comfy_kitchen_int8'
 ATTENTION_EXISTING = 'existing'
+OVERRIDE_MARKER = '_h3_optimizations_dense_backend'
 
 
 @dataclass(frozen=True)
@@ -18,29 +22,13 @@ class DenseResolution:
     backend_kind: str
 
 
-_BACKENDS = {
-    (8, 0): ('SageSM80MemoryEfficientBackend', 'dense_sage_sm80'),
-    (8, 6): ('SageSM86MemoryEfficientBackend', 'dense_sage_sm86'),
-    (8, 9): ('SM89SageMemoryEfficientBackend', 'dense_sage_sm89'),
-    (9, 0): ('SageSM90MemoryEfficientBackend', 'dense_sage_sm90'),
-    (12, 0): ('SageSM12xMemoryEfficientBackend', 'dense_sage_sm12x'),
-    (12, 1): ('SageSM12xMemoryEfficientBackend', 'dense_sage_sm12x'),
-}
-
-
-def _backend_class(name):
-    from . import attention
-
-    return getattr(attention, name)
-
-
 def _existing_resolution(requested, reason):
     return DenseResolution(
         requested,
         ATTENTION_EXISTING,
         None,
         reason,
-        'existing',
+        ATTENTION_EXISTING,
     )
 
 
@@ -48,30 +36,63 @@ def preserve_dense_attention(reason):
     return _existing_resolution(ATTENTION_EXISTING, reason)
 
 
-def resolve_dense_attention(environment):
-    if not environment.cuda_available or environment.capability is None:
-        return _existing_resolution(ATTENTION_AUTO, environment.device_name)
+def is_installed_dense_attention(transformer_options):
+    options = transformer_options or {}
+    override = options.get('optimized_attention_override')
+    return getattr(override, OVERRIDE_MARKER, None) == ATTENTION_COMFY_KITCHEN_INT8
 
-    entry = _BACKENDS.get(tuple(environment.capability))
-    if entry is None:
+
+def resolve_dense_attention(model_patcher):
+    options = (
+        getattr(model_patcher, 'model_options', {})
+        .get('transformer_options', {})
+        or {}
+    )
+    if 'optimized_attention_override' in options:
+        if is_installed_dense_attention(options):
+            return DenseResolution(
+                ATTENTION_AUTO,
+                ATTENTION_COMFY_KITCHEN_INT8,
+                None,
+                'Comfy Kitchen INT8 is already installed through ModelPatcher',
+                ATTENTION_COMFY_KITCHEN_INT8,
+            )
         return _existing_resolution(
             ATTENTION_AUTO,
-            'no prepared dense Sage backend supports %s'
-            % environment.architecture,
+            'preserved an explicit optimized-attention override',
         )
-    class_name, backend_kind = entry
-    try:
-        backend = _backend_class(class_name)()
-    except Exception as exc:
+
+    backend = get_attention_function(ATTENTION_COMFY_KITCHEN_INT8, None)
+    if backend is None:
         return _existing_resolution(
             ATTENTION_AUTO,
-            '%s preflight failed: %s: %s'
-            % (class_name, type(exc).__name__, exc),
+            'Comfy Kitchen INT8 is unavailable; using normal Comfy selection',
         )
     return DenseResolution(
         ATTENTION_AUTO,
-        backend_kind,
+        ATTENTION_COMFY_KITCHEN_INT8,
         backend,
-        '%s detected' % environment.architecture.upper(),
-        backend_kind,
+        'selected through ComfyUI public attention registry',
+        ATTENTION_COMFY_KITCHEN_INT8,
     )
+
+
+def install_dense_attention(model_patcher, resolution):
+    if resolution.backend is None:
+        return False
+    model_patcher.set_model_optimized_attention(resolution.backend)
+    override = model_patcher.model_options[
+        'transformer_options'
+    ]['optimized_attention_override']
+    setattr(override, OVERRIDE_MARKER, ATTENTION_COMFY_KITCHEN_INT8)
+    return True
+
+
+def clear_installed_dense_attention(model_patcher):
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    if not is_installed_dense_attention(options):
+        return False
+    del options['optimized_attention_override']
+    return True

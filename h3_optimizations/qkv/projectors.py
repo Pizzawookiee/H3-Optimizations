@@ -1,4 +1,4 @@
-"""Format-guarded fused-QKV projectors for dense and Sparse Sage."""
+"""Format-guarded fused-QKV projector for Sparse Sage."""
 
 from __future__ import annotations
 
@@ -15,66 +15,6 @@ def _unsupported(required, message):
             % message
         )
     return None
-
-
-class DenseFusedQKVProjector:
-    """Guard the dense ConvRot projector and fall back for auto requests."""
-
-    name = "h3_fused_qkv_dense_sage"
-    qk_format = "sage_per_thread_int8"
-
-    def __init__(self, required=False, tensor_core=None):
-        from ..dense_fused_qkv import (
-            DenseFusedQKVProjector as Implementation,
-        )
-
-        self.required = bool(required)
-        self._implementation = Implementation(
-            tensor_core=tensor_core
-        )
-
-    @property
-    def installation_signature(self):
-        return (
-            self.name,
-            self.qk_format,
-            bool(self.required),
-            self._implementation.installation_signature,
-        )
-
-    def bind(self, module):
-        callback = getattr(
-            self._implementation, "bind", None
-        )
-        return None if callback is None else callback(module)
-
-    def try_project(
-        self,
-        module,
-        x,
-        rope_freqs,
-        *,
-        layer_index,
-        transformer_options,
-    ):
-        actual = describe_linear(module.qkv_proj)
-        if not actual.convrot_int8_256:
-            return _unsupported(
-                self.required,
-                "QKV format is %s" % actual.label,
-            )
-        try:
-            return self._implementation.project(
-                module,
-                x,
-                rope_freqs,
-                layer_index=layer_index,
-                transformer_options=transformer_options,
-            )
-        except Exception as exc:
-            if is_fused_weight_format_error(exc):
-                return _unsupported(self.required, str(exc))
-            raise
 
 
 class SparseFusedQKVProjector:

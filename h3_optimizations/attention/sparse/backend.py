@@ -8,7 +8,10 @@ from .config import (
     MODE_SAGE128_FUSED_QKV,
     resolve_video_budget,
 )
-from .fused_qkv import FusedQKVProjector
+from .fused_qkv import (
+    FusedQKVProjector,
+    sparse_fused_qkv_contract_mismatch,
+)
 from .router import SparseRouterError, SparseTileRouter
 from .sparse_sage import (
     SparseSageError,
@@ -80,13 +83,11 @@ class HybridSparseBackend:
                     self.executor.spec.kv_tile,
                 )
             )
-        if self.config.mode == MODE_SAGE128_FUSED_QKV and (
-            self.executor.spec.capability != (8, 9)
-            or self.executor.spec.q_tile != 128
-            or self.executor.spec.kv_tile != 64
-        ):
+        mismatch = sparse_fused_qkv_contract_mismatch(self.executor.spec)
+        if self.config.mode == MODE_SAGE128_FUSED_QKV and mismatch is not None:
             raise SparseSageError(
-                'fused QKV requires SM89 and the 128Q x 64KV Sparse Sage ABI'
+                'fused QKV does not match the Sparse Sage carrier contract: %s'
+                % mismatch
             )
 
     @staticmethod

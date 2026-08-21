@@ -44,6 +44,52 @@ class PreparedFusedQKV:
     smooth_k: bool = False
 
 
+def sparse_fused_qkv_contract_mismatch(spec):
+    if spec is None:
+        return 'Sparse Sage ABI was not resolved'
+    expected = (
+        ('q_tile', Q_TILE),
+        ('kv_tile', KV_TILE),
+        ('qk_format', 'block_int8'),
+        ('q_scale_layout', 'per_q_tile_float32'),
+        ('k_scale_layout', 'per_kv_tile_float32'),
+        ('projected_v_format', 'floating_hnd'),
+        ('summary_format', 'tile_mean'),
+    )
+    for name, value in expected:
+        if getattr(spec, name, None) != value:
+            return '%s=%r does not match %r' % (
+                name,
+                getattr(spec, name, None),
+                value,
+            )
+    if getattr(spec, 'v_format', None) not in ('fp16', 'fp8'):
+        return 'unsupported V carrier format %r' % getattr(
+            spec,
+            'v_format',
+            None,
+        )
+    if getattr(spec, 'accumulator', None) not in ('f16', 'f32'):
+        return 'unsupported accumulator %r' % getattr(
+            spec,
+            'accumulator',
+            None,
+        )
+    if not callable(getattr(spec, 'kernel', None)):
+        return 'Sparse Sage kernel callable is unavailable'
+    if getattr(spec, 'v_format', None) == 'fp8':
+        fused = getattr(spec, 'fused_v_ops', None)
+        if not all(
+            callable(getattr(fused, name, None))
+            for name in (
+                'transpose_pad_permute_cuda',
+                'scale_fuse_quant_cuda',
+            )
+        ):
+            return 'Sparse Sage FP8 V preparation callables are unavailable'
+    return None
+
+
 def validate_prepared_fused_qkv(prepared):
     sequence = int(prepared.sequence)
     heads = int(prepared.heads)
