@@ -145,14 +145,24 @@ class HeldFP8QKV:
     def __exit__(self, exc_type, exc, tb):
         return self.binding.__exit__(exc_type, exc, tb)
 
-    def project_hnd(self, x, rope_freqs, start, end):
+    def _finish(self, rows, rope):
         from ..attention_forward import finish_qkv_projection, to_hnd
 
-        chunk_rope = None if rope_freqs is None else rope_freqs[:, start:end]
-        projected = self.binding.linear(x[start:end])
+        projected = self.binding.linear(rows)
         return to_hnd(
-            *finish_qkv_projection(self.attention, projected, chunk_rope)
+            *finish_qkv_projection(self.attention, projected, rope)
         )
+
+    def project_hnd(self, x, rope_freqs, start, end):
+        chunk_rope = None if rope_freqs is None else rope_freqs[:, start:end]
+        return self._finish(x[start:end], chunk_rope)
+
+    def project_rows(self, x, rope_freqs, rows):
+        sample_x = x.index_select(0, rows)
+        sample_rope = (
+            None if rope_freqs is None else rope_freqs.index_select(1, rows)
+        )
+        return self._finish(sample_x, sample_rope)
 
 
 class HeldFP8MLP:
