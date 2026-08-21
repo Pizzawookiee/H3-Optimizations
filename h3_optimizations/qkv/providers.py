@@ -10,7 +10,9 @@ QKV_SPARSE_CONVROT_INT8 = 'convrot_int8_sparse_sage'
 QKV_TRITON_SPARSE_CHUNKED = 'chunked_triton_int8_sparse'
 
 MLP_OFF = 'off'
-MLP_GENERIC_CHUNKED = 'generic_chunked_quantized'
+MLP_PRESERVE_UPSTREAM = 'preserve_upstream_mlp'
+MLP_FLOAT_CHUNKED = 'float_chunked'
+MLP_FP8_CHUNKED = 'fp8_chunked'
 MLP_CONVROT_INT8_TWO_SLICE = 'convrot_int8_two_slice'
 
 
@@ -42,7 +44,7 @@ def resolve_qkv_provider(
     kitchen_producer_available=False,
 ):
     if request == FUSED_QKV_OFF:
-        return _standard_qkv('fused QKV was disabled')
+        return _standard_qkv('QKV projection optimization was disabled')
     if not inventory.qkv:
         return _standard_qkv('the H3 model has no QKV projection inventory')
     if not inventory.homogeneous('qkv'):
@@ -50,7 +52,7 @@ def resolve_qkv_provider(
     if not inventory.qkv_convrot_int8_256:
         labels = ', '.join(sorted(set(inventory.labels('qkv'))))
         return _standard_qkv(
-            'no fused provider supports QKV format %s'
+            'native checkpoint projection preserves QKV format %s'
             % (labels or 'unknown')
         )
     if backend_kind == 'comfy_kitchen_int8':
@@ -104,7 +106,7 @@ def _convrot_compatible(inventory):
     )
 
 
-def resolve_mlp_provider(inventory, *, request):
+def resolve_mlp_provider(inventory, *, request, fp8_available=False):
     if request == MLP_MEMORY_OFF:
         return MLPProviderResolution(
             MLP_OFF,
@@ -128,15 +130,39 @@ def resolve_mlp_provider(inventory, *, request):
                 'feature slices'
             ),
         )
+    if inventory.mlp_fp8:
+        if fp8_available:
+            return MLPProviderResolution(
+                MLP_FP8_CHUNKED,
+                'mlp_chunked_fp8',
+                'checkpoint-native FP8 MLP uses held weights and bounded token chunks',
+            )
+        return MLPProviderResolution(
+            MLP_PRESERVE_UPSTREAM,
+            'off',
+            'FP8 checkpoint detected but accelerated FP8 execution is unavailable',
+        )
+    if inventory.mlp_plain_float:
+        if fp8_available:
+            return MLPProviderResolution(
+                MLP_FP8_CHUNKED,
+                'mlp_chunked_fp8',
+                'floating H3 MLP weights are converted to FP8 E4M3 for Memory auto',
+            )
+        return MLPProviderResolution(
+            MLP_FLOAT_CHUNKED,
+            'mlp_chunked_native',
+            'floating H3 MLP uses bounded held-weight token chunking',
+        )
 
     labels = sorted(
         set(inventory.labels('fc1')) | set(inventory.labels('fc2'))
     )
     return MLPProviderResolution(
-        MLP_GENERIC_CHUNKED,
-        'mlp_chunked_native',
+        MLP_PRESERVE_UPSTREAM,
+        'off',
         (
-            'generic token chunking preserves the model linear formats: %s'
+            'no H3 memory provider supports MLP format %s; preserving upstream Comfy execution'
             % (', '.join(labels) or 'unknown')
         ),
     )
