@@ -20,7 +20,7 @@ from .status import (
     format_sparse_status,
 )
 
-DEFAULT_CHUNK_ROWS = 2048
+DEFAULT_CHUNK_ROWS = 4096
 NODE_CATEGORY = 'H3-Optimizations/Model Patches'
 
 
