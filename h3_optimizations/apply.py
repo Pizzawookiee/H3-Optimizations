@@ -40,6 +40,7 @@ from .qkv.providers import (
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
+    QKV_SPARSE_FP8_CHUNKED,
     QKV_TRITON_SPARSE_CHUNKED,
     resolve_mlp_provider,
     resolve_qkv_provider,
@@ -115,19 +116,27 @@ def _resolve_sparse(plan, environment, inventory):
         backend_kind=ATTENTION_SPARSE,
         triton_available=bool(SPARSE_TRITON_AVAILABLE),
         sparse_spec=kernel_spec,
+        memory_optimize=plan.memory is not None,
+        fp8_available=_fp8_execution_available(environment),
     )
-    use_fused = qkv.provider_id == QKV_SPARSE_CONVROT_INT8
+    use_projected = qkv.provider_id in (
+        QKV_SPARSE_CONVROT_INT8,
+        QKV_SPARSE_FP8_CHUNKED,
+    )
     config = HybridSparseConfig(
-        mode=MODE_SAGE128_FUSED_QKV if use_fused else MODE_SAGE128,
+        mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
         video_budget=float(plan.sparse.video_budget),
         density_mode=DENSITY_FIXED,
         denser_early_late_steps=bool(plan.sparse.denser_early_late_steps),
         strict=True,
     )
     projector = None
-    if use_fused:
+    if qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
         from .qkv.projectors import SparseFusedQKVProjector
         projector = SparseFusedQKVProjector(kernel_spec, chunk_rows=4096)
+    elif qkv.provider_id == QKV_SPARSE_FP8_CHUNKED:
+        from .attention.sparse.fp8_qkv import FP8SparseQKVProjector
+        projector = FP8SparseQKVProjector(kernel_spec, chunk_rows=4096)
     backend = HybridSparseBackend(config, kernel_spec=kernel_spec, projector=projector)
     return ResolvedAttention(
         requested=ATTENTION_SPARSE,
