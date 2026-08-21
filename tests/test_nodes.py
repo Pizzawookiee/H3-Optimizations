@@ -67,6 +67,7 @@ class NodeTests(unittest.TestCase):
             input_by_id(memory, 'mlp_memory').options,
             ['auto', 'off'],
         )
+        self.assertEqual(input_by_id(memory, 'chunk_rows').default, 4096)
         self.assertEqual(sparse.node_id, 'H3SparseAttention')
         self.assertEqual(sparse.display_name, 'H3 Sparse Attention')
         self.assertEqual(

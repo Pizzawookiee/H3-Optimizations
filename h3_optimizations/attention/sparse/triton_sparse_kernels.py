@@ -20,6 +20,8 @@ if TRITON_AVAILABLE:
         triton.Config({'BLOCK_M': 32, 'PIPE_STAGES': 3}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'PIPE_STAGES': 2}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_M': 64, 'PIPE_STAGES': 3}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'PIPE_STAGES': 2}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'PIPE_STAGES': 2}, num_warps=8, num_stages=2),
     ]
 
     def _autotune(configs, key):
