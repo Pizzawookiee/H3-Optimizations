@@ -3,6 +3,8 @@
 from ..attention_forward import project_qkv, to_hnd
 
 
-def project_chunk_hnd(module, x, rope_freqs, start, end):
+def project_chunk_hnd(module, x, rope_freqs, start, end, projector=None):
+    if projector is not None:
+        return projector.project_hnd(x, rope_freqs, start, end)
     chunk_rope = None if rope_freqs is None else rope_freqs[:, start:end]
     return to_hnd(*project_qkv(module, x[start:end], chunk_rope))
