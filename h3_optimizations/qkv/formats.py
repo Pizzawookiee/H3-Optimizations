@@ -12,7 +12,20 @@ FP8_LAYOUTS = frozenset(
         "TensorCoreFP8E5M2Layout",
     )
 )
+RAW_FP8_LAYOUT_BY_DTYPE = {
+    "float8_e4m3fn": "TensorCoreFP8E4M3Layout",
+    "float8_e5m2": "TensorCoreFP8E5M2Layout",
+}
 NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
+
+
+def _dtype_name(value):
+    text = "unknown" if value is None else str(value)
+    return text.removeprefix("torch.")
+
+
+def raw_fp8_layout_for_dtype(value):
+    return RAW_FP8_LAYOUT_BY_DTYPE.get(_dtype_name(value))
 
 
 @dataclass(frozen=True)
@@ -33,8 +46,27 @@ class LinearWeightFormat:
         return self.layout_name == "TensorWiseINT8Layout"
 
     @property
-    def fp8(self):
+    def comfy_quantized_fp8(self):
         return self.quantized and self.layout_name in FP8_LAYOUTS
+
+    @property
+    def raw_fp8(self):
+        return (
+            not self.quantized
+            and raw_fp8_layout_for_dtype(self.logical_dtype) is not None
+        )
+
+    @property
+    def fp8(self):
+        return self.comfy_quantized_fp8 or self.raw_fp8
+
+    @property
+    def fp8_layout_name(self):
+        if self.comfy_quantized_fp8:
+            return self.layout_name
+        if self.raw_fp8:
+            return raw_fp8_layout_for_dtype(self.logical_dtype)
+        return None
 
     @property
     def nvfp4(self):
@@ -42,7 +74,7 @@ class LinearWeightFormat:
 
     @property
     def plain_float(self):
-        return not self.quantized and any(
+        return not self.quantized and not self.raw_fp8 and any(
             name in self.logical_dtype.lower()
             for name in ("bfloat16", "float16", "bf16", "fp16")
         )
