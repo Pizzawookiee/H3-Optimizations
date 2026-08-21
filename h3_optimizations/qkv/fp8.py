@@ -17,6 +17,12 @@ class FP8BindingError(RuntimeError):
     pass
 
 
+def _stream_from_handle(handle):
+    if isinstance(handle, tuple) and handle:
+        return handle[0]
+    return None
+
+
 class HeldFP8Linear:
     """Acquire one H3 linear once and execute it through FP8 matmul.
 
@@ -61,6 +67,10 @@ class HeldFP8Linear:
                 if not self.allow_float_conversion:
                     raise FP8BindingError(
                         "FP8 provider received a floating weight without conversion enabled"
+                    )
+                if bias is not None:
+                    raise FP8BindingError(
+                        "floating FP8 conversion currently requires bias-free H3 linears"
                     )
                 if getattr(weight, "dtype", None) not in (
                     torch.bfloat16,
@@ -189,6 +199,13 @@ class HeldFP8MLP:
                 allow_float_conversion=self.allow_float_conversion,
             )
             self.fc2_binding.__enter__()
+            stream1 = _stream_from_handle(self.fc1_binding.handle)
+            stream2 = _stream_from_handle(self.fc2_binding.handle)
+            if stream1 is not None and stream1 is stream2:
+                raise FP8BindingError(
+                    "fc1 and fc2 were acquired from the same async cast stream; "
+                    "the second reusable cast buffer can overwrite the first"
+                )
             return self
         except Exception:
             self.release()
