@@ -40,7 +40,7 @@ class MemoryTests(unittest.TestCase):
     def test_config_contains_no_epilogue_mode(self):
         config = ActivationMemoryConfig()
         self.assertEqual(config.mode, MODE_NATIVE)
-        self.assertEqual(config.chunk_rows, 2048)
+        self.assertEqual(config.chunk_rows, 4096)
         self.assertTrue(
             ActivationMemoryConfig(
                 mode=MODE_CONVROT_2SLICE

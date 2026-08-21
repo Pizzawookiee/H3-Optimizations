@@ -16,6 +16,9 @@ from h3_optimizations.plan import (  # noqa: E402
 
 
 class PlanTests(unittest.TestCase):
+    def test_memory_request_defaults_to_four_thousand_rows(self):
+        self.assertEqual(MemoryRequest().chunk_rows, 4096)
+
     def test_sparse_request_defaults_to_thirty_percent_video_budget(self):
         self.assertEqual(SparseRequest().video_budget, 0.3)
 

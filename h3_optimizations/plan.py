@@ -30,7 +30,7 @@ class MemoryRequest:
 
     fused_qkv: str = FUSED_QKV_AUTO
     mlp_memory: str = MLP_MEMORY_AUTO
-    chunk_rows: int = 2048
+    chunk_rows: int = 4096
 
     def __post_init__(self):
         if self.fused_qkv not in FUSED_QKV_REQUESTS:
