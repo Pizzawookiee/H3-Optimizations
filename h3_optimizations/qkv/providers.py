@@ -7,6 +7,7 @@ from ..plan import FUSED_QKV_OFF, MLP_MEMORY_AUTO, MLP_MEMORY_OFF
 QKV_STANDARD = 'standard_h3_qkv'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_SPARSE_CONVROT_INT8 = 'convrot_int8_sparse_sage'
+QKV_TRITON_SPARSE_CHUNKED = 'chunked_triton_int8_sparse'
 
 MLP_OFF = 'off'
 MLP_GENERIC_CHUNKED = 'generic_chunked_quantized'
@@ -61,6 +62,14 @@ def resolve_qkv_provider(
             QKV_DENSE_KITCHEN_CHUNKED,
             False,
             '4K ConvRot QKV chunks into Comfy Kitchen INT8 carriers',
+        )
+    if backend_kind == 'triton_sparse_int8':
+        if not triton_available:
+            return _standard_qkv('Triton is unavailable')
+        return QKVProviderResolution(
+            QKV_TRITON_SPARSE_CHUNKED,
+            True,
+            '4K ConvRot QKV chunks into Triton INT8 sparse carriers',
         )
     if backend_kind == 'sparse_sage':
         if not triton_available:
