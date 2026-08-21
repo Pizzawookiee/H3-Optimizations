@@ -16,6 +16,8 @@ depend on ComfyUI-H3-Extended.
   boundary tiles dense. Its optional early/late policy adds 30 percentage
   points to the first two and last two sampler steps, capped at 100 percent.
 
+Both nodes are grouped under H3-Optimizations > Model Patches.
+
 Both nodes are order-independent. Unsupported model families pass through
 unchanged. Auto modes retain the existing implementation when a specialized
 provider cannot satisfy its complete format and runtime contract.

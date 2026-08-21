@@ -28,8 +28,6 @@ def _gate_add(x, other, gate):
 
 
 def _open_generic_held(block, sample, config):
-    if not config.prefer_held_weights:
-        return None, None
     held = HeldMLP(block.mlp, sample)
     try:
         held.__enter__()

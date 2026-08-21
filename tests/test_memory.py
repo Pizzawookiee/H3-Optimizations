@@ -41,7 +41,6 @@ class MemoryTests(unittest.TestCase):
         config = ActivationMemoryConfig()
         self.assertEqual(config.mode, MODE_NATIVE)
         self.assertEqual(config.chunk_rows, 2048)
-        self.assertTrue(config.prefer_held_weights)
         self.assertTrue(
             ActivationMemoryConfig(
                 mode=MODE_CONVROT_2SLICE
@@ -235,7 +234,6 @@ class MemoryTests(unittest.TestCase):
                 mode=MODE_NATIVE,
                 chunk_rows=256,
                 alignment=256,
-                prefer_held_weights=False,
             ),
         )(
             x.clone(),

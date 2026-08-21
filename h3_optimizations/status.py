@@ -25,13 +25,6 @@ def _provider_text(section, fallback_label):
     return provider if not reason else '%s - %s' % (provider, reason)
 
 
-def format_disabled_status(node_name):
-    return (
-        '%s is disabled. No new optimization request was applied; '
-        'upstream model patches are unchanged.' % node_name
-    )
-
-
 def format_memory_status(model):
     status = _status(model)
     if status is None:

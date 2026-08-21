@@ -43,20 +43,17 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(memory.node_id, 'H3MemoryOptimization')
         self.assertEqual(memory.display_name, 'H3 Memory Optimization')
         self.assertEqual(
+            memory.category,
+            'H3-Optimizations/Model Patches',
+        )
+        self.assertEqual(
             [item.id for item in memory.inputs],
             [
                 'model',
-                'enabled',
-                'attention',
                 'fused_qkv',
                 'mlp_memory',
                 'chunk_rows',
-                'prefer_held_weights',
             ],
-        )
-        self.assertEqual(
-            input_by_id(memory, 'attention').options,
-            ['auto', 'existing'],
         )
         self.assertEqual(
             input_by_id(memory, 'fused_qkv').options,
@@ -69,10 +66,13 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(sparse.node_id, 'H3SparseAttention')
         self.assertEqual(sparse.display_name, 'H3 Sparse Attention')
         self.assertEqual(
+            sparse.category,
+            'H3-Optimizations/Model Patches',
+        )
+        self.assertEqual(
             [item.id for item in sparse.inputs],
             [
                 'model',
-                'enabled',
                 'video_budget',
                 'denser_early_late_steps',
             ],
@@ -86,15 +86,6 @@ class NodeTests(unittest.TestCase):
     def test_extension_exposes_only_the_two_production_nodes(self):
         nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
         self.assertEqual(nodes, [H3MemoryOptimization, H3SparseAttention])
-
-    def test_disabled_nodes_are_exact_pass_throughs(self):
-        marker = object()
-        memory = H3MemoryOptimization.execute(marker, enabled=False)
-        sparse = H3SparseAttention.execute(marker, enabled=False)
-        self.assertIs(memory.args[0], marker)
-        self.assertIs(sparse.args[0], marker)
-        self.assertIn('disabled', memory.ui.value.lower())
-        self.assertIn('disabled', sparse.ui.value.lower())
 
     def test_non_h3_models_do_not_probe_the_runtime(self):
         class OtherModel:

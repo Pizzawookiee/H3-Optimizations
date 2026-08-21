@@ -132,11 +132,10 @@ def test_node_schema_and_request():
         [item.id for item in schema.inputs]
         == [
             'model',
-            'enabled',
             'video_budget',
             'denser_early_late_steps',
         ],
-        'density toggle is appended after existing serialized inputs',
+        'schema exposes only controls that affect sparse execution',
     )
     denser = input_by_id(schema, 'denser_early_late_steps')
     check(
@@ -162,7 +161,7 @@ def test_node_schema_and_request():
         result.args[0] is patched
         and request.video_budget == 0.5
         and request.denser_early_late_steps is True,
-        'node carries the enabled policy into the sparse request',
+        'node carries the denser-step policy into the sparse request',
     )
 
 

@@ -2,7 +2,9 @@
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -21,6 +23,12 @@ from h3_optimizations.attention.sage_arch import (  # noqa: E402
     SageSM80MemoryEfficientBackend,
     SageSM86MemoryEfficientBackend,
     SageSM90MemoryEfficientBackend,
+)
+from h3_optimizations.dense_resolver import (  # noqa: E402
+    ATTENTION_AUTO,
+    ATTENTION_EXISTING,
+    preserve_dense_attention,
+    resolve_dense_attention,
 )
 
 
@@ -103,6 +111,46 @@ class FakeFP8:
             ),
             None,
         )
+
+
+class DenseResolverTests(unittest.TestCase):
+    def test_memory_policy_automatically_selects_supported_backend(self):
+        backend = object()
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(8, 9),
+            device_name='fake SM89',
+            architecture='sm89',
+        )
+        with patch(
+            'h3_optimizations.dense_resolver._backend_class',
+            return_value=lambda: backend,
+        ):
+            resolution = resolve_dense_attention(environment)
+        self.assertEqual(resolution.requested, ATTENTION_AUTO)
+        self.assertEqual(resolution.selected, 'dense_sage_sm89')
+        self.assertIs(resolution.backend, backend)
+
+    def test_automatic_policy_falls_back_to_existing_attention(self):
+        resolution = resolve_dense_attention(
+            SimpleNamespace(
+                cuda_available=False,
+                capability=None,
+                device_name='cpu',
+                architecture='cpu',
+            )
+        )
+        self.assertEqual(resolution.requested, ATTENTION_AUTO)
+        self.assertEqual(resolution.selected, ATTENTION_EXISTING)
+        self.assertIsNone(resolution.backend)
+
+    def test_empty_plan_preserves_existing_attention(self):
+        resolution = preserve_dense_attention(
+            'no memory optimization requested'
+        )
+        self.assertEqual(resolution.requested, ATTENTION_EXISTING)
+        self.assertEqual(resolution.selected, ATTENTION_EXISTING)
+        self.assertIsNone(resolution.backend)
 
 
 class DenseBackendTests(unittest.TestCase):

@@ -15,14 +15,13 @@ from .attention.sparse import (
 from .attention.sparse.fused_qkv import (
     TRITON_AVAILABLE as SPARSE_TRITON_AVAILABLE,
 )
-from .dense_resolver import resolve_dense_attention
+from .dense_resolver import preserve_dense_attention, resolve_dense_attention
 from .environment import RuntimeEnvironment
 from .memory.config import ActivationMemoryConfig
 from .memory.patch import install as install_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import configure_backend
 from .plan import (
-    ATTENTION_EXISTING,
     DENSITY_FIXED,
     FUSED_QKV_OFF,
     H3OptimizationPlan,
@@ -71,8 +70,11 @@ def _dense_triton_available():
 
 def _resolve_dense(plan, environment, inventory):
     memory = plan.memory
-    requested = ATTENTION_EXISTING if memory is None else memory.attention
-    dense = resolve_dense_attention(requested, environment)
+    dense = (
+        preserve_dense_attention('no memory optimization requested')
+        if memory is None
+        else resolve_dense_attention(environment)
+    )
     qkv = resolve_qkv_provider(
         inventory,
         request=_fused_request(plan),
@@ -161,7 +163,6 @@ def _install_mlp(model_patcher, plan, inventory):
         mode=resolution.activation_mode,
         chunk_rows=int(memory.chunk_rows),
         strict=False,
-        prefer_held_weights=bool(memory.prefer_held_weights),
     )
     return resolution, int(install_memory_patch(model_patcher, config))
 

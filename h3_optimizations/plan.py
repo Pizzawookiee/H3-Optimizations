@@ -9,10 +9,6 @@ PLAN_KEY = 'h3_optimizations_plan'
 STATUS_KEY = 'h3_optimizations_status'
 PLAN_VERSION = 1
 
-ATTENTION_AUTO = 'auto'
-ATTENTION_EXISTING = 'existing'
-ATTENTION_REQUESTS = (ATTENTION_AUTO, ATTENTION_EXISTING)
-
 FUSED_QKV_AUTO = 'auto'
 FUSED_QKV_OFF = 'off'
 FUSED_QKV_REQUESTS = (FUSED_QKV_AUTO, FUSED_QKV_OFF)
@@ -31,15 +27,11 @@ DENSITY_FIXED = 'fixed'
 class MemoryRequest:
     '''Execution and activation-memory options owned by the memory node.'''
 
-    attention: str = ATTENTION_AUTO
     fused_qkv: str = FUSED_QKV_AUTO
     mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 2048
-    prefer_held_weights: bool = True
 
     def __post_init__(self):
-        if self.attention not in ATTENTION_REQUESTS:
-            raise ValueError('unknown H3 attention request %r' % self.attention)
         if self.fused_qkv not in FUSED_QKV_REQUESTS:
             raise ValueError('unknown fused QKV request %r' % self.fused_qkv)
         if self.mlp_memory not in MLP_MEMORY_REQUESTS:
@@ -58,11 +50,9 @@ class MemoryRequest:
     @property
     def signature(self):
         return (
-            self.attention,
             self.fused_qkv,
             self.mlp_memory,
             int(self.chunk_rows),
-            bool(self.prefer_held_weights),
         )
 
 

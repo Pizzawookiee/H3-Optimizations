@@ -19,7 +19,6 @@ class ActivationMemoryConfig:
     chunk_rows: int = DEFAULT_CHUNK_ROWS
     alignment: int = DEFAULT_ALIGNMENT
     strict: bool = True
-    prefer_held_weights: bool = True
 
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
@@ -57,5 +56,4 @@ class ActivationMemoryConfig:
             int(self.chunk_rows),
             int(self.alignment),
             bool(self.strict),
-            bool(self.prefer_held_weights),
         )

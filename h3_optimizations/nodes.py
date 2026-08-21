@@ -4,8 +4,6 @@ from comfy_api.latest import ComfyExtension, io, ui
 
 from .apply import apply_plan
 from .plan import (
-    ATTENTION_AUTO,
-    ATTENTION_EXISTING,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     MAX_CHUNK_ROWS,
@@ -17,12 +15,12 @@ from .plan import (
     read_plan,
 )
 from .status import (
-    format_disabled_status,
     format_memory_status,
     format_sparse_status,
 )
 
 DEFAULT_CHUNK_ROWS = 2048
+NODE_CATEGORY = 'H3-Optimizations/Model Patches'
 
 
 class H3MemoryOptimization(io.ComfyNode):
@@ -33,7 +31,7 @@ class H3MemoryOptimization(io.ComfyNode):
         return io.Schema(
             node_id='H3MemoryOptimization',
             display_name='H3 Memory Optimization',
-            category='model/patch/minimax',
+            category=NODE_CATEGORY,
             description=(
                 'Production memory and execution optimizations for MiniMax H3. '
                 'Other model families pass through unchanged. Auto preserves '
@@ -50,28 +48,6 @@ class H3MemoryOptimization(io.ComfyNode):
             ],
             inputs=[
                 io.Model.Input('model'),
-                io.Boolean.Input(
-                    'enabled',
-                    display_name='Enable',
-                    default=True,
-                    tooltip=(
-                        'When disabled, this node applies no new request and '
-                        'leaves upstream model patches unchanged.'
-                    ),
-                ),
-                io.Combo.Input(
-                    'attention',
-                    display_name='Dense attention when Sparse is absent',
-                    options=[ATTENTION_AUTO, ATTENTION_EXISTING],
-                    default=ATTENTION_AUTO,
-                    advanced=True,
-                    tooltip=(
-                        'auto selects a prepared dense Sage backend supported '
-                        'by the current GPU. existing preserves the incoming '
-                        'dense attention implementation. Sparse Attention '
-                        'takes ownership when both nodes are present.'
-                    ),
-                ),
                 io.Combo.Input(
                     'fused_qkv',
                     display_name='QKV projection optimization',
@@ -107,17 +83,6 @@ class H3MemoryOptimization(io.ComfyNode):
                         'chunks may be faster but use more activation memory.'
                     ),
                 ),
-                io.Boolean.Input(
-                    'prefer_held_weights',
-                    display_name='Hold weights across chunks',
-                    default=True,
-                    advanced=True,
-                    tooltip=(
-                        'Acquire fc1 and fc2 once when Comfy weight handles are '
-                        'safe to retain. Unsafe reusable buffers automatically '
-                        'use ordinary per-chunk module calls.'
-                    ),
-                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -126,27 +91,15 @@ class H3MemoryOptimization(io.ComfyNode):
     def execute(
         cls,
         model,
-        enabled=True,
-        attention=ATTENTION_AUTO,
         fused_qkv=FUSED_QKV_AUTO,
         mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
-        prefer_held_weights=True,
     ):
-        if not enabled:
-            return io.NodeOutput(
-                model,
-                ui=ui.PreviewText(
-                    format_disabled_status('H3 Memory Optimization')
-                ),
-            )
         plan = read_plan(model).with_memory(
             MemoryRequest(
-                attention=attention,
                 fused_qkv=fused_qkv,
                 mlp_memory=mlp_memory,
                 chunk_rows=int(chunk_rows),
-                prefer_held_weights=bool(prefer_held_weights),
             )
         )
         patched = apply_plan(model, plan)
@@ -164,7 +117,7 @@ class H3SparseAttention(io.ComfyNode):
         return io.Schema(
             node_id='H3SparseAttention',
             display_name='H3 Sparse Attention',
-            category='model/patch/minimax',
+            category=NODE_CATEGORY,
             description=(
                 'Fixed-density Sparse Sage attention for MiniMax H3. Other '
                 'models pass through unchanged. Text, reference conditioning, '
@@ -180,15 +133,6 @@ class H3SparseAttention(io.ComfyNode):
             ],
             inputs=[
                 io.Model.Input('model'),
-                io.Boolean.Input(
-                    'enabled',
-                    display_name='Enable',
-                    default=True,
-                    tooltip=(
-                        'When disabled, this node applies no new sparse request '
-                        'and leaves upstream model patches unchanged.'
-                    ),
-                ),
                 io.Float.Input(
                     'video_budget',
                     display_name='Video KV budget',
@@ -221,17 +165,9 @@ class H3SparseAttention(io.ComfyNode):
     def execute(
         cls,
         model,
-        enabled=True,
         video_budget=0.5,
         denser_early_late_steps=False,
     ):
-        if not enabled:
-            return io.NodeOutput(
-                model,
-                ui=ui.PreviewText(
-                    format_disabled_status('H3 Sparse Attention')
-                ),
-            )
         plan = read_plan(model).with_sparse(
             SparseRequest(
                 video_budget=float(video_budget),
