@@ -52,7 +52,7 @@ def sparse_spec():
         k_scale_layout='per_kv_tile_float32',
         projected_v_format='floating_hnd',
         summary_format='tile_mean',
-        v_format='f16',
+        v_format='fp16',
         accumulator='f16',
         kernel=lambda *_args: None,
         fused_v_ops=None,
