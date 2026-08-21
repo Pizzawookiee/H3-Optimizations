@@ -6,7 +6,9 @@ from ..plan import FUSED_QKV_OFF, MLP_MEMORY_AUTO, MLP_MEMORY_OFF
 
 QKV_STANDARD = 'standard_h3_qkv'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
+QKV_DENSE_FP8_CHUNKED = 'chunked_fp8_kitchen_qkv'
 QKV_SPARSE_CONVROT_INT8 = 'convrot_int8_sparse_sage'
+QKV_SPARSE_FP8_CHUNKED = 'chunked_fp8_sparse_sage'
 QKV_TRITON_SPARSE_CHUNKED = 'chunked_triton_int8_sparse'
 
 MLP_OFF = 'off'
@@ -34,6 +36,12 @@ def _standard_qkv(reason):
     return QKVProviderResolution(QKV_STANDARD, False, reason)
 
 
+def _sparse_contract_ok(sparse_spec):
+    from ..attention.sparse.fused_qkv import sparse_fused_qkv_contract_mismatch
+
+    return sparse_fused_qkv_contract_mismatch(sparse_spec) is None
+
+
 def resolve_qkv_provider(
     inventory,
     *,
@@ -42,6 +50,8 @@ def resolve_qkv_provider(
     triton_available=False,
     sparse_spec=None,
     kitchen_producer_available=False,
+    memory_optimize=False,
+    fp8_available=False,
 ):
     if request == FUSED_QKV_OFF:
         return _standard_qkv('QKV projection optimization was disabled')
@@ -49,6 +59,33 @@ def resolve_qkv_provider(
         return _standard_qkv('the H3 model has no QKV projection inventory')
     if not inventory.homogeneous('qkv'):
         return _standard_qkv('H3 QKV layers use mixed weight formats')
+
+    fp8_memory_candidate = (
+        memory_optimize
+        and fp8_available
+        and (inventory.qkv_fp8 or inventory.qkv_plain_float)
+    )
+    if fp8_memory_candidate:
+        source = 'checkpoint-native FP8' if inventory.qkv_fp8 else 'BF16/FP16 converted to FP8 E4M3'
+        if backend_kind == 'comfy_kitchen_int8':
+            if not kitchen_producer_available:
+                return _standard_qkv('Comfy Kitchen external producer API is unavailable')
+            return QKVProviderResolution(
+                QKV_DENSE_FP8_CHUNKED,
+                False,
+                '%s QKV uses held FP8 projection into chunked Kitchen carriers' % source,
+            )
+        if backend_kind == 'sparse_sage':
+            if not triton_available:
+                return _standard_qkv('Triton is unavailable')
+            if not _sparse_contract_ok(sparse_spec):
+                return _standard_qkv('the selected Sparse Sage ABI cannot consume chunked projected QKV')
+            return QKVProviderResolution(
+                QKV_SPARSE_FP8_CHUNKED,
+                True,
+                '%s QKV uses held FP8 projection into Sparse Sage carriers' % source,
+            )
+
     if not inventory.qkv_convrot_int8_256:
         labels = ', '.join(sorted(set(inventory.labels('qkv'))))
         return _standard_qkv(
