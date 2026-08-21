@@ -57,11 +57,11 @@ def _project_anchor_samples(module, x, rope_freqs, positions, projector=None):
     rows = torch.tensor(positions, dtype=torch.int64, device=x.device)
     if projector is not None:
         _q, k, _v = projector.project_rows(x, rope_freqs, rows)
-    else:
-        sample_x = x.index_select(0, rows)
-        sample_rope = _rope_rows(rope_freqs, rows)
-        _q, k, _v = project_qkv(module, sample_x, sample_rope)
-    return k
+        return k
+    sample_x = x.index_select(0, rows)
+    sample_rope = _rope_rows(rope_freqs, rows)
+    _q, k, _v = project_qkv(module, sample_x, sample_rope)
+    return k.transpose(0, 1).unsqueeze(0)
 
 
 def run_chunked_kitchen_qkv(
