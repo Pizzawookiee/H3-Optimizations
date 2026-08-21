@@ -5,10 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+FP8_LAYOUTS = frozenset(
+    (
+        "TensorCoreFP8Layout",
+        "TensorCoreFP8E4M3Layout",
+        "TensorCoreFP8E5M2Layout",
+    )
+)
+NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
+
+
 @dataclass(frozen=True)
 class LinearWeightFormat:
     layout_name: str | None
     quantized: bool
+    logical_dtype: str
     storage_dtype: str
     shape: tuple[int, ...]
     transposed: bool
@@ -20,6 +31,27 @@ class LinearWeightFormat:
     @property
     def tensorwise_int8(self):
         return self.layout_name == "TensorWiseINT8Layout"
+
+    @property
+    def fp8(self):
+        return self.quantized and self.layout_name in FP8_LAYOUTS
+
+    @property
+    def nvfp4(self):
+        return self.quantized and self.layout_name == NVFP4_LAYOUT
+
+    @property
+    def plain_float(self):
+        return not self.quantized and any(
+            name in self.logical_dtype.lower()
+            for name in ("bfloat16", "float16", "bf16", "fp16")
+        )
+
+    @property
+    def other_quantized(self):
+        return self.quantized and not (
+            self.fp8 or self.nvfp4 or self.convrot_int8_256
+        )
 
     @property
     def convrot_int8_256(self):
@@ -38,8 +70,8 @@ class LinearWeightFormat:
             suffix = ""
             if self.convrot:
                 suffix = "+convrot%d" % int(self.convrot_group_size or 0)
-            return "%s%s" % (self.layout_name, suffix)
-        return "%s:%s" % (self.weight_type, self.storage_dtype)
+            return "%s%s[%s]" % (self.layout_name, suffix, self.storage_dtype)
+        return "%s:%s" % (self.weight_type, self.logical_dtype)
 
 
 @dataclass(frozen=True)
@@ -53,12 +85,38 @@ class H3LinearInventory:
         return bool(self.qkv) and all(item.convrot_int8_256 for item in self.qkv)
 
     @property
+    def qkv_fp8(self):
+        return bool(self.qkv) and all(item.fp8 for item in self.qkv)
+
+    @property
+    def qkv_plain_float(self):
+        return bool(self.qkv) and all(item.plain_float for item in self.qkv)
+
+    @property
     def mlp_convrot_int8_256(self):
         return (
             bool(self.fc1)
             and len(self.fc1) == len(self.fc2)
             and all(item.convrot_int8_256 for item in self.fc1)
             and all(item.convrot_int8_256 for item in self.fc2)
+        )
+
+    @property
+    def mlp_fp8(self):
+        return (
+            bool(self.fc1)
+            and len(self.fc1) == len(self.fc2)
+            and all(item.fp8 for item in self.fc1)
+            and all(item.fp8 for item in self.fc2)
+        )
+
+    @property
+    def mlp_plain_float(self):
+        return (
+            bool(self.fc1)
+            and len(self.fc1) == len(self.fc2)
+            and all(item.plain_float for item in self.fc1)
+            and all(item.plain_float for item in self.fc2)
         )
 
     def labels(self, name):
@@ -79,13 +137,27 @@ def _is_quantized(weight):
     return isinstance(weight, QuantizedTensor)
 
 
+def _dtype_string(value):
+    return "unknown" if value is None else str(value)
+
+
+def _logical_dtype(weight):
+    return _dtype_string(getattr(weight, "dtype", None))
+
+
 def _storage_dtype(weight):
-    dtype = getattr(weight, "dtype", None)
+    dtype = getattr(weight, "storage_dtype", None)
+    if dtype is not None:
+        return str(dtype)
+    qdata = getattr(weight, "_qdata", None)
+    dtype = getattr(qdata, "dtype", None)
     if dtype is not None:
         return str(dtype)
     value = getattr(weight, "_value", None)
     dtype = getattr(value, "dtype", None)
-    return "unknown" if dtype is None else str(dtype)
+    if dtype is not None:
+        return str(dtype)
+    return _logical_dtype(weight)
 
 
 def describe_weight(weight, *, bias=None):
@@ -99,6 +171,7 @@ def describe_weight(weight, *, bias=None):
     return LinearWeightFormat(
         layout_name=getattr(weight, "_layout_cls", None),
         quantized=_is_quantized(weight),
+        logical_dtype=_logical_dtype(weight),
         storage_dtype=_storage_dtype(weight),
         shape=shape,
         transposed=bool(getattr(params, "transposed", False)),
