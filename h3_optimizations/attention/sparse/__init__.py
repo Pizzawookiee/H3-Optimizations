@@ -38,6 +38,19 @@ _EXPORT_MODULES = {
     'load_sparse_sage_spec': '.sparse_sage',
     'preflight_sparse_sage': '.sparse_sage',
     'resolve_sparse_sage_spec': '.sparse_sage',
+    'ChunkedTritonSparseQKVProjector': '.triton_qkv',
+    'PreparedTritonSparseQKV': '.triton_qkv',
+    'TritonSparseQKVError': '.triton_qkv',
+    'pack_float_qkv': '.triton_qkv',
+    'pack_triton_v_chunk_into': '.triton_qkv',
+    'run_chunked_triton_sparse_qkv': '.triton_qkv',
+    'validate_prepared_triton_sparse_qkv': '.triton_qkv',
+    'PreparedTritonSparse': '.triton_sparse',
+    'TritonSparseBackend': '.triton_sparse',
+    'TritonSparseError': '.triton_sparse',
+    'TritonSparseExecutor': '.triton_sparse',
+    'TritonSparseSpec': '.triton_sparse',
+    'preflight_triton_sparse': '.triton_sparse',
 }
 
 
