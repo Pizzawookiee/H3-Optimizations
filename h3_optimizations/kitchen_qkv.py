@@ -13,6 +13,7 @@ from .attention_forward import project_qkv
 from .dense_resolver import is_installed_dense_attention
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
+from .qkv.fp8 import FP8BindingError, HeldFP8QKV
 
 
 CHUNK_ROWS = 4096
@@ -52,13 +53,15 @@ def _rope_rows(rope_freqs, rows):
     return rope_freqs.index_select(1, rows)
 
 
-def _project_anchor_samples(module, x, rope_freqs, positions):
+def _project_anchor_samples(module, x, rope_freqs, positions, projector=None):
     rows = torch.tensor(positions, dtype=torch.int64, device=x.device)
-    sample_x = x.index_select(0, rows)
-    sample_rope = _rope_rows(rope_freqs, rows)
-    q, k, v = project_qkv(module, sample_x, sample_rope)
-    del q, v, sample_x, sample_rope, rows
-    return k.transpose(0, 1).unsqueeze(0)
+    if projector is not None:
+        _q, k, _v = projector.project_rows(x, rope_freqs, rows)
+    else:
+        sample_x = x.index_select(0, rows)
+        sample_rope = _rope_rows(rope_freqs, rows)
+        _q, k, _v = project_qkv(module, sample_x, sample_rope)
+    return k
 
 
 def run_chunked_kitchen_qkv(
@@ -70,55 +73,79 @@ def run_chunked_kitchen_qkv(
     transformer_options,
     spec,
     chunk_rows=CHUNK_ROWS,
+    fp8_projection=False,
 ):
     del layer_index, transformer_options
     kitchen = comfy.quant_ops.ck
-    samples = _project_anchor_samples(
-        module,
-        x,
-        rope_freqs,
-        spec.k_anchor_positions,
-    )
-    anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
-    del samples
-    producer = kitchen.create_int8_attention_producer(spec, anchor)
-    del anchor
-
-    sequence = int(x.shape[0])
-    retained_v = None
-    for start in range(0, sequence, int(chunk_rows)):
-        end = min(start + int(chunk_rows), sequence)
-        q, k, v = project_chunk_hnd(module, x, rope_freqs, start, end)
-        if retained_v is None:
-            retained_v = v.new_empty(
-                (1, int(module.heads), sequence, int(module.head_dim))
+    held = None
+    try:
+        if fp8_projection:
+            fmt = describe_linear(module.qkv_proj)
+            held = HeldFP8QKV(
+                module,
+                x[:1],
+                allow_float_conversion=fmt.plain_float,
             )
-        kitchen.quantize_int8_attention_qk_chunk(
-            producer,
-            q,
-            k,
-            q_start=start,
-            k_start=start,
-        )
-        retained_v[:, :, start:end, :].copy_(v)
-        del q, k, v
+            held.__enter__()
 
-    kitchen.quantize_int8_attention_v(producer, retained_v)
-    del retained_v
-    return PreparedChunkedKitchenQKV(
-        kitchen.finalize_int8_attention_producer(producer)
-    )
+        samples = _project_anchor_samples(
+            module,
+            x,
+            rope_freqs,
+            spec.k_anchor_positions,
+            projector=held,
+        )
+        anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
+        del samples
+        producer = kitchen.create_int8_attention_producer(spec, anchor)
+        del anchor
+
+        sequence = int(x.shape[0])
+        retained_v = None
+        for start in range(0, sequence, int(chunk_rows)):
+            end = min(start + int(chunk_rows), sequence)
+            q, k, v = project_chunk_hnd(
+                module,
+                x,
+                rope_freqs,
+                start,
+                end,
+                projector=held,
+            )
+            if retained_v is None:
+                retained_v = v.new_empty(
+                    (1, int(module.heads), sequence, int(module.head_dim))
+                )
+            kitchen.quantize_int8_attention_qk_chunk(
+                producer,
+                q,
+                k,
+                q_start=start,
+                k_start=start,
+            )
+            retained_v[:, :, start:end, :].copy_(v)
+            del q, k, v
+
+        kitchen.quantize_int8_attention_v(producer, retained_v)
+        del retained_v
+        return PreparedChunkedKitchenQKV(
+            kitchen.finalize_int8_attention_producer(producer)
+        )
+    finally:
+        if held is not None:
+            held.__exit__(None, None, None)
 
 
 class ChunkedKitchenQKVProjector:
     name = 'chunked_kitchen_qkv'
 
-    def __init__(self, chunk_rows=CHUNK_ROWS):
+    def __init__(self, chunk_rows=CHUNK_ROWS, fp8_projection=False):
         self.chunk_rows = int(chunk_rows)
+        self.fp8_projection = bool(fp8_projection)
 
     @property
     def installation_signature(self):
-        return (self.name, self.chunk_rows)
+        return (self.name, self.chunk_rows, self.fp8_projection)
 
     def try_project(
         self,
@@ -130,12 +157,18 @@ class ChunkedKitchenQKVProjector:
         transformer_options,
     ):
         kitchen = comfy.quant_ops.ck
+        fmt = describe_linear(module.qkv_proj)
+        format_ok = (
+            fmt.fp8 or fmt.plain_float
+            if self.fp8_projection
+            else fmt.convrot_int8_256
+        )
         if (
             not is_installed_dense_attention(transformer_options)
             or comfy.model_management.in_training
             or x.ndim != 2
             or not x.is_cuda
-            or not describe_linear(module.qkv_proj).convrot_int8_256
+            or not format_ok
             or not producer_api_available(kitchen, x.device)
         ):
             return None
@@ -155,15 +188,19 @@ class ChunkedKitchenQKVProjector:
             or self.chunk_rows % int(spec.sequence_alignment)
         ):
             return None
-        return run_chunked_kitchen_qkv(
-            module,
-            x,
-            rope_freqs,
-            layer_index=layer_index,
-            transformer_options=transformer_options,
-            spec=spec,
-            chunk_rows=self.chunk_rows,
-        )
+        try:
+            return run_chunked_kitchen_qkv(
+                module,
+                x,
+                rope_freqs,
+                layer_index=layer_index,
+                transformer_options=transformer_options,
+                spec=spec,
+                chunk_rows=self.chunk_rows,
+                fp8_projection=self.fp8_projection,
+            )
+        except FP8BindingError:
+            return None
 
 
 class ChunkedKitchenAttentionBackend:
