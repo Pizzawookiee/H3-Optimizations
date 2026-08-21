@@ -46,6 +46,12 @@ compiler are available. Both paths use `--no-deps`, so they cannot replace
 Torch or other ComfyUI packages. The first Linux source build may add several
 minutes to startup.
 
+Linux source builds enable Ninja with half the detected logical CPU count as
+the default worker pool and two `nvcc` threads per worker. Existing `MAX_JOBS`
+or `NVCC_THREADS` environment values override those defaults. The installer
+verifies the pinned Git commit and its expected build settings before applying
+this local build-only patch.
+
 An existing `spas_sage_attn` installation is left unchanged when its compiled
 ABI validates for the active Torch, CUDA, and GPU. If it is stale, startup
 reinstalls it only when a verified Windows wheel or the pinned Linux source

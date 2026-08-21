@@ -1,5 +1,6 @@
 '''Install a verified Sparse Sage wheel before ComfyUI loads this pack.'''
 
+from contextlib import contextmanager
 import importlib
 import importlib.util
 import json
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -23,9 +25,12 @@ RELEASE_ROOT = (
     'https://github.com/woct0rdho/SpargeAttn/releases/download'
 )
 SPARGE_SOURCE_REF = '067d80cb6b76345c7b8be40e86c7d19a3cf7c4eb'
-SPARGE_SOURCE = (
-    'git+https://github.com/woct0rdho/SpargeAttn.git@' + SPARGE_SOURCE_REF
-)
+SPARGE_REPOSITORY = 'https://github.com/woct0rdho/SpargeAttn.git'
+SPARGE_SOURCE = 'git+' + SPARGE_REPOSITORY + '@' + SPARGE_SOURCE_REF
+_SPARGE_NINJA_DISABLED = 'BuildExtension.with_options(use_ninja=False)'
+_SPARGE_NINJA_ENABLED = 'BuildExtension.with_options(use_ninja=True)'
+_SPARGE_NVCC_ALL_CORES = 'f"--threads={os.cpu_count()}"'
+_SPARGE_NVCC_CONFIGURED = 'f"--threads={os.environ.get(\'NVCC_THREADS\', \'2\')}"'
 _LINUX_BUILD_REQUIREMENTS = {
     'ninja': 'ninja',
     'packaging': 'packaging',
@@ -202,6 +207,26 @@ def _run_pip(arguments, *, timeout, environment=None):
     return False
 
 
+def _run_command(command, *, timeout, operation):
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.error('%s %s failed: %s', LOG_PREFIX, operation, exc)
+        return None
+    if result.returncode == 0:
+        return result
+    output = (result.stdout or '').strip().splitlines()
+    detail = output[-1] if output else 'command exited with code %d' % result.returncode
+    logging.error('%s %s failed: %s', LOG_PREFIX, operation, detail)
+    return None
+
+
 def _install_windows_wheel(wheel, *, force_reinstall=False):
     arguments = [
         '--no-deps',
@@ -256,6 +281,89 @@ def _nvcc_version(nvcc):
     return tuple(int(part) for part in match.groups())
 
 
+def _checkout_pinned_sparge(destination):
+    git = shutil.which('git')
+    if git is None:
+        return False
+    if _run_command(
+        [git, 'clone', '--quiet', '--no-checkout', SPARGE_REPOSITORY, str(destination)],
+        timeout=INSTALL_TIMEOUT_SECONDS,
+        operation='Sparse Sage source checkout',
+    ) is None:
+        return False
+    if _run_command(
+        [git, '-C', str(destination), 'checkout', '--quiet', '--detach', SPARGE_SOURCE_REF],
+        timeout=INSTALL_TIMEOUT_SECONDS,
+        operation='Sparse Sage source checkout',
+    ) is None:
+        return False
+    result = _run_command(
+        [git, '-C', str(destination), 'rev-parse', 'HEAD'],
+        timeout=30,
+        operation='Sparse Sage source verification',
+    )
+    if result is None:
+        return False
+    if (result.stdout or '').strip().lower() != SPARGE_SOURCE_REF:
+        logging.error('%s Sparse Sage source checkout did not resolve the pinned commit', LOG_PREFIX)
+        return False
+    return True
+
+
+def _patch_sparge_setup(path):
+    try:
+        source = path.read_text(encoding='utf-8')
+    except OSError as exc:
+        logging.error('%s Sparse Sage build setup could not be read: %s', LOG_PREFIX, exc)
+        return False
+    replacements = (
+        (_SPARGE_NINJA_DISABLED, _SPARGE_NINJA_ENABLED),
+        (_SPARGE_NVCC_ALL_CORES, _SPARGE_NVCC_CONFIGURED),
+    )
+    for original, replacement in replacements:
+        if source.count(original) != 1:
+            logging.error('%s pinned Sparse Sage build setup no longer matches', LOG_PREFIX)
+            return False
+        source = source.replace(original, replacement)
+    try:
+        path.write_text(source, encoding='utf-8')
+    except OSError as exc:
+        logging.error('%s Sparse Sage build setup could not be updated: %s', LOG_PREFIX, exc)
+        return False
+    return True
+
+
+@contextmanager
+def _prepared_linux_source(source):
+    if source != SPARGE_SOURCE:
+        logging.error('%s refused an unpinned Sparse Sage source', LOG_PREFIX)
+        yield None
+        return
+    with TemporaryDirectory(prefix='h3-sparge-build-') as temporary:
+        checkout = Path(temporary) / 'SpargeAttn'
+        if not _checkout_pinned_sparge(checkout):
+            yield None
+            return
+        if not _patch_sparge_setup(checkout / 'setup.py'):
+            yield None
+            return
+        yield checkout
+
+
+def _linux_build_environment(nvcc):
+    environment = os.environ.copy()
+    environment['CUDA_HOME'] = str(Path(nvcc).resolve().parent.parent)
+    logical_cores = max(1, os.cpu_count() or 1)
+    environment.setdefault('MAX_JOBS', str(max(1, logical_cores // 2)))
+    environment.setdefault('NVCC_THREADS', str(min(2, logical_cores)))
+    # Avoid cuda_fp*.hpp's unresolved __assert_fail path in Linux nvcc builds.
+    nvcc_flags = environment.get('NVCC_APPEND_FLAGS', '').split()
+    if '-DNDEBUG' not in nvcc_flags:
+        nvcc_flags.append('-DNDEBUG')
+    environment['NVCC_APPEND_FLAGS'] = ' '.join(nvcc_flags)
+    return environment
+
+
 def _install_linux_source(source, *, force_reinstall=False):
     if shutil.which('git') is None:
         logging.warning('%s Linux Sparse Sage installation requires git', LOG_PREFIX)
@@ -277,25 +385,28 @@ def _install_linux_source(source, *, force_reinstall=False):
         timeout=INSTALL_TIMEOUT_SECONDS,
     ):
         return False
-    environment = os.environ.copy()
-    environment['CUDA_HOME'] = str(Path(nvcc).resolve().parent.parent)
-    # Avoid cuda_fp*.hpp's unresolved __assert_fail path in Linux nvcc builds.
-    nvcc_flags = environment.get('NVCC_APPEND_FLAGS', '').split()
-    if '-DNDEBUG' not in nvcc_flags:
-        nvcc_flags.append('-DNDEBUG')
-    environment['NVCC_APPEND_FLAGS'] = ' '.join(nvcc_flags)
+    environment = _linux_build_environment(nvcc)
+    logging.info(
+        '%s building Sparse Sage with %s parallel jobs and %s nvcc threads per job',
+        LOG_PREFIX,
+        environment['MAX_JOBS'],
+        environment['NVCC_THREADS'],
+    )
     arguments = [
         '--no-build-isolation',
         '--no-deps',
     ]
     if force_reinstall:
         arguments.append('--force-reinstall')
-    arguments.append(source)
-    return _run_pip(
-        arguments,
-        timeout=BUILD_TIMEOUT_SECONDS,
-        environment=environment,
-    )
+    with _prepared_linux_source(source) as prepared_source:
+        if prepared_source is None:
+            return False
+        arguments.append(str(prepared_source))
+        return _run_pip(
+            arguments,
+            timeout=BUILD_TIMEOUT_SECONDS,
+            environment=environment,
+        )
 
 
 def ensure_sparse_sage():

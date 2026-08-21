@@ -1,5 +1,6 @@
 '''CPU-only tests for the Sparse Sage startup installer.'''
 
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import runpy
@@ -169,6 +170,98 @@ class SparseInstallTests(unittest.TestCase):
             )
         )
 
+    def test_pinned_source_patch_enables_ninja_and_bounds_nvcc_threads(self):
+        class SetupFile:
+            def __init__(self):
+                self.source = '\n'.join(
+                    (
+                        sparse_install._SPARGE_NINJA_DISABLED,
+                        sparse_install._SPARGE_NVCC_ALL_CORES,
+                    )
+                )
+
+            def read_text(self, *, encoding):
+                self.assert_encoding = encoding
+                return self.source
+
+            def write_text(self, source, *, encoding):
+                self.source = source
+                self.assert_encoding = encoding
+
+        setup = SetupFile()
+        self.assertTrue(sparse_install._patch_sparge_setup(setup))
+        self.assertNotIn(sparse_install._SPARGE_NINJA_DISABLED, setup.source)
+        self.assertNotIn(sparse_install._SPARGE_NVCC_ALL_CORES, setup.source)
+        self.assertIn(sparse_install._SPARGE_NINJA_ENABLED, setup.source)
+        self.assertIn(sparse_install._SPARGE_NVCC_CONFIGURED, setup.source)
+        self.assertEqual(setup.assert_encoding, 'utf-8')
+        compile(setup.source, 'setup.py', 'exec')
+
+    def test_pinned_source_patch_rejects_unreviewed_setup(self):
+        class SetupFile:
+            def __init__(self):
+                self.written = False
+
+            def read_text(self, *, encoding):
+                return 'changed upstream setup'
+
+            def write_text(self, source, *, encoding):
+                self.written = True
+
+        setup = SetupFile()
+        with self.assertLogs(level='ERROR'):
+            self.assertFalse(sparse_install._patch_sparge_setup(setup))
+        self.assertFalse(setup.written)
+
+    @patch.object(sparse_install.shutil, 'which', return_value='/usr/bin/git')
+    @patch.object(sparse_install, '_run_command')
+    def test_source_checkout_verifies_exact_pinned_commit(self, run, _which):
+        run.side_effect = (
+            subprocess.CompletedProcess([], 0, stdout=''),
+            subprocess.CompletedProcess([], 0, stdout=''),
+            subprocess.CompletedProcess([], 0, stdout=sparse_install.SPARGE_SOURCE_REF + '\n'),
+        )
+        destination = Path('build') / 'SpargeAttn'
+        self.assertTrue(sparse_install._checkout_pinned_sparge(destination))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                '/usr/bin/git',
+                'clone',
+                '--quiet',
+                '--no-checkout',
+                sparse_install.SPARGE_REPOSITORY,
+                str(destination),
+            ],
+        )
+        self.assertIn(sparse_install.SPARGE_SOURCE_REF, run.call_args_list[1].args[0])
+
+    def test_linux_build_defaults_to_half_the_logical_cores(self):
+        with patch.object(os, 'cpu_count', return_value=16), patch.dict(
+            os.environ,
+            {'NVCC_APPEND_FLAGS': '--keep-this-flag'},
+            clear=True,
+        ):
+            environment = sparse_install._linux_build_environment(
+                '/usr/local/cuda/bin/nvcc'
+            )
+        self.assertEqual(environment['MAX_JOBS'], '8')
+        self.assertEqual(environment['NVCC_THREADS'], '2')
+        self.assertEqual(environment['NVCC_APPEND_FLAGS'], '--keep-this-flag -DNDEBUG')
+
+    def test_linux_build_respects_explicit_parallelism(self):
+        with patch.object(os, 'cpu_count', return_value=16), patch.dict(
+            os.environ,
+            {'MAX_JOBS': '3', 'NVCC_THREADS': '1'},
+            clear=True,
+        ):
+            environment = sparse_install._linux_build_environment(
+                '/usr/local/cuda/bin/nvcc'
+            )
+        self.assertEqual(environment['MAX_JOBS'], '3')
+        self.assertEqual(environment['NVCC_THREADS'], '1')
+
     @patch.object(sparse_install.subprocess, 'run')
     def test_runtime_probe_does_not_import_torch_in_parent(self, run):
         run.return_value = subprocess.CompletedProcess(
@@ -315,11 +408,16 @@ class SparseInstallTests(unittest.TestCase):
         _nvcc,
         _which,
     ):
+        prepared_source = Path('verified') / 'SpargeAttn'
         with patch.dict(
             os.environ,
             {'NVCC_APPEND_FLAGS': '--keep-this-flag'},
             clear=False,
-        ):
+        ), patch.object(
+            sparse_install,
+            '_prepared_linux_source',
+            return_value=nullcontext(prepared_source),
+        ) as prepared, patch.object(os, 'cpu_count', return_value=16):
             self.assertTrue(
                 sparse_install._install_linux_source(
                     sparse_install.SPARGE_SOURCE
@@ -328,8 +426,8 @@ class SparseInstallTests(unittest.TestCase):
         arguments = run_pip.call_args.args[0]
         self.assertIn('--no-build-isolation', arguments)
         self.assertIn('--no-deps', arguments)
-        self.assertEqual(arguments[-1], sparse_install.SPARGE_SOURCE)
-        self.assertIn(sparse_install.SPARGE_SOURCE_REF, arguments[-1])
+        self.assertEqual(arguments[-1], str(prepared_source))
+        prepared.assert_called_once_with(sparse_install.SPARGE_SOURCE)
         self.assertEqual(
             run_pip.call_args.kwargs['environment']['CUDA_HOME'],
             str(Path('/usr/local/cuda/bin/nvcc').resolve().parent.parent),
@@ -338,6 +436,8 @@ class SparseInstallTests(unittest.TestCase):
             run_pip.call_args.kwargs['environment']['NVCC_APPEND_FLAGS'],
             '--keep-this-flag -DNDEBUG',
         )
+        self.assertEqual(run_pip.call_args.kwargs['environment']['MAX_JOBS'], '8')
+        self.assertEqual(run_pip.call_args.kwargs['environment']['NVCC_THREADS'], '2')
 
     @patch.object(sparse_install.subprocess, 'run')
     def test_nvcc_version_is_validated_without_torch(self, run):
