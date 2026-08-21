@@ -40,6 +40,7 @@ from .model import get_h3_blocks, is_minimax_h3
 from .patch import configure_backend
 from .plan import (
     DENSITY_FIXED,
+    FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     H3OptimizationPlan,
     PLAN_KEY,
@@ -48,6 +49,7 @@ from .plan import (
 from .qkv.formats import inspect_h3_linears
 from .qkv.providers import (
     MLP_OFF,
+    MLP_PRESERVE_UPSTREAM,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     QKV_TRITON_SPARSE_CHUNKED,
@@ -81,8 +83,21 @@ class ResolvedAttention:
     dense_resolution: object | None = None
 
 
-def _fused_request(plan):
-    return FUSED_QKV_OFF if plan.memory is None else plan.memory.fused_qkv
+def _qkv_request(plan):
+    if plan.memory is not None:
+        return plan.memory.fused_qkv
+    if plan.sparse is not None:
+        return FUSED_QKV_AUTO
+    return FUSED_QKV_OFF
+
+
+def _fp8_execution_available(environment):
+    capability = getattr(environment, 'capability', None)
+    return (
+        bool(getattr(environment, 'cuda_available', False))
+        and capability is not None
+        and tuple(capability) >= (8, 9)
+    )
 
 
 def _resolve_dense(plan, model, inventory, environment=None):
@@ -94,7 +109,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
     )
     qkv = resolve_qkv_provider(
         inventory,
-        request=_fused_request(plan),
+        request=_qkv_request(plan),
         backend_kind=dense.backend_kind,
         kitchen_producer_available=producer_api_available(
             device=getattr(environment, 'device_index', None)
@@ -126,7 +141,7 @@ def _resolve_sparse(plan, environment, inventory):
     )
     qkv = resolve_qkv_provider(
         inventory,
-        request=_fused_request(plan),
+        request=_qkv_request(plan),
         backend_kind=ATTENTION_SPARSE,
         triton_available=bool(SPARSE_TRITON_AVAILABLE),
         sparse_spec=kernel_spec,
@@ -179,7 +194,7 @@ def _resolve_fp8_flex(
     )
     qkv = resolve_qkv_provider(
         inventory,
-        request=_fused_request(plan),
+        request=_qkv_request(plan),
         backend_kind=ATTENTION_FP8_FLEX,
     )
     config = HybridSparseConfig(
@@ -213,7 +228,7 @@ def _resolve_triton_sparse(plan, environment, inventory, sparse_error):
     )
     qkv = resolve_qkv_provider(
         inventory,
-        request=_fused_request(plan),
+        request=_qkv_request(plan),
         backend_kind=ATTENTION_TRITON_SPARSE,
         triton_available=True,
     )
@@ -304,7 +319,7 @@ def _resolve_attention(plan, model, inventory, environment):
                 )
 
 
-def _install_mlp(model_patcher, plan, inventory):
+def _install_mlp(model_patcher, plan, inventory, environment):
     memory = plan.memory
     if memory is None:
         return resolve_mlp_provider(inventory, request='off'), 0
@@ -312,8 +327,9 @@ def _install_mlp(model_patcher, plan, inventory):
     resolution = resolve_mlp_provider(
         inventory,
         request=memory.mlp_memory,
+        fp8_available=_fp8_execution_available(environment),
     )
-    if resolution.provider_id == MLP_OFF:
+    if resolution.provider_id in (MLP_OFF, MLP_PRESERVE_UPSTREAM):
         return resolution, 0
 
     config = ActivationMemoryConfig(
@@ -389,7 +405,7 @@ def _status(
             }
         ),
         'fused_qkv': {
-            'requested': _fused_request(plan),
+            'requested': _qkv_request(plan),
             'provider': qkv.provider_id,
             'fused': bool(qkv.fused),
             'reason': qkv.reason,
@@ -494,7 +510,12 @@ def apply_plan(model, plan: H3OptimizationPlan):
             'no H3 Memory Optimization request'
         )
 
-    mlp, mlp_blocks = _install_mlp(patched, plan, inventory)
+    mlp, mlp_blocks = _install_mlp(
+        patched,
+        plan,
+        inventory,
+        environment,
+    )
     runtime_installed = False
     if sparse_execution_selected:
         _session, _created = _ensure_sparse_runtime(patched)
