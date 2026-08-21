@@ -199,7 +199,9 @@ class ChunkedKitchenQKVProjector:
                 chunk_rows=self.chunk_rows,
                 fp8_projection=self.fp8_projection,
             )
-        except FP8BindingError:
+        except (FP8BindingError, RuntimeError, TypeError, ValueError):
+            if not self.fp8_projection:
+                raise
             return None
 
 
