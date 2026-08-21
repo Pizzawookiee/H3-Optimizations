@@ -1,12 +1,15 @@
 '''FP8 FlexAttention fallback for fixed-density H3 sparse routing.'''
 
 from dataclasses import dataclass
+import importlib
 import inspect
+import logging
 
 import torch
 
 import comfy.model_management
 
+from .. import AttentionBackendUnavailable
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
 from .router import KV_TILE, Q_TILE, SparseRouterError, SparseTileRouter
@@ -15,6 +18,8 @@ from .router import KV_TILE, Q_TILE, SparseRouterError, SparseTileRouter
 CHUNK_ROWS = 4096
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
+FLEX_BACKEND_FLASH = 'FLASH'
+FLEX_BACKEND_TRITON = 'TRITON'
 
 
 class FP8FlexError(RuntimeError):
@@ -26,6 +31,7 @@ class FP8FlexSpec:
     version: str
     attention: object
     block_mask_type: object
+    kernel_backend: str = FLEX_BACKEND_TRITON
     fp8_dtype: torch.dtype = FP8_DTYPE
     q_tile: int = Q_TILE
     kv_tile: int = KV_TILE
@@ -37,12 +43,13 @@ class FP8FlexSpec:
             self.fp8_dtype,
             self.q_tile,
             self.kv_tile,
+            self.kernel_backend,
             id(self.attention),
             id(self.block_mask_type),
         )
 
 
-def load_fp8_flex_spec():
+def load_fp8_flex_spec(kernel_backend=FLEX_BACKEND_TRITON):
     try:
         from torch.nn.attention.flex_attention import BlockMask, flex_attention
     except ImportError as exc:
@@ -71,7 +78,27 @@ def load_fp8_flex_spec():
         version=str(torch.__version__),
         attention=attention,
         block_mask_type=BlockMask,
+        kernel_backend=str(kernel_backend),
     )
+
+
+def _flash_attention_available():
+    try:
+        interface = importlib.import_module('flash_attn.cute.interface')
+    except (ImportError, OSError):
+        return False
+    return callable(getattr(interface, '_flash_attn_fwd', None))
+
+
+def select_flex_kernel_backend(capability, flash_available=None):
+    if int(capability[0]) < 9:
+        return FLEX_BACKEND_TRITON
+    available = (
+        _flash_attention_available()
+        if flash_available is None
+        else bool(flash_available())
+    )
+    return FLEX_BACKEND_FLASH if available else FLEX_BACKEND_TRITON
 
 
 def preflight_fp8_flex(
@@ -81,6 +108,7 @@ def preflight_fp8_flex(
     device=None,
     fp8_supported=None,
     dynamo_supported=None,
+    flash_available=None,
     loader=None,
 ):
     if not cuda_available():
@@ -109,7 +137,13 @@ def preflight_fp8_flex(
         dynamo_supported = torch._dynamo.is_dynamo_supported
     if not dynamo_supported():
         raise FP8FlexError('PyTorch Dynamo is unavailable for FlexAttention')
-    return (loader or load_fp8_flex_spec)()
+    kernel_backend = select_flex_kernel_backend(
+        capability,
+        flash_available=flash_available,
+    )
+    if loader is not None:
+        return loader(kernel_backend)
+    return load_fp8_flex_spec(kernel_backend)
 
 
 def block_mask_from_delta_lut(spec, lut, valid_block_num, sequence):
@@ -188,10 +222,10 @@ def _quantize_fp8(x, scale, chunk_rows, *, column_major=False):
 
 @dataclass
 class PreparedFP8Flex:
-    q: torch.Tensor
+    q_fp8: torch.Tensor
     k_fp8: torch.Tensor
     v_fp8: torch.Tensor
-    k_scale: torch.Tensor
+    qk_scale: torch.Tensor
     v_scale: torch.Tensor
     block_mask: object
     output_dtype: torch.dtype
@@ -200,6 +234,7 @@ class PreparedFP8Flex:
     sequence: int
     heads: int
     metadata: dict
+    compile_signature: tuple
 
 
 class FP8FlexBackend:
@@ -242,6 +277,8 @@ class FP8FlexBackend:
         if self.chunk_rows <= 0:
             raise ValueError('FP8 Flex chunk rows must be positive')
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
+        self._validated_signatures = set()
+        self._unavailable_signatures = {}
 
     @property
     def installation_signature(self):
@@ -304,6 +341,15 @@ class FP8FlexBackend:
 
     def prepare(self, q, k, v, *, layer_index, transformer_options):
         heads, sequence = self._validate(q, k, v)
+        compile_signature = (
+            str(q.device),
+            q.dtype,
+            tuple(q.shape),
+            self.spec.kernel_backend,
+        )
+        unavailable = self._unavailable_signatures.get(compile_signature)
+        if unavailable is not None:
+            raise AttentionBackendUnavailable(unavailable)
         snapshot = self._snapshot(transformer_options, sequence)
         video_budget = resolve_video_budget(
             self.config,
@@ -326,9 +372,10 @@ class FP8FlexBackend:
             valid_block_num,
             sequence,
         )
-        q_carrier = q.clone(memory_format=torch.contiguous_format)
+        q_scale = _per_head_scale(q, self.chunk_rows)
         k_scale = _per_head_scale(k, self.chunk_rows)
         v_scale = _per_head_scale(v, self.chunk_rows)
+        q_fp8 = _quantize_fp8(q, q_scale, self.chunk_rows)
         k_fp8 = _quantize_fp8(k, k_scale, self.chunk_rows)
         v_fp8 = _quantize_fp8(
             v,
@@ -341,14 +388,14 @@ class FP8FlexBackend:
             {
                 'layer': int(layer_index),
                 'flex_attention_heads': int(heads),
-                'qkv_projection': 'standard_q_float_kv_fp8',
+                'qkv_projection': 'standard_qkv_fp8',
             }
         )
         return PreparedFP8Flex(
-            q=q_carrier,
+            q_fp8=q_fp8,
             k_fp8=k_fp8,
             v_fp8=v_fp8,
-            k_scale=k_scale,
+            qk_scale=q_scale * k_scale,
             v_scale=v_scale,
             block_mask=block_mask,
             output_dtype=q.dtype,
@@ -357,39 +404,62 @@ class FP8FlexBackend:
             sequence=int(sequence),
             heads=int(heads),
             metadata=metadata,
+            compile_signature=compile_signature,
         )
 
     def execute(self, prepared):
-        k_scale = prepared.k_scale
+        qk_scale = prepared.qk_scale
 
-        def restore_k_scale(score, batch, head, _q_index, _kv_index):
-            return score * k_scale[batch, head]
+        def restore_qk_scale(score, batch, head, _q_index, _kv_index):
+            return score.float() * qk_scale[batch, head]
 
-        output = self.spec.attention(
-            prepared.q,
-            prepared.k_fp8,
-            prepared.v_fp8,
-            score_mod=restore_k_scale,
-            block_mask=prepared.block_mask,
-            scale=prepared.q.shape[-1] ** -0.5,
-            kernel_options={
-                'BLOCK_M': int(self.spec.q_tile),
-                'BLOCK_N': int(self.spec.kv_tile),
-                'ROWS_GUARANTEED_SAFE': True,
-            },
-        )
-        if (
-            tuple(output.shape) != prepared.output_shape
-            or output.dtype != prepared.output_dtype
-            or output.device != prepared.q.device
-        ):
-            raise FP8FlexError(
-                'FlexAttention returned an invalid output contract'
+        kernel_options = {
+            'BACKEND': self.spec.kernel_backend,
+            'ROWS_GUARANTEED_SAFE': True,
+        }
+        if self.spec.kernel_backend == FLEX_BACKEND_TRITON:
+            kernel_options.update(
+                BLOCK_M=int(self.spec.q_tile),
+                BLOCK_N=int(self.spec.kv_tile),
             )
-        output.mul_(
-            prepared.v_scale.to(dtype=output.dtype)[..., None, None]
-        )
+        try:
+            output = self.spec.attention(
+                prepared.q_fp8,
+                prepared.k_fp8,
+                prepared.v_fp8,
+                score_mod=restore_qk_scale,
+                block_mask=prepared.block_mask,
+                scale=prepared.q_fp8.shape[-1] ** -0.5,
+                kernel_options=kernel_options,
+            )
+            if (
+                tuple(output.shape) != prepared.output_shape
+                or output.dtype != self.spec.fp8_dtype
+                or output.device != prepared.q_fp8.device
+            ):
+                raise FP8FlexError(
+                    'FlexAttention returned an invalid output contract'
+                )
+            output = output.to(prepared.output_dtype)
+            output.mul_(
+                prepared.v_scale.to(dtype=output.dtype)[..., None, None]
+            )
+        except Exception as exc:
+            if prepared.compile_signature in self._validated_signatures:
+                raise
+            detail = str(exc).splitlines()[0]
+            reason = (
+                'FP8 FlexAttention %s failed before validation: %s'
+                % (self.spec.kernel_backend, detail)
+            )
+            self._unavailable_signatures[prepared.compile_signature] = reason
+            logging.warning('[H3 Optimizations] %s; using dense attention', reason)
+            raise AttentionBackendUnavailable(reason) from exc
+        self._validated_signatures.add(prepared.compile_signature)
         return output
+
+    def requires_fallback_inputs(self, prepared):
+        return prepared.compile_signature not in self._validated_signatures
 
     def as_status(self):
         return {
@@ -402,8 +472,9 @@ class FP8FlexBackend:
             'flex_attention': self.spec.version,
             'sparse_q_tile': self.spec.q_tile,
             'sparse_kv_tile': self.spec.kv_tile,
-            'q_dtype': 'fp16_or_bf16',
-            'kv_dtype': str(self.spec.fp8_dtype),
-            'kv_scale_layout': 'per_head_float32',
+            'kernel_backend': self.spec.kernel_backend,
+            'qkv_dtype': str(self.spec.fp8_dtype),
+            'qkv_scale_layout': 'per_head_float32',
+            'output_dtype': 'fp16_or_bf16',
             'approximate': True,
         }

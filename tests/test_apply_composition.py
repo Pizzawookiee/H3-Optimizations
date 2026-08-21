@@ -311,6 +311,18 @@ class ApplyCompositionTests(unittest.TestCase):
             ),
         ), mock.patch.object(
             apply_module,
+            '_resolve_triton_sparse',
+            side_effect=apply_module.TritonSparseError(
+                'INT8 Triton is unavailable'
+            ),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_fp8_flex',
+            side_effect=apply_module.FP8FlexError(
+                'FP8 FlexAttention is unavailable'
+            ),
+        ), mock.patch.object(
+            apply_module,
             'install_v_layout_compat',
             return_value=SimpleNamespace(
                 state='installed',

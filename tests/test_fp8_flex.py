@@ -24,19 +24,27 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 import h3_optimizations.apply as apply_module  # noqa: E402
+import h3_optimizations.attention_forward as attention_forward  # noqa: E402
+from h3_optimizations.attention import (  # noqa: E402
+    AttentionBackendUnavailable,
+)
 from h3_optimizations.attention.sparse.config import (  # noqa: E402
     HybridSparseConfig,
 )
 from h3_optimizations.attention.sparse.fp8_flex import (  # noqa: E402
+    FLEX_BACKEND_FLASH,
+    FLEX_BACKEND_TRITON,
     FP8FlexBackend,
     FP8FlexError,
     FP8FlexSpec,
     block_mask_from_delta_lut,
     load_fp8_flex_spec,
     preflight_fp8_flex,
+    select_flex_kernel_backend,
 )
 from h3_optimizations.plan import (  # noqa: E402
     H3OptimizationPlan,
+    MemoryRequest,
     SparseRequest,
     STATUS_KEY,
 )
@@ -92,11 +100,15 @@ class FakeRouter:
 
 class FP8FlexTests(unittest.TestCase):
     @staticmethod
-    def _spec(attention=lambda *_args, **_kwargs: None):
+    def _spec(
+        attention=lambda *_args, **_kwargs: None,
+        kernel_backend=FLEX_BACKEND_TRITON,
+    ):
         return FP8FlexSpec(
             version='test-flex',
             attention=attention,
             block_mask_type=BlockMask,
+            kernel_backend=kernel_backend,
         )
 
     def test_preflight_requires_cuda_fp8_and_dynamo(self):
@@ -121,16 +133,42 @@ class FP8FlexTests(unittest.TestCase):
                 dynamo_supported=lambda: False,
             )
 
-        spec = self._spec()
+        spec = self._spec(kernel_backend=FLEX_BACKEND_FLASH)
+        selected = []
         self.assertIs(
             preflight_fp8_flex(
                 cuda_available=lambda: True,
                 capability_getter=lambda: (12, 0),
                 fp8_supported=lambda: True,
                 dynamo_supported=lambda: True,
-                loader=lambda: spec,
+                flash_available=lambda: True,
+                loader=lambda backend: selected.append(backend) or spec,
             ),
             spec,
+        )
+        self.assertEqual(selected, [FLEX_BACKEND_FLASH])
+
+    def test_kernel_backend_uses_flash_only_with_complete_eligible_runtime(self):
+        self.assertEqual(
+            select_flex_kernel_backend(
+                (12, 0),
+                flash_available=lambda: True,
+            ),
+            FLEX_BACKEND_FLASH,
+        )
+        self.assertEqual(
+            select_flex_kernel_backend(
+                (8, 9),
+                flash_available=lambda: True,
+            ),
+            FLEX_BACKEND_TRITON,
+        )
+        self.assertEqual(
+            select_flex_kernel_backend(
+                (12, 0),
+                flash_available=lambda: False,
+            ),
+            FLEX_BACKEND_TRITON,
         )
 
     def test_loader_compiles_flex_attention_for_sparse_execution(self):
@@ -140,9 +178,10 @@ class FP8FlexTests(unittest.TestCase):
             'compile',
             return_value=compiled_attention,
         ) as compile_attention:
-            spec = load_fp8_flex_spec()
+            spec = load_fp8_flex_spec(FLEX_BACKEND_FLASH)
 
         self.assertIs(spec.attention, compiled_attention)
+        self.assertEqual(spec.kernel_backend, FLEX_BACKEND_FLASH)
         compile_attention.assert_called_once_with(
             mock.ANY,
             fullgraph=True,
@@ -171,7 +210,7 @@ class FP8FlexTests(unittest.TestCase):
         )
         self.assertIsNone(block_mask.q_indices)
 
-    def test_backend_keeps_q_floating_and_quantizes_scaled_kv(self):
+    def test_backend_quantizes_all_qkv_and_restores_output_dtype(self):
         calls = []
 
         def attention(q, k, v, **kwargs):
@@ -185,9 +224,11 @@ class FP8FlexTests(unittest.TestCase):
             chunk_rows=128,
             allow_cpu_for_tests=True,
         )
-        q = torch.randn((1, 2, 192, 128), dtype=torch.bfloat16)
+        q = torch.empty((1, 2, 192, 128), dtype=torch.bfloat16)
         k = torch.empty_like(q)
         v = torch.empty_like(q)
+        q[:, 0].fill_(1)
+        q[:, 1].fill_(2)
         k[:, 0].fill_(2)
         k[:, 1].fill_(4)
         v[:, 0].fill_(3)
@@ -213,15 +254,18 @@ class FP8FlexTests(unittest.TestCase):
                 transformer_options={},
             )
 
-        self.assertEqual(prepared.q.dtype, torch.bfloat16)
-        self.assertNotEqual(prepared.q.data_ptr(), q.data_ptr())
+        self.assertEqual(prepared.q_fp8.dtype, torch.float8_e4m3fn)
         self.assertEqual(prepared.k_fp8.dtype, torch.float8_e4m3fn)
         self.assertEqual(prepared.v_fp8.dtype, torch.float8_e4m3fn)
+        self.assertEqual(prepared.q_fp8.stride(-1), 1)
         self.assertEqual(prepared.k_fp8.stride(-1), 1)
         self.assertEqual(prepared.v_fp8.stride(-2), 1)
         torch.testing.assert_close(
-            prepared.k_scale,
-            torch.tensor([[2 / 448, 4 / 448]], dtype=torch.float32),
+            prepared.qk_scale,
+            torch.tensor(
+                [[2 / (448 ** 2), 8 / (448 ** 2)]],
+                dtype=torch.float32,
+            ),
         )
         torch.testing.assert_close(
             prepared.v_scale,
@@ -234,10 +278,14 @@ class FP8FlexTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), tuple(q.shape))
         self.assertEqual(len(calls), 1)
         call_q, call_k, call_v, kwargs = calls[0]
-        self.assertIs(call_q, prepared.q)
+        self.assertIs(call_q, prepared.q_fp8)
         self.assertIs(call_k, prepared.k_fp8)
         self.assertIs(call_v, prepared.v_fp8)
         self.assertIs(kwargs['block_mask'], prepared.block_mask)
+        self.assertEqual(
+            kwargs['kernel_options']['BACKEND'],
+            FLEX_BACKEND_TRITON,
+        )
         self.assertEqual(kwargs['kernel_options']['BLOCK_M'], 128)
         self.assertEqual(kwargs['kernel_options']['BLOCK_N'], 64)
         self.assertTrue(
@@ -245,16 +293,17 @@ class FP8FlexTests(unittest.TestCase):
         )
         self.assertIs(
             kwargs['score_mod'].__closure__[0].cell_contents,
-            prepared.k_scale,
+            prepared.qk_scale,
         )
         restored = kwargs['score_mod'](
-            torch.tensor(2.0),
+            torch.tensor(2.0, dtype=torch.float8_e4m3fn),
             torch.tensor(0),
             torch.tensor(1),
             torch.tensor(0),
             torch.tensor(0),
         )
-        torch.testing.assert_close(restored, prepared.k_scale[0, 1] * 2)
+        self.assertEqual(restored.dtype, torch.float32)
+        torch.testing.assert_close(restored, prepared.qk_scale[0, 1] * 2)
         torch.testing.assert_close(
             output[:, 0].float(),
             torch.full_like(output[:, 0].float(), 3 / 448),
@@ -262,7 +311,146 @@ class FP8FlexTests(unittest.TestCase):
             rtol=2e-3,
         )
 
-    def test_selection_prefers_flex_then_keeps_dense_as_final_fallback(self):
+    def test_first_execution_failure_retires_only_the_unvalidated_signature(self):
+        calls = 0
+
+        def attention(q, _k, _v, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError('synthetic lowering failure')
+            return torch.ones_like(q)
+
+        backend = FP8FlexBackend(
+            spec=self._spec(attention),
+            router=FakeRouter(),
+            chunk_rows=128,
+            allow_cpu_for_tests=True,
+        )
+        q = torch.ones((1, 1, 128, 128), dtype=torch.bfloat16)
+        snapshot = SimpleNamespace(
+            valid_layout=True,
+            error=None,
+            layout=SimpleNamespace(seq_len=128),
+            step_index=0,
+            total_steps=1,
+        )
+        with mock.patch.object(backend, '_snapshot', return_value=snapshot):
+            prepared = backend.prepare(
+                q,
+                q,
+                q,
+                layer_index=0,
+                transformer_options={},
+            )
+
+        with self.assertRaisesRegex(
+            AttentionBackendUnavailable,
+            'synthetic lowering failure',
+        ):
+            backend.execute(prepared)
+        with self.assertRaises(AttentionBackendUnavailable):
+            backend.prepare(
+                q,
+                q,
+                q,
+                layer_index=1,
+                transformer_options={},
+            )
+        self.assertEqual(calls, 1)
+
+    def test_failure_after_successful_validation_remains_hard(self):
+        calls = 0
+
+        def attention(q, _k, _v, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError('validated runtime failure')
+            return torch.ones_like(q)
+
+        backend = FP8FlexBackend(
+            spec=self._spec(attention),
+            router=FakeRouter(),
+            chunk_rows=128,
+            allow_cpu_for_tests=True,
+        )
+        q = torch.ones((1, 1, 128, 128), dtype=torch.bfloat16)
+        snapshot = SimpleNamespace(
+            valid_layout=True,
+            error=None,
+            layout=SimpleNamespace(seq_len=128),
+            step_index=0,
+            total_steps=1,
+        )
+        with mock.patch.object(backend, '_snapshot', return_value=snapshot):
+            first = backend.prepare(
+                q,
+                q,
+                q,
+                layer_index=0,
+                transformer_options={},
+            )
+            self.assertTrue(backend.requires_fallback_inputs(first))
+            backend.execute(first)
+            second = backend.prepare(
+                q,
+                q,
+                q,
+                layer_index=1,
+                transformer_options={},
+            )
+
+        self.assertFalse(backend.requires_fallback_inputs(second))
+        with self.assertRaisesRegex(RuntimeError, 'validated runtime failure'):
+            backend.execute(second)
+
+    def test_attention_forward_uses_dense_qkv_when_backend_is_unavailable(self):
+        class Backend:
+            name = 'synthetic'
+
+            @staticmethod
+            def prepare(*_args, **_kwargs):
+                raise AttentionBackendUnavailable('not compiled')
+
+        q = torch.randn((3, 2, 4), dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        dense_calls = []
+
+        def dense(_module, call_q, call_k, call_v, options, attention=None):
+            dense_calls.append((call_q, call_k, call_v, options, attention))
+            return torch.ones((1, 2, 3, 4), dtype=torch.bfloat16)
+
+        module = SimpleNamespace(
+            heads=2,
+            head_dim=4,
+            out_proj=lambda value: value,
+        )
+        forward = attention_forward.make_forward(
+            module,
+            0,
+            backend=Backend(),
+            backend_fallback_to_dense=True,
+        )
+        options = {'marker': True}
+        with mock.patch.object(
+            attention_forward,
+            'project_qkv',
+            return_value=(q, k, v),
+        ), mock.patch.object(
+            attention_forward,
+            '_legacy_attention',
+            side_effect=dense,
+        ):
+            output = forward(object(), transformer_options=options)
+
+        self.assertEqual(tuple(output.shape), (3, 8))
+        self.assertEqual(len(dense_calls), 1)
+        self.assertTrue(dense_calls[0][2].is_contiguous())
+        self.assertIs(dense_calls[0][3], options)
+
+    def test_selection_uses_flex_after_sparse_sage_and_triton_fail(self):
         plan = H3OptimizationPlan().with_sparse(SparseRequest())
         dense_qkv = QKVProviderResolution(
             QKV_STANDARD,
@@ -293,6 +481,10 @@ class FP8FlexTests(unittest.TestCase):
             side_effect=apply_module.SparseSageError('ABI missing'),
         ), mock.patch.object(
             apply_module,
+            '_resolve_triton_sparse',
+            side_effect=apply_module.TritonSparseError('Triton missing'),
+        ), mock.patch.object(
+            apply_module,
             'preflight_fp8_flex',
             return_value=self._spec(),
         ):
@@ -305,8 +497,10 @@ class FP8FlexTests(unittest.TestCase):
 
         self.assertEqual(attention.selected, 'flex_attention_fp8')
         self.assertEqual(attention.requested, 'sparse_sage')
+        self.assertIs(attention.dense_resolution, dense.dense_resolution)
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
         self.assertIn('ABI missing', attention.reason)
+        self.assertIn('Triton missing', attention.reason)
 
         with mock.patch.object(
             apply_module,
@@ -316,6 +510,10 @@ class FP8FlexTests(unittest.TestCase):
             apply_module,
             '_resolve_sparse',
             side_effect=apply_module.SparseSageError('ABI missing'),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_triton_sparse',
+            side_effect=apply_module.TritonSparseError('Triton missing'),
         ), mock.patch.object(
             apply_module,
             '_resolve_fp8_flex',
@@ -330,9 +528,10 @@ class FP8FlexTests(unittest.TestCase):
 
         self.assertEqual(attention.selected, 'existing')
         self.assertIs(qkv, dense_qkv)
+        self.assertIn('Triton missing', attention.reason)
         self.assertIn('FP8 missing', attention.reason)
 
-    def test_sparse_sage_success_does_not_probe_flex(self):
+    def test_sparse_sage_success_does_not_probe_other_fallbacks(self):
         plan = H3OptimizationPlan().with_sparse(SparseRequest())
         resolved = (
             apply_module.ResolvedAttention(
@@ -359,6 +558,9 @@ class FP8FlexTests(unittest.TestCase):
             return_value=resolved,
         ), mock.patch.object(
             apply_module,
+            '_resolve_triton_sparse',
+        ) as triton_sparse, mock.patch.object(
+            apply_module,
             '_resolve_fp8_flex',
         ) as flex:
             actual = apply_module._resolve_attention(
@@ -369,10 +571,14 @@ class FP8FlexTests(unittest.TestCase):
             )
 
         self.assertIs(actual, resolved)
+        triton_sparse.assert_not_called()
         flex.assert_not_called()
 
     def test_apply_installs_flex_as_the_sparse_execution_backend(self):
-        plan = H3OptimizationPlan().with_sparse(SparseRequest())
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(),
+            sparse=SparseRequest(),
+        )
         qkv = QKVProviderResolution(
             QKV_STANDARD,
             False,
@@ -380,12 +586,14 @@ class FP8FlexTests(unittest.TestCase):
         )
         mlp = MLPProviderResolution('off', 'off', 'disabled')
         backend = SimpleNamespace(name='flex_attention_fp8')
+        dense_resolution = SimpleNamespace(backend=object())
         attention = apply_module.ResolvedAttention(
             requested='sparse_sage',
             selected='flex_attention_fp8',
             backend=backend,
             reason='Sparse Sage unavailable; using FP8 FlexAttention',
             backend_kind='flex_attention_fp8',
+            dense_resolution=dense_resolution,
         )
         environment = SimpleNamespace(
             cuda_available=True,
@@ -430,13 +638,20 @@ class FP8FlexTests(unittest.TestCase):
             '_ensure_sparse_runtime',
             return_value=(object(), True),
         ) as runtime:
-            patched = apply_module.apply_plan(FakeModel(), plan)
+            with mock.patch.object(
+                apply_module,
+                'install_dense_attention',
+                return_value=True,
+            ) as install_dense:
+                patched = apply_module.apply_plan(FakeModel(), plan)
 
         configure.assert_called_once_with(
             mock.ANY,
             backend,
             projector=None,
+            backend_fallback_to_dense=True,
         )
+        install_dense.assert_called_once_with(patched, dense_resolution)
         runtime.assert_called_once()
         status = patched.model_options['transformer_options'][STATUS_KEY]
         self.assertEqual(status['attention']['selected'], 'flex_attention_fp8')

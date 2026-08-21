@@ -2,6 +2,11 @@
 
 from importlib import import_module
 
+
+class AttentionBackendUnavailable(RuntimeError):
+    pass
+
+
 _SPARSE_EXPORTS = {
     'HybridSparseBackend',
     'HybridSparseConfig',
@@ -17,6 +22,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    'AttentionBackendUnavailable',
     'HybridSparseBackend',
     'HybridSparseConfig',
     'SparseSageError',

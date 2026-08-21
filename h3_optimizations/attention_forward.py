@@ -4,6 +4,8 @@ import comfy.ldm.minimax.model as h3_model
 import comfy.model_management
 import comfy.quant_ops
 
+from .attention import AttentionBackendUnavailable
+
 
 def project_qkv(module, x, rope_freqs):
     seq = x.shape[0]
@@ -115,6 +117,7 @@ def make_forward(
     attention=None,
     projector=None,
     fallback_forward=None,
+    backend_fallback_to_dense=False,
 ):
     if backend is not None and attention is not None:
         raise ValueError('pass either backend or attention, not both')
@@ -168,18 +171,40 @@ def make_forward(
                 attention=attention,
             )
         else:
-            prepared = backend.prepare(
-                q,
-                k,
-                v,
-                layer_index=layer_index,
-                transformer_options=transformer_options,
-            )
-            del q, k, v
+            fallback_inputs_available = True
             try:
-                out_hnd = backend.execute(prepared)
-            finally:
-                del prepared
+                prepared = backend.prepare(
+                    q,
+                    k,
+                    v,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+                retain_fallback_inputs = (
+                    backend_fallback_to_dense
+                    and backend.requires_fallback_inputs(prepared)
+                )
+                if not retain_fallback_inputs:
+                    del q, k, v
+                    fallback_inputs_available = False
+                try:
+                    out_hnd = backend.execute(prepared)
+                finally:
+                    del prepared
+            except AttentionBackendUnavailable:
+                if (
+                    not backend_fallback_to_dense
+                    or not fallback_inputs_available
+                ):
+                    raise
+                v = v.contiguous()
+                out_hnd = _legacy_attention(
+                    module,
+                    q,
+                    k,
+                    v,
+                    transformer_options,
+                )
             if out_hnd.ndim != 4:
                 raise RuntimeError(
                     '%s returned rank-%d output; expected HND rank 4'

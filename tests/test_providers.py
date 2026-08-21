@@ -18,6 +18,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     QKV_STANDARD,
+    QKV_TRITON_SPARSE_CHUNKED,
     resolve_mlp_provider,
     resolve_qkv_provider,
 )
@@ -121,6 +122,18 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(sparse.provider_id, QKV_SPARSE_CONVROT_INT8)
         self.assertTrue(sparse.fused)
+
+        triton_sparse = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='triton_sparse_int8',
+            triton_available=True,
+        )
+        self.assertEqual(
+            triton_sparse.provider_id,
+            QKV_TRITON_SPARSE_CHUNKED,
+        )
+        self.assertTrue(triton_sparse.fused)
 
         mlp = resolve_mlp_provider(inventory, request='auto')
         self.assertEqual(mlp.provider_id, MLP_CONVROT_INT8_TWO_SLICE)

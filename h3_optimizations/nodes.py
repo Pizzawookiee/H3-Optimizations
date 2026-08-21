@@ -57,7 +57,8 @@ class H3MemoryOptimization(io.ComfyNode):
                     tooltip=(
                         'auto uses 4K chunked Comfy Kitchen QKV for compatible '
                         'dense H3 and native-carrier 4K chunked QKV for compatible '
-                        'Sparse Sage. off uses standard H3 QKV.'
+                        'Sparse Sage or INT8 Triton sparse attention. off uses '
+                        'standard H3 QKV.'
                     ),
                 ),
                 io.Combo.Input(
@@ -124,8 +125,8 @@ class H3SparseAttention(io.ComfyNode):
                 'models pass through unchanged. Text, reference conditioning, '
                 'audio, non-video queries, and mixed boundary tiles remain dense. '
                 'If Sparse Sage is unavailable, supported NVIDIA GPUs use '
-                'FP8 FlexAttention before falling back to resolved dense '
-                'attention.'
+                'INT8 Triton sparse attention, then FP8 FlexAttention, before '
+                'falling back to resolved dense attention.'
             ),
             search_aliases=[
                 'H3 sparse',

@@ -73,13 +73,18 @@ native-carrier 4K chunked QKV and the ConvRot MLP path additionally require
 Triton.
 Missing dense capabilities return to upstream H3 QKV and normal Comfy
 attention. Missing Sparse Sage dependency, device, architecture, or compiled
-ABI capabilities select PyTorch FlexAttention on an FP8-capable NVIDIA GPU.
-Flex retains Q in its normal floating dtype, stores K/V as per-head-scaled
-E4M3, and consumes the router's 128Q x 64KV block route directly. If that API,
-Dynamo, CUDA, or FP8 compute is unavailable, the resolved dense H3 path remains
-the final fallback. Errors raised after a validated sparse backend begins
-execution remain hard errors instead of silently changing attention behavior
-mid-run.
+ABI capabilities select the package INT8 Triton sparse backend on NVIDIA
+compute capability 8.0 or newer. It consumes the same 128Q x 64KV route and,
+for compatible ConvRot-256 TensorWise INT8 checkpoints, uses 4K QKV chunks to
+produce its INT8 carriers directly. If that backend is unavailable, PyTorch
+FP8 FlexAttention is next. Flex stores Q/K/V as per-head-scaled E4M3, restores
+Q/K scale before softmax, converts the FP8 output back to the original floating
+dtype, and consumes the same route. Hopper and Blackwell request the FA4
+backend when its CuTe package is installed; other supported runtimes use the
+Triton Flex kernel. If neither sparse fallback is available, the resolved dense
+H3 path remains the final fallback. Errors raised after a validated sparse
+backend begins execution remain hard errors instead of silently changing
+attention behavior mid-run.
 
 spas_sage_attn is not a normal package dependency because its compiled backend
 must match Torch, CUDA, and the GPU architecture. The guarded pre-startup
@@ -92,8 +97,10 @@ when a verified replacement is available.
 - Python 3.10 or newer
 - Any backend supported by ComfyUI's MiniMax H3 implementation for the final
   dense fallback
-- NVIDIA SM89 or newer with PyTorch FlexAttention and FP8 compute for the
-  sparse fallback when Sparse Sage is unavailable
+- NVIDIA SM80 or newer with Triton for the first sparse fallback when Sparse
+  Sage is unavailable
+- An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the next sparse
+  fallback when INT8 Triton is unavailable
 - NVIDIA CUDA SM80, SM86, SM87, SM89, SM90, or SM120 for Sparse Sage
 
 Dense QKV eligibility follows the complete producer specification returned by
@@ -114,9 +121,15 @@ and Sparse Sage capability fallback, stale-install repair selection, chunk
 boundaries and RoPE slices, non-H3 no-op behavior, sparse contract and
 route geometry, runtime step/layout publication, and source isolation. GPU
 kernel validation is intentionally separate because it requires the matching
-hardware and compiled backend packages.
+hardware and compiled backend packages. FP8 Flex CPU contracts cover all-FP8
+carrier layouts, explicit Triton/FA4 selection, and first-call dense fallback.
 
 Run the CPU suite from the ComfyUI root:
 
     $env:CUDA_VISIBLE_DEVICES = '-1'
     .\.venv\Scripts\python.exe -m unittest discover -s custom_nodes\H3-Optimizations\tests -p 'test_*.py' -v
+
+The three-way attention benchmark derives each carrier contract from the
+current checkout and verifies identical sparse routes before timing:
+
+    .\.venv\Scripts\python.exe custom_nodes\H3-Optimizations\benchmarks\bench_sparse_backends.py --output sparse-backends.json --i-understand-this-uses-gpu
