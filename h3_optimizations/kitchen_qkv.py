@@ -9,8 +9,9 @@ import torch
 import comfy.model_management
 import comfy.quant_ops
 
-from .attention_forward import project_qkv, to_hnd
+from .attention_forward import project_qkv
 from .dense_resolver import is_installed_dense_attention
+from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 
 
@@ -60,12 +61,6 @@ def _project_anchor_samples(module, x, rope_freqs, positions):
     return k.transpose(0, 1).unsqueeze(0)
 
 
-def _project_chunk(module, x, rope_freqs, start, end):
-    chunk_rope = None if rope_freqs is None else rope_freqs[:, start:end]
-    q, k, v = project_qkv(module, x[start:end], chunk_rope)
-    return to_hnd(q, k, v)
-
-
 def run_chunked_kitchen_qkv(
     module,
     x,
@@ -93,7 +88,7 @@ def run_chunked_kitchen_qkv(
     retained_v = None
     for start in range(0, sequence, int(chunk_rows)):
         end = min(start + int(chunk_rows), sequence)
-        q, k, v = _project_chunk(module, x, rope_freqs, start, end)
+        q, k, v = project_chunk_hnd(module, x, rope_freqs, start, end)
         if retained_v is None:
             retained_v = v.new_empty(
                 (1, int(module.heads), sequence, int(module.head_dim))

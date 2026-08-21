@@ -65,7 +65,8 @@ Dense execution uses ComfyUI's public `comfy_kitchen_int8` attention backend.
 Chunked dense QKV additionally requires a Comfy Kitchen release exposing its
 external INT8-attention producer contract and ConvRot-256 TensorWise INT8 QKV
 weights. Sparse Attention requires a compatible spas_sage_attn build; its
-native-carrier fused QKV and the ConvRot MLP path additionally require Triton.
+native-carrier 4K chunked QKV and the ConvRot MLP path additionally require
+Triton.
 Missing dense capabilities return to upstream H3 QKV and normal Comfy
 attention. Missing Sparse Sage dependency, device, architecture, or compiled
 ABI capabilities do the same while producing a concise status reason. Errors
@@ -87,11 +88,11 @@ when a verified replacement is available.
 
 Dense QKV eligibility follows the complete producer specification returned by
 Comfy Kitchen; it is not gated on a particular compute capability. Sparse Sage
-accepts the exact ABI exported by a compatible spas_sage_attn build. Its fused
-QKV producer is selected only when the active kernel's Q/K tiles, scale layouts,
-V carrier, accumulator, summaries, and callables all match. A mismatched QKV
-format uses standard sparse QKV. An unvalidated Sparse Sage architecture uses
-dense H3 attention.
+accepts the exact ABI exported by a compatible spas_sage_attn build. Its
+chunked QKV producer is selected only when the active kernel's Q/K tiles, scale
+layouts, V carrier, accumulator, summaries, and callables all match. A
+mismatched QKV format uses standard sparse QKV. An unvalidated Sparse Sage
+architecture uses dense H3 attention.
 
 Node IDs are H3MemoryOptimization and H3SparseAttention. H3-Extended is not
 required.

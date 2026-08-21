@@ -86,6 +86,8 @@ def format_sparse_status(model):
     ]
     if selected != 'sparse_sage' and reason:
         lines.insert(1, 'Sparse fallback: %s' % reason)
+    if qkv.get('provider') == 'convrot_int8_sparse_sage':
+        lines[2] += ' (%d-row chunks)' % int(qkv.get('chunk_rows') or 4096)
     if sparse.get('denser_early_late_steps'):
         lines.insert(
             2,

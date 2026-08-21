@@ -78,7 +78,7 @@ def resolve_qkv_provider(
         return QKVProviderResolution(
             QKV_SPARSE_CONVROT_INT8,
             True,
-            'ConvRot-256 TensorWise INT8 QKV matches the complete Sparse Sage carrier contract',
+            '4K ConvRot QKV chunks into Sparse Sage-native carriers',
         )
     return _standard_qkv(
         'the resolved attention backend has no fused-QKV consumer'

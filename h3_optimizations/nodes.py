@@ -55,7 +55,7 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=FUSED_QKV_AUTO,
                     tooltip=(
                         'auto uses 4K chunked Comfy Kitchen QKV for compatible '
-                        'dense H3 and native-carrier fused QKV for compatible '
+                        'dense H3 and native-carrier 4K chunked QKV for compatible '
                         'Sparse Sage. off uses standard H3 QKV.'
                     ),
                 ),

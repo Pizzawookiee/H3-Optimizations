@@ -23,6 +23,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 import h3_optimizations.kitchen_qkv as kitchen_qkv  # noqa: E402
+import h3_optimizations.qkv.chunked as chunked_qkv  # noqa: E402
 from h3_optimizations.attention_forward import make_forward  # noqa: E402
 from h3_optimizations.dense_resolver import (  # noqa: E402
     ATTENTION_COMFY_KITCHEN_INT8,
@@ -121,6 +122,10 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             fake,
         ), mock.patch.object(
             kitchen_qkv,
+            'project_qkv',
+            side_effect=project,
+        ), mock.patch.object(
+            chunked_qkv,
             'project_qkv',
             side_effect=project,
         ):

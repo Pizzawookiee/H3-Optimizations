@@ -134,7 +134,10 @@ def _resolve_sparse(plan, environment, inventory):
     if use_fused:
         from .qkv.projectors import SparseFusedQKVProjector
 
-        projector = SparseFusedQKVProjector()
+        projector = SparseFusedQKVProjector(
+            kernel_spec,
+            chunk_rows=4096,
+        )
     backend = HybridSparseBackend(
         config,
         kernel_spec=kernel_spec,

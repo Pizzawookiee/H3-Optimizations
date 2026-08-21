@@ -68,6 +68,22 @@ class SourceIsolationTests(unittest.TestCase):
             for fragment in banned:
                 self.assertNotIn(fragment, text, '%s exports %s' % (path, fragment))
 
+    def test_sparse_production_uses_chunked_projector(self):
+        apply_source = (SOURCE / 'apply.py').read_text(encoding='utf-8')
+        projector_source = (
+            SOURCE / 'qkv' / 'projectors.py'
+        ).read_text(encoding='utf-8')
+        backend_source = (
+            SOURCE / 'attention' / 'sparse' / 'backend.py'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn('SparseFusedQKVProjector(', apply_source)
+        self.assertIn('chunk_rows=4096', apply_source)
+        self.assertIn('ChunkedSparseQKVProjector', projector_source)
+        self.assertNotIn('FusedQKVProjector as Implementation', projector_source)
+        self.assertIn('ChunkedSparseQKVProjector(kernel_spec)', backend_source)
+        self.assertNotIn('FusedQKVProjector()', backend_source)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -8,10 +8,8 @@ from .config import (
     MODE_SAGE128_FUSED_QKV,
     resolve_video_budget,
 )
-from .fused_qkv import (
-    FusedQKVProjector,
-    sparse_fused_qkv_contract_mismatch,
-)
+from .chunked_qkv import ChunkedSparseQKVProjector
+from .fused_qkv import sparse_fused_qkv_contract_mismatch
 from .router import SparseRouterError, SparseTileRouter
 from .sparse_sage import (
     SparseSageError,
@@ -56,7 +54,7 @@ class HybridSparseBackend:
             self.config.mode == MODE_SAGE128_FUSED_QKV
             and self.projector is None
         ):
-            self.projector = FusedQKVProjector()
+            self.projector = ChunkedSparseQKVProjector(kernel_spec)
         self.executor = SparseSageExecutor(
             kernel_spec,
             allow_cpu_for_tests=allow_cpu_for_tests,
@@ -119,9 +117,7 @@ class HybridSparseBackend:
                 type(projector).__module__,
                 type(projector).__qualname__,
                 getattr(projector, 'name', None),
-                self._callable_signature(
-                    getattr(projector, 'tensor_core', None)
-                ),
+                getattr(projector, 'installation_signature', None),
             ),
         )
 
@@ -248,5 +244,7 @@ class HybridSparseBackend:
             'sparse_extension_layout': self.executor.spec.extension_layout,
             'approximate': True,
             'fused_qkv': self.projector is not None,
+            'qkv_projector': getattr(self.projector, 'name', None),
+            'qkv_chunk_rows': getattr(self.projector, 'chunk_rows', None),
             'smooth_k': False if self.projector is not None else True,
         }

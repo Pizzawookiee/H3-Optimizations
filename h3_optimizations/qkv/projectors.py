@@ -1,4 +1,4 @@
-"""Format-guarded fused-QKV projector for Sparse Sage."""
+"""Format-guarded chunked QKV projector for Sparse Sage."""
 
 from __future__ import annotations
 
@@ -11,26 +11,28 @@ from .formats import (
 def _unsupported(required, message):
     if required:
         raise RuntimeError(
-            "required fused QKV became unavailable at runtime: %s"
+            "required sparse QKV optimization became unavailable at runtime: %s"
             % message
         )
     return None
 
 
 class SparseFusedQKVProjector:
-    """Guard the sparse ConvRot projector and fall back for auto requests."""
+    """Guard chunked sparse QKV and fall back for auto requests."""
 
-    name = "h3_fused_qkv_sparse_sage"
+    name = "chunked_sparse_sage_qkv"
     qk_format = "sparge_block_int8"
 
-    def __init__(self, required=False, tensor_core=None):
-        from ..attention.sparse.fused_qkv import (
-            FusedQKVProjector as Implementation,
+    def __init__(self, spec, required=False, chunk_rows=4096):
+        from ..attention.sparse.chunked_qkv import (
+            ChunkedSparseQKVProjector as Implementation,
         )
 
         self.required = bool(required)
+        self.chunk_rows = int(chunk_rows)
         self._implementation = Implementation(
-            tensor_core=tensor_core
+            spec,
+            chunk_rows=self.chunk_rows,
         )
 
     @property
@@ -41,12 +43,6 @@ class SparseFusedQKVProjector:
             bool(self.required),
             self._implementation.installation_signature,
         )
-
-    def bind(self, module):
-        callback = getattr(
-            self._implementation, "bind", None
-        )
-        return None if callback is None else callback(module)
 
     def try_project(
         self,
