@@ -43,13 +43,20 @@ def format_memory_status(model):
         'QKV: %s' % _provider_text(qkv, 'standard_h3_qkv'),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
-    if qkv.get('provider') == 'chunked_kitchen_qkv':
+    if qkv.get('provider') in (
+        'chunked_kitchen_qkv',
+        'chunked_fp8_kitchen_qkv',
+    ):
         lines[2] += ' (%d-row chunks, Kitchen %s)' % (
             int(qkv.get('chunk_rows') or 4096),
             qkv.get('producer_abi') or 'producer ABI unavailable',
         )
     chunk_rows = mlp.get('chunk_rows')
-    if chunk_rows is not None and mlp.get('provider') != 'off':
+    if chunk_rows is not None and mlp.get('provider') not in (
+        None,
+        'off',
+        'preserve_upstream_mlp',
+    ):
         lines[-1] += ' (%d-row chunks)' % int(chunk_rows)
     return '\n'.join(lines)
 
@@ -92,6 +99,7 @@ def format_sparse_status(model):
         lines.insert(1, 'Sparse fallback: %s' % reason)
     if qkv.get('provider') in (
         'convrot_int8_sparse_sage',
+        'chunked_fp8_sparse_sage',
         'chunked_triton_int8_sparse',
     ):
         lines[2] += ' (%d-row chunks)' % int(qkv.get('chunk_rows') or 4096)
@@ -102,7 +110,7 @@ def format_sparse_status(model):
         )
     if mlp.get('provider') not in (None, 'off'):
         lines.append(
-            'Upstream MLP optimization: %s'
+            'MLP: %s'
             % _provider_text(mlp, 'off')
         )
     return '\n'.join(lines)
