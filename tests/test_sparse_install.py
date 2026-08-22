@@ -133,16 +133,17 @@ class SparseInstallTests(unittest.TestCase):
             )
         )
 
-    def test_linux_uses_pinned_source_build(self):
+    def test_linux_uses_pinned_upstream_source_build_for_sm89(self):
         self.assertEqual(
             sparse_install._linux_source_for(
                 'Linux',
                 'x86_64',
                 '2.9.0+cu128',
                 '12.8',
+                (8, 9),
             ),
-            'git+https://github.com/woct0rdho/SpargeAttn.git@'
-            '067d80cb6b76345c7b8be40e86c7d19a3cf7c4eb',
+            'git+https://github.com/thu-ml/SpargeAttn.git@'
+            'ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a',
         )
         self.assertIsNone(
             sparse_install._linux_source_for(
@@ -150,16 +151,17 @@ class SparseInstallTests(unittest.TestCase):
                 'aarch64',
                 '2.9.0+cu128',
                 '12.8',
+                (8, 9),
             )
         )
-        self.assertEqual(
+        self.assertIsNone(
             sparse_install._linux_source_for(
                 'Linux',
                 'x86_64',
-                '2.9.0',
-                '',
-            ),
-            sparse_install.SPARGE_SOURCE,
+                '2.9.0+cu122',
+                '12.2',
+                (8, 9),
+            )
         )
         self.assertIsNone(
             sparse_install._linux_source_for(
@@ -167,10 +169,32 @@ class SparseInstallTests(unittest.TestCase):
                 'x86_64',
                 '2.2.0+cu118',
                 '11.8',
+                (8, 9),
             )
         )
 
-    def test_pinned_source_patch_enables_ninja_and_bounds_nvcc_threads(self):
+    def test_linux_sm120_uses_pinned_compatibility_fork(self):
+        self.assertEqual(
+            sparse_install._linux_source_for(
+                'Linux',
+                'x86_64',
+                '2.14.0+cu130',
+                '13.0',
+                (12, 0),
+            ),
+            sparse_install.FORK_SPARGE_SOURCE,
+        )
+        self.assertIsNone(
+            sparse_install._linux_source_for(
+                'Linux',
+                'x86_64',
+                '2.9.0+cu126',
+                '12.6',
+                (12, 0),
+            )
+        )
+
+    def test_fork_source_patch_enables_ninja_and_bounds_nvcc_threads(self):
         class SetupFile:
             def __init__(self):
                 self.source = '\n'.join(
@@ -189,7 +213,7 @@ class SparseInstallTests(unittest.TestCase):
                 self.assert_encoding = encoding
 
         setup = SetupFile()
-        self.assertTrue(sparse_install._patch_sparge_setup(setup))
+        self.assertTrue(sparse_install._patch_fork_setup(setup))
         self.assertNotIn(sparse_install._SPARGE_NINJA_DISABLED, setup.source)
         self.assertNotIn(sparse_install._SPARGE_NVCC_ALL_CORES, setup.source)
         self.assertIn(sparse_install._SPARGE_NINJA_ENABLED, setup.source)
@@ -197,20 +221,20 @@ class SparseInstallTests(unittest.TestCase):
         self.assertEqual(setup.assert_encoding, 'utf-8')
         compile(setup.source, 'setup.py', 'exec')
 
-    def test_pinned_source_patch_rejects_unreviewed_setup(self):
+    def test_fork_source_patch_rejects_unreviewed_setup(self):
         class SetupFile:
             def __init__(self):
                 self.written = False
 
             def read_text(self, *, encoding):
-                return 'changed upstream setup'
+                return 'changed fork setup'
 
             def write_text(self, source, *, encoding):
                 self.written = True
 
         setup = SetupFile()
         with self.assertLogs(level='ERROR'):
-            self.assertFalse(sparse_install._patch_sparge_setup(setup))
+            self.assertFalse(sparse_install._patch_fork_setup(setup))
         self.assertFalse(setup.written)
 
     @patch.object(sparse_install.shutil, 'which', return_value='/usr/bin/git')
@@ -219,10 +243,16 @@ class SparseInstallTests(unittest.TestCase):
         run.side_effect = (
             subprocess.CompletedProcess([], 0, stdout=''),
             subprocess.CompletedProcess([], 0, stdout=''),
-            subprocess.CompletedProcess([], 0, stdout=sparse_install.SPARGE_SOURCE_REF + '\n'),
+            subprocess.CompletedProcess(
+                [], 0, stdout=sparse_install.UPSTREAM_SPARGE_SOURCE_REF + '\n'
+            ),
         )
         destination = Path('build') / 'SpargeAttn'
-        self.assertTrue(sparse_install._checkout_pinned_sparge(destination))
+        self.assertTrue(
+            sparse_install._checkout_pinned_sparge(
+                destination, sparse_install.UPSTREAM_SPARGE_SOURCE
+            )
+        )
         self.assertEqual(run.call_count, 3)
         self.assertEqual(
             run.call_args_list[0].args[0],
@@ -231,36 +261,59 @@ class SparseInstallTests(unittest.TestCase):
                 'clone',
                 '--quiet',
                 '--no-checkout',
-                sparse_install.SPARGE_REPOSITORY,
+                sparse_install.UPSTREAM_SPARGE_REPOSITORY,
                 str(destination),
             ],
         )
-        self.assertIn(sparse_install.SPARGE_SOURCE_REF, run.call_args_list[1].args[0])
+        self.assertIn(
+            sparse_install.UPSTREAM_SPARGE_SOURCE_REF,
+            run.call_args_list[1].args[0],
+        )
 
     def test_linux_build_defaults_to_half_the_logical_cores(self):
+        with patch.object(os, 'cpu_count', return_value=16), patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            environment = sparse_install._linux_build_environment(
+                '/usr/local/cuda/bin/nvcc',
+                (8, 9),
+                sparse_install.UPSTREAM_SPARGE_SOURCE,
+            )
+        self.assertEqual(environment['MAX_JOBS'], '8')
+        self.assertEqual(environment['TORCH_CUDA_ARCH_LIST'], '8.9')
+        self.assertNotIn('NVCC_THREADS', environment)
+        self.assertNotIn('NVCC_APPEND_FLAGS', environment)
+
+    def test_linux_build_respects_explicit_parallelism(self):
+        with patch.object(os, 'cpu_count', return_value=16), patch.dict(
+            os.environ,
+            {'MAX_JOBS': '3', 'TORCH_CUDA_ARCH_LIST': '8.9'},
+            clear=True,
+        ):
+            environment = sparse_install._linux_build_environment(
+                '/usr/local/cuda/bin/nvcc',
+                (8, 9),
+                sparse_install.UPSTREAM_SPARGE_SOURCE,
+            )
+        self.assertEqual(environment['MAX_JOBS'], '3')
+        self.assertEqual(environment['TORCH_CUDA_ARCH_LIST'], '8.9')
+
+    def test_sm120_fork_build_keeps_bounded_nvcc_threads(self):
         with patch.object(os, 'cpu_count', return_value=16), patch.dict(
             os.environ,
             {'NVCC_APPEND_FLAGS': '--keep-this-flag'},
             clear=True,
         ):
             environment = sparse_install._linux_build_environment(
-                '/usr/local/cuda/bin/nvcc'
+                '/usr/local/cuda/bin/nvcc',
+                (12, 0),
+                sparse_install.FORK_SPARGE_SOURCE,
             )
         self.assertEqual(environment['MAX_JOBS'], '8')
         self.assertEqual(environment['NVCC_THREADS'], '2')
         self.assertEqual(environment['NVCC_APPEND_FLAGS'], '--keep-this-flag -DNDEBUG')
-
-    def test_linux_build_respects_explicit_parallelism(self):
-        with patch.object(os, 'cpu_count', return_value=16), patch.dict(
-            os.environ,
-            {'MAX_JOBS': '3', 'NVCC_THREADS': '1'},
-            clear=True,
-        ):
-            environment = sparse_install._linux_build_environment(
-                '/usr/local/cuda/bin/nvcc'
-            )
-        self.assertEqual(environment['MAX_JOBS'], '3')
-        self.assertEqual(environment['NVCC_THREADS'], '1')
 
     @patch.object(sparse_install.subprocess, 'run')
     def test_runtime_probe_does_not_import_torch_in_parent(self, run):
@@ -409,35 +462,31 @@ class SparseInstallTests(unittest.TestCase):
         _which,
     ):
         prepared_source = Path('verified') / 'SpargeAttn'
-        with patch.dict(
-            os.environ,
-            {'NVCC_APPEND_FLAGS': '--keep-this-flag'},
-            clear=False,
-        ), patch.object(
+        with patch.object(
             sparse_install,
             '_prepared_linux_source',
             return_value=nullcontext(prepared_source),
         ) as prepared, patch.object(os, 'cpu_count', return_value=16):
             self.assertTrue(
                 sparse_install._install_linux_source(
-                    sparse_install.SPARGE_SOURCE
+                    sparse_install.UPSTREAM_SPARGE_SOURCE,
+                    capability=(8, 9),
                 )
             )
         arguments = run_pip.call_args.args[0]
         self.assertIn('--no-build-isolation', arguments)
         self.assertIn('--no-deps', arguments)
         self.assertEqual(arguments[-1], str(prepared_source))
-        prepared.assert_called_once_with(sparse_install.SPARGE_SOURCE)
+        prepared.assert_called_once_with(sparse_install.UPSTREAM_SPARGE_SOURCE)
+        environment = run_pip.call_args.kwargs['environment']
         self.assertEqual(
-            run_pip.call_args.kwargs['environment']['CUDA_HOME'],
+            environment['CUDA_HOME'],
             str(Path('/usr/local/cuda/bin/nvcc').resolve().parent.parent),
         )
-        self.assertEqual(
-            run_pip.call_args.kwargs['environment']['NVCC_APPEND_FLAGS'],
-            '--keep-this-flag -DNDEBUG',
-        )
-        self.assertEqual(run_pip.call_args.kwargs['environment']['MAX_JOBS'], '8')
-        self.assertEqual(run_pip.call_args.kwargs['environment']['NVCC_THREADS'], '2')
+        self.assertEqual(environment['MAX_JOBS'], '8')
+        self.assertEqual(environment['TORCH_CUDA_ARCH_LIST'], '8.9')
+        self.assertNotIn('NVCC_THREADS', environment)
+        self.assertNotIn('NVCC_APPEND_FLAGS', environment)
 
     @patch.object(sparse_install.subprocess, 'run')
     def test_nvcc_version_is_validated_without_torch(self, run):
@@ -464,7 +513,22 @@ class SparseInstallTests(unittest.TestCase):
         with self.assertLogs(level='WARNING'):
             self.assertFalse(
                 sparse_install._install_linux_source(
-                    sparse_install.SPARGE_SOURCE
+                    sparse_install.UPSTREAM_SPARGE_SOURCE,
+                    capability=(8, 9),
+                )
+            )
+        run_pip.assert_not_called()
+
+    @patch.object(sparse_install.shutil, 'which', return_value='/usr/bin/git')
+    @patch.object(sparse_install, '_linux_nvcc', return_value='/usr/local/cuda/bin/nvcc')
+    @patch.object(sparse_install, '_nvcc_version', return_value=(12, 3))
+    @patch.object(sparse_install, '_run_pip')
+    def test_sm89_requires_nvcc_12_4(self, run_pip, _version, _nvcc, _which):
+        with self.assertLogs(level='WARNING'):
+            self.assertFalse(
+                sparse_install._install_linux_source(
+                    sparse_install.UPSTREAM_SPARGE_SOURCE,
+                    capability=(8, 9),
                 )
             )
         run_pip.assert_not_called()
@@ -479,7 +543,7 @@ class SparseInstallTests(unittest.TestCase):
         with self.assertLogs(level='ERROR'):
             self.assertFalse(
                 sparse_install._run_pip(
-                    ['--no-deps', sparse_install.SPARGE_SOURCE],
+                    ['--no-deps', sparse_install.UPSTREAM_SPARGE_SOURCE],
                     timeout=1,
                 )
             )

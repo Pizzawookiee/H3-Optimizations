@@ -38,7 +38,7 @@ workflow containing either H3 Sparse Attention node also remains runnable when
 Sparse Sage is unavailable: supported NVIDIA GPUs first use the package INT8
 Triton sparse backend, then FP8 FlexAttention when available, before keeping the
 resolved dense H3 path. The selected fallback and reason appear in the node
-status text. Explicit advanced early/middle/late budgets are preserved across
+status text. Explicit advanced early/middle/late densities are preserved across
 all sparse fallback backends.
 
 ## Install
@@ -51,29 +51,67 @@ Restart ComfyUI after cloning. The nodes then appear under H3-Optimizations;
 ComfyUI-Manager is not required.
 
 Before node registration, startup checks the active Torch backend in a child
-process. Supported Windows NVIDIA installations use matching upstream Sparse
-Sage wheels with pinned hashes. Linux x86-64 NVIDIA installations build a
-pinned SpargeAttention revision from source when `git` and the CUDA `nvcc`
-compiler are available. Both paths use `--no-deps`, so they cannot replace
-Torch or other ComfyUI packages. The first Linux source build may add several
-minutes to startup.
+process. Supported Windows NVIDIA installations use matching verified
+`woct0rdho/SpargeAttn` wheels with pinned hashes. Linux x86-64 NVIDIA
+installations build a pinned SpargeAttention revision from source when `git`
+and the CUDA `nvcc` compiler are available. Linux SM80, SM86, SM87, SM89, and
+SM90 builds use the original `thu-ml/SpargeAttn` repository. Linux SM120 uses
+the compatibility fork because upstream SpargeAttn does not currently build an
+SM120 extension. Both paths use `--no-deps`, so they cannot replace Torch or
+other ComfyUI packages. The first Linux source build may add several minutes to
+startup.
 
-Linux source builds enable Ninja with half the detected logical CPU count as
-the default worker pool and two `nvcc` threads per worker. Existing `MAX_JOBS`
-or `NVCC_THREADS` environment values override those defaults. The installer
-verifies the pinned Git commit and its expected build settings before applying
-this local build-only patch.
+Linux builds set `TORCH_CUDA_ARCH_LIST` to the detected GPU and use Ninja with
+half the detected logical CPU count as the default worker pool. Existing
+`MAX_JOBS` values override that default. The installer verifies the pinned Git
+commit before building. The SM120 compatibility-fork path additionally applies
+the local build-only Ninja/nvcc-thread patch used by the Windows-compatible
+fork.
 
 An existing `spas_sage_attn` installation is left unchanged when its compiled
 ABI validates for the active Torch, CUDA, and GPU. If it is stale, startup
-reinstalls it only when a verified Windows wheel or the pinned Linux source
-build matches the runtime. Set `H3_OPTIMIZATIONS_SKIP_SPARSE_INSTALL=1` to
-disable all automatic Sparse Sage installation and repair.
+reinstalls it only when a verified Windows wheel or pinned Linux source build
+matches the runtime. Set `H3_OPTIMIZATIONS_SKIP_SPARSE_INSTALL=1` to disable all
+automatic Sparse Sage installation and repair.
 
-Verified automatic wheels cover CUDA 12.4 with Torch 2.5.1, CUDA 12.6 with
-Torch 2.6.0, CUDA 12.8 with Torch 2.7.1, 2.8.0, or 2.9 and newer, and CUDA 13.0
-with Torch 2.9 or newer. The Linux build requires Torch 2.3 or newer and CUDA
-12.0 or newer, `git`, and `nvcc` 12.0 or newer.
+Verified automatic Windows wheels cover CUDA 12.4 with Torch 2.5.1, CUDA 12.6
+with Torch 2.6.0, CUDA 12.8 with Torch 2.7.1, 2.8.0, or 2.9 and newer, and CUDA
+13.0 with Torch 2.9 or newer. Linux source builds require Torch 2.3 or newer,
+`git`, and `nvcc`. The minimum CUDA compiler is 12.0 for SM80/86/87, 12.4 for
+SM89 and SM90, and 12.8 for SM120.
+
+### Manual Sparse Sage recovery
+
+If automatic Sparse Sage installation did not run, invoke the same pre-startup
+installer manually with the Python interpreter that launches ComfyUI. The
+script probes the active Torch, CUDA, GPU, and any existing `spas_sage_attn`
+installation, then selects the same verified Windows wheel or pinned Linux
+source build that normal startup would use.
+
+From a Linux ComfyUI root using the common `.venv` layout:
+
+    ./.venv/bin/python custom_nodes/H3-Optimizations/prestartup_script.py
+
+From a Windows ComfyUI root using the common `.venv` layout:
+
+    .\.venv\Scripts\python.exe custom_nodes\H3-Optimizations\prestartup_script.py
+
+From the root of a standard Windows portable package:
+
+    .\python_embeded\python.exe ComfyUI\custom_nodes\H3-Optimizations\prestartup_script.py
+
+If ComfyUI uses another environment, replace the Python path above with that
+interpreter. The CLI prints the installer decisions and exits successfully only
+when Sparse Sage validates for the active runtime. On Windows it automatically
+chooses the matching hash-pinned wheel when one exists. On Linux it checks the
+required source-build toolchain and reports missing `git`, `nvcc`, unsupported
+CUDA versions, or build failures directly. An RTX 4090 is SM89 and therefore
+requires `nvcc` 12.4 or newer for the Linux Sparse Sage build.
+
+Restart ComfyUI after a successful manual install. If the script cannot provide
+a compatible Sparse Sage build, workflows still load: backend `auto` continues
+to INT8 Triton, then FP8 FlexAttention when supported, then the resolved dense
+H3 attention path.
 
 ROCm, MPS, XPU, CPU, future GPU architectures, NVIDIA installations without a
 matching wheel/build toolchain, and failed Sparse Sage builds are left
