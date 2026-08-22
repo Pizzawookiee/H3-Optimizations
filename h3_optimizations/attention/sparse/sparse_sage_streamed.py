@@ -14,6 +14,9 @@ import math
 import torch
 
 from ...qkv.chunked import project_chunk_hnd
+from ...qkv.formats import describe_linear
+from ...qkv.fp8 import HeldFP8QKV
+from ...qkv.w4a8 import HeldW4A8QKV
 from .backend import HybridSparseBackend
 from .chunked_qkv import pack_sparse_qk_chunk_into
 from .config import resolve_video_budget
@@ -38,6 +41,26 @@ from ...mlp_sharing.route import router_kwargs as _route_kwargs
 DEFAULT_PROJECT_CHUNK_ROWS = 1024
 DEFAULT_QUERY_CHUNK_ROWS = 4096
 OUT_PROJ_CHUNK_ROWS = 2048
+
+
+def _open_held_projector(module, x):
+    """Open the provider-resolved held projector for non-ConvRot streaming."""
+    fmt = describe_linear(module.qkv_proj)
+    if fmt.w4a8:
+        held = HeldW4A8QKV(module, x[:1])
+    elif fmt.fp8 or fmt.plain_float:
+        held = HeldFP8QKV(
+            module,
+            x[:1],
+            allow_float_conversion=fmt.plain_float,
+        )
+    else:
+        raise SparseSageError(
+            "streamed non-ConvRot Sparse Sage expected FP8, floating, or W4A8 "
+            "QKV weights; got %s" % fmt.label
+        )
+    held.__enter__()
+    return held
 
 
 @dataclass
@@ -865,64 +888,94 @@ def run_streamed_sparse_sage_qkv(
                 v_scratch,
             )
     else:
-        # Compatibility path for non-ConvRot projected providers.
-        for start in range(0, sequence, project_chunk_rows):
-            end = min(start + project_chunk_rows, sequence)
-            q, k, v = project_chunk_hnd(
-                module,
-                x,
-                rope_freqs,
-                start,
-                end,
-            )
-            try:
-                _collect_q_summary_chunk(
-                    q,
-                    q_summary,
-                    row_start=start,
-                    q_tile=spec.q_tile,
+        # FP8/plain-float/W4A8 path: preserve the provider's held projection
+        # binding across both preparation passes. Re-entering module.qkv_proj
+        # for every slab can reacquire or rematerialize the effective weight,
+        # defeating the low-VRAM provider selected by the resolver.
+        held_projector = _open_held_projector(module, x)
+        try:
+            for start in range(0, sequence, project_chunk_rows):
+                end = min(start + project_chunk_rows, sequence)
+                q, k, v = project_chunk_hnd(
+                    module,
+                    x,
+                    rope_freqs,
+                    start,
+                    end,
+                    projector=held_projector,
                 )
-                pack_sparse_qk_chunk_into(
-                    k,
-                    k_int8,
-                    k_scale,
-                    k_summary,
-                    row_start=start,
-                    block_size=spec.kv_tile,
-                )
-                update_v_amax(v_amax, v)
-            finally:
-                del q, k, v
+                try:
+                    _collect_q_summary_chunk(
+                        q,
+                        q_summary,
+                        row_start=start,
+                        q_tile=spec.q_tile,
+                    )
+                    pack_sparse_qk_chunk_into(
+                        k,
+                        k_int8,
+                        k_scale,
+                        k_summary,
+                        row_start=start,
+                        block_size=spec.kv_tile,
+                    )
+                    update_v_amax(v_amax, v)
+                finally:
+                    del q, k, v
 
-        v_scale = finalize_v_scale(v_amax, spec.v_quant_bound)
-        del v_amax
-        v_carrier = allocate_v_carrier(
-            sequence=sequence,
-            heads=heads,
-            head_dim=HEAD_DIM,
-            device=x.device,
-        )
-        for start in range(0, sequence, project_chunk_rows):
-            end = min(start + project_chunk_rows, sequence)
-            q_unused, k_unused, v = project_chunk_hnd(
-                module,
-                x,
-                rope_freqs,
-                start,
-                end,
+            v_scale = finalize_v_scale(v_amax, spec.v_quant_bound)
+            del v_amax
+            v_carrier = allocate_v_carrier(
+                sequence=sequence,
+                heads=heads,
+                head_dim=HEAD_DIM,
+                device=x.device,
             )
-            try:
-                pack_v_chunk(
-                    v,
-                    v_carrier,
-                    v_scale,
-                    row_start=start,
-                    sequence=sequence,
-                    fused_v_ops=spec.fused_v_ops,
-                    scale_max=spec.v_quant_bound,
-                )
-            finally:
-                del q_unused, k_unused, v
+
+            project_v_hnd = getattr(held_projector, "project_v_hnd", None)
+            for start in range(0, sequence, project_chunk_rows):
+                end = min(start + project_chunk_rows, sequence)
+                if callable(project_v_hnd):
+                    # HeldFP8QKV can project only V on pass two, retaining the
+                    # existing V-only optimization without recomputing Q/K.
+                    v = project_v_hnd(x, start, end)
+                    try:
+                        pack_v_chunk(
+                            v,
+                            v_carrier,
+                            v_scale,
+                            row_start=start,
+                            sequence=sequence,
+                            fused_v_ops=spec.fused_v_ops,
+                            scale_max=spec.v_quant_bound,
+                        )
+                    finally:
+                        del v
+                else:
+                    # Native W4A8 currently has no V-only projection API, but
+                    # the QKV weight remains held across all chunks.
+                    q_unused, k_unused, v = project_chunk_hnd(
+                        module,
+                        x,
+                        rope_freqs,
+                        start,
+                        end,
+                        projector=held_projector,
+                    )
+                    try:
+                        pack_v_chunk(
+                            v,
+                            v_carrier,
+                            v_scale,
+                            row_start=start,
+                            sequence=sequence,
+                            fused_v_ops=spec.fused_v_ops,
+                            scale_max=spec.v_quant_bound,
+                        )
+                    finally:
+                        del q_unused, k_unused, v
+        finally:
+            held_projector.__exit__(None, None, None)
 
     return _validate_projected(
         StreamedSparseSageQKV(
@@ -1017,6 +1070,7 @@ def _make_local_q(
     q_int8,
     q_scale,
     q_summary_scratch,
+    projector=None,
 ):
     rows = row_end - row_start
     if projected.q_only_convrot:
@@ -1042,6 +1096,7 @@ def _make_local_q(
         projected.rope_freqs,
         row_start,
         row_end,
+        projector=projector,
     )
     try:
         pack_sparse_qk_chunk_into(
@@ -1291,6 +1346,7 @@ def _execute_streamed(module, backend, prepared):
     )
 
     held_q_state = None
+    held_projector = None
     x_int8_buffer = None
     x_scale_buffer = None
     if projected.q_only_convrot:
@@ -1308,6 +1364,8 @@ def _execute_streamed(module, backend, prepared):
             dtype=torch.float32,
             device=projected.x.device,
         )
+    else:
+        held_projector = _open_held_projector(projected.module, projected.x)
 
     route_iter = backend.router.iter_lut_chunks(
         prepared.route_plan,
@@ -1375,6 +1433,7 @@ def _execute_streamed(module, backend, prepared):
                     q_int8=q_int8,
                     q_scale=q_scale,
                     q_summary_scratch=q_summary_scratch,
+                    projector=held_projector,
                 )
 
             spec.dispatch(
@@ -1419,6 +1478,8 @@ def _execute_streamed(module, backend, prepared):
         if callable(close):
             close()
         _release_q_only_state(held_q_state)
+        if held_projector is not None:
+            held_projector.__exit__(None, None, None)
         if prepared.route_plan is not None and len(prepared.route_plan) >= 2:
             prepared.route_plan[0] = None
             prepared.route_plan[1] = None
