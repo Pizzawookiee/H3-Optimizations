@@ -74,7 +74,7 @@ class SparseFusedQKVProjector:
 
 
 class TritonSparseQKVProjector:
-    """Guard chunked INT8 Triton sparse QKV and fall back for auto requests."""
+    """Guard chunked Triton sparse QKV and fall back for auto requests."""
 
     name = "chunked_triton_sparse_qkv"
     qk_format = "block_int8"
@@ -125,7 +125,7 @@ class TritonSparseQKVProjector:
         transformer_options,
     ):
         actual = describe_linear(module.qkv_proj)
-        if not actual.convrot_int8_256:
+        if not (actual.convrot_int8_256 or actual.w4a8):
             return _unsupported(
                 self.required,
                 "QKV format is %s" % actual.label,
