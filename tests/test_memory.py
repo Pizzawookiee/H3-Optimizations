@@ -78,6 +78,39 @@ class MemoryTests(unittest.TestCase):
                 8,
             )
 
+    def test_chunk_planner_slices_per_token_modulation_selector(self):
+        selector = torch.tensor(
+            [0, 3, 6, 9, 0, 3, 6, 9, 0, 3, 6, 9, 0, 3],
+            dtype=torch.long,
+        )
+        result = list(
+            chunks.iter_mod_chunks(
+                [(0, 5, 1), (5, 19, selector)],
+                19,
+                max_rows=8,
+                alignment=4,
+                mod_rows=12,
+            )
+        )
+        self.assertEqual(
+            [(chunk.start, chunk.stop) for chunk in result],
+            [(0, 5), (5, 13), (13, 19)],
+        )
+        self.assertEqual(result[0].mod_row, 1)
+        self.assertTrue(torch.equal(result[1].mod_row, selector[:8]))
+        self.assertTrue(torch.equal(result[2].mod_row, selector[8:]))
+
+        with self.assertRaisesRegex(ValueError, 'has 3 rows, expected 4'):
+            chunks.validate_mod_segments(
+                [(0, 4, torch.tensor([0, 1, 2], dtype=torch.long))],
+                4,
+            )
+        with self.assertRaisesRegex(TypeError, 'integer dtype'):
+            chunks.validate_mod_segments(
+                [(0, 4, torch.zeros(4, dtype=torch.float32))],
+                4,
+            )
+
     def test_acquired_weight_release_is_exactly_once(self):
         acquired = linear_module.AcquiredLinear(
             'module',
@@ -196,8 +229,8 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(path, 'held_convrot_2slice')
         self.assertIsNone(session.tiles)
 
-    def test_generic_chunked_forward_matches_core(self):
-        torch.manual_seed(2)
+    @staticmethod
+    def _make_block():
         block = DiTBlock(
             hidden=32,
             heads=2,
@@ -215,11 +248,61 @@ class MemoryTests(unittest.TestCase):
                 torch.randn_like(parameter) * 0.03
             )
             parameter.requires_grad_(False)
+        return block
+
+    def test_generic_chunked_forward_matches_core(self):
+        torch.manual_seed(2)
+        block = self._make_block()
 
         torch.manual_seed(3)
         x = torch.randn(19, 32) * 0.1
         t_emb = torch.randn(1, 24) * 0.1
         segments = [(0, 5, 0), (5, 13, 1), (13, 19, 2)]
+        expected = block.forward(
+            x.clone(),
+            t_emb,
+            segments,
+            rope_freqs=None,
+            transformer_options={},
+        )
+        actual = make_forward(
+            block,
+            0,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=256,
+                alignment=256,
+            ),
+        )(
+            x.clone(),
+            t_emb,
+            segments,
+            rope_freqs=None,
+            transformer_options={},
+        )
+        self.assertTrue(
+            torch.allclose(actual, expected, rtol=1e-5, atol=2e-6)
+        )
+        self.assertTrue(torch.isfinite(actual).all())
+
+    def test_masked_per_token_forward_matches_core_across_chunks(self):
+        torch.manual_seed(31)
+        block = self._make_block()
+
+        torch.manual_seed(32)
+        x = torch.randn(300, 32) * 0.1
+        # Four timestep embeddings produce twelve modulation rows (3 modalities
+        # per timestep), matching ComfyUI's per-token noise-mask representation.
+        t_emb = torch.randn(4, 24) * 0.1
+        selector = torch.tensor(
+            ([0, 3, 6, 9] * 65),
+            dtype=torch.long,
+        )
+        segments = [
+            (0, 20, 1),
+            (20, 280, selector),
+            (280, 300, 2),
+        ]
         expected = block.forward(
             x.clone(),
             t_emb,
