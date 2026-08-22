@@ -1,10 +1,11 @@
-'''Compare INT8 Triton, FP8 FlexAttention, and Sparse Sage on identical H3 Q/K/V.'''
+'''Compare H3 sparse-attention backends on identical Q/K/V and routing.'''
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import fields, is_dataclass
 import importlib.metadata
+from itertools import combinations
 import json
 from pathlib import Path
 import statistics
@@ -30,7 +31,7 @@ from bench_chunked_sparse_qkv import (  # noqa: E402
 )
 
 
-ARM_ORDER = ('int8_triton', 'fp8_flex', 'sparse_sage')
+ARM_ORDER = ('int8_triton', 'fp8_flex', 'sparse_sage', 'plaguekind_sla')
 DEFAULT_SEQUENCE = 54006
 DEFAULT_HEADS = 56
 DEFAULT_PARITY_SEQUENCE = 1024
@@ -40,8 +41,8 @@ DEFAULT_VIDEO_BUDGET = 0.3
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            'Compare the INT8 Triton sparse fallback, FP8 FlexAttention, and '
-            'Sparse Sage from identical already-projected H3 Q/K/V tensors.'
+            'Compare INT8 Triton, FP8 FlexAttention, Sparse Sage, and the '
+            'PlagueKind SLA kernel from identical already-projected H3 Q/K/V.'
         )
     )
     parser.add_argument('--sequence', type=int, default=DEFAULT_SEQUENCE)
@@ -122,7 +123,7 @@ def prepared_route(torch, name, prepared):
     payload = prepared_payload(name, prepared)
     if name == 'fp8_flex':
         return payload.block_mask.kv_num_blocks, payload.block_mask.kv_indices
-    if name == 'int8_triton' and not hasattr(payload, 'lut'):
+    if name in ('int8_triton', 'plaguekind_sla') and not hasattr(payload, 'lut'):
         indices = torch.zeros(
             (*payload.valid_block_num.shape, payload.kv_tiles),
             dtype=torch.int32,
@@ -364,15 +365,10 @@ def parity_report(torch, arms, q, k, v, config, q_tile, kv_tile, sequence, video
         for name, output in outputs.items()
     }
     pairwise = {
-        'int8_triton_vs_fp8_flex': tensor_metrics(
-            torch, outputs['int8_triton'], outputs['fp8_flex']
-        ),
-        'int8_triton_vs_sparse_sage': tensor_metrics(
-            torch, outputs['int8_triton'], outputs['sparse_sage']
-        ),
-        'fp8_flex_vs_sparse_sage': tensor_metrics(
-            torch, outputs['fp8_flex'], outputs['sparse_sage']
-        ),
+        '%s_vs_%s' % (left, right): tensor_metrics(
+            torch, outputs[left], outputs[right]
+        )
+        for left, right in combinations(ARM_ORDER, 2)
     }
     del outputs, reference, q, k, v, expected_lut, expected_valid
     return {
@@ -429,6 +425,10 @@ def main(argv=None):
         TritonSparseError,
         preflight_triton_sparse,
     )
+    from plaguekind_sla import (
+        PlagueKindSLABackend,
+        PlagueKindSLASpec,
+    )
 
     if not torch.cuda.is_available():
         raise SystemExit('CUDA is required')
@@ -459,6 +459,7 @@ def main(argv=None):
         )
     except SparseSageError as exc:
         raise SystemExit('Sparse Sage backend unavailable: %s' % exc) from exc
+    plaguekind_spec = PlagueKindSLASpec()
 
     try:
         q_tile, kv_tile = validate_geometry(
@@ -466,6 +467,7 @@ def main(argv=None):
                 'int8_triton': int8_spec,
                 'fp8_flex': flex_spec,
                 'sparse_sage': sage_spec,
+                'plaguekind_sla': plaguekind_spec,
             }
         )
     except ValueError as exc:
@@ -478,6 +480,7 @@ def main(argv=None):
         'int8_triton': TritonSparseBackend(config, spec=int8_spec),
         'fp8_flex': FP8FlexBackend(config, spec=flex_spec),
         'sparse_sage': HybridSparseBackend(config, kernel_spec=sage_spec),
+        'plaguekind_sla': PlagueKindSLABackend(config, spec=plaguekind_spec),
     }
 
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -602,6 +605,7 @@ def main(argv=None):
             'triton': package_version('triton'),
             'fp8_flex': flex_spec.version,
             'sparse_sage': sage_spec.version,
+            'plaguekind_sla_source': plaguekind_spec.source_commit,
         },
         'gpu': {
             'device': args.device,
@@ -635,6 +639,13 @@ def main(argv=None):
                 'kernel': sage_spec.kernel_name,
                 'qkv': 'INT8 Q/K, %s V' % sage_spec.v_format.upper(),
                 'accumulator': sage_spec.accumulator,
+            },
+            'plaguekind_sla': {
+                'implementation': plaguekind_spec.implementation,
+                'source_commit': plaguekind_spec.source_commit,
+                'qkv': 'BF16/FP16 contiguous BLHD',
+                'route': 'shared route split into dense-prefix and sparse-video launches',
+                'accumulator': 'fp32',
             },
         },
         'prepared_tensor_bytes': prepared_bytes,

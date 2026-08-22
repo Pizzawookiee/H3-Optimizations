@@ -23,6 +23,9 @@ comfy.options.enable_args_parsing()
 from h3_optimizations.apply import apply_plan  # noqa: E402
 from h3_optimizations.environment import RuntimeEnvironment  # noqa: E402
 from h3_optimizations.nodes import (  # noqa: E402
+    H3MLPSharing,
+    H3MLPSharingProbe,
+    H3MLPSharingProbeOutput,
     H3MemoryOptimization,
     H3OptimizationsExtension,
     H3SparseAttention,
@@ -40,6 +43,9 @@ def input_by_id(schema, input_id):
 class NodeTests(unittest.TestCase):
     def test_public_schemas_are_small_and_stable(self):
         memory = H3MemoryOptimization.define_schema()
+        sharing = H3MLPSharing.define_schema()
+        probe = H3MLPSharingProbe.define_schema()
+        probe_output = H3MLPSharingProbeOutput.define_schema()
         sparse = H3SparseAttention.define_schema()
         advanced = H3SparseAttentionAdvanced.define_schema()
         self.assertEqual(memory.node_id, 'H3MemoryOptimization')
@@ -136,13 +142,49 @@ class NodeTests(unittest.TestCase):
         self.assertNotIn('Experimental', memory.display_name)
         self.assertNotIn('Experimental', sparse.display_name)
         self.assertNotIn('Experimental', advanced.display_name)
+        self.assertEqual(probe.node_id, 'H3MLPSharingProbe')
+        self.assertEqual(probe.category, 'H3-Optimizations/Experiments')
+        self.assertEqual(sharing.node_id, 'H3MLPSharing')
+        self.assertEqual(sharing.category, 'H3-Optimizations/Experiments')
+        self.assertEqual(
+            [item.id for item in sharing.inputs],
+            [
+                'model',
+                'enabled',
+                'removal_fraction',
+                'selector',
+                'start_after_step',
+                'layers',
+                'selector_seed',
+                'run_tag',
+            ],
+        )
+        self.assertEqual(input_by_id(sharing, 'removal_fraction').default, '50%')
+        self.assertEqual(input_by_id(sharing, 'start_after_step').default, 3)
+        self.assertEqual(probe_output.node_id, 'H3MLPSharingProbeOutput')
+        self.assertTrue(probe_output.is_output_node)
+        self.assertEqual([item.id for item in probe_output.inputs], ['samples'])
+        self.assertEqual(
+            [item.id for item in probe.inputs],
+            [
+                'model',
+                'enabled',
+                'layers',
+                'include_mean_input',
+                'mean_batch_rows',
+                'run_tag',
+            ],
+        )
 
-    def test_extension_exposes_three_production_nodes(self):
+    def test_extension_exposes_production_and_experiment_nodes(self):
         nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
         self.assertEqual(
             nodes,
             [
                 H3MemoryOptimization,
+                H3MLPSharing,
+                H3MLPSharingProbe,
+                H3MLPSharingProbeOutput,
                 H3SparseAttention,
                 H3SparseAttentionAdvanced,
             ],

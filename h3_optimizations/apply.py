@@ -41,9 +41,11 @@ from .kitchen_qkv import (
 )
 from .memory.config import ActivationMemoryConfig
 from .memory.patch import install as install_memory_patch
+from .mlp_sharing.execution import install_sharing
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import configure_backend
 from .plan import (
+    ATTENTION_EXISTING,
     DENSITY_FIXED,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
@@ -137,7 +139,11 @@ def _resolve_dense(plan, model, inventory, environment=None):
     dense = (
         preserve_dense_attention('no memory optimization requested')
         if memory is None
-        else resolve_dense_attention(model)
+        else (
+            preserve_dense_attention('existing dense attention was requested')
+            if memory.attention == ATTENTION_EXISTING
+            else resolve_dense_attention(model)
+        )
     )
     qkv = resolve_qkv_provider(
         inventory,
@@ -395,7 +401,8 @@ def _install_mlp(model_patcher, plan, inventory, environment):
     config = ActivationMemoryConfig(
         mode=resolution.activation_mode,
         chunk_rows=int(memory.chunk_rows),
-        strict=False,
+        strict=bool(memory.mlp_strict),
+        prefer_held_weights=bool(memory.prefer_held_weights),
     )
     return resolution, int(install_memory_patch(model_patcher, config))
 
@@ -435,6 +442,7 @@ def _status(
     *,
     attention_blocks,
     mlp_blocks,
+    mlp_sharing_installed,
     runtime_installed,
     inventory,
     v_layout,
@@ -494,6 +502,22 @@ def _status(
             ),
             'patched_blocks': int(mlp_blocks),
         },
+        'mlp_sharing': (
+            None
+            if plan.mlp_sharing is None
+            else {
+                'installed': bool(mlp_sharing_installed),
+                'selector': plan.mlp_sharing.selector,
+                'requested_removal_fraction': float(
+                    plan.mlp_sharing.removal_fraction
+                ),
+                'start_after_step': int(plan.mlp_sharing.start_after_step),
+                'layers': list(plan.mlp_sharing.layers),
+                'selector_seed': int(plan.mlp_sharing.selector_seed),
+                'geometry': list(plan.mlp_sharing.geometry),
+                'reconstruction': 'representative',
+            }
+        ),
         'weight_formats': _inventory_status(inventory),
         'runtime_installed': bool(runtime_installed),
         'device': {
@@ -581,9 +605,20 @@ def apply_plan(model, plan: H3OptimizationPlan):
         inventory,
         environment,
     )
+    mlp_sharing_installed = False
+    if plan.mlp_sharing is not None and plan.memory is not None:
+        if mlp.provider_id in (MLP_OFF, MLP_PRESERVE_UPSTREAM):
+            raise RuntimeError(
+                'H3 MLP Sharing requires an executable H3 Memory Optimization '
+                'MLP provider; resolved %s' % mlp.provider_id
+            )
+        install_sharing(patched, plan.mlp_sharing)
+        mlp_sharing_installed = True
     runtime_installed = False
     if sparse_execution_selected:
         _session, _created = _ensure_sparse_runtime(patched)
+        runtime_installed = True
+    if mlp_sharing_installed:
         runtime_installed = True
 
     patched.model_options[PLAN_KEY] = plan
@@ -598,6 +633,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
         mlp,
         attention_blocks=attention_blocks,
         mlp_blocks=mlp_blocks,
+        mlp_sharing_installed=mlp_sharing_installed,
         runtime_installed=runtime_installed,
         inventory=inventory,
         v_layout=v_layout,

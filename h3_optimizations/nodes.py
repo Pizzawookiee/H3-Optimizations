@@ -3,6 +3,15 @@
 from comfy_api.latest import ComfyExtension, io, ui
 
 from .apply import apply_plan
+from .mlp_sharing import MLPSharingProbeConfig
+from .mlp_sharing.config import (
+    DEFAULT_LAYER_TEXT,
+    EXECUTION_SELECTORS,
+    MLPSharingConfig,
+    REMOVAL_OPTIONS,
+    removal_option,
+)
+from .mlp_sharing.probe import install_probe
 from .plan import (
     DEFAULT_EDGE_KV,
     DEFAULT_EDGE_STEPS,
@@ -134,6 +143,209 @@ class H3MemoryOptimization(io.ComfyNode):
         return io.NodeOutput(
             patched,
             ui=ui.PreviewText(format_memory_status(patched)),
+        )
+
+
+class H3MLPSharingProbe(io.ComfyNode):
+    '''Output-exact local-token MLP sharing oracle.'''
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3MLPSharingProbe',
+            display_name='H3 MLP Sharing Probe',
+            category='H3-Optimizations/Experiments',
+            description=(
+                'Runs the exact chunked H3 MLP and measures counterfactual '
+                '1T x 2Y x 2X target-video output sharing. Inference output is '
+                'unchanged. Place it after H3 Memory Optimization.'
+            ),
+            inputs=[
+                io.Model.Input('model'),
+                io.Boolean.Input('enabled', default=True),
+                io.String.Input(
+                    'layers',
+                    default=DEFAULT_LAYER_TEXT,
+                    tooltip='Comma-separated H3 block indices to measure.',
+                ),
+                io.Boolean.Input(
+                    'include_mean_input',
+                    default=True,
+                    tooltip=(
+                        'Also evaluates each candidate pair mean through the '
+                        'same exact MLP for mean-input reconstruction metrics.'
+                    ),
+                ),
+                io.Int.Input(
+                    'mean_batch_rows',
+                    default=1024,
+                    min=64,
+                    max=4096,
+                    step=64,
+                    advanced=True,
+                    tooltip='Maximum extra mean-input rows per diagnostic MLP call.',
+                ),
+                io.String.Input('run_tag', default='mlp-sharing-stage1'),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        enabled=True,
+        layers=DEFAULT_LAYER_TEXT,
+        include_mean_input=True,
+        mean_batch_rows=1024,
+        run_tag='mlp-sharing-stage1',
+    ):
+        if not enabled:
+            return io.NodeOutput(model)
+        config = MLPSharingProbeConfig(
+            layers=layers,
+            include_mean_input=bool(include_mean_input),
+            mean_batch_rows=int(mean_batch_rows),
+            run_tag=str(run_tag),
+        )
+        patched = model.clone()
+        install_probe(patched, config)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(
+                'Output-exact MLP sharing probe armed for layers %s'
+                % ','.join(str(layer) for layer in config.layers)
+            ),
+        )
+
+
+class H3MLPSharing(io.ComfyNode):
+    '''Executable target-video MLP output sharing for quality experiments.'''
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3MLPSharing',
+            display_name='H3 MLP Sharing',
+            category='H3-Optimizations/Experiments',
+            description=(
+                'Evaluates fewer target-video MLP rows and broadcasts each '
+                'representative output while retaining full-resolution attention, '
+                'per-token gates, and residual streams. The first three sampler '
+                'steps remain exact by default.'
+            ),
+            inputs=[
+                io.Model.Input('model'),
+                io.Boolean.Input('enabled', default=True),
+                io.Combo.Input(
+                    'removal_fraction',
+                    display_name='MLP evaluations removed',
+                    options=list(REMOVAL_OPTIONS),
+                    default='50%',
+                    tooltip=(
+                        'Requested target-video row reduction inside complete local '
+                        'cells. The report records the realized fraction after chunk '
+                        'and modulation-boundary exclusions.'
+                    ),
+                ),
+                io.Combo.Input(
+                    'selector',
+                    options=list(EXECUTION_SELECTORS),
+                    default='input_cosine',
+                ),
+                io.Int.Input(
+                    'start_after_step',
+                    display_name='Protect first steps',
+                    default=3,
+                    min=0,
+                    max=1000,
+                    step=1,
+                    tooltip=(
+                        'Steps with indices below this value use the exact MLP. '
+                        '3 protects sampler steps 0, 1, and 2.'
+                    ),
+                ),
+                io.String.Input(
+                    'layers',
+                    default='all',
+                    advanced=True,
+                    tooltip='all or comma-separated H3 block indices.',
+                ),
+                io.Int.Input(
+                    'selector_seed',
+                    default=0,
+                    min=0,
+                    max=0x7FFFFFFF,
+                    advanced=True,
+                ),
+                io.String.Input(
+                    'run_tag',
+                    default='mlp-sharing-quality',
+                    advanced=True,
+                ),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        enabled=True,
+        removal_fraction='50%',
+        selector='input_cosine',
+        start_after_step=3,
+        layers='all',
+        selector_seed=0,
+        run_tag='mlp-sharing-quality',
+    ):
+        if not enabled:
+            return io.NodeOutput(model)
+        config = MLPSharingConfig(
+            selector=selector,
+            removal_fraction=removal_fraction,
+            start_after_step=int(start_after_step),
+            layers=layers,
+            selector_seed=int(selector_seed),
+            run_tag=str(run_tag),
+        )
+        plan = read_plan(model).with_mlp_sharing(config)
+        patched = apply_plan(model, plan)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(
+                'MLP sharing %s with %s after %d protected step(s)'
+                % (
+                    removal_option(config.removal_fraction),
+                    config.selector,
+                    config.start_after_step,
+                )
+            ),
+        )
+
+
+class H3MLPSharingProbeOutput(io.ComfyNode):
+    '''Terminal sink for H3 video-and-audio latents in probe workflows.'''
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3MLPSharingProbeOutput',
+            display_name='H3 MLP Sharing Probe Output',
+            category='H3-Optimizations/Experiments',
+            description=(
+                'Completes an MLP sharing probe without decoding or trying to '
+                'serialize the MiniMax H3 video-and-audio latent.'
+            ),
+            inputs=[io.Latent.Input('samples')],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, samples):
+        del samples
+        return io.NodeOutput(
+            ui=ui.PreviewText('H3 MLP sharing probe sampling completed')
         )
 
 
@@ -311,6 +523,9 @@ class H3OptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             H3MemoryOptimization,
+            H3MLPSharing,
+            H3MLPSharingProbe,
+            H3MLPSharingProbeOutput,
             H3SparseAttention,
             H3SparseAttentionAdvanced,
         ]

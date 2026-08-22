@@ -470,6 +470,7 @@ class FP8FlexTests(unittest.TestCase):
             capability=(12, 0),
             device_index=0,
         )
+        inventory = SimpleNamespace(qkv=())
 
         with mock.patch.object(
             apply_module,
@@ -491,7 +492,7 @@ class FP8FlexTests(unittest.TestCase):
             attention, qkv = apply_module._resolve_attention(
                 plan,
                 object(),
-                object(),
+                inventory,
                 environment,
             )
 
@@ -522,7 +523,7 @@ class FP8FlexTests(unittest.TestCase):
             attention, qkv = apply_module._resolve_attention(
                 plan,
                 object(),
-                object(),
+                inventory,
                 environment,
             )
 

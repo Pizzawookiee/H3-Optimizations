@@ -9,17 +9,38 @@ PACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK))
 
 from h3_optimizations.plan import (  # noqa: E402
+    ATTENTION_EXISTING,
+    FUSED_QKV_REQUIRED,
     H3OptimizationPlan,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MemoryRequest,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_TRITON,
     SparseRequest,
 )
+from h3_optimizations.mlp_sharing.config import MLPSharingConfig  # noqa: E402
 
 
 class PlanTests(unittest.TestCase):
     def test_memory_request_defaults_to_four_thousand_rows(self):
-        self.assertEqual(MemoryRequest().chunk_rows, 4096)
+        request = MemoryRequest()
+        self.assertEqual(request.chunk_rows, 4096)
+        self.assertTrue(request.prefer_held_weights)
+        self.assertFalse(request.mlp_strict)
+
+    def test_legacy_adapter_options_are_part_of_memory_identity(self):
+        request = MemoryRequest(
+            attention=ATTENTION_EXISTING,
+            fused_qkv=FUSED_QKV_REQUIRED,
+            mlp_memory=MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+            chunk_rows=2048,
+            prefer_held_weights=False,
+            mlp_strict=True,
+        )
+        self.assertEqual(request.signature[0], ATTENTION_EXISTING)
+        self.assertEqual(request.signature[1], FUSED_QKV_REQUIRED)
+        self.assertFalse(request.prefer_held_weights)
+        self.assertTrue(request.mlp_strict)
 
     def test_sparse_request_defaults_to_thirty_percent_video_budget(self):
         request = SparseRequest()
@@ -56,17 +77,35 @@ class PlanTests(unittest.TestCase):
     def test_node_order_does_not_change_the_plan(self):
         memory = MemoryRequest()
         sparse = SparseRequest(video_budget=0.5)
-        first = H3OptimizationPlan().with_memory(memory).with_sparse(sparse)
-        second = H3OptimizationPlan().with_sparse(sparse).with_memory(memory)
+        sharing = MLPSharingConfig()
+        first = (
+            H3OptimizationPlan()
+            .with_memory(memory)
+            .with_sparse(sparse)
+            .with_mlp_sharing(sharing)
+        )
+        second = (
+            H3OptimizationPlan()
+            .with_mlp_sharing(sharing)
+            .with_sparse(sparse)
+            .with_memory(memory)
+        )
         self.assertEqual(first, second)
         self.assertEqual(first.signature, second.signature)
 
     def test_identical_requests_are_idempotent(self):
         memory = MemoryRequest()
         sparse = SparseRequest()
-        plan = H3OptimizationPlan().with_memory(memory).with_sparse(sparse)
+        sharing = MLPSharingConfig()
+        plan = (
+            H3OptimizationPlan()
+            .with_memory(memory)
+            .with_sparse(sparse)
+            .with_mlp_sharing(sharing)
+        )
         self.assertEqual(plan.with_memory(memory), plan)
         self.assertEqual(plan.with_sparse(sparse), plan)
+        self.assertEqual(plan.with_mlp_sharing(sharing), plan)
 
     def test_conflicting_duplicate_requests_fail(self):
         plan = H3OptimizationPlan().with_memory(MemoryRequest())
@@ -75,6 +114,9 @@ class PlanTests(unittest.TestCase):
         plan = H3OptimizationPlan().with_sparse(SparseRequest())
         with self.assertRaisesRegex(ValueError, 'different H3 Sparse'):
             plan.with_sparse(SparseRequest(video_budget=0.4))
+        plan = H3OptimizationPlan().with_mlp_sharing(MLPSharingConfig())
+        with self.assertRaisesRegex(ValueError, 'different H3 MLP Sharing'):
+            plan.with_mlp_sharing(MLPSharingConfig(removal_fraction=0.25))
 
     def test_validation_boundaries(self):
         MemoryRequest(chunk_rows=256)

@@ -2,10 +2,11 @@
 
 from dataclasses import dataclass
 
+MODE_BF16 = 'mlp_chunked_bf16'
 MODE_NATIVE = 'mlp_chunked_native'
 MODE_FP8 = 'mlp_chunked_fp8'
 MODE_CONVROT_2SLICE = 'mlp_chunked_convrot_2slice'
-IMPLEMENTED_MODES = (MODE_NATIVE, MODE_FP8, MODE_CONVROT_2SLICE)
+IMPLEMENTED_MODES = (MODE_BF16, MODE_NATIVE, MODE_FP8, MODE_CONVROT_2SLICE)
 DEFAULT_MODE = MODE_NATIVE
 
 MIN_CHUNK_ROWS = 256
@@ -20,6 +21,7 @@ class ActivationMemoryConfig:
     chunk_rows: int = DEFAULT_CHUNK_ROWS
     alignment: int = DEFAULT_ALIGNMENT
     strict: bool = True
+    prefer_held_weights: bool = True
 
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
@@ -47,6 +49,10 @@ class ActivationMemoryConfig:
         return self.mode == MODE_NATIVE
 
     @property
+    def bf16_swiglu(self):
+        return self.mode == MODE_BF16
+
+    @property
     def fp8(self):
         return self.mode == MODE_FP8
 
@@ -61,4 +67,5 @@ class ActivationMemoryConfig:
             int(self.chunk_rows),
             int(self.alignment),
             bool(self.strict),
+            bool(self.prefer_held_weights),
         )

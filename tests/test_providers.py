@@ -25,6 +25,10 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     resolve_mlp_provider,
     resolve_qkv_provider,
 )
+from h3_optimizations.plan import (  # noqa: E402
+    MLP_MEMORY_LEGACY_BF16,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+)
 
 
 class FakeWeight:
@@ -243,6 +247,33 @@ class ProviderTests(unittest.TestCase):
             sparse_spec=sparse_spec(capability=(9, 0), q_tile=64, kv_tile=128),
         )
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
+
+    def test_required_fused_qkv_fails_instead_of_using_fp8_conversion(self):
+        inventory = inspect_h3_linears([block(self.plain)])
+        with self.assertRaisesRegex(RuntimeError, 'required fused QKV'):
+            resolve_qkv_provider(
+                inventory,
+                request='required',
+                backend_kind='comfy_kitchen_int8',
+                kitchen_producer_available=True,
+                memory_optimize=True,
+                fp8_available=True,
+            )
+
+    def test_legacy_mlp_requests_use_supported_production_modes(self):
+        convrot = inspect_h3_linears([block(self.convrot)])
+        required = resolve_mlp_provider(
+            convrot,
+            request=MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+        )
+        self.assertEqual(required.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
+        plain = inspect_h3_linears([block(self.plain)])
+        bf16 = resolve_mlp_provider(
+            plain,
+            request=MLP_MEMORY_LEGACY_BF16,
+        )
+        self.assertEqual(bf16.provider_id, MLP_FLOAT_CHUNKED)
+        self.assertEqual(bf16.activation_mode, 'mlp_chunked_bf16')
 
 
 if __name__ == '__main__':

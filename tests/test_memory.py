@@ -26,6 +26,7 @@ from comfy.ldm.minimax.model import DiTBlock  # noqa: E402
 
 from h3_optimizations.memory import chunks  # noqa: E402
 from h3_optimizations.memory.config import (  # noqa: E402
+    MODE_BF16,
     MODE_CONVROT_2SLICE,
     MODE_NATIVE,
     ActivationMemoryConfig,
@@ -50,6 +51,12 @@ class MemoryTests(unittest.TestCase):
             ActivationMemoryConfig(
                 mode='mlp_chunked_convrot_epilogue'
             )
+        compatibility = ActivationMemoryConfig(
+            mode=MODE_BF16,
+            prefer_held_weights=False,
+        )
+        self.assertTrue(compatibility.bf16_swiglu)
+        self.assertFalse(compatibility.prefer_held_weights)
 
     def test_chunk_planner_preserves_modulation_boundaries(self):
         result = list(

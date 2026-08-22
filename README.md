@@ -28,8 +28,22 @@ does not import or depend on ComfyUI-H3-Extended.
   Triton -> FP8 FlexAttention -> dense fallback chain. Explicit Sparse Sage,
   INT8 Triton, or FP8 FlexAttention selections are hard requirements and error
   if unavailable; bypass the node to force dense attention.
+- H3 MLP Sharing Probe is an output-exact Stage 1 diagnostic. Place it after
+  H3 Memory Optimization. It observes target-video 1T x 2Y x 2X cells at the
+  requested layers, compares output-oracle, input-cosine, input-L2, and random
+  local selectors, and writes layer/step merge-error curves under
+  `output/h3_mlp_sharing_probe`. Mean-input reconstruction is optional and adds
+  diagnostic MLP work without changing the denoiser result.
+- H3 MLP Sharing is the executable quality experiment. It keeps attention,
+  per-token modulation, gates, residual streams, and packed output resolution
+  exact while evaluating fewer target-video MLP rows inside local spatial
+  cells. Input-cosine and deterministic random-local selectors support 0, 25,
+  50, 75, and 87.5 percent requested removal. Steps 0-2 remain exact by
+  default; reports include realized row counts after chunk and modulation
+  exclusions.
 
-All three nodes are grouped under H3-Optimizations > Model Patches.
+The production nodes are grouped under H3-Optimizations > Model Patches. MLP
+sharing and its output-exact probe are under H3-Optimizations > Experiments.
 
 The nodes are order-independent. Unsupported model families pass through
 unchanged. Auto modes retain the existing implementation when a specialized
@@ -47,8 +61,8 @@ From the ComfyUI custom-nodes directory:
 
     git clone https://github.com/Zironic/H3-Optimizations
 
-Restart ComfyUI after cloning. The three nodes then appear under
-H3-Optimizations > Model Patches; ComfyUI-Manager is not required.
+Restart ComfyUI after cloning. The nodes then appear under H3-Optimizations;
+ComfyUI-Manager is not required.
 
 Before node registration, startup checks the active Torch backend in a child
 process. Supported Windows NVIDIA installations use matching upstream Sparse
@@ -140,8 +154,11 @@ mismatched QKV format uses standard sparse QKV. An unvalidated Sparse Sage
 architecture uses the next backend only in `auto`; an explicit Sparse Sage
 request errors instead.
 
-Node IDs are H3MemoryOptimization, H3SparseAttention, and
-H3SparseAttentionAdvanced. H3-Extended is not required.
+Production node IDs are H3MemoryOptimization, H3SparseAttention, and
+H3SparseAttentionAdvanced. Experiment node IDs are H3MLPSharing,
+H3MLPSharingProbe, and H3MLPSharingProbeOutput; the latter terminates API
+workflows without serializing H3's nested video-and-audio latent. H3-Extended
+is not required.
 
 ## Validation
 
@@ -159,6 +176,16 @@ Run the CPU suite from the ComfyUI root:
 
     $env:CUDA_VISIBLE_DEVICES = '-1'
     .\.venv\Scripts\python.exe -m unittest discover -s custom_nodes\H3-Optimizations\tests -p 'test_*.py' -v
+
+Run one paired exact/candidate latent experiment from the current Ref2VA UI
+workflow, after explicitly authorizing GPU use:
+
+    .\.venv\Scripts\python.exe custom_nodes\H3-Optimizations\benchmarks\run_mlp_sharing_quality_experiment.py "D:\AI\ComfyUI\user\default\workflows\Minimax Ref Accel.json" --removal-fraction 50% --selector input_cosine --start-after-step 3 --i-understand-this-uses-gpu
+
+Add `--matrix` to run the exact-repeat, zero-path, similarity, and matched
+random-local controls at every supported removal level. Each pair writes
+selective callback trajectories under `output/h3_latent_capture` and its CPU
+comparison under `output/h3_latent_comparison`.
 
 The three-way attention benchmark derives each carrier contract from the
 current checkout and verifies identical sparse routes before timing:

@@ -19,6 +19,11 @@ SPEC = importlib.util.spec_from_file_location('bench_sparse_backends', BENCHMARK
 bench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bench)
 
+try:
+    import plaguekind_sla
+except ImportError:
+    plaguekind_sla = None
+
 
 class SparseBackendBenchmarkTests(unittest.TestCase):
     def test_defaults_match_h3_and_current_sparse_budget(self):
@@ -47,7 +52,7 @@ class SparseBackendBenchmarkTests(unittest.TestCase):
         absolute = bench.absolute_lut(torch, lut)
         self.assertEqual(absolute.tolist(), [[[[0, 2, 3], [1, 2, 4]]]])
 
-    def test_compact_triton_route_is_expanded_for_comparison(self):
+    def test_compact_fixed_topk_routes_are_expanded_for_comparison(self):
         payload = SimpleNamespace(
             valid_block_num=torch.tensor([[[3, 2]]], dtype=torch.int32),
             kv_indices=torch.tensor([[[[0, 2]]]], dtype=torch.int32),
@@ -57,9 +62,14 @@ class SparseBackendBenchmarkTests(unittest.TestCase):
             sparse_selected=2,
         )
         prepared = SimpleNamespace(sparse=payload)
-        valid, indices = bench.prepared_route(torch, 'int8_triton', prepared)
-        self.assertEqual(valid.tolist(), [[[3, 2]]])
-        self.assertEqual(indices.tolist(), [[[[0, 1, 2], [0, 2, 0]]]])
+        for name, value in (
+            ('int8_triton', prepared),
+            ('plaguekind_sla', payload),
+        ):
+            with self.subTest(name=name):
+                valid, indices = bench.prepared_route(torch, name, value)
+                self.assertEqual(valid.tolist(), [[[3, 2]]])
+                self.assertEqual(indices.tolist(), [[[[0, 1, 2], [0, 2, 0]]]])
 
     def test_route_mismatch_stops_comparison(self):
         routes = {
@@ -93,6 +103,48 @@ class SparseBackendBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(all_fp8['qkv'], 'FP8 Q/K/V')
         self.assertEqual(mixed['qkv'], 'floating Q, FP8 K/V')
+
+    @unittest.skipIf(plaguekind_sla is None, 'Triton is unavailable')
+    def test_plaguekind_adapter_splits_dense_and_sparse_fixed_topk_launches(self):
+        from h3_optimizations.attention.sparse.config import HybridSparseConfig
+
+        calls = []
+
+        def kernel(q, k, v, lut, topk, q_tile, kv_tile, output):
+            calls.append((tuple(q.shape), tuple(lut.shape), topk, q_tile, kv_tile))
+            output.fill_(len(calls))
+
+        config = HybridSparseConfig(video_budget=0.5)
+        backend = plaguekind_sla.PlagueKindSLABackend(config, kernel=kernel)
+        q = torch.zeros((1, 2, 384, 128), dtype=torch.bfloat16)
+        options = bench.runtime_options(
+            384,
+            bench.make_layout(384, 256),
+            q.dtype,
+            q.device,
+        )
+        prepared = backend.prepare(
+            q,
+            q,
+            q,
+            layer_index=0,
+            transformer_options=options,
+        )
+        output = backend.execute(prepared)
+
+        self.assertEqual(tuple(output.shape), tuple(q.shape))
+        self.assertEqual(prepared.dense_q_tiles, 2)
+        self.assertEqual(prepared.sparse_q_tiles, 1)
+        self.assertEqual(prepared.sparse_selected, 5)
+        self.assertEqual(
+            calls,
+            [
+                ((1, 256, 2, 128), (1, 2, 2, 6), 6, 128, 64),
+                ((1, 128, 2, 128), (1, 2, 1, 5), 5, 128, 64),
+            ],
+        )
+        self.assertTrue(torch.all(output[..., :256, :] == 1))
+        self.assertTrue(torch.all(output[..., 256:, :] == 2))
 
 
 if __name__ == '__main__':

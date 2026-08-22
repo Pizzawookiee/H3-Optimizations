@@ -131,3 +131,25 @@ def iter_mod_chunks(segments, seq_len, max_rows, alignment=1, mod_rows=None):
                 chunk_selector = selector[offset:offset + size]
             yield TokenChunk(start, stop, chunk_selector)
             start = stop
+
+
+def iter_modulation_chunks(segments, max_rows):
+    """Bound only per-token selector gathers; scalar segments stay unsplit.
+
+    Unlike ``iter_mod_chunks`` this never splits a segment that carries one
+    scalar modulation row, so the whole-segment fast path is preserved.
+    """
+    max_rows = int(max_rows)
+    for start, stop, selector in segments:
+        if not torch.is_tensor(selector):
+            yield start, stop, selector
+            continue
+        offset = 0
+        while start + offset < stop:
+            size = min(max_rows, stop - start - offset)
+            yield (
+                start + offset,
+                start + offset + size,
+                selector[offset:offset + size],
+            )
+            offset += size

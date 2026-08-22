@@ -202,6 +202,24 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
         self.assertIsNone(attention.projector)
 
+    def test_legacy_existing_request_preserves_incoming_attention(self):
+        model = FakePatcher()
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(attention='existing')
+        )
+        with patch.object(
+            apply_module,
+            'resolve_dense_attention',
+            side_effect=AssertionError('existing must skip dense selection'),
+        ):
+            attention, qkv = apply_module._resolve_dense(
+                plan,
+                model,
+                self._convrot_inventory(),
+            )
+        self.assertEqual(attention.selected, ATTENTION_EXISTING)
+        self.assertEqual(qkv.provider_id, QKV_STANDARD)
+
 
 if __name__ == '__main__':
     unittest.main()

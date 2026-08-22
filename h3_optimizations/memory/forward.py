@@ -6,7 +6,11 @@ import torch
 
 import comfy.model_management
 
-from .chunks import iter_mod_chunks, validate_mod_segments
+from .chunks import (
+    iter_mod_chunks,
+    iter_modulation_chunks,
+    validate_mod_segments,
+)
 from .linear import (
     ConvRotTwoSliceMLP,
     HeldMLP,
@@ -16,6 +20,8 @@ from .linear import (
     module_swiglu_fc2,
     swiglu_eager,
 )
+from .observer import get_mlp_observer, notify_exact_mlp, notify_mlp_block_end
+from .sharing import get_mlp_sharing
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -44,25 +50,9 @@ def _gate_add(x, other, gate, selector):
     return x
 
 
-def _iter_modulation_chunks(segments, max_rows):
-    '''Bound only per-token selector gathers; scalar segments stay unsplit.'''
-    max_rows = int(max_rows)
-    for start, stop, selector in segments:
-        if not torch.is_tensor(selector):
-            yield start, stop, selector
-            continue
-        offset = 0
-        while start + offset < stop:
-            size = min(max_rows, stop - start - offset)
-            yield (
-                start + offset,
-                start + offset + size,
-                selector[offset:offset + size],
-            )
-            offset += size
-
-
 def _open_generic_held(block, sample, config):
+    if not config.prefer_held_weights:
+        return None, None
     held = HeldMLP(block.mlp, sample)
     try:
         held.__enter__()
@@ -115,6 +105,28 @@ def _open_mlp(block, sample, config):
         return held, 'held' if held is not None else 'module', detail
 
 
+def _run_mlp(block, h, held, mlp_path, config):
+    expanded = None
+    if mlp_path == 'convrot':
+        out, path = held.fc1_fc2(h)
+    elif mlp_path == 'fp8':
+        out, path = held.fc1_fc2(h, swiglu_eager)
+    elif mlp_path == 'held':
+        expanded = held.fc1(h)
+        out, path = held.fc2_swiglu(
+            expanded,
+            native=config.native_swiglu,
+        )
+    else:
+        expanded = module_fc1(block.mlp, h)
+        out, path = module_swiglu_fc2(
+            block.mlp,
+            expanded,
+            native=config.native_swiglu,
+        )
+    return out, expanded, path
+
+
 def make_forward(block, layer_index, config, original_forward=None):
     '''Build an unbound replacement for one MiniMax H3 DiT block.'''
 
@@ -163,7 +175,7 @@ def make_forward(block, layer_index, config, original_forward=None):
         # so long masked sequences do not materialize full [tokens, hidden]
         # shift/scale/gate tensors.
         h = block.norm1(x)
-        for start, stop, selector in _iter_modulation_chunks(
+        for start, stop, selector in iter_modulation_chunks(
             segments,
             config.chunk_rows,
         ):
@@ -178,7 +190,7 @@ def make_forward(block, layer_index, config, original_forward=None):
             rope_freqs=rope_freqs,
             transformer_options=transformer_options,
         )
-        for start, stop, selector in _iter_modulation_chunks(
+        for start, stop, selector in iter_modulation_chunks(
             segments,
             config.chunk_rows,
         ):
@@ -191,6 +203,12 @@ def make_forward(block, layer_index, config, original_forward=None):
         del h, attn_out
 
         held, mlp_path, held_error = _open_mlp(block, x[:1], config)
+        mlp_observer = get_mlp_observer(transformer_options)
+        mlp_sharing = get_mlp_sharing(transformer_options)
+        if mlp_observer is not None and mlp_sharing is not None:
+            raise RuntimeError(
+                'output-exact MLP observation and executable sharing cannot coexist'
+            )
         if held_error is not None:
             logging.warning(
                 '%s block %d selected a format-compatible MLP fallback: %s',
@@ -208,23 +226,46 @@ def make_forward(block, layer_index, config, original_forward=None):
                     scale_mlp,
                     chunk.mod_row,
                 )
-                expanded = None
-                if mlp_path == 'convrot':
-                    out, _path = held.fc1_fc2(h)
-                elif mlp_path == 'fp8':
-                    out, _path = held.fc1_fc2(h, swiglu_eager)
-                elif mlp_path == 'held':
-                    expanded = held.fc1(h)
-                    out, _path = held.fc2_swiglu(
-                        expanded,
-                        native=config.native_swiglu,
+
+                def evaluate_mlp(value):
+                    return _run_mlp(
+                        block,
+                        value,
+                        held,
+                        mlp_path,
+                        config,
                     )
+
+                if mlp_sharing is None:
+                    out, expanded, _path = evaluate_mlp(h)
                 else:
-                    expanded = module_fc1(block.mlp, h)
-                    out, _path = module_swiglu_fc2(
-                        block.mlp,
-                        expanded,
-                        native=config.native_swiglu,
+                    out, expanded, _path = mlp_sharing.evaluate_chunk(
+                        layer_index,
+                        transformer_options,
+                        h=h,
+                        selector=chunk.mod_row,
+                        chunk_start=chunk.start,
+                        chunk_stop=chunk.stop,
+                        evaluate_mlp=evaluate_mlp,
+                    )
+
+                if mlp_observer is not None:
+                    def evaluate_probe_mlp(value):
+                        probe_out, probe_expanded, _probe_path = evaluate_mlp(value)
+                        del probe_expanded, _probe_path
+                        return probe_out
+
+                    notify_exact_mlp(
+                        layer_index,
+                        transformer_options,
+                        h=h,
+                        y=out,
+                        residual=x[chunk.start:chunk.stop],
+                        gate=gate_mlp,
+                        selector=chunk.mod_row,
+                        chunk_start=chunk.start,
+                        chunk_stop=chunk.stop,
+                        evaluate_mlp=evaluate_probe_mlp,
                     )
                 _gate_add(
                     x[chunk.start:chunk.stop],
@@ -236,6 +277,10 @@ def make_forward(block, layer_index, config, original_forward=None):
         finally:
             if held is not None:
                 held.__exit__(None, None, None)
+        if mlp_observer is not None:
+            notify_mlp_block_end(layer_index, transformer_options)
+        if mlp_sharing is not None:
+            mlp_sharing.end_mlp_block(layer_index, transformer_options)
         return x
 
     forward._h3_optimizations_memory = True

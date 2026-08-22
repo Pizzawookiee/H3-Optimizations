@@ -2,7 +2,15 @@
 
 from dataclasses import dataclass
 
-from ..plan import FUSED_QKV_OFF, MLP_MEMORY_AUTO, MLP_MEMORY_OFF
+from ..plan import (
+    FUSED_QKV_OFF,
+    FUSED_QKV_REQUIRED,
+    MLP_MEMORY_AUTO,
+    MLP_MEMORY_LEGACY_BF16,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_LEGACY_NATIVE,
+    MLP_MEMORY_OFF,
+)
 
 QKV_STANDARD = 'standard_h3_qkv'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
@@ -36,6 +44,12 @@ def _standard_qkv(reason):
     return QKVProviderResolution(QKV_STANDARD, False, reason)
 
 
+def _required_or_standard(request, reason):
+    if request == FUSED_QKV_REQUIRED:
+        raise RuntimeError('required fused QKV is unavailable: %s' % reason)
+    return _standard_qkv(reason)
+
+
 def _sparse_contract_ok(sparse_spec):
     from ..attention.sparse.fused_qkv import sparse_fused_qkv_contract_mismatch
 
@@ -56,12 +70,17 @@ def resolve_qkv_provider(
     if request == FUSED_QKV_OFF:
         return _standard_qkv('QKV projection optimization was disabled')
     if not inventory.qkv:
-        return _standard_qkv('the H3 model has no QKV projection inventory')
+        return _required_or_standard(
+            request, 'the H3 model has no QKV projection inventory'
+        )
     if not inventory.homogeneous('qkv'):
-        return _standard_qkv('H3 QKV layers use mixed weight formats')
+        return _required_or_standard(
+            request, 'H3 QKV layers use mixed weight formats'
+        )
 
     fp8_memory_candidate = (
-        memory_optimize
+        request != FUSED_QKV_REQUIRED
+        and memory_optimize
         and fp8_available
         and (inventory.qkv_fp8 or inventory.qkv_plain_float)
     )
@@ -69,7 +88,9 @@ def resolve_qkv_provider(
         source = 'checkpoint-native FP8' if inventory.qkv_fp8 else 'BF16/FP16 converted to FP8 E4M3'
         if backend_kind == 'comfy_kitchen_int8':
             if not kitchen_producer_available:
-                return _standard_qkv('Comfy Kitchen external producer API is unavailable')
+                return _required_or_standard(
+                    request, 'Comfy Kitchen external producer API is unavailable'
+                )
             return QKVProviderResolution(
                 QKV_DENSE_FP8_CHUNKED,
                 False,
@@ -77,9 +98,12 @@ def resolve_qkv_provider(
             )
         if backend_kind == 'sparse_sage':
             if not triton_available:
-                return _standard_qkv('Triton is unavailable')
+                return _required_or_standard(request, 'Triton is unavailable')
             if not _sparse_contract_ok(sparse_spec):
-                return _standard_qkv('the selected Sparse Sage ABI cannot consume chunked projected QKV')
+                return _required_or_standard(
+                    request,
+                    'the selected Sparse Sage ABI cannot consume chunked projected QKV',
+                )
             return QKVProviderResolution(
                 QKV_SPARSE_FP8_CHUNKED,
                 True,
@@ -88,13 +112,15 @@ def resolve_qkv_provider(
 
     if not inventory.qkv_convrot_int8_256:
         labels = ', '.join(sorted(set(inventory.labels('qkv'))))
-        return _standard_qkv(
+        return _required_or_standard(
+            request,
             'native checkpoint projection preserves QKV format %s'
             % (labels or 'unknown')
         )
     if backend_kind == 'comfy_kitchen_int8':
         if not kitchen_producer_available:
-            return _standard_qkv(
+            return _required_or_standard(
+                request,
                 'Comfy Kitchen external producer API is unavailable'
             )
         return QKVProviderResolution(
@@ -104,7 +130,7 @@ def resolve_qkv_provider(
         )
     if backend_kind == 'triton_sparse_int8':
         if not triton_available:
-            return _standard_qkv('Triton is unavailable')
+            return _required_or_standard(request, 'Triton is unavailable')
         return QKVProviderResolution(
             QKV_TRITON_SPARSE_CHUNKED,
             True,
@@ -112,14 +138,15 @@ def resolve_qkv_provider(
         )
     if backend_kind == 'sparse_sage':
         if not triton_available:
-            return _standard_qkv('Triton is unavailable')
+            return _required_or_standard(request, 'Triton is unavailable')
         from ..attention.sparse.fused_qkv import (
             sparse_fused_qkv_contract_mismatch,
         )
 
         mismatch = sparse_fused_qkv_contract_mismatch(sparse_spec)
         if mismatch is not None:
-            return _standard_qkv(
+            return _required_or_standard(
+                request,
                 'the selected Sparse Sage ABI cannot consume fused QKV: %s'
                 % mismatch
             )
@@ -128,7 +155,8 @@ def resolve_qkv_provider(
             True,
             '4K ConvRot QKV chunks into Sparse Sage-native carriers',
         )
-    return _standard_qkv(
+    return _required_or_standard(
+        request,
         'the resolved attention backend has no fused-QKV consumer'
     )
 
@@ -150,15 +178,36 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
             'off',
             'MLP memory optimization was disabled',
         )
-    if request != MLP_MEMORY_AUTO:
-        raise ValueError('unknown MLP memory request %r' % request)
     if not inventory.fc1 or not inventory.fc2:
+        if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
+            raise RuntimeError(
+                'required ConvRot two-slice MLP is unavailable: '
+                'the H3 model has no MLP inventory'
+            )
         return MLPProviderResolution(
             MLP_OFF,
             'off',
             'the H3 model has no MLP inventory',
         )
     if _convrot_compatible(inventory):
+        if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
+            return MLPProviderResolution(
+                MLP_CONVROT_INT8_TWO_SLICE,
+                'mlp_chunked_convrot_2slice',
+                'deprecated compatibility request requires ConvRot two-slice execution',
+            )
+        if request in (MLP_MEMORY_LEGACY_BF16, MLP_MEMORY_LEGACY_NATIVE):
+            return MLPProviderResolution(
+                MLP_FLOAT_CHUNKED,
+                (
+                    'mlp_chunked_bf16'
+                    if request == MLP_MEMORY_LEGACY_BF16
+                    else 'mlp_chunked_native'
+                ),
+                'deprecated compatibility request preserves explicit chunked MLP math',
+            )
+        if request != MLP_MEMORY_AUTO:
+            raise ValueError('unknown MLP memory request %r' % request)
         return MLPProviderResolution(
             MLP_CONVROT_INT8_TWO_SLICE,
             'mlp_chunked_convrot_2slice',
@@ -167,6 +216,26 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
                 'feature slices'
             ),
         )
+    if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
+        labels = sorted(
+            set(inventory.labels('fc1')) | set(inventory.labels('fc2'))
+        )
+        raise RuntimeError(
+            'required ConvRot two-slice MLP is unavailable for %s'
+            % (', '.join(labels) or 'unknown formats')
+        )
+    if request in (MLP_MEMORY_LEGACY_BF16, MLP_MEMORY_LEGACY_NATIVE):
+        return MLPProviderResolution(
+            MLP_FLOAT_CHUNKED,
+            (
+                'mlp_chunked_bf16'
+                if request == MLP_MEMORY_LEGACY_BF16
+                else 'mlp_chunked_native'
+            ),
+            'deprecated compatibility request preserves explicit chunked MLP math',
+        )
+    if request != MLP_MEMORY_AUTO:
+        raise ValueError('unknown MLP memory request %r' % request)
     if inventory.mlp_fp8:
         if fp8_available:
             return MLPProviderResolution(
