@@ -6,9 +6,9 @@ import torch
 
 import comfy.model_management
 
-from ...qkv.chunked import project_chunk_hnd
 from ...qkv.formats import describe_linear
 from ...qkv.fp8 import FP8BindingError, HeldFP8QKV
+from ...qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 from .chunked_qkv import _validate_chunk_rows, pack_sparse_qk_chunk_into
 from .fused_qkv import (
     FusedQKVError,
@@ -61,14 +61,15 @@ def run_fp8_sparse_qkv(
         raise FusedQKVError("chunked Sparse Sage QKV requires H3 head_dim 128")
 
     fmt = describe_linear(module.qkv_proj)
-    held = None
-    if not fmt.w4a8:
+    if fmt.w4a8:
+        held = HeldW4A8QKV(module, x[:1])
+    else:
         held = HeldFP8QKV(
             module,
             x[:1],
             allow_float_conversion=fmt.plain_float,
         )
-        held.__enter__()
+    held.__enter__()
     try:
         shape = (1, heads, sequence, head_dim)
         q_blocks = (sequence + int(spec.q_tile) - 1) // int(spec.q_tile)
@@ -91,12 +92,7 @@ def run_fp8_sparse_qkv(
 
         for start in range(0, sequence, chunk_rows):
             end = min(start + chunk_rows, sequence)
-            if held is None:
-                q, k, chunk_v = project_chunk_hnd(
-                    module, x, rope_freqs, start, end
-                )
-            else:
-                q, k, chunk_v = held.project_hnd(x, rope_freqs, start, end)
+            q, k, chunk_v = held.project_hnd(x, rope_freqs, start, end)
             pack_sparse_qk_chunk_into(
                 q,
                 q_int8,
@@ -134,14 +130,13 @@ def run_fp8_sparse_qkv(
             )
         )
     finally:
-        if held is not None:
-            held.__exit__(None, None, None)
+        held.__exit__(None, None, None)
 
 
 class FP8SparseQKVProjector:
     """Project FP8, float, or native W4A8 H3 QKV into Sparse Sage carriers."""
 
-    name = "chunked_fp8_sparse_sage_qkv"
+    name = "chunked_native_sparse_sage_qkv"
     qk_format = "sparge_block_int8"
 
     def __init__(self, spec, required=False, chunk_rows=CHUNK_ROWS):
@@ -190,7 +185,14 @@ class FP8SparseQKVProjector:
                 spec=self.spec,
                 chunk_rows=self.chunk_rows,
             )
-        except (FP8BindingError, FusedQKVError, RuntimeError, TypeError, ValueError):
+        except (
+            FP8BindingError,
+            W4A8BindingError,
+            FusedQKVError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
             if self.required:
                 raise
             return None
