@@ -15,14 +15,18 @@ from ..plan import (
 QKV_STANDARD = 'standard_h3_qkv'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_DENSE_FP8_CHUNKED = 'chunked_fp8_kitchen_qkv'
+QKV_DENSE_W4A8_CHUNKED = QKV_DENSE_KITCHEN_CHUNKED
 QKV_SPARSE_CONVROT_INT8 = 'convrot_int8_sparse_sage'
 QKV_SPARSE_FP8_CHUNKED = 'chunked_fp8_sparse_sage'
+QKV_SPARSE_W4A8_CHUNKED = QKV_SPARSE_FP8_CHUNKED
 QKV_TRITON_SPARSE_CHUNKED = 'chunked_triton_int8_sparse'
+QKV_TRITON_W4A8_CHUNKED = QKV_TRITON_SPARSE_CHUNKED
 
 MLP_OFF = 'off'
 MLP_PRESERVE_UPSTREAM = 'preserve_upstream_mlp'
 MLP_FLOAT_CHUNKED = 'float_chunked'
 MLP_FP8_CHUNKED = 'fp8_chunked'
+MLP_W4A8_CHUNKED = 'w4a8_chunked'
 MLP_CONVROT_INT8_TWO_SLICE = 'convrot_int8_two_slice'
 
 
@@ -78,6 +82,39 @@ def resolve_qkv_provider(
             request, 'H3 QKV layers use mixed weight formats'
         )
 
+    if memory_optimize and inventory.qkv_w4a8:
+        if backend_kind == 'comfy_kitchen_int8':
+            if not kitchen_producer_available:
+                return _required_or_standard(
+                    request, 'Comfy Kitchen external producer API is unavailable'
+                )
+            return QKVProviderResolution(
+                QKV_DENSE_W4A8_CHUNKED,
+                False,
+                'checkpoint-native W4A8 QKV is projected in bounded token chunks into Kitchen carriers',
+            )
+        if backend_kind == 'sparse_sage':
+            if not triton_available:
+                return _required_or_standard(request, 'Triton is unavailable')
+            if not _sparse_contract_ok(sparse_spec):
+                return _required_or_standard(
+                    request,
+                    'the selected Sparse Sage ABI cannot consume chunked projected QKV',
+                )
+            return QKVProviderResolution(
+                QKV_SPARSE_W4A8_CHUNKED,
+                True,
+                'checkpoint-native W4A8 QKV is projected in bounded token chunks into Sparse Sage carriers',
+            )
+        if backend_kind == 'triton_sparse_int8':
+            if not triton_available:
+                return _required_or_standard(request, 'Triton is unavailable')
+            return QKVProviderResolution(
+                QKV_TRITON_W4A8_CHUNKED,
+                True,
+                'checkpoint-native W4A8 QKV is projected in bounded token chunks into Triton sparse carriers',
+            )
+
     fp8_memory_candidate = (
         request != FUSED_QKV_REQUIRED
         and memory_optimize
@@ -120,8 +157,7 @@ def resolve_qkv_provider(
     if backend_kind == 'comfy_kitchen_int8':
         if not kitchen_producer_available:
             return _required_or_standard(
-                request,
-                'Comfy Kitchen external producer API is unavailable'
+                request, 'Comfy Kitchen external producer API is unavailable'
             )
         return QKVProviderResolution(
             QKV_DENSE_KITCHEN_CHUNKED,
@@ -236,6 +272,12 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
         )
     if request != MLP_MEMORY_AUTO:
         raise ValueError('unknown MLP memory request %r' % request)
+    if inventory.mlp_w4a8:
+        return MLPProviderResolution(
+            MLP_W4A8_CHUNKED,
+            'mlp_chunked_native',
+            'checkpoint-native W4A8 MLP uses held quantized weights and bounded token chunks',
+        )
     if inventory.mlp_fp8:
         if fp8_available:
             return MLPProviderResolution(
