@@ -46,6 +46,7 @@ class _HeldQOnlyState:
     qdata: torch.Tensor
     weight_scale: torch.Tensor
     q_norm: torch.Tensor
+    k_norm: torch.Tensor
     handle: object
     held_weight: object
     bias: object
@@ -89,13 +90,24 @@ def _acquire_q_only_state(module, x):
             device=x.device,
             dtype=x.dtype,
         ).contiguous()
-        if q_norm.numel() != HEAD_DIM or q_norm.dtype != x.dtype:
-            raise FusedQKVError("held Q-only fused H3 RMSNorm weight is invalid")
+        k_norm = comfy.model_management.cast_to(
+            module.k_norm.weight,
+            device=x.device,
+            dtype=x.dtype,
+        ).contiguous()
+        if (
+            q_norm.numel() != HEAD_DIM
+            or k_norm.numel() != HEAD_DIM
+            or q_norm.dtype != x.dtype
+            or k_norm.dtype != x.dtype
+        ):
+            raise FusedQKVError("held fused H3 RMSNorm weights are invalid")
         return _HeldQOnlyState(
             module=module,
             qdata=qdata,
             weight_scale=weight_scale,
             q_norm=q_norm,
+            k_norm=k_norm,
             handle=handle,
             held_weight=held_weight,
             bias=bias,
@@ -232,6 +244,148 @@ def _run_q_only_held(
         KIND=0,
         BLOCK_M=_fused_qkv_mod.Q_TILE,
         BLOCK_N=HEAD_DIM,
+        BLOCK_K=128,
+        num_warps=8,
+        num_stages=3,
+    )
+
+
+def _rope_args(x, rope_freqs):
+    if rope_freqs is None:
+        return x.new_empty((1, 1, 1, 16, 2, 2)), (0, 0, 0, 0), False
+    return (
+        rope_freqs,
+        (
+            rope_freqs.stride(1),
+            rope_freqs.stride(3),
+            rope_freqs.stride(4),
+            rope_freqs.stride(5),
+        ),
+        True,
+    )
+
+
+def _run_prep_qkv_held(
+    state,
+    x,
+    rope_freqs,
+    *,
+    q_int8,
+    q_scale,
+    q_summary,
+    k_int8,
+    k_scale,
+    k_summary,
+    v,
+    x_int8_scratch,
+    x_scale_scratch,
+):
+    """Project Q/K/V for prep with one activation quantization and held weights."""
+    sequence = int(x.shape[0])
+    heads = int(state.heads)
+    rope, rope_strides, has_rope = _rope_args(x, rope_freqs)
+    x_int8, x_scale = _quantize_projection_input_into(
+        x,
+        x_int8_scratch,
+        x_scale_scratch,
+    )
+
+    qk_grid = (
+        _fused_qkv_mod.triton.cdiv(sequence, _fused_qkv_mod.Q_TILE),
+        heads,
+    )
+    for kind in (0, 1):
+        _fused_qkv_mod._fused_qk_kernel[qk_grid](
+            x_int8,
+            state.qdata,
+            x_scale,
+            state.weight_scale,
+            state.q_norm,
+            state.k_norm,
+            rope,
+            q_int8,
+            q_scale,
+            k_int8,
+            k_scale,
+            q_summary,
+            k_summary,
+            sequence=sequence,
+            hidden=state.hidden,
+            heads=heads,
+            weight_stride_output=state.qdata.stride(0),
+            weight_stride_inner=state.qdata.stride(1),
+            rope_stride_seq=rope_strides[0],
+            rope_stride_dim=rope_strides[1],
+            rope_stride_rot=rope_strides[2],
+            rope_stride_pair=rope_strides[3],
+            epsilon=state.epsilon,
+            has_rope=has_rope,
+            KIND=kind,
+            BLOCK_M=_fused_qkv_mod.Q_TILE,
+            BLOCK_N=HEAD_DIM,
+            BLOCK_K=128,
+            num_warps=8,
+            num_stages=3,
+        )
+
+    v_grid = (
+        _fused_qkv_mod.triton.cdiv(sequence, 128),
+        _fused_qkv_mod.triton.cdiv(heads * HEAD_DIM, 256),
+    )
+    _fused_qkv_mod._fused_v_kernel[v_grid](
+        x_int8,
+        state.qdata,
+        x_scale,
+        state.weight_scale,
+        v,
+        sequence=sequence,
+        hidden=state.hidden,
+        output_features=heads * HEAD_DIM,
+        head_dim=HEAD_DIM,
+        weight_stride_output=state.qdata.stride(0),
+        weight_stride_inner=state.qdata.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=256,
+        BLOCK_K=128,
+        num_warps=8,
+        num_stages=3,
+    )
+
+
+def _run_v_only_held(
+    state,
+    x,
+    *,
+    v,
+    x_int8_scratch,
+    x_scale_scratch,
+):
+    """Run only the existing fused V projection for streamed prep pass two."""
+    sequence = int(x.shape[0])
+    heads = int(state.heads)
+    x_int8, x_scale = _quantize_projection_input_into(
+        x,
+        x_int8_scratch,
+        x_scale_scratch,
+    )
+    v_grid = (
+        _fused_qkv_mod.triton.cdiv(sequence, 128),
+        _fused_qkv_mod.triton.cdiv(heads * HEAD_DIM, 256),
+    )
+    _fused_qkv_mod._fused_v_kernel[v_grid](
+        x_int8,
+        state.qdata,
+        x_scale,
+        state.weight_scale,
+        v,
+        sequence=sequence,
+        hidden=state.hidden,
+        output_features=heads * HEAD_DIM,
+        head_dim=HEAD_DIM,
+        weight_stride_output=state.qdata.stride(0),
+        weight_stride_inner=state.qdata.stride(1),
+        BLOCK_M=128,
+        BLOCK_N=256,
         BLOCK_K=128,
         num_warps=8,
         num_stages=3,
@@ -498,69 +652,277 @@ def run_streamed_sparse_sage_qkv(
         device=x.device,
     )
 
-    # Pass 1: collect Q routing summaries, build full K, and obtain the exact
-    # global per-[head,dim] V scale required by SpargeAttn.
-    for start in range(0, sequence, project_chunk_rows):
-        end = min(start + project_chunk_rows, sequence)
-        q, k, v = project_chunk_hnd(
-            module,
-            x,
-            rope_freqs,
-            start,
-            end,
+    if q_only_convrot:
+        # ConvRot fast path: hold the quantized QKV projection once, quantize
+        # each activation slab once in pass one, and never materialize BF16 Q/K.
+        max_rows = min(project_chunk_rows, sequence)
+        max_q_blocks = (max_rows + int(spec.q_tile) - 1) // int(spec.q_tile)
+        max_k_blocks = (max_rows + int(spec.kv_tile) - 1) // int(spec.kv_tile)
+        hidden = int(x.shape[1])
+
+        x_int8_scratch = torch.empty(
+            (max_rows, hidden),
+            dtype=torch.int8,
+            device=x.device,
         )
-        try:
-            _collect_q_summary_chunk(
-                q,
-                q_summary,
-                row_start=start,
-                q_tile=spec.q_tile,
-            )
-            pack_sparse_qk_chunk_into(
-                k,
-                k_int8,
-                k_scale,
-                k_summary,
-                row_start=start,
-                block_size=spec.kv_tile,
-            )
-            update_v_amax(v_amax, v)
-        finally:
-            del q, k, v
-
-    v_scale = finalize_v_scale(v_amax, spec.v_quant_bound)
-    del v_amax
-
-    v_carrier = allocate_v_carrier(
-        sequence=sequence,
-        heads=heads,
-        head_dim=HEAD_DIM,
-        device=x.device,
-    )
-
-    # Pass 2: reproject bounded slabs and write only V into the permanent
-    # Sparse Sage FP8 carrier. Q/K from this pass are temporary.
-    for start in range(0, sequence, project_chunk_rows):
-        end = min(start + project_chunk_rows, sequence)
-        q_unused, k_unused, v = project_chunk_hnd(
-            module,
-            x,
-            rope_freqs,
-            start,
-            end,
+        x_scale_scratch = torch.empty(
+            (max_rows, 1),
+            dtype=torch.float32,
+            device=x.device,
         )
+        q_int8_scratch = torch.empty(
+            (1, heads, max_rows, HEAD_DIM),
+            dtype=torch.int8,
+            device=x.device,
+        )
+        q_scale_scratch = torch.empty(
+            (1, heads, max_q_blocks),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        q_summary_scratch = torch.empty(
+            (1, heads, max_q_blocks, HEAD_DIM),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        k_int8_scratch = torch.empty(
+            (1, heads, max_rows, HEAD_DIM),
+            dtype=torch.int8,
+            device=x.device,
+        )
+        k_scale_scratch = torch.empty(
+            (1, heads, max_k_blocks),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        k_summary_scratch = torch.empty(
+            (1, heads, max_k_blocks, HEAD_DIM),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        v_scratch = torch.empty(
+            (1, heads, max_rows, HEAD_DIM),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        held_prep = _acquire_q_only_state(module, x)
         try:
-            pack_v_chunk(
-                v,
-                v_carrier,
-                v_scale,
-                row_start=start,
+            for start in range(0, sequence, project_chunk_rows):
+                end = min(start + project_chunk_rows, sequence)
+                rows = end - start
+                q_local_blocks = (
+                    rows + int(spec.q_tile) - 1
+                ) // int(spec.q_tile)
+                k_local_blocks = (
+                    rows + int(spec.kv_tile) - 1
+                ) // int(spec.kv_tile)
+                full_chunk = rows == max_rows
+
+                if full_chunk:
+                    q_local = q_int8_scratch
+                    q_scale_local = q_scale_scratch
+                    q_summary_local = q_summary_scratch
+                    k_local = k_int8_scratch
+                    k_scale_local = k_scale_scratch
+                    k_summary_local = k_summary_scratch
+                    v_local = v_scratch
+                else:
+                    q_local = torch.empty(
+                        (1, heads, rows, HEAD_DIM),
+                        dtype=torch.int8,
+                        device=x.device,
+                    )
+                    q_scale_local = torch.empty(
+                        (1, heads, q_local_blocks),
+                        dtype=torch.float32,
+                        device=x.device,
+                    )
+                    q_summary_local = torch.empty(
+                        (1, heads, q_local_blocks, HEAD_DIM),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                    k_local = torch.empty(
+                        (1, heads, rows, HEAD_DIM),
+                        dtype=torch.int8,
+                        device=x.device,
+                    )
+                    k_scale_local = torch.empty(
+                        (1, heads, k_local_blocks),
+                        dtype=torch.float32,
+                        device=x.device,
+                    )
+                    k_summary_local = torch.empty(
+                        (1, heads, k_local_blocks, HEAD_DIM),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                    v_local = torch.empty(
+                        (1, heads, rows, HEAD_DIM),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+
+                chunk_rope = (
+                    None if rope_freqs is None else rope_freqs[:, start:end]
+                )
+                _run_prep_qkv_held(
+                    held_prep,
+                    x[start:end],
+                    chunk_rope,
+                    q_int8=q_local,
+                    q_scale=q_scale_local,
+                    q_summary=q_summary_local,
+                    k_int8=k_local,
+                    k_scale=k_scale_local,
+                    k_summary=k_summary_local,
+                    v=v_local,
+                    x_int8_scratch=x_int8_scratch[:rows],
+                    x_scale_scratch=x_scale_scratch[:rows],
+                )
+
+                q_block_start = start // int(spec.q_tile)
+                k_block_start = start // int(spec.kv_tile)
+                q_summary[
+                    ...,
+                    q_block_start:q_block_start + q_local_blocks,
+                    :,
+                ].copy_(q_summary_local)
+                k_int8[..., start:end, :].copy_(k_local)
+                k_scale[
+                    ...,
+                    k_block_start:k_block_start + k_local_blocks,
+                ].copy_(k_scale_local)
+                k_summary[
+                    ...,
+                    k_block_start:k_block_start + k_local_blocks,
+                    :,
+                ].copy_(k_summary_local)
+                update_v_amax(v_amax, v_local)
+
+                if not full_chunk:
+                    del (
+                        q_local,
+                        q_scale_local,
+                        q_summary_local,
+                        k_local,
+                        k_scale_local,
+                        k_summary_local,
+                        v_local,
+                    )
+
+            v_scale = finalize_v_scale(v_amax, spec.v_quant_bound)
+            del v_amax
+            v_carrier = allocate_v_carrier(
                 sequence=sequence,
-                fused_v_ops=spec.fused_v_ops,
-                scale_max=spec.v_quant_bound,
+                heads=heads,
+                head_dim=HEAD_DIM,
+                device=x.device,
             )
+
+            # Pass two is genuinely V-only: no Q/K GEMMs or BF16 Q/K outputs.
+            for start in range(0, sequence, project_chunk_rows):
+                end = min(start + project_chunk_rows, sequence)
+                rows = end - start
+                if rows == max_rows:
+                    v_local = v_scratch
+                else:
+                    v_local = torch.empty(
+                        (1, heads, rows, HEAD_DIM),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                _run_v_only_held(
+                    held_prep,
+                    x[start:end],
+                    v=v_local,
+                    x_int8_scratch=x_int8_scratch[:rows],
+                    x_scale_scratch=x_scale_scratch[:rows],
+                )
+                pack_v_chunk(
+                    v_local,
+                    v_carrier,
+                    v_scale,
+                    row_start=start,
+                    sequence=sequence,
+                    fused_v_ops=spec.fused_v_ops,
+                    scale_max=spec.v_quant_bound,
+                )
+                if rows != max_rows:
+                    del v_local
         finally:
-            del q_unused, k_unused, v
+            _release_q_only_state(held_prep)
+            del (
+                x_int8_scratch,
+                x_scale_scratch,
+                q_int8_scratch,
+                q_scale_scratch,
+                q_summary_scratch,
+                k_int8_scratch,
+                k_scale_scratch,
+                k_summary_scratch,
+                v_scratch,
+            )
+    else:
+        # Compatibility path for non-ConvRot projected providers.
+        for start in range(0, sequence, project_chunk_rows):
+            end = min(start + project_chunk_rows, sequence)
+            q, k, v = project_chunk_hnd(
+                module,
+                x,
+                rope_freqs,
+                start,
+                end,
+            )
+            try:
+                _collect_q_summary_chunk(
+                    q,
+                    q_summary,
+                    row_start=start,
+                    q_tile=spec.q_tile,
+                )
+                pack_sparse_qk_chunk_into(
+                    k,
+                    k_int8,
+                    k_scale,
+                    k_summary,
+                    row_start=start,
+                    block_size=spec.kv_tile,
+                )
+                update_v_amax(v_amax, v)
+            finally:
+                del q, k, v
+
+        v_scale = finalize_v_scale(v_amax, spec.v_quant_bound)
+        del v_amax
+        v_carrier = allocate_v_carrier(
+            sequence=sequence,
+            heads=heads,
+            head_dim=HEAD_DIM,
+            device=x.device,
+        )
+        for start in range(0, sequence, project_chunk_rows):
+            end = min(start + project_chunk_rows, sequence)
+            q_unused, k_unused, v = project_chunk_hnd(
+                module,
+                x,
+                rope_freqs,
+                start,
+                end,
+            )
+            try:
+                pack_v_chunk(
+                    v,
+                    v_carrier,
+                    v_scale,
+                    row_start=start,
+                    sequence=sequence,
+                    fused_v_ops=spec.fused_v_ops,
+                    scale_max=spec.v_quant_bound,
+                )
+            finally:
+                del q_unused, k_unused, v
 
     return _validate_projected(
         StreamedSparseSageQKV(
@@ -1060,8 +1422,26 @@ def _execute_streamed(module, backend, prepared):
         if prepared.route_plan is not None and len(prepared.route_plan) >= 2:
             prepared.route_plan[0] = None
             prepared.route_plan[1] = None
+        prepared.route_plan = None
+
+        # The attention result already lives in projected.x. Drop every large
+        # carrier before returning so the following MLP weight acquisition does
+        # not overlap K/V or streamed-attention scratch residency.
         projected.q_summary = None
         projected.k_summary = None
+        projected.k_int8 = None
+        projected.k_scale = None
+        projected.v_carrier = None
+        projected.v_scale = None
+        del (
+            q_int8_buffer,
+            q_scale_buffer,
+            q_summary_buffer,
+            output_buffer,
+            pv_threshold,
+        )
+        if x_int8_buffer is not None:
+            del x_int8_buffer, x_scale_buffer
 
     return result
 
