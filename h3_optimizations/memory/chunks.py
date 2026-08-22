@@ -5,15 +5,6 @@ from dataclasses import dataclass
 import torch
 
 
-_INTEGER_DTYPES = {
-    torch.int8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-    torch.uint8,
-}
-
-
 @dataclass(frozen=True)
 class TokenChunk:
     start: int
@@ -37,9 +28,9 @@ def _normalize_selector(selector, span, index, mod_rows):
                 "segment %d modulation selector has %d rows, expected %d"
                 % (index, selector.numel(), span)
             )
-        if selector.dtype not in _INTEGER_DTYPES:
+        if selector.dtype != torch.long:
             raise TypeError(
-                "segment %d modulation selector must use an integer dtype, got %s"
+                "segment %d modulation selector must use torch.long integer dtype, got %s"
                 % (index, selector.dtype)
             )
         # Do not reduce CUDA selectors here to validate values. This function is
@@ -62,7 +53,7 @@ def validate_mod_segments(segments, seq_len, mod_rows=None):
 
     H3's modulation segments must cover the packed sequence contiguously. The
     selector is either one scalar modulation-row index for the whole segment or
-    a rank-1 integer tensor containing one modulation-row index per token.
+    a rank-1 LongTensor containing one modulation-row index per token.
     """
     seq_len = int(seq_len)
     if seq_len < 0:
