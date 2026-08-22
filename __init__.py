@@ -9,7 +9,7 @@ except ModuleNotFoundError:
 
     sys.modules['h3_optimizations'] = _h3_optimizations
 
-from h3_optimizations.nodes import H3OptimizationsExtension
+from h3_optimizations.public_nodes import H3OptimizationsExtension
 
 
 async def comfy_entrypoint() -> H3OptimizationsExtension:
