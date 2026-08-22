@@ -21,12 +21,27 @@ from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 LOG_PREFIX = '[H3 Optimizations]'
 
 
-def _scale_shift(h, shift, scale):
-    return h.mul_(1.0 + scale.to(h.dtype)).add_(shift.to(h.dtype))
+def _mod_row(values, selector, dtype):
+    if torch.is_tensor(selector) and selector.device != values.device:
+        selector = selector.to(device=values.device)
+    return values[selector].to(dtype)
 
 
-def _gate_add(x, other, gate):
-    return x.addcmul_(other, gate.to(x.dtype))
+def _scale_shift(h, shift, scale, selector):
+    scale_rows = _mod_row(scale, selector, h.dtype)
+    h.mul_(1.0 + scale_rows)
+    del scale_rows
+    shift_rows = _mod_row(shift, selector, h.dtype)
+    h.add_(shift_rows)
+    del shift_rows
+    return h
+
+
+def _gate_add(x, other, gate, selector):
+    gate_rows = _mod_row(gate, selector, x.dtype)
+    x.addcmul_(other, gate_rows)
+    del gate_rows
+    return x
 
 
 def _open_generic_held(block, sample, config):
@@ -115,26 +130,42 @@ def make_forward(block, layer_index, config, original_forward=None):
             x.shape[0],
             mod_rows=shift_msa.shape[0],
         )
+        chunks = tuple(
+            iter_mod_chunks(
+                segments,
+                x.shape[0],
+                config.chunk_rows,
+                alignment=config.alignment,
+                mod_rows=shift_mlp.shape[0],
+            )
+        )
 
+        # ComfyUI may attach a per-token modulation-row selector to masked H3
+        # video/audio segments. Apply those gathers in the same bounded slabs as
+        # the MLP so a long masked sequence does not materialize full-sequence
+        # [tokens, hidden] shift/scale/gate tensors.
         h = block.norm1(x)
-        for start, stop, row in segments:
-            _scale_shift(h[start:stop], shift_msa[row], scale_msa[row])
+        for chunk in chunks:
+            _scale_shift(
+                h[chunk.start:chunk.stop],
+                shift_msa,
+                scale_msa,
+                chunk.mod_row,
+            )
         attn_out = block.attn(
             h,
             rope_freqs=rope_freqs,
             transformer_options=transformer_options,
         )
-        for start, stop, row in segments:
-            _gate_add(x[start:stop], attn_out[start:stop], gate_msa[row])
+        for chunk in chunks:
+            _gate_add(
+                x[chunk.start:chunk.stop],
+                attn_out[chunk.start:chunk.stop],
+                gate_msa,
+                chunk.mod_row,
+            )
         del h, attn_out
 
-        chunks = iter_mod_chunks(
-            segments,
-            x.shape[0],
-            config.chunk_rows,
-            alignment=config.alignment,
-            mod_rows=shift_mlp.shape[0],
-        )
         held, mlp_path, held_error = _open_mlp(block, x[:1], config)
         if held_error is not None:
             logging.warning(
@@ -149,8 +180,9 @@ def make_forward(block, layer_index, config, original_forward=None):
                 h = block.norm2(x[chunk.start:chunk.stop])
                 _scale_shift(
                     h,
-                    shift_mlp[chunk.mod_row],
-                    scale_mlp[chunk.mod_row],
+                    shift_mlp,
+                    scale_mlp,
+                    chunk.mod_row,
                 )
                 expanded = None
                 if mlp_path == 'convrot':
@@ -173,7 +205,8 @@ def make_forward(block, layer_index, config, original_forward=None):
                 _gate_add(
                     x[chunk.start:chunk.stop],
                     out,
-                    gate_mlp[chunk.mod_row],
+                    gate_mlp,
+                    chunk.mod_row,
                 )
                 del h, expanded, out
         finally:
