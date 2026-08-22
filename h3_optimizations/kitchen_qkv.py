@@ -14,6 +14,7 @@ from .dense_resolver import is_installed_dense_attention
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.fp8 import FP8BindingError, HeldFP8QKV
+from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 
 
 CHUNK_ROWS = 4096
@@ -79,13 +80,16 @@ def run_chunked_kitchen_qkv(
     kitchen = comfy.quant_ops.ck
     held = None
     try:
+        fmt = describe_linear(module.qkv_proj)
         if fp8_projection:
-            fmt = describe_linear(module.qkv_proj)
             held = HeldFP8QKV(
                 module,
                 x[:1],
                 allow_float_conversion=fmt.plain_float,
             )
+            held.__enter__()
+        elif fmt.w4a8:
+            held = HeldW4A8QKV(module, x[:1])
             held.__enter__()
 
         samples = _project_anchor_samples(
@@ -161,7 +165,7 @@ class ChunkedKitchenQKVProjector:
         format_ok = (
             fmt.fp8 or fmt.plain_float
             if self.fp8_projection
-            else fmt.convrot_int8_256
+            else (fmt.convrot_int8_256 or fmt.w4a8)
         )
         if (
             not is_installed_dense_attention(transformer_options)
@@ -199,8 +203,14 @@ class ChunkedKitchenQKVProjector:
                 chunk_rows=self.chunk_rows,
                 fp8_projection=self.fp8_projection,
             )
-        except (FP8BindingError, RuntimeError, TypeError, ValueError):
-            if not self.fp8_projection:
+        except (
+            FP8BindingError,
+            W4A8BindingError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            if not self.fp8_projection and not fmt.w4a8:
                 raise
             return None
 

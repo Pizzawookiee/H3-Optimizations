@@ -14,8 +14,12 @@ from h3_optimizations.qkv.formats import inspect_h3_linears  # noqa: E402
 from h3_optimizations.qkv.providers import (  # noqa: E402
     MLP_FP8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
+    MLP_W4A8_CHUNKED,
+    QKV_DENSE_W4A8_CHUNKED,
     QKV_SPARSE_FP8_CHUNKED,
+    QKV_SPARSE_W4A8_CHUNKED,
     QKV_STANDARD,
+    QKV_TRITON_W4A8_CHUNKED,
     resolve_mlp_provider,
     resolve_qkv_provider,
 )
@@ -68,6 +72,10 @@ class AlternativeCheckpointCompatibilityTests(unittest.TestCase):
             layout='TensorCoreFP8E4M3Layout',
             storage_dtype='float8_e4m3fn',
         )
+        self.w4a8 = FakeWeight(
+            layout='AsymW4A8Int8Layout',
+            storage_dtype='int8',
+        )
         self.nvfp4 = FakeWeight(
             layout='TensorCoreNVFP4Layout',
             storage_dtype='uint8',
@@ -108,6 +116,62 @@ class AlternativeCheckpointCompatibilityTests(unittest.TestCase):
                 ).provider_id,
                 MLP_FP8_CHUNKED,
             )
+
+    def test_w4a8_uses_native_chunked_providers(self):
+        inventory = inspect_h3_linears([block(self.w4a8)])
+        self.assertTrue(inventory.qkv[0].w4a8)
+        self.assertTrue(inventory.qkv_w4a8)
+        self.assertTrue(inventory.mlp_w4a8)
+        self.assertFalse(inventory.qkv[0].other_quantized)
+
+        sparse = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='sparse_sage',
+            triton_available=True,
+            sparse_spec=sparse_spec(),
+            memory_optimize=False,
+            fp8_available=False,
+        )
+        self.assertEqual(sparse.provider_id, QKV_SPARSE_W4A8_CHUNKED)
+
+        triton = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='triton_sparse_int8',
+            triton_available=True,
+            memory_optimize=False,
+            fp8_available=False,
+        )
+        self.assertEqual(triton.provider_id, QKV_TRITON_W4A8_CHUNKED)
+
+        dense_without_memory = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='comfy_kitchen_int8',
+            kitchen_producer_available=True,
+            memory_optimize=False,
+            fp8_available=False,
+        )
+        self.assertEqual(dense_without_memory.provider_id, QKV_STANDARD)
+
+        dense_with_memory = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='comfy_kitchen_int8',
+            kitchen_producer_available=True,
+            memory_optimize=True,
+            fp8_available=False,
+        )
+        self.assertEqual(dense_with_memory.provider_id, QKV_DENSE_W4A8_CHUNKED)
+
+        mlp = resolve_mlp_provider(
+            inventory,
+            request='auto',
+            fp8_available=False,
+        )
+        self.assertEqual(mlp.provider_id, MLP_W4A8_CHUNKED)
+        self.assertEqual(mlp.activation_mode, 'mlp_chunked_native')
 
     def test_raw_torch_fp8_uses_fp8_memory_providers(self):
         dtypes = [

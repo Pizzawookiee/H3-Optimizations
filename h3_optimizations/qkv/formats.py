@@ -17,6 +17,7 @@ RAW_FP8_LAYOUT_BY_DTYPE = {
     "float8_e5m2": "TensorCoreFP8E5M2Layout",
 }
 NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
+W4A8_LAYOUT = "AsymW4A8Int8Layout"
 
 
 def _dtype_name(value):
@@ -73,6 +74,10 @@ class LinearWeightFormat:
         return self.quantized and self.layout_name == NVFP4_LAYOUT
 
     @property
+    def w4a8(self):
+        return self.quantized and self.layout_name == W4A8_LAYOUT
+
+    @property
     def plain_float(self):
         return not self.quantized and not self.raw_fp8 and any(
             name in self.logical_dtype.lower()
@@ -82,7 +87,7 @@ class LinearWeightFormat:
     @property
     def other_quantized(self):
         return self.quantized and not (
-            self.fp8 or self.nvfp4 or self.convrot_int8_256
+            self.fp8 or self.nvfp4 or self.w4a8 or self.convrot_int8_256
         )
 
     @property
@@ -121,6 +126,10 @@ class H3LinearInventory:
         return bool(self.qkv) and all(item.fp8 for item in self.qkv)
 
     @property
+    def qkv_w4a8(self):
+        return bool(self.qkv) and all(item.w4a8 for item in self.qkv)
+
+    @property
     def qkv_plain_float(self):
         return bool(self.qkv) and all(item.plain_float for item in self.qkv)
 
@@ -140,6 +149,15 @@ class H3LinearInventory:
             and len(self.fc1) == len(self.fc2)
             and all(item.fp8 for item in self.fc1)
             and all(item.fp8 for item in self.fc2)
+        )
+
+    @property
+    def mlp_w4a8(self):
+        return (
+            bool(self.fc1)
+            and len(self.fc1) == len(self.fc2)
+            and all(item.w4a8 for item in self.fc1)
+            and all(item.w4a8 for item in self.fc2)
         )
 
     @property
