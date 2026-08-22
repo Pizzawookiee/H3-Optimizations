@@ -49,6 +49,10 @@ from .plan import (
     FUSED_QKV_OFF,
     H3OptimizationPlan,
     PLAN_KEY,
+    SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_FLEX,
+    SPARSE_BACKEND_SAGE,
+    SPARSE_BACKEND_TRITON,
     STATUS_KEY,
 )
 from .qkv.formats import inspect_h3_linears
@@ -240,14 +244,20 @@ def _resolve_fp8_flex(
         **_sparse_config_kwargs(plan),
     )
     backend = FP8FlexBackend(config, spec=spec)
+    if fallback_reason is None:
+        reason = 'explicit FP8 FlexAttention selection'
+        dense_resolution = None
+    else:
+        reason = '%s; using FP8 FlexAttention' % fallback_reason
+        dense_resolution = dense_attention.dense_resolution
     return (
         ResolvedAttention(
             requested=ATTENTION_SPARSE,
             selected=ATTENTION_FP8_FLEX,
             backend=backend,
-            reason='%s; using FP8 FlexAttention' % fallback_reason,
+            reason=reason,
             backend_kind=ATTENTION_FP8_FLEX,
-            dense_resolution=dense_attention.dense_resolution,
+            dense_resolution=dense_resolution,
         ),
         qkv,
     )
@@ -278,15 +288,20 @@ def _resolve_triton_sparse(plan, environment, inventory, sparse_error):
         spec=spec,
         projector=projector,
     )
+    reason = (
+        'explicit INT8 Triton sparse attention selection'
+        if sparse_error is None
+        else (
+            'Sparse Sage unavailable: %s; using INT8 Triton sparse attention'
+            % sparse_error
+        )
+    )
     return (
         ResolvedAttention(
             requested=ATTENTION_SPARSE,
             selected=ATTENTION_TRITON_SPARSE,
             backend=backend,
-            reason=(
-                'Sparse Sage unavailable: %s; using INT8 Triton sparse attention'
-                % sparse_error
-            ),
+            reason=reason,
             backend_kind=ATTENTION_TRITON_SPARSE,
             projector=projector,
         ),
@@ -295,6 +310,23 @@ def _resolve_triton_sparse(plan, environment, inventory, sparse_error):
 
 
 def _resolve_attention(plan, model, inventory, environment):
+    if plan.sparse is not None:
+        backend_request = plan.sparse.backend
+        if backend_request == SPARSE_BACKEND_SAGE:
+            return _resolve_sparse(plan, environment, inventory)
+        if backend_request == SPARSE_BACKEND_TRITON:
+            return _resolve_triton_sparse(plan, environment, inventory, None)
+        if backend_request == SPARSE_BACKEND_FLEX:
+            return _resolve_fp8_flex(
+                plan,
+                environment,
+                inventory,
+                None,
+                None,
+            )
+        if backend_request != SPARSE_BACKEND_AUTO:
+            raise ValueError('unknown sparse backend request %r' % backend_request)
+
     dense_attention, dense_qkv = _resolve_dense(
         plan,
         model,
@@ -303,6 +335,7 @@ def _resolve_attention(plan, model, inventory, environment):
     )
     if plan.sparse is None:
         return dense_attention, dense_qkv
+
     try:
         return _resolve_sparse(plan, environment, inventory)
     except SparseSageError as sparse_exc:
@@ -424,6 +457,7 @@ def _status(
             None
             if plan.sparse is None
             else {
+                'backend': plan.sparse.backend,
                 'video_budget': float(plan.sparse.video_budget),
                 'denser_early_late_steps': bool(
                     plan.sparse.denser_early_late_steps
@@ -494,13 +528,18 @@ def apply_plan(model, plan: H3OptimizationPlan):
         ATTENTION_TRITON_SPARSE,
         ATTENTION_FP8_FLEX,
     )
+    flex_dense_fallback = (
+        attention.backend_kind == ATTENTION_FP8_FLEX
+        and plan.sparse is not None
+        and plan.sparse.backend == SPARSE_BACKEND_AUTO
+    )
     if sparse_execution_selected:
         if attention.backend_kind == ATTENTION_FP8_FLEX:
             _backend, attention_blocks = configure_backend(
                 patched,
                 attention.backend,
                 projector=attention.projector,
-                backend_fallback_to_dense=True,
+                backend_fallback_to_dense=flex_dense_fallback,
             )
         else:
             _backend, attention_blocks = configure_backend(
@@ -508,10 +547,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
                 attention.backend,
                 projector=attention.projector,
             )
-        if (
-            attention.backend_kind == ATTENTION_FP8_FLEX
-            and attention.dense_resolution is not None
-        ):
+        if flex_dense_fallback and attention.dense_resolution is not None:
             install_dense_attention(patched, attention.dense_resolution)
         v_layout = not_applicable_v_layout(
             '%s owns the main H3 forward' % attention.selected

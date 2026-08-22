@@ -17,6 +17,17 @@ MLP_MEMORY_AUTO = 'auto'
 MLP_MEMORY_OFF = 'off'
 MLP_MEMORY_REQUESTS = (MLP_MEMORY_AUTO, MLP_MEMORY_OFF)
 
+SPARSE_BACKEND_AUTO = 'auto'
+SPARSE_BACKEND_SAGE = 'Sparse Sage'
+SPARSE_BACKEND_TRITON = 'INT8 Triton'
+SPARSE_BACKEND_FLEX = 'FP8 FlexAttention'
+SPARSE_BACKEND_REQUESTS = (
+    SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_SAGE,
+    SPARSE_BACKEND_TRITON,
+    SPARSE_BACKEND_FLEX,
+)
+
 MIN_CHUNK_ROWS = 256
 MAX_CHUNK_ROWS = 65_536
 CHUNK_ALIGNMENT = 256
@@ -93,9 +104,12 @@ class SparseRequest:
     early_kv: float | None = None
     late_steps: int | None = None
     late_kv: float | None = None
+    backend: str = SPARSE_BACKEND_AUTO
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
+        if self.backend not in SPARSE_BACKEND_REQUESTS:
+            raise ValueError('unknown sparse backend request %r' % self.backend)
         _validate_edge_schedule(
             self.early_steps,
             self.early_kv,
@@ -118,6 +132,7 @@ class SparseRequest:
             float(self.video_budget),
             DENSITY_FIXED,
             bool(self.denser_early_late_steps),
+            self.backend,
             None if self.early_steps is None else int(self.early_steps),
             None if self.early_kv is None else float(self.early_kv),
             None if self.late_steps is None else int(self.late_steps),
