@@ -51,29 +51,57 @@ Restart ComfyUI after cloning. The nodes then appear under H3-Optimizations;
 ComfyUI-Manager is not required.
 
 Before node registration, startup checks the active Torch backend in a child
-process. Supported Windows NVIDIA installations use matching upstream Sparse
-Sage wheels with pinned hashes. Linux x86-64 NVIDIA installations build a
-pinned SpargeAttention revision from source when `git` and the CUDA `nvcc`
-compiler are available. Both paths use `--no-deps`, so they cannot replace
-Torch or other ComfyUI packages. The first Linux source build may add several
-minutes to startup.
+process. Supported Windows NVIDIA installations use matching verified
+`woct0rdho/SpargeAttn` wheels with pinned hashes. Linux x86-64 NVIDIA
+installations build a pinned SpargeAttention revision from source when `git`
+and the CUDA `nvcc` compiler are available. Linux SM80, SM86, SM87, SM89, and
+SM90 builds use the original `thu-ml/SpargeAttn` repository. Linux SM120 uses
+the compatibility fork because upstream SpargeAttn does not currently build an
+SM120 extension. Both paths use `--no-deps`, so they cannot replace Torch or
+other ComfyUI packages. The first Linux source build may add several minutes to
+startup.
 
-Linux source builds enable Ninja with half the detected logical CPU count as
-the default worker pool and two `nvcc` threads per worker. Existing `MAX_JOBS`
-or `NVCC_THREADS` environment values override those defaults. The installer
-verifies the pinned Git commit and its expected build settings before applying
-this local build-only patch.
+Linux builds set `TORCH_CUDA_ARCH_LIST` to the detected GPU and use Ninja with
+half the detected logical CPU count as the default worker pool. Existing
+`MAX_JOBS` values override that default. The installer verifies the pinned Git
+commit before building. The SM120 compatibility-fork path additionally applies
+the local build-only Ninja/nvcc-thread patch used by the Windows-compatible
+fork.
 
 An existing `spas_sage_attn` installation is left unchanged when its compiled
 ABI validates for the active Torch, CUDA, and GPU. If it is stale, startup
-reinstalls it only when a verified Windows wheel or the pinned Linux source
-build matches the runtime. Set `H3_OPTIMIZATIONS_SKIP_SPARSE_INSTALL=1` to
-disable all automatic Sparse Sage installation and repair.
+reinstalls it only when a verified Windows wheel or pinned Linux source build
+matches the runtime. Set `H3_OPTIMIZATIONS_SKIP_SPARSE_INSTALL=1` to disable all
+automatic Sparse Sage installation and repair.
 
-Verified automatic wheels cover CUDA 12.4 with Torch 2.5.1, CUDA 12.6 with
-Torch 2.6.0, CUDA 12.8 with Torch 2.7.1, 2.8.0, or 2.9 and newer, and CUDA 13.0
-with Torch 2.9 or newer. The Linux build requires Torch 2.3 or newer and CUDA
-12.0 or newer, `git`, and `nvcc` 12.0 or newer.
+Verified automatic Windows wheels cover CUDA 12.4 with Torch 2.5.1, CUDA 12.6
+with Torch 2.6.0, CUDA 12.8 with Torch 2.7.1, 2.8.0, or 2.9 and newer, and CUDA
+13.0 with Torch 2.9 or newer. Linux source builds require Torch 2.3 or newer,
+`git`, and `nvcc`. The minimum CUDA compiler is 12.0 for SM80/86/87, 12.4 for
+SM89 and SM90, and 12.8 for SM120.
+
+### Manual Sparse Sage install on Linux
+
+If automatic installation does not run, first activate the same Python
+environment that launches ComfyUI and confirm that the CUDA compiler exists:
+
+    cd /path/to/ComfyUI
+    source .venv/bin/activate
+    nvcc --version
+
+For a Linux RTX 4090 (SM89), CUDA 12.4 or newer is required. Then install the
+upstream SpargeAttn package in that same environment:
+
+    python -m pip install ninja packaging setuptools wheel
+    TORCH_CUDA_ARCH_LIST=8.9 python -m pip install --no-build-isolation --no-deps git+https://github.com/thu-ml/SpargeAttn.git
+
+Restart ComfyUI after the build. A minimal import check is:
+
+    python -c "import spas_sage_attn; print('SpargeAttn installed OK')"
+
+For reproducible automated installs, H3-Optimizations uses a pinned upstream
+commit rather than following upstream `main`; the command above is intended as
+the simplest manual recovery path for users troubleshooting an installation.
 
 ROCm, MPS, XPU, CPU, future GPU architectures, NVIDIA installations without a
 matching wheel/build toolchain, and failed Sparse Sage builds are left
