@@ -35,9 +35,11 @@ class H3MemoryOptimization(io.ComfyNode):
             category=NODE_CATEGORY,
             description=(
                 'Production memory and execution optimizations for MiniMax H3. '
-                'Other model families pass through unchanged. Auto preserves '
-                'the checkpoint weight formats and selects specialized paths '
-                'only when their complete runtime contracts are supported.'
+                'ConvRot INT8 uses the specialized paths. Native FP8 uses held '
+                'chunked FP8 execution, and ordinary BF16/FP16 H3 QKV/MLP '
+                'weights may be converted to FP8 E4M3 when accelerated FP8 is '
+                'available. NVFP4 and unsupported quantized formats preserve '
+                'upstream Comfy execution.'
             ),
             search_aliases=[
                 'H3 VRAM',
@@ -55,10 +57,11 @@ class H3MemoryOptimization(io.ComfyNode):
                     options=[FUSED_QKV_AUTO, FUSED_QKV_OFF],
                     default=FUSED_QKV_AUTO,
                     tooltip=(
-                        'auto uses 4K chunked Comfy Kitchen QKV for compatible '
-                        'dense H3 and native-carrier 4K chunked QKV for compatible '
-                        'Sparse Sage or INT8 Triton sparse attention. off uses '
-                        'standard H3 QKV.'
+                        'auto uses compatible chunked QKV projection providers. '
+                        'ConvRot INT8 keeps its specialized path; FP8 uses held '
+                        'FP8 projection; BF16/FP16 may be converted to FP8 E4M3. '
+                        'Unsupported quantized formats use standard Comfy QKV. '
+                        'off always uses standard H3 QKV.'
                     ),
                 ),
                 io.Combo.Input(
@@ -67,9 +70,10 @@ class H3MemoryOptimization(io.ComfyNode):
                     options=[MLP_MEMORY_AUTO, MLP_MEMORY_OFF],
                     default=MLP_MEMORY_AUTO,
                     tooltip=(
-                        'auto uses the validated ConvRot two-slice path when '
-                        'compatible and otherwise preserves the checkpoint '
-                        'linear format through bounded token chunking.'
+                        'auto uses the ConvRot two-slice path when compatible, '
+                        'held chunked FP8 for FP8 checkpoints, and FP8 E4M3 '
+                        'execution for ordinary BF16/FP16 weights when supported. '
+                        'NVFP4 and unsupported quantized formats remain upstream.'
                     ),
                 ),
                 io.Int.Input(
@@ -121,12 +125,14 @@ class H3SparseAttention(io.ComfyNode):
             display_name='H3 Sparse Attention',
             category=NODE_CATEGORY,
             description=(
-                'Fixed-density Sparse Sage attention for MiniMax H3. Other '
-                'models pass through unchanged. Text, reference conditioning, '
-                'audio, non-video queries, and mixed boundary tiles remain dense. '
-                'If Sparse Sage is unavailable, supported NVIDIA GPUs use '
-                'INT8 Triton sparse attention, then FP8 FlexAttention, before '
-                'falling back to resolved dense attention.'
+                'Fixed-density Sparse Sage attention for MiniMax H3. Sparse '
+                'Attention is checkpoint-format independent: compatible ConvRot '
+                'weights may use fused projection, while FP8, BF16, NVFP4, and '
+                'other Comfy-supported checkpoints can use native QKV projection. '
+                'Text, reference conditioning, audio, non-video queries, and mixed '
+                'boundary tiles remain dense. If Sparse Sage is unavailable, '
+                'supported NVIDIA GPUs use INT8 Triton sparse attention, then '
+                'FP8 FlexAttention, before falling back to resolved dense attention.'
             ),
             search_aliases=[
                 'H3 sparse',

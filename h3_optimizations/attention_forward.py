@@ -7,10 +7,10 @@ import comfy.quant_ops
 from .attention import AttentionBackendUnavailable
 
 
-def project_qkv(module, x, rope_freqs):
-    seq = x.shape[0]
+def finish_qkv_projection(module, projected, rope_freqs):
+    seq = projected.shape[0]
     inner = module.heads * module.head_dim
-    q, k, v = module.qkv_proj(x).split(inner, dim=-1)
+    q, k, v = projected.split(inner, dim=-1)
     v = v.view(seq, module.heads, module.head_dim)
 
     if rope_freqs is not None:
@@ -20,11 +20,11 @@ def project_qkv(module, x, rope_freqs):
         k = k.view(1, seq, module.heads, module.head_dim)
         qw = comfy.model_management.cast_to(
             module.q_norm.weight,
-            device=x.device,
+            device=projected.device,
         )
         kw = comfy.model_management.cast_to(
             module.k_norm.weight,
-            device=x.device,
+            device=projected.device,
         )
         rot = rope_freqs.shape[-3] * 2
         comfy.quant_ops.ck.rms_rope_split_half_(
@@ -46,6 +46,10 @@ def project_qkv(module, x, rope_freqs):
             k.view(seq, module.heads, module.head_dim)
         )
     return q, k, v
+
+
+def project_qkv(module, x, rope_freqs):
+    return finish_qkv_projection(module, module.qkv_proj(x), rope_freqs)
 
 
 def to_hnd(q, k, v):

@@ -14,7 +14,9 @@ from .linear import (
     bind_convrot_mlp,
     module_fc1,
     module_swiglu_fc2,
+    swiglu_eager,
 )
+from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 
 LOG_PREFIX = '[H3 Optimizations]'
 
@@ -40,15 +42,36 @@ def _open_generic_held(block, sample, config):
         return None, '%s: %s' % (type(exc).__name__, exc)
 
 
+def _open_fp8(block, sample, config):
+    allow_float_conversion = not hasattr(block.mlp.fc1.weight, '_layout_cls')
+    held = HeldFP8MLP(
+        block.mlp,
+        sample,
+        allow_float_conversion=allow_float_conversion,
+    )
+    try:
+        held.__enter__()
+        return held, None
+    except (FP8BindingError, RuntimeError, TypeError, ValueError) as exc:
+        if config.strict:
+            raise
+        held.release()
+        return None, '%s: %s' % (type(exc).__name__, exc)
+
+
 def _open_mlp(block, sample, config):
+    if config.fp8:
+        held, error = _open_fp8(block, sample, config)
+        return held, 'fp8' if held is not None else 'module', error
+
     if not config.convrot_2slice:
         held, error = _open_generic_held(block, sample, config)
-        return held, False, error
+        return held, 'held' if held is not None else 'module', error
 
     held = ConvRotTwoSliceMLP(block.mlp, sample)
     try:
         held.__enter__()
-        return held, True, None
+        return held, 'convrot', None
     except (RuntimeError, TypeError, ValueError) as exc:
         if config.strict:
             raise
@@ -56,7 +79,7 @@ def _open_mlp(block, sample, config):
         detail = '%s: %s' % (type(exc).__name__, exc)
         if generic_error is not None:
             detail += '; held fallback unavailable: %s' % generic_error
-        return held, False, detail
+        return held, 'held' if held is not None else 'module', detail
 
 
 def make_forward(block, layer_index, config, original_forward=None):
@@ -112,7 +135,7 @@ def make_forward(block, layer_index, config, original_forward=None):
             alignment=config.alignment,
             mod_rows=shift_mlp.shape[0],
         )
-        held, use_convrot, held_error = _open_mlp(block, x[:1], config)
+        held, mlp_path, held_error = _open_mlp(block, x[:1], config)
         if held_error is not None:
             logging.warning(
                 '%s block %d selected a format-compatible MLP fallback: %s',
@@ -130,9 +153,11 @@ def make_forward(block, layer_index, config, original_forward=None):
                     scale_mlp[chunk.mod_row],
                 )
                 expanded = None
-                if use_convrot:
+                if mlp_path == 'convrot':
                     out, _path = held.fc1_fc2(h)
-                elif held is not None:
+                elif mlp_path == 'fp8':
+                    out, _path = held.fc1_fc2(h, swiglu_eager)
+                elif mlp_path == 'held':
                     expanded = held.fc1(h)
                     out, _path = held.fc2_swiglu(
                         expanded,
