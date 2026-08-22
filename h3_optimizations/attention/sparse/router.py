@@ -218,7 +218,13 @@ class SparseTileRouter:
         )
         return lut.contiguous(), valid.contiguous(), metadata
 
-    def build_lut(self, q, k, layout, video_budget):
+    def _notify(self, sink, geometry, indices):
+        '''Report the pure-video KV-tile selection to an optional sink.'''
+        if sink is None:
+            return
+        sink(indices, geometry, self.kv_tile)
+
+    def build_lut(self, q, k, layout, video_budget, *, sink=None):
         if q.ndim != 4 or k.ndim != 4:
             raise SparseRouterError('tile router expects HND rank-4 Q/K')
         if q.shape != k.shape:
@@ -237,12 +243,14 @@ class SparseTileRouter:
         retained = self._retained(video_budget, geometry)
         metadata = self._metadata(geometry, video_budget, retained)
         if retained == geometry.pure_video_kv_tiles:
+            self._notify(sink, geometry, None)
             return self._dense_lut(q, geometry, metadata)
         return self._build_lut_from_summaries(
             self._mean_pool(q, self.q_tile),
             self._mean_pool(k, self.kv_tile),
             geometry,
             video_budget,
+            sink=sink,
         )
 
     def build_lut_from_summaries(
@@ -251,6 +259,8 @@ class SparseTileRouter:
         k_summary,
         layout,
         video_budget,
+        *,
+        sink=None,
     ):
         if q_summary.ndim != 4 or k_summary.ndim != 4:
             raise SparseRouterError(
@@ -284,6 +294,7 @@ class SparseTileRouter:
             k_summary,
             geometry,
             video_budget,
+            sink=sink,
         )
 
     @staticmethod
@@ -316,11 +327,14 @@ class SparseTileRouter:
         k_means,
         geometry,
         video_budget,
+        *,
+        sink=None,
     ):
         batch, heads = q_means.shape[:2]
         retained = self._retained(video_budget, geometry)
         metadata = self._metadata(geometry, video_budget, retained)
         if retained == geometry.pure_video_kv_tiles:
+            self._notify(sink, geometry, None)
             return self._dense_lut(q_means, geometry, metadata)
         dense = torch.arange(
             geometry.kv_tiles,
@@ -347,6 +361,7 @@ class SparseTileRouter:
             ].transpose(-1, -2),
         )
         indices = torch.topk(scores, retained, dim=-1).indices
+        self._notify(sink, geometry, indices)
         sparse_rows = self._pack_rows(
             indices,
             geometry,

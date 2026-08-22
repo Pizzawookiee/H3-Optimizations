@@ -51,6 +51,7 @@ DENSITY_FIXED = 'fixed'
 DEFAULT_VIDEO_BUDGET = 0.3
 DEFAULT_EDGE_STEPS = 2
 DEFAULT_EDGE_KV = 0.5
+H3_LAYER_COUNT = 50
 
 
 def _validate_sparse_budget(name, value):
@@ -75,6 +76,21 @@ def _validate_edge_schedule(early_steps, early_kv, late_steps, late_kv):
             raise ValueError('%s must be a non-negative integer' % name)
     _validate_sparse_budget('early_kv', early_kv)
     _validate_sparse_budget('late_kv', late_kv)
+
+
+def parse_layer_video_budgets(value):
+    text = str(value).strip()
+    if not text:
+        return None
+    budgets = tuple(float(item.strip()) for item in text.split(','))
+    if len(budgets) != H3_LAYER_COUNT:
+        raise ValueError(
+            'layer_video_budgets must contain exactly %d comma-separated values'
+            % H3_LAYER_COUNT
+        )
+    for layer_index, budget in enumerate(budgets):
+        _validate_sparse_budget('layer_video_budgets[%d]' % layer_index, budget)
+    return budgets
 
 
 @dataclass(frozen=True)
@@ -129,6 +145,7 @@ class SparseRequest:
     late_steps: int | None = None
     late_kv: float | None = None
     backend: str = SPARSE_BACKEND_AUTO
+    layer_video_budgets: tuple[float, ...] | None = None
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
@@ -140,10 +157,29 @@ class SparseRequest:
             self.late_steps,
             self.late_kv,
         )
+        if self.layer_video_budgets is not None:
+            budgets = tuple(float(value) for value in self.layer_video_budgets)
+            if len(budgets) != H3_LAYER_COUNT:
+                raise ValueError(
+                    'layer_video_budgets must contain exactly %d values'
+                    % H3_LAYER_COUNT
+                )
+            for layer_index, budget in enumerate(budgets):
+                _validate_sparse_budget(
+                    'layer_video_budgets[%d]' % layer_index,
+                    budget,
+                )
+            object.__setattr__(self, 'layer_video_budgets', budgets)
         if self.advanced_schedule and self.denser_early_late_steps:
             raise ValueError(
                 'explicit early/late budgets cannot be combined with the '
                 'legacy denser early/late toggle'
+            )
+        if self.layer_video_budgets is not None and (
+            self.denser_early_late_steps or self.advanced_schedule
+        ):
+            raise ValueError(
+                'static per-layer budgets cannot be combined with early/late schedules'
             )
 
     @property
@@ -161,6 +197,7 @@ class SparseRequest:
             None if self.early_kv is None else float(self.early_kv),
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
+            self.layer_video_budgets,
         )
 
 

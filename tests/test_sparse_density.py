@@ -62,7 +62,8 @@ class RecordingRouter:
     def __init__(self):
         self.budgets = []
 
-    def build_lut(self, _q, _k, _layout, budget):
+    def build_lut(self, _q, _k, _layout, budget, *, sink=None):
+        del sink
         self.budgets.append(float(budget))
         return object(), object(), MaskMetadata(budget)
 
@@ -72,7 +73,10 @@ class RecordingRouter:
         _k_summary,
         _layout,
         budget,
+        *,
+        sink=None,
     ):
+        del sink
         self.budgets.append(float(budget))
         return object(), object(), MaskMetadata(budget)
 
@@ -137,8 +141,9 @@ def test_node_schema_and_request():
             'model',
             'video_budget',
             'denser_early_late_steps',
+            'layer_video_budgets',
         ],
-        'standard schema preserves the legacy sparse controls',
+        'standard schema appends the optional static layer table',
     )
     denser = input_by_id(schema, 'denser_early_late_steps')
     check(
@@ -167,6 +172,23 @@ def test_node_schema_and_request():
         and request.denser_early_late_steps is True
         and request.advanced_schedule is False,
         'standard node carries the legacy denser-step policy',
+    )
+
+    layer_budgets = ','.join(['0.1'] * 25 + ['0.3'] * 25)
+    with mock.patch(
+        'h3_optimizations.nodes.apply_plan',
+        return_value=patched,
+    ) as apply:
+        H3SparseAttention.execute(
+            model,
+            video_budget=0.2,
+            layer_video_budgets=layer_budgets,
+        )
+    request = apply.call_args.args[1].sparse
+    check(
+        request.layer_video_budgets[:25] == (0.1,) * 25
+        and request.layer_video_budgets[25:] == (0.3,) * 25,
+        'standard node parses exactly 50 static layer budgets',
     )
 
 
@@ -357,6 +379,51 @@ def test_advanced_step_budgets():
     )
 
 
+def test_static_layer_budgets():
+    print('H3 Sparse Attention static layer budgets')
+    budgets = tuple(0.1 + layer_index * 0.01 for layer_index in range(50))
+    config = HybridSparseConfig(
+        video_budget=0.2,
+        layer_video_budgets=budgets,
+    )
+    check(
+        resolve_video_budget(config, 3, 20, 0) == 0.1
+        and resolve_video_budget(config, 3, 20, 49) == 0.59,
+        'static table resolves budgets by transformer layer',
+    )
+
+    backend = make_backend(config)
+    q = k = v = TensorStub()
+    backend.prepare(
+        q,
+        k,
+        v,
+        layer_index=7,
+        transformer_options=options(3),
+    )
+    projected = SimpleNamespace(
+        sequence=384,
+        q_summary=object(),
+        k_summary=object(),
+        heads=2,
+    )
+    backend.prepare_projected(
+        projected,
+        layer_index=31,
+        transformer_options=options(3),
+    )
+    check(
+        backend.router.budgets == [0.17, 0.41000000000000003],
+        'normal and projected routing both use the current layer budget',
+    )
+    try:
+        resolve_video_budget(config, 3, 20)
+    except ValueError as exc:
+        check('layer_index is required' in str(exc), 'missing layer index fails clearly')
+    else:
+        raise AssertionError('missing layer index should fail')
+
+
 def test_runtime_step_resolution():
     print('H3 runtime sampler-step publication')
     session = H3RuntimeSession()
@@ -406,6 +473,7 @@ def main():
     test_advanced_node_schema_and_request()
     test_step_budgets()
     test_advanced_step_budgets()
+    test_static_layer_budgets()
     test_runtime_step_resolution()
     print('\nall H3 sparse density tests passed')
 

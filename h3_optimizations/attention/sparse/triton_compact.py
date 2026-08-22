@@ -157,6 +157,7 @@ def backend_prepare(self, q, k, v, *, layer_index, transformer_options):
         self.config,
         snapshot.step_index,
         snapshot.total_steps,
+        layer_index,
     )
     try:
         route, mask_metadata = build_compact_absolute_route_from_qk(
@@ -199,6 +200,7 @@ def backend_prepare_projected(
         self.config,
         snapshot.step_index,
         snapshot.total_steps,
+        layer_index,
     )
     try:
         route, mask_metadata = build_compact_absolute_route(

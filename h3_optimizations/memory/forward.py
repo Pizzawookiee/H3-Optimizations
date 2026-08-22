@@ -22,6 +22,7 @@ from .linear import (
 )
 from .observer import get_mlp_observer, notify_exact_mlp, notify_mlp_block_end
 from .sharing import get_mlp_sharing
+from ..mlp_sharing.route import get_route_recorder
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -147,6 +148,11 @@ def make_forward(block, layer_index, config, original_forward=None):
                 'the original block forward'
             )
 
+        route_recorder = get_route_recorder(transformer_options)
+        if route_recorder is not None:
+            # Each block forward writes its own route; never read a stale one.
+            route_recorder.clear(layer_index)
+
         (
             shift_msa,
             scale_msa,
@@ -190,6 +196,14 @@ def make_forward(block, layer_index, config, original_forward=None):
             rope_freqs=rope_freqs,
             transformer_options=transformer_options,
         )
+        if route_recorder is not None:
+            route_recorder.record_attention_energy(
+                layer_index,
+                attn_out,
+                gate_msa,
+                segments,
+                config.chunk_rows,
+            )
         for start, stop, selector in iter_modulation_chunks(
             segments,
             config.chunk_rows,

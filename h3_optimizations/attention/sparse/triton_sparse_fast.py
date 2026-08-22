@@ -15,6 +15,7 @@ from .triton_qkv import (
     pack_float_qkv,
     validate_prepared_triton_sparse_qkv,
 )
+from ...mlp_sharing.route import router_kwargs as _route_kwargs
 
 try:
     import triton
@@ -805,6 +806,7 @@ class TritonSparseBackend:
             self.config,
             snapshot.step_index,
             snapshot.total_steps,
+            layer_index,
         )
         try:
             lut, valid_block_num, mask_metadata = self.router.build_lut(
@@ -812,6 +814,7 @@ class TritonSparseBackend:
                 k,
                 snapshot.layout,
                 video_budget,
+                **_route_kwargs(transformer_options, layer_index),
             )
         except SparseRouterError as exc:
             raise TritonSparseError('sparse routing failed: %s' % exc) from exc
@@ -843,6 +846,7 @@ class TritonSparseBackend:
             self.config,
             snapshot.step_index,
             snapshot.total_steps,
+            layer_index,
         )
         try:
             lut, valid_block_num, mask_metadata = self.router.build_lut_from_summaries(
@@ -850,6 +854,7 @@ class TritonSparseBackend:
                 projected.k_summary,
                 snapshot.layout,
                 video_budget,
+                **_route_kwargs(transformer_options, layer_index),
             )
         except SparseRouterError as exc:
             raise TritonSparseError('sparse routing failed: %s' % exc) from exc

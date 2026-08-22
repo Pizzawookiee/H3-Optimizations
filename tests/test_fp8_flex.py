@@ -79,7 +79,8 @@ class FakeRouter:
     q_tile = 128
     kv_tile = 64
 
-    def build_lut(self, q, _k, _layout, _video_budget):
+    def build_lut(self, q, _k, _layout, _video_budget, *, sink=None):
+        del sink
         q_tiles = (q.shape[-2] + self.q_tile - 1) // self.q_tile
         kv_tiles = (q.shape[-2] + self.kv_tile - 1) // self.kv_tile
         dense_delta = torch.ones(kv_tiles, dtype=torch.int32)

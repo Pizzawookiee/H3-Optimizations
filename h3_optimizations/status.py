@@ -112,6 +112,17 @@ def format_sparse_status(model):
         lines.insert(1, 'Requested sparse backend: %s' % backend_request)
     elif selected != 'sparse_sage' and reason:
         lines.insert(1, 'Sparse fallback: %s' % reason)
+    layer_budgets = sparse.get('layer_video_budgets')
+    if layer_budgets:
+        lines.insert(
+            2,
+            'Static layer table: %d layers, %.1f%%-%.1f%% KV'
+            % (
+                len(layer_budgets),
+                min(layer_budgets) * 100.0,
+                max(layer_budgets) * 100.0,
+            ),
+        )
     if qkv.get('provider') in (
         'convrot_int8_sparse_sage',
         'chunked_fp8_sparse_sage',

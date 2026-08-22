@@ -26,6 +26,7 @@ from .plan import (
     SPARSE_BACKEND_REQUESTS,
     MemoryRequest,
     SparseRequest,
+    parse_layer_video_budgets,
     read_plan,
 )
 from .status import (
@@ -388,6 +389,17 @@ class H3SparseAttention(io.ComfyNode):
                         'the first 2 and last 2 sampling steps, capped at 100%.'
                     ),
                 ),
+                io.String.Input(
+                    'layer_video_budgets',
+                    display_name='Per-layer video KV budgets',
+                    default='',
+                    advanced=True,
+                    tooltip=(
+                        'Optional comma-separated budget fractions for all 50 H3 '
+                        'layers. Applies at every sampling step and cannot be '
+                        'combined with Denser Early/Late steps.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -398,11 +410,15 @@ class H3SparseAttention(io.ComfyNode):
         model,
         video_budget=DEFAULT_VIDEO_BUDGET,
         denser_early_late_steps=False,
+        layer_video_budgets='',
     ):
         plan = read_plan(model).with_sparse(
             SparseRequest(
                 video_budget=float(video_budget),
                 denser_early_late_steps=bool(denser_early_late_steps),
+                layer_video_budgets=parse_layer_video_budgets(
+                    layer_video_budgets
+                ),
             )
         )
         patched = apply_plan(model, plan)

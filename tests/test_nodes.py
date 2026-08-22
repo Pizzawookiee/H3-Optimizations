@@ -87,12 +87,14 @@ class NodeTests(unittest.TestCase):
                 'model',
                 'video_budget',
                 'denser_early_late_steps',
+                'layer_video_budgets',
             ],
         )
         self.assertEqual(input_by_id(sparse, 'video_budget').default, 0.3)
         self.assertFalse(
             input_by_id(sparse, 'denser_early_late_steps').default
         )
+        self.assertEqual(input_by_id(sparse, 'layer_video_budgets').default, '')
 
         self.assertEqual(advanced.node_id, 'H3SparseAttentionAdvanced')
         self.assertEqual(

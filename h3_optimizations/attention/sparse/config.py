@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 import math
 
+from ...plan import H3_LAYER_COUNT
+
 MODE_SAGE128 = 'sage128'
 MODE_SAGE128_FUSED_QKV = 'sage128_fused_qkv'
 IMPLEMENTED_MODES = (MODE_SAGE128, MODE_SAGE128_FUSED_QKV)
@@ -31,6 +33,7 @@ class HybridSparseConfig:
     early_kv: float | None = None
     late_steps: int | None = None
     late_kv: float | None = None
+    layer_video_budgets: tuple[float, ...] | None = None
 
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
@@ -41,6 +44,16 @@ class HybridSparseConfig:
         _validate_budget('video_budget', self.video_budget)
         _validate_budget('early_kv', self.early_kv)
         _validate_budget('late_kv', self.late_kv)
+        if self.layer_video_budgets is not None:
+            budgets = tuple(float(value) for value in self.layer_video_budgets)
+            if len(budgets) != H3_LAYER_COUNT:
+                raise ValueError(
+                    'layer_video_budgets must contain exactly %d values'
+                    % H3_LAYER_COUNT
+                )
+            for layer_index, budget in enumerate(budgets):
+                _validate_budget('layer_video_budgets[%d]' % layer_index, budget)
+            object.__setattr__(self, 'layer_video_budgets', budgets)
         if self.density_mode != DENSITY_FIXED:
             raise ValueError('only fixed Sparse Sage density is supported')
         values = (self.early_steps, self.early_kv, self.late_steps, self.late_kv)
@@ -55,6 +68,12 @@ class HybridSparseConfig:
             ):
                 if isinstance(value, bool) or int(value) != value or int(value) < 0:
                     raise ValueError('%s must be a non-negative integer' % name)
+        if self.layer_video_budgets is not None and (
+            self.denser_early_late_steps or self.early_steps is not None
+        ):
+            raise ValueError(
+                'static per-layer budgets cannot be combined with early/late schedules'
+            )
 
     @property
     def signature(self):
@@ -68,10 +87,21 @@ class HybridSparseConfig:
             None if self.early_kv is None else float(self.early_kv),
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
+            self.layer_video_budgets,
         )
 
 
-def resolve_video_budget(config, step_index, total_steps):
+def resolve_video_budget(config, step_index, total_steps, layer_index=None):
+    if config.layer_video_budgets is not None:
+        if layer_index is None:
+            raise ValueError('layer_index is required for static per-layer budgets')
+        if isinstance(layer_index, bool) or int(layer_index) != layer_index:
+            raise ValueError('layer_index must be an integer')
+        layer_index = int(layer_index)
+        if not 0 <= layer_index < len(config.layer_video_budgets):
+            raise ValueError('layer_index is outside the static per-layer budget table')
+        return float(config.layer_video_budgets[layer_index])
+
     budget = float(config.video_budget)
     step_index = int(step_index)
     total_steps = int(total_steps)

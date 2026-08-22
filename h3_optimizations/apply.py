@@ -130,6 +130,7 @@ def _sparse_config_kwargs(plan):
         'early_kv': sparse.early_kv,
         'late_steps': sparse.late_steps,
         'late_kv': sparse.late_kv,
+        'layer_video_budgets': sparse.layer_video_budgets,
         'strict': True,
     }
 
@@ -474,6 +475,11 @@ def _status(
                 'early_kv': plan.sparse.early_kv,
                 'late_steps': plan.sparse.late_steps,
                 'late_kv': plan.sparse.late_kv,
+                'layer_video_budgets': (
+                    None
+                    if plan.sparse.layer_video_budgets is None
+                    else list(plan.sparse.layer_video_budgets)
+                ),
             }
         ),
         'fused_qkv': {
