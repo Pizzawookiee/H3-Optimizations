@@ -28,6 +28,14 @@ does not import or depend on ComfyUI-H3-Extended.
   Triton -> FP8 FlexAttention -> dense fallback chain. Explicit Sparse Sage,
   INT8 Triton, or FP8 FlexAttention selections are hard requirements and error
   if unavailable; bypass the node to force dense attention.
+- H3 Attention Ordering Probe compares native, explicit row-major, time-major,
+  Morton/Z-order, and deterministic enclosing-cube/filter Hilbert traversals on
+  the same post-RoPE target-video Q/K/V. It uses the production 128Q x 64KV
+  fixed-density route, keeps non-video and mixed boundary tiles dense, aligns
+  sampled outputs back to native query indices, and reports block locality,
+  retained dense-attention mass, and relative L1/L2 output error. It does not
+  change the attention path's token order. While armed it bypasses projected
+  QKV preparation so the floating post-RoPE tensors remain observable.
 - H3 MLP Sharing Probe is an output-exact Stage 1 diagnostic. Place it after
   H3 Memory Optimization. It observes target-video 1T x 2Y x 2X cells at the
   requested layers, compares output-oracle, input-cosine, input-L2, and random
@@ -41,11 +49,22 @@ does not import or depend on ComfyUI-H3-Extended.
   50, 75, and 87.5 percent requested removal. Steps 0-2 remain exact by
   default; reports include realized row counts after chunk and modulation
   exclusions.
+- H3 MLP Stage 0 Probe is an output-exact diagnostic that scores the designs
+  before either approximate path is written. Place it after H3 Memory
+  Optimization and leave H3 Sparse Attention enabled at its normal budget so
+  the attention route exists. It reports, per layer and step, how much of the
+  true MLP-update energy each attention selector's top-k captures over 64-row
+  target-video KV tiles, how concentrated the cross-step SwiGLU delta is across
+  the 56 ConvRot groups at token, 64-row, 128-row, and whole-video sharing,
+  how much of that delta AdaLN modulation alone explains, and what BF16 and FP8
+  E4M3 cost as cache representations. A step whose attention route came back
+  fully dense is recorded as dense and takes no selector statistics.
 
-The production nodes are grouped under H3-Optimizations > Model Patches. MLP
-sharing and its output-exact probe are under H3-Optimizations > Experiments.
+The production nodes are grouped under H3-Optimizations > Model Patches. The
+ordering probe, MLP sharing, its output-exact probe, and the Stage 0 probe are
+under H3-Optimizations > Experiments.
 
-The nodes are order-independent. Unsupported model families pass through
+The production nodes are order-independent. Unsupported model families pass through
 unchanged. Auto modes retain the existing implementation when a specialized
 provider cannot satisfy its complete format and runtime contract. A saved
 workflow containing either H3 Sparse Attention node also remains runnable when
@@ -155,10 +174,10 @@ architecture uses the next backend only in `auto`; an explicit Sparse Sage
 request errors instead.
 
 Production node IDs are H3MemoryOptimization, H3SparseAttention, and
-H3SparseAttentionAdvanced. Experiment node IDs are H3MLPSharing,
-H3MLPSharingProbe, and H3MLPSharingProbeOutput; the latter terminates API
-workflows without serializing H3's nested video-and-audio latent. H3-Extended
-is not required.
+H3SparseAttentionAdvanced. Experiment node IDs are H3AttentionOrderingProbe,
+H3MLPSharing, H3MLPSharingProbe, H3MLPStage0, and H3MLPSharingProbeOutput; the last
+terminates API workflows without serializing H3's nested video-and-audio
+latent. H3-Extended is not required.
 
 ## Validation
 
@@ -166,11 +185,19 @@ CPU tests cover node schemas, plan composition, backend classification, dense
 and Sparse Sage capability fallback, explicit sparse-backend selection,
 stale-install repair selection, chunk boundaries and RoPE slices, non-H3 no-op
 behavior, sparse contract and route geometry, runtime step/layout publication,
-explicit early/middle/late density schedules, and source isolation. GPU kernel
-validation is intentionally separate because it requires the matching hardware
+explicit early/middle/late density schedules, deterministic video-only ordering
+permutations and inverses, fixed-density ordering metrics, and source isolation.
+GPU kernel validation is intentionally separate because it requires the matching hardware
 and compiled backend packages. FP8 Flex CPU contracts cover all-FP8 carrier
 layouts, explicit Triton/FA4 selection, and first-call dense fallback in
 backend `auto`.
+
+For a live ordering experiment, place H3 Attention Ordering Probe after H3
+Sparse Attention. Start with one layer, one step, and 20/30/50 percent Video KV;
+the default 64 identical native-video query samples keep the dense teacher
+bounded. Results are written under `output/h3_token_ordering/<run>/` as
+`report.txt`, `summary.json`, and `results.json`. This is GPU/model work and is
+intentionally separate from the CPU contract suite.
 
 Run the CPU suite from the ComfyUI root:
 
@@ -186,6 +213,11 @@ Add `--matrix` to run the exact-repeat, zero-path, similarity, and matched
 random-local controls at every supported removal level. Each pair writes
 selective callback trajectories under `output/h3_latent_capture` and its CPU
 comparison under `output/h3_latent_comparison`.
+
+Read one Stage 0 report directory into its four decision tables. This needs no
+GPU and no running server:
+
+    .\.venv\Scripts\python.exe custom_nodes\H3-Optimizations\benchmarks\report_mlp_stage0.py "D:\AI\ComfyUI\Output\h3_mlp_stage0\mlp-stage0_20260822-120000_request0"
 
 The three-way attention benchmark derives each carrier contract from the
 current checkout and verifies identical sparse routes before timing:

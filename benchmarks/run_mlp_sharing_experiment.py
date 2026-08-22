@@ -299,7 +299,10 @@ async def _wait_for_job(server, socket, prompt_id):
         try:
             message = await socket.receive(timeout=30)
         except asyncio.TimeoutError:
-            job = _json_request(server + '/api/jobs/' + prompt_id)
+            try:
+                job = _json_request(server + '/api/jobs/' + prompt_id)
+            except OSError:
+                continue
             if job['status'] in ('completed', 'failed', 'cancelled'):
                 return job
             continue

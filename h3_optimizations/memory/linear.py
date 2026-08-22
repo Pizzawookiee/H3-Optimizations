@@ -454,6 +454,42 @@ class ConvRotTwoSliceMLP:
         self.release()
         return False
 
+    def fc1_swiglu(self, x):
+        """Return the full SwiGLU activation for diagnostic row subsets.
+
+        The prepacked tiles split the FFN in half, and tile ``g`` owns SwiGLU
+        features ``[g * width, (g + 1) * width)``, so concatenating the tiles in
+        order reproduces the natural feature layout ``fc2`` expects.
+        """
+        if self.tiles is None:
+            raise RuntimeError("ConvRot two-slice session is not active")
+        comfy.ops.run_every_op()
+        parts = []
+        for tile in self.tiles:
+            expanded = self.convrot_linear(
+                x, tile["fc1_weight"], tile["fc1_scale"], input_act=None
+            )
+            parts.append(swiglu_eager(expanded))
+            del expanded
+        return torch.cat(parts, dim=-1)
+
+    def fc2_activation(self, activated):
+        """Apply fc2 to an already-activated SwiGLU vector."""
+        if self.tiles is None:
+            raise RuntimeError("ConvRot two-slice session is not active")
+        comfy.ops.run_every_op()
+        width = int(activated.shape[-1]) // len(self.tiles)
+        output = None
+        for index, tile in enumerate(self.tiles):
+            partial = self.convrot_linear(
+                activated[..., index * width:(index + 1) * width],
+                tile["fc2_weight"],
+                tile["fc2_scale"],
+                input_act=None,
+            )
+            output = partial if output is None else output.add_(partial)
+        return output
+
     def fc1_fc2(self, x, stage_factory=None):
         if self.tiles is None:
             raise RuntimeError("ConvRot two-slice session is not active")

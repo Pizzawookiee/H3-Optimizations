@@ -140,3 +140,61 @@ class MLPSharingConfig:
             int(self.selector_seed),
             str(self.run_tag),
         )
+
+
+STAGE0_KV_TILE = 64
+STAGE0_SAMPLE_ROWS = 128
+
+
+@dataclass(frozen=True)
+class Stage0Config:
+    """One dense-MLP diagnostic run over attention selection and cache reuse."""
+
+    layers: tuple = DEFAULT_LAYERS
+    measure_cache: bool = True
+    sample_blocks: int = 4
+    cache_step_stride: int = 1
+    start_step: int = 1
+    selector_seed: int = 0
+    run_tag: str = 'mlp-stage0'
+
+    def __post_init__(self):
+        object.__setattr__(self, 'layers', parse_layers(self.layers))
+        if isinstance(self.sample_blocks, bool):
+            raise ValueError('sample_blocks must be an integer')
+        if int(self.sample_blocks) < 1 or int(self.sample_blocks) > 64:
+            raise ValueError('sample_blocks must be in [1, 64]')
+        object.__setattr__(self, 'sample_blocks', int(self.sample_blocks))
+        if isinstance(self.cache_step_stride, bool):
+            raise ValueError('cache_step_stride must be an integer')
+        if int(self.cache_step_stride) < 1:
+            raise ValueError('cache_step_stride must be at least 1')
+        object.__setattr__(self, 'cache_step_stride', int(self.cache_step_stride))
+        if isinstance(self.start_step, bool) or int(self.start_step) < 0:
+            raise ValueError('start_step must be a non-negative integer')
+        object.__setattr__(self, 'start_step', int(self.start_step))
+        if isinstance(self.selector_seed, bool):
+            raise ValueError('selector_seed must be an integer')
+        object.__setattr__(self, 'selector_seed', int(self.selector_seed))
+        tag = str(self.run_tag)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', tag):
+            raise ValueError(
+                'run_tag must start with a letter or number and contain only '
+                'letters, numbers, dot, underscore, or dash'
+            )
+
+    @property
+    def sample_rows(self):
+        return int(self.sample_blocks) * STAGE0_SAMPLE_ROWS
+
+    @property
+    def signature(self):
+        return (
+            tuple(self.layers),
+            bool(self.measure_cache),
+            int(self.sample_blocks),
+            int(self.cache_step_stride),
+            int(self.start_step),
+            int(self.selector_seed),
+            str(self.run_tag),
+        )

@@ -10,9 +10,11 @@ Two signals are collected per pure-video KV tile:
 ``hit_rate``
     Fraction of ``(head, query tile)`` draws that retained the tile as a KV
     source. It answers "did other target-video tokens want to read here".
-``energy``
+``attention_update_energy``
     Mean ``|gate_msa * attention_output|^2`` over the tile's rows. It answers
-    "did attention change this region".
+    "did attention change this region". This is a property of the tile's own
+    query rows, not of how often other rows read it, so it is deliberately not
+    named to match ``hit_rate``.
 
 Nothing here changes attention or MLP output. Recording is opt-in: with no
 recorder in ``transformer_options`` the router and the block forward take their
@@ -25,7 +27,7 @@ import torch
 
 ROUTE_KEY = 'h3_optimizations_attention_route'
 DEFAULT_KV_TILE = 64
-SIGNALS = ('hit_rate', 'energy')
+SIGNALS = ('hit_rate', 'attention_update_energy')
 
 
 class AttentionRouteError(RuntimeError):
@@ -43,7 +45,10 @@ class BlockRoute:
         self.draws = 0
         self.dense = False
         self.counts = None
-        self.energy = None
+        # Absolute per-KV-tile means over the whole packed sequence; the
+        # accessor below slices them to the video-relative indexing that
+        # hit_rate and every consumer use.
+        self.tile_energy = None
 
     @property
     def has_selection(self):
@@ -62,11 +67,24 @@ class BlockRoute:
             )
         return self.counts.float() / float(self.draws)
 
+    def attention_update_energy(self):
+        '''Per-tile gated attention-residual energy, video-relative.'''
+        if self.tile_energy is None or not self.has_selection:
+            return None
+        start = int(self.video_kv_start)
+        stop = start + int(self.video_kv_tiles)
+        if int(self.tile_energy.shape[0]) < stop:
+            raise AttentionRouteError(
+                'recorded %d KV tiles but the route needs %d'
+                % (int(self.tile_energy.shape[0]), stop)
+            )
+        return self.tile_energy[start:stop]
+
     def signal(self, name):
         if name == 'hit_rate':
             return self.hit_rate()
-        if name == 'energy':
-            return self.energy
+        if name == 'attention_update_energy':
+            return self.attention_update_energy()
         raise AttentionRouteError('unknown attention route signal %r' % name)
 
     def as_dict(self):
@@ -78,7 +96,7 @@ class BlockRoute:
             'draws': int(self.draws),
             'dense': bool(self.dense),
             'has_counts': self.counts is not None,
-            'has_energy': self.energy is not None,
+            'has_attention_update_energy': self.tile_energy is not None,
         }
 
 
@@ -199,7 +217,7 @@ class AttentionRouteRecorder:
             energy[start:stop] = gated.float().pow(2).sum(dim=-1)
             del gate_rows, gated
         route = self._route(layer_index)
-        route.energy = _tile_means(energy, self.kv_tile)
+        route.tile_energy = _tile_means(energy, self.kv_tile)
         return route
 
 

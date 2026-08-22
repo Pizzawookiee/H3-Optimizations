@@ -23,9 +23,11 @@ comfy.options.enable_args_parsing()
 from h3_optimizations.apply import apply_plan  # noqa: E402
 from h3_optimizations.environment import RuntimeEnvironment  # noqa: E402
 from h3_optimizations.nodes import (  # noqa: E402
+    H3AttentionOrderingProbe,
     H3MLPSharing,
     H3MLPSharingProbe,
     H3MLPSharingProbeOutput,
+    H3MLPStage0,
     H3MemoryOptimization,
     H3OptimizationsExtension,
     H3SparseAttention,
@@ -43,6 +45,7 @@ def input_by_id(schema, input_id):
 class NodeTests(unittest.TestCase):
     def test_public_schemas_are_small_and_stable(self):
         memory = H3MemoryOptimization.define_schema()
+        ordering = H3AttentionOrderingProbe.define_schema()
         sharing = H3MLPSharing.define_schema()
         probe = H3MLPSharingProbe.define_schema()
         probe_output = H3MLPSharingProbeOutput.define_schema()
@@ -94,7 +97,9 @@ class NodeTests(unittest.TestCase):
         self.assertFalse(
             input_by_id(sparse, 'denser_early_late_steps').default
         )
-        self.assertEqual(input_by_id(sparse, 'layer_video_budgets').default, '')
+        layer_budgets = input_by_id(sparse, 'layer_video_budgets')
+        self.assertEqual(layer_budgets.default, '')
+        self.assertTrue(layer_budgets.optional)
 
         self.assertEqual(advanced.node_id, 'H3SparseAttentionAdvanced')
         self.assertEqual(
@@ -177,6 +182,24 @@ class NodeTests(unittest.TestCase):
                 'run_tag',
             ],
         )
+        self.assertEqual(ordering.node_id, 'H3AttentionOrderingProbe')
+        self.assertEqual(ordering.category, 'H3-Optimizations/Experiments')
+        self.assertEqual(
+            [item.id for item in ordering.inputs],
+            [
+                'model',
+                'enabled',
+                'layers',
+                'steps',
+                'video_budgets',
+                'query_samples',
+                'head_chunk',
+                'capture_uncond',
+                'run_tag',
+            ],
+        )
+        self.assertEqual(input_by_id(ordering, 'video_budgets').default, '20,30,50')
+        self.assertEqual(input_by_id(ordering, 'query_samples').default, 64)
 
     def test_extension_exposes_production_and_experiment_nodes(self):
         nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
@@ -184,9 +207,11 @@ class NodeTests(unittest.TestCase):
             nodes,
             [
                 H3MemoryOptimization,
+                H3AttentionOrderingProbe,
                 H3MLPSharing,
                 H3MLPSharingProbe,
                 H3MLPSharingProbeOutput,
+                H3MLPStage0,
                 H3SparseAttention,
                 H3SparseAttentionAdvanced,
             ],

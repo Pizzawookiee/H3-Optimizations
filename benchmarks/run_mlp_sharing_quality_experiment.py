@@ -109,6 +109,7 @@ def _build_prompt(workflow, args, arm):
                 'early_kv': 0.5,
                 'late_steps': 0,
                 'late_kv': 0.5,
+                'backend': args.sparse_backend,
             },
         },
         '5': {
@@ -120,6 +121,7 @@ def _build_prompt(workflow, args, arm):
                 'early_kv': 0.5,
                 'late_steps': 0,
                 'late_kv': 0.5,
+                'backend': args.sparse_backend,
             },
         },
         '6': {
@@ -268,6 +270,11 @@ def main(argv=None):
     parser.add_argument('--layers', default='all')
     parser.add_argument('--selector-seed', type=int, default=0)
     parser.add_argument('--video-budget', type=float, default=0.2)
+    parser.add_argument(
+        '--sparse-backend',
+        choices=('auto', 'Sparse Sage', 'INT8 Triton', 'FP8 FlexAttention'),
+        default='auto',
+    )
     parser.add_argument('--video-latent-frames', default='0%,20%,40%,60%,80%,100%')
     parser.add_argument(
         '--vram-guard-mb',

@@ -128,6 +128,28 @@ def _run_mlp(block, h, held, mlp_path, config):
     return out, expanded, path
 
 
+def _run_fc1_swiglu(block, h, held, mlp_path):
+    """Diagnostic-only SwiGLU activation for a small row subset."""
+    if mlp_path == 'convrot':
+        return held.fc1_swiglu(h)
+    if mlp_path == 'fp8':
+        return swiglu_eager(held.fc1_binding.linear(h))
+    if mlp_path == 'held':
+        return swiglu_eager(held.fc1(h))
+    return swiglu_eager(module_fc1(block.mlp, h))
+
+
+def _run_fc2_activation(block, activated, held, mlp_path):
+    """Diagnostic-only fc2 applied to an already-activated SwiGLU vector."""
+    if mlp_path == 'convrot':
+        return held.fc2_activation(activated)
+    if mlp_path == 'fp8':
+        return held.fc2_binding.linear(activated)
+    if mlp_path == 'held':
+        return held.fc2_weight.linear(activated)
+    return block.mlp.fc2(activated)
+
+
 def make_forward(block, layer_index, config, original_forward=None):
     '''Build an unbound replacement for one MiniMax H3 DiT block.'''
 
@@ -269,6 +291,12 @@ def make_forward(block, layer_index, config, original_forward=None):
                         del probe_expanded, _probe_path
                         return probe_out
 
+                    def evaluate_probe_activation(value):
+                        return _run_fc1_swiglu(block, value, held, mlp_path)
+
+                    def apply_probe_fc2(value):
+                        return _run_fc2_activation(block, value, held, mlp_path)
+
                     notify_exact_mlp(
                         layer_index,
                         transformer_options,
@@ -276,10 +304,15 @@ def make_forward(block, layer_index, config, original_forward=None):
                         y=out,
                         residual=x[chunk.start:chunk.stop],
                         gate=gate_mlp,
+                        shift=shift_mlp,
+                        scale=scale_mlp,
                         selector=chunk.mod_row,
                         chunk_start=chunk.start,
                         chunk_stop=chunk.stop,
                         evaluate_mlp=evaluate_probe_mlp,
+                        evaluate_activation=evaluate_probe_activation,
+                        apply_fc2=apply_probe_fc2,
+                        mlp_path=mlp_path,
                     )
                 _gate_add(
                     x[chunk.start:chunk.stop],

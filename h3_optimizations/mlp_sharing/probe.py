@@ -82,7 +82,9 @@ class MLPSharingProbeSession:
         chunk_start,
         chunk_stop,
         evaluate_mlp,
+        **unused,
     ):
+        del unused          # shift/scale and the Stage 0 activation seams
         if int(layer_index) not in self.config.layers:
             return
         snapshot = get_runtime_snapshot(transformer_options)

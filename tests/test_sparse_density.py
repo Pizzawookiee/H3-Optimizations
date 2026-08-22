@@ -417,6 +417,15 @@ def test_static_layer_budgets():
         'normal and projected routing both use the current layer budget',
     )
     try:
+        HybridSparseConfig(
+            denser_early_late_steps=True,
+            layer_video_budgets=budgets,
+        )
+    except ValueError as exc:
+        check('cannot be combined' in str(exc), 'step and layer schedules conflict clearly')
+    else:
+        raise AssertionError('step and layer schedules should conflict')
+    try:
         resolve_video_budget(config, 3, 20)
     except ValueError as exc:
         check('layer_index is required' in str(exc), 'missing layer index fails clearly')

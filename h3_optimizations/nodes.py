@@ -11,7 +11,16 @@ from .mlp_sharing.config import (
     REMOVAL_OPTIONS,
     removal_option,
 )
+from .mlp_sharing.config import Stage0Config
 from .mlp_sharing.probe import install_probe
+from .mlp_sharing.stage0 import install_stage0
+from .ordering_probe import (
+    AttentionOrderingConfig,
+    DEFAULT_BUDGETS as ORDERING_DEFAULT_BUDGETS,
+    DEFAULT_LAYERS as ORDERING_DEFAULT_LAYERS,
+    DEFAULT_STEPS as ORDERING_DEFAULT_STEPS,
+    install_ordering_probe,
+)
 from .plan import (
     DEFAULT_EDGE_KV,
     DEFAULT_EDGE_STEPS,
@@ -220,6 +229,104 @@ class H3MLPSharingProbe(io.ComfyNode):
         )
 
 
+class H3AttentionOrderingProbe(io.ComfyNode):
+    '''Compare post-RoPE target-video traversal orders without changing token order.'''
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3AttentionOrderingProbe',
+            display_name='H3 Attention Ordering Probe',
+            category='H3-Optimizations/Experiments',
+            description=(
+                'Compares native, explicit row-major, time-major, Morton, and '
+                'enclosing-cube Hilbert target-video ordering at identical '
+                'fixed 128Q x 64KV density. Q/K/V are observed after RoPE; '
+                'the model keeps its production token order. Place this node '
+                'after H3 Sparse Attention.'
+            ),
+            inputs=[
+                io.Model.Input('model'),
+                io.Boolean.Input('enabled', default=True),
+                io.String.Input(
+                    'layers',
+                    default=','.join(str(value) for value in ORDERING_DEFAULT_LAYERS),
+                    tooltip='Comma-separated H3 block indices to measure.',
+                ),
+                io.String.Input(
+                    'steps',
+                    default=','.join(str(value) for value in ORDERING_DEFAULT_STEPS),
+                    tooltip='Comma-separated zero-based sampler steps to measure.',
+                ),
+                io.String.Input(
+                    'video_budgets',
+                    default=','.join('%.0f' % (100.0 * value) for value in ORDERING_DEFAULT_BUDGETS),
+                    tooltip='Target-video KV percentages compared at identical tile density.',
+                ),
+                io.Int.Input(
+                    'query_samples',
+                    default=64,
+                    min=1,
+                    max=1024,
+                    tooltip='Same native target-video query tokens sampled for every ordering.',
+                ),
+                io.Int.Input(
+                    'head_chunk',
+                    default=2,
+                    min=1,
+                    max=56,
+                    advanced=True,
+                    tooltip='Attention heads analyzed together. Lower values reduce probe VRAM.',
+                ),
+                io.Boolean.Input(
+                    'capture_uncond',
+                    default=False,
+                    advanced=True,
+                    tooltip='Also measure the negative/unconditional branch.',
+                ),
+                io.String.Input('run_tag', default='attention-ordering'),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        enabled=True,
+        layers=','.join(str(value) for value in ORDERING_DEFAULT_LAYERS),
+        steps=','.join(str(value) for value in ORDERING_DEFAULT_STEPS),
+        video_budgets=','.join('%.0f' % (100.0 * value) for value in ORDERING_DEFAULT_BUDGETS),
+        query_samples=64,
+        head_chunk=2,
+        capture_uncond=False,
+        run_tag='attention-ordering',
+    ):
+        if not enabled:
+            return io.NodeOutput(model)
+        config = AttentionOrderingConfig(
+            layers=layers,
+            steps=steps,
+            budgets=video_budgets,
+            query_samples=int(query_samples),
+            head_chunk=int(head_chunk),
+            capture_uncond=bool(capture_uncond),
+            run_tag=str(run_tag),
+        )
+        patched = model.clone()
+        install_ordering_probe(patched, config)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(
+                'Post-RoPE ordering probe armed for layers %s, steps %s'
+                % (
+                    ','.join(str(value) for value in config.layers),
+                    ','.join(str(value) for value in config.steps),
+                )
+            ),
+        )
+
+
 class H3MLPSharing(io.ComfyNode):
     '''Executable target-video MLP output sharing for quality experiments.'''
 
@@ -393,6 +500,7 @@ class H3SparseAttention(io.ComfyNode):
                     'layer_video_budgets',
                     display_name='Per-layer video KV budgets',
                     default='',
+                    optional=True,
                     advanced=True,
                     tooltip=(
                         'Optional comma-separated budget fractions for all 50 H3 '
@@ -535,13 +643,127 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         )
 
 
+class H3MLPStage0(io.ComfyNode):
+    '''Dense-MLP diagnostic for attention selection and cache reuse.'''
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3MLPStage0',
+            display_name='H3 MLP Stage 0 Probe',
+            category='H3-Optimizations/Experiments',
+            description=(
+                'Runs the exact chunked H3 MLP and measures whether attention '
+                'signals identify disposable MLP work, how concentrated the '
+                'cross-step SwiGLU delta is, and whether an FP8 cache survives '
+                'it. Inference output is unchanged. Place it after H3 Memory '
+                'Optimization and keep H3 Sparse Attention enabled so the '
+                'attention route exists.'
+            ),
+            inputs=[
+                io.Model.Input('model'),
+                io.Boolean.Input('enabled', default=True),
+                io.String.Input(
+                    'layers',
+                    default=DEFAULT_LAYER_TEXT,
+                    tooltip='Comma-separated H3 block indices to measure.',
+                ),
+                io.Boolean.Input(
+                    'measure_cache',
+                    default=True,
+                    tooltip=(
+                        'Also measure cross-step SwiGLU delta structure, the '
+                        'AdaLN share of it, and FP8 cache error on a small '
+                        'fixed sample of target-video blocks.'
+                    ),
+                ),
+                io.Int.Input(
+                    'sample_blocks',
+                    default=4,
+                    min=1,
+                    max=64,
+                    tooltip=(
+                        'Number of 128-row target-video blocks held across '
+                        'steps for the cache measurements.'
+                    ),
+                ),
+                io.Int.Input(
+                    'start_step',
+                    default=1,
+                    min=0,
+                    max=1000,
+                    advanced=True,
+                    tooltip='First sampler step that carries cache state.',
+                ),
+                io.Int.Input(
+                    'cache_step_stride',
+                    default=1,
+                    min=1,
+                    max=64,
+                    advanced=True,
+                    tooltip='Refresh the held sample every N sampler steps.',
+                ),
+                io.Int.Input(
+                    'selector_seed',
+                    default=0,
+                    min=0,
+                    max=2**31 - 1,
+                    advanced=True,
+                ),
+                io.String.Input('run_tag', default='mlp-stage0'),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        enabled=True,
+        layers=DEFAULT_LAYER_TEXT,
+        measure_cache=True,
+        sample_blocks=4,
+        start_step=1,
+        cache_step_stride=1,
+        selector_seed=0,
+        run_tag='mlp-stage0',
+    ):
+        if not enabled:
+            return io.NodeOutput(model)
+        config = Stage0Config(
+            layers=layers,
+            measure_cache=bool(measure_cache),
+            sample_blocks=int(sample_blocks),
+            start_step=int(start_step),
+            cache_step_stride=int(cache_step_stride),
+            selector_seed=int(selector_seed),
+            run_tag=str(run_tag),
+        )
+        patched = model.clone()
+        install_stage0(patched, config)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(
+                'Stage 0 armed for layers %s; cache measurement %s'
+                % (
+                    ','.join(str(layer) for layer in config.layers),
+                    'on (%d rows)' % config.sample_rows
+                    if config.measure_cache
+                    else 'off',
+                )
+            ),
+        )
+
+
 class H3OptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             H3MemoryOptimization,
+            H3AttentionOrderingProbe,
             H3MLPSharing,
             H3MLPSharingProbe,
             H3MLPSharingProbeOutput,
+            H3MLPStage0,
             H3SparseAttention,
             H3SparseAttentionAdvanced,
         ]
