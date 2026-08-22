@@ -1,4 +1,4 @@
-'''Resolve and apply the complete two-node H3 optimization plan.'''
+'''Resolve and apply the complete H3 optimization plan.'''
 
 from __future__ import annotations
 
@@ -114,6 +114,20 @@ def _fp8_execution_available(environment):
         return False
 
 
+def _sparse_config_kwargs(plan):
+    sparse = plan.sparse
+    return {
+        'video_budget': float(sparse.video_budget),
+        'density_mode': DENSITY_FIXED,
+        'denser_early_late_steps': bool(sparse.denser_early_late_steps),
+        'early_steps': sparse.early_steps,
+        'early_kv': sparse.early_kv,
+        'late_steps': sparse.late_steps,
+        'late_kv': sparse.late_kv,
+        'strict': True,
+    }
+
+
 def _resolve_dense(plan, model, inventory, environment=None):
     memory = plan.memory
     dense = (
@@ -175,10 +189,7 @@ def _resolve_sparse(plan, environment, inventory):
     )
     config = HybridSparseConfig(
         mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
-        video_budget=float(plan.sparse.video_budget),
-        density_mode=DENSITY_FIXED,
-        denser_early_late_steps=bool(plan.sparse.denser_early_late_steps),
-        strict=True,
+        **_sparse_config_kwargs(plan),
     )
     projector = None
     if qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
@@ -226,10 +237,7 @@ def _resolve_fp8_flex(
     )
     config = HybridSparseConfig(
         mode=MODE_SAGE128,
-        video_budget=float(plan.sparse.video_budget),
-        density_mode=DENSITY_FIXED,
-        denser_early_late_steps=bool(plan.sparse.denser_early_late_steps),
-        strict=True,
+        **_sparse_config_kwargs(plan),
     )
     backend = FP8FlexBackend(config, spec=spec)
     return (
@@ -258,10 +266,7 @@ def _resolve_triton_sparse(plan, environment, inventory, sparse_error):
     )
     config = HybridSparseConfig(
         mode=MODE_SAGE128,
-        video_budget=float(plan.sparse.video_budget),
-        density_mode=DENSITY_FIXED,
-        denser_early_late_steps=bool(plan.sparse.denser_early_late_steps),
-        strict=True,
+        **_sparse_config_kwargs(plan),
     )
     projector = None
     if qkv.provider_id == QKV_TRITON_SPARSE_CHUNKED:
@@ -423,6 +428,10 @@ def _status(
                 'denser_early_late_steps': bool(
                     plan.sparse.denser_early_late_steps
                 ),
+                'early_steps': plan.sparse.early_steps,
+                'early_kv': plan.sparse.early_kv,
+                'late_steps': plan.sparse.late_steps,
+                'late_kv': plan.sparse.late_kv,
             }
         ),
         'fused_qkv': {

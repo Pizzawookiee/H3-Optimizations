@@ -22,6 +22,32 @@ MAX_CHUNK_ROWS = 65_536
 CHUNK_ALIGNMENT = 256
 DENSITY_FIXED = 'fixed'
 DEFAULT_VIDEO_BUDGET = 0.3
+DEFAULT_EDGE_STEPS = 2
+DEFAULT_EDGE_KV = 0.5
+
+
+def _validate_sparse_budget(name, value):
+    budget = float(value)
+    if not math.isfinite(budget) or not 0.01 <= budget <= 1.0:
+        raise ValueError('%s must be finite and in [0.01, 1]' % name)
+
+
+def _validate_edge_schedule(early_steps, early_kv, late_steps, late_kv):
+    values = (early_steps, early_kv, late_steps, late_kv)
+    if not any(value is not None for value in values):
+        return
+    if not all(value is not None for value in values):
+        raise ValueError(
+            'early_steps, early_kv, late_steps, and late_kv must be set together'
+        )
+    for name, value in (
+        ('early_steps', early_steps),
+        ('late_steps', late_steps),
+    ):
+        if isinstance(value, bool) or int(value) != value or int(value) < 0:
+            raise ValueError('%s must be a non-negative integer' % name)
+    _validate_sparse_budget('early_kv', early_kv)
+    _validate_sparse_budget('late_kv', late_kv)
 
 
 @dataclass(frozen=True)
@@ -59,15 +85,32 @@ class MemoryRequest:
 
 @dataclass(frozen=True)
 class SparseRequest:
-    '''Fixed-density Sparse Sage attention request.'''
+    '''Fixed-density sparse attention request.'''
 
     video_budget: float = DEFAULT_VIDEO_BUDGET
     denser_early_late_steps: bool = False
+    early_steps: int | None = None
+    early_kv: float | None = None
+    late_steps: int | None = None
+    late_kv: float | None = None
 
     def __post_init__(self):
-        budget = float(self.video_budget)
-        if not math.isfinite(budget) or not 0.01 <= budget <= 1.0:
-            raise ValueError('video_budget must be finite and in [0.01, 1]')
+        _validate_sparse_budget('video_budget', self.video_budget)
+        _validate_edge_schedule(
+            self.early_steps,
+            self.early_kv,
+            self.late_steps,
+            self.late_kv,
+        )
+        if self.advanced_schedule and self.denser_early_late_steps:
+            raise ValueError(
+                'explicit early/late budgets cannot be combined with the '
+                'legacy denser early/late toggle'
+            )
+
+    @property
+    def advanced_schedule(self):
+        return self.early_steps is not None
 
     @property
     def signature(self):
@@ -75,6 +118,10 @@ class SparseRequest:
             float(self.video_budget),
             DENSITY_FIXED,
             bool(self.denser_early_late_steps),
+            None if self.early_steps is None else int(self.early_steps),
+            None if self.early_kv is None else float(self.early_kv),
+            None if self.late_steps is None else int(self.late_steps),
+            None if self.late_kv is None else float(self.late_kv),
         )
 
 

@@ -26,6 +26,7 @@ from h3_optimizations.nodes import (  # noqa: E402
     H3MemoryOptimization,
     H3OptimizationsExtension,
     H3SparseAttention,
+    H3SparseAttentionAdvanced,
 )
 from h3_optimizations.plan import H3OptimizationPlan  # noqa: E402
 
@@ -40,6 +41,7 @@ class NodeTests(unittest.TestCase):
     def test_public_schemas_are_small_and_stable(self):
         memory = H3MemoryOptimization.define_schema()
         sparse = H3SparseAttention.define_schema()
+        advanced = H3SparseAttentionAdvanced.define_schema()
         self.assertEqual(memory.node_id, 'H3MemoryOptimization')
         self.assertEqual(memory.display_name, 'H3 Memory Optimization')
         self.assertEqual(
@@ -59,10 +61,9 @@ class NodeTests(unittest.TestCase):
             input_by_id(memory, 'fused_qkv').options,
             ['auto', 'off'],
         )
-        self.assertIn(
-            'chunked Comfy Kitchen QKV',
-            input_by_id(memory, 'fused_qkv').tooltip,
-        )
+        fused_qkv_tooltip = input_by_id(memory, 'fused_qkv').tooltip
+        self.assertIn('chunked QKV projection providers', fused_qkv_tooltip)
+        self.assertIn('BF16/FP16', fused_qkv_tooltip)
         self.assertEqual(
             input_by_id(memory, 'mlp_memory').options,
             ['auto', 'off'],
@@ -86,12 +87,46 @@ class NodeTests(unittest.TestCase):
         self.assertFalse(
             input_by_id(sparse, 'denser_early_late_steps').default
         )
+
+        self.assertEqual(advanced.node_id, 'H3SparseAttentionAdvanced')
+        self.assertEqual(
+            advanced.display_name,
+            'H3 Sparse Attention (Advanced)',
+        )
+        self.assertEqual(
+            advanced.category,
+            'H3-Optimizations/Model Patches',
+        )
+        self.assertEqual(
+            [item.id for item in advanced.inputs],
+            [
+                'model',
+                'video_budget',
+                'early_steps',
+                'early_kv',
+                'late_steps',
+                'late_kv',
+            ],
+        )
+        self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.3)
+        self.assertEqual(input_by_id(advanced, 'early_steps').default, 2)
+        self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)
+        self.assertEqual(input_by_id(advanced, 'late_steps').default, 2)
+        self.assertEqual(input_by_id(advanced, 'late_kv').default, 0.5)
         self.assertNotIn('Experimental', memory.display_name)
         self.assertNotIn('Experimental', sparse.display_name)
+        self.assertNotIn('Experimental', advanced.display_name)
 
-    def test_extension_exposes_only_the_two_production_nodes(self):
+    def test_extension_exposes_three_production_nodes(self):
         nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
-        self.assertEqual(nodes, [H3MemoryOptimization, H3SparseAttention])
+        self.assertEqual(
+            nodes,
+            [
+                H3MemoryOptimization,
+                H3SparseAttention,
+                H3SparseAttentionAdvanced,
+            ],
+        )
 
     def test_non_h3_models_do_not_probe_the_runtime(self):
         class OtherModel:

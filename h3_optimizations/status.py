@@ -70,10 +70,10 @@ def format_sparse_status(model):
     mlp = status.get('mlp', {})
     sparse = status.get('sparse') or {}
     attention = status.get('attention', {})
+    plan_sparse = getattr(_plan(model), 'sparse', None)
     budget = sparse.get('video_budget')
     if budget is None:
-        plan = _plan(model)
-        budget = getattr(getattr(plan, 'sparse', None), 'video_budget', 0.0)
+        budget = getattr(plan_sparse, 'video_budget', 0.0)
 
     selected = attention.get('selected') or 'normal Comfy attention'
     reason = str(attention.get('reason') or '').strip()
@@ -102,12 +102,52 @@ def format_sparse_status(model):
         'chunked_fp8_sparse_sage',
         'chunked_triton_int8_sparse',
     ):
-        lines[2] += ' (%d-row chunks)' % int(qkv.get('chunk_rows') or 4096)
-    if sparse.get('denser_early_late_steps'):
+        qkv_index = next(
+            index for index, line in enumerate(lines) if line.startswith('QKV:')
+        )
+        lines[qkv_index] += ' (%d-row chunks)' % int(
+            qkv.get('chunk_rows') or 4096
+        )
+
+    early_steps = sparse.get('early_steps')
+    if early_steps is None:
+        early_steps = getattr(plan_sparse, 'early_steps', None)
+    if early_steps is not None:
+        early_kv = sparse.get('early_kv')
+        late_steps = sparse.get('late_steps')
+        late_kv = sparse.get('late_kv')
+        if early_kv is None:
+            early_kv = getattr(plan_sparse, 'early_kv', budget)
+        if late_steps is None:
+            late_steps = getattr(plan_sparse, 'late_steps', 0)
+        if late_kv is None:
+            late_kv = getattr(plan_sparse, 'late_kv', budget)
+        schedule_line = (
+            'Early: first %d steps at %.1f%% KV; Late: last %d steps at %.1f%% KV.'
+            % (
+                int(early_steps),
+                float(early_kv) * 100.0,
+                int(late_steps),
+                float(late_kv) * 100.0,
+            )
+        )
+        budget_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith('Requested video KV budget:')
+        )
+        lines.insert(budget_index + 1, schedule_line)
+    elif sparse.get('denser_early_late_steps'):
+        budget_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith('Requested video KV budget:')
+        )
         lines.insert(
-            2,
+            budget_index + 1,
             'First 2 and last 2 steps add 30 percentage points, capped at 100%.',
         )
+
     if mlp.get('provider') not in (None, 'off'):
         lines.append(
             'MLP: %s'
