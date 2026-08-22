@@ -13,6 +13,8 @@ from .plan import (
     MIN_CHUNK_ROWS,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_OFF,
+    SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_REQUESTS,
     MemoryRequest,
     SparseRequest,
     read_plan,
@@ -199,7 +201,7 @@ class H3SparseAttention(io.ComfyNode):
 
 
 class H3SparseAttentionAdvanced(io.ComfyNode):
-    '''Sparse attention with explicit early, middle, and late KV budgets.'''
+    '''Sparse attention with explicit backend and edge KV budgets.'''
 
     @classmethod
     def define_schema(cls):
@@ -211,14 +213,15 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 'Advanced fixed-density sparse attention for MiniMax H3. '
                 'Video KV budget controls middle sampling steps; Early KV and '
                 'Late KV override the first and last configured step counts. '
-                'It uses the same checkpoint-format selection and sparse '
-                'fallback backends as H3 Sparse Attention.'
+                'Backend auto uses the normal fallback chain; explicit backend '
+                'selections are hard requirements.'
             ),
             search_aliases=[
                 'H3 sparse advanced',
                 'H3 sparse schedule',
                 'Sparse Sage advanced',
                 'H3 early late KV',
+                'H3 sparse backend',
             ],
             inputs=[
                 io.Model.Input('model'),
@@ -259,6 +262,19 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     step=0.01,
                     tooltip='Video KV budget used during the late-step window.',
                 ),
+                io.Combo.Input(
+                    'backend',
+                    display_name='Sparse backend',
+                    options=list(SPARSE_BACKEND_REQUESTS),
+                    default=SPARSE_BACKEND_AUTO,
+                    tooltip=(
+                        'auto uses Sparse Sage, then INT8 Triton, then FP8 '
+                        'FlexAttention, then the resolved dense fallback. '
+                        'Explicit backend choices fail if that backend is '
+                        'unavailable and do not switch to another backend. '
+                        'Bypass this node to force dense attention.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -272,6 +288,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         early_kv=DEFAULT_EDGE_KV,
         late_steps=DEFAULT_EDGE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
+        backend=SPARSE_BACKEND_AUTO,
     ):
         plan = read_plan(model).with_sparse(
             SparseRequest(
@@ -280,6 +297,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 early_kv=float(early_kv),
                 late_steps=int(late_steps),
                 late_kv=float(late_kv),
+                backend=backend,
             )
         )
         patched = apply_plan(model, plan)

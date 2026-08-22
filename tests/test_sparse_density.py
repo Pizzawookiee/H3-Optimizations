@@ -163,6 +163,7 @@ def test_node_schema_and_request():
     check(
         result.args[0] is patched
         and request.video_budget == 0.5
+        and request.backend == 'auto'
         and request.denser_early_late_steps is True
         and request.advanced_schedule is False,
         'standard node carries the legacy denser-step policy',
@@ -181,8 +182,16 @@ def test_advanced_node_schema_and_request():
             'early_kv',
             'late_steps',
             'late_kv',
+            'backend',
         ],
-        'advanced schema exposes explicit early and late controls',
+        'advanced schema preserves existing controls and appends backend selection',
+    )
+    backend = input_by_id(schema, 'backend')
+    check(
+        backend.default == 'auto'
+        and backend.options
+        == ['auto', 'Sparse Sage', 'INT8 Triton', 'FP8 FlexAttention'],
+        'advanced backend selector exposes the supported sparse backends',
     )
     check(
         input_by_id(schema, 'early_steps').default == 2
@@ -205,17 +214,19 @@ def test_advanced_node_schema_and_request():
             early_kv=0.6,
             late_steps=4,
             late_kv=0.7,
+            backend='INT8 Triton',
         )
     request = apply.call_args.args[1].sparse
     check(
         result.args[0] is patched
+        and request.backend == 'INT8 Triton'
         and request.video_budget == 0.3
         and request.early_steps == 3
         and request.early_kv == 0.6
         and request.late_steps == 4
         and request.late_kv == 0.7
         and request.denser_early_late_steps is False,
-        'advanced node carries the complete explicit schedule',
+        'advanced node carries the backend and complete explicit schedule',
     )
 
 

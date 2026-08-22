@@ -106,8 +106,28 @@ class NodeTests(unittest.TestCase):
                 'early_kv',
                 'late_steps',
                 'late_kv',
+                'backend',
             ],
         )
+        self.assertEqual(
+            [item.id for item in advanced.inputs[:6]],
+            [
+                'model',
+                'video_budget',
+                'early_steps',
+                'early_kv',
+                'late_steps',
+                'late_kv',
+            ],
+        )
+        backend = input_by_id(advanced, 'backend')
+        self.assertEqual(backend.default, 'auto')
+        self.assertEqual(
+            backend.options,
+            ['auto', 'Sparse Sage', 'INT8 Triton', 'FP8 FlexAttention'],
+        )
+        self.assertIn('hard requirements', advanced.description)
+        self.assertIn('Bypass this node', backend.tooltip)
         self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.3)
         self.assertEqual(input_by_id(advanced, 'early_steps').default, 2)
         self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)

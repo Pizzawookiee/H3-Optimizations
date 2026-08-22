@@ -1,6 +1,6 @@
 '''Compact UI summaries for resolved H3 optimization plans.'''
 
-from .plan import PLAN_KEY, STATUS_KEY
+from .plan import PLAN_KEY, SPARSE_BACKEND_AUTO, STATUS_KEY
 
 
 def _model_options(model):
@@ -23,6 +23,15 @@ def _provider_text(section, fallback_label):
     provider = section.get('provider') or fallback_label
     reason = str(section.get('reason') or '').strip()
     return provider if not reason else '%s - %s' % (provider, reason)
+
+
+def _mark_runtime_fallback(qkv, line):
+    if qkv.get('provider') in (
+        'chunked_fp8_kitchen_qkv',
+        'chunked_fp8_sparse_sage',
+    ):
+        return line + ' [selected; runtime FP8 binding may fall back to standard QKV]'
+    return line
 
 
 def format_memory_status(model):
@@ -51,6 +60,7 @@ def format_memory_status(model):
             int(qkv.get('chunk_rows') or 4096),
             qkv.get('producer_abi') or 'producer ABI unavailable',
         )
+    lines[2] = _mark_runtime_fallback(qkv, lines[2])
     chunk_rows = mlp.get('chunk_rows')
     if chunk_rows is not None and mlp.get('provider') not in (
         None,
@@ -74,6 +84,9 @@ def format_sparse_status(model):
     budget = sparse.get('video_budget')
     if budget is None:
         budget = getattr(plan_sparse, 'video_budget', 0.0)
+    backend_request = sparse.get('backend')
+    if backend_request is None:
+        backend_request = getattr(plan_sparse, 'backend', SPARSE_BACKEND_AUTO)
 
     selected = attention.get('selected') or 'normal Comfy attention'
     reason = str(attention.get('reason') or '').strip()
@@ -95,7 +108,9 @@ def format_sparse_status(model):
             'non-video context and mixed boundary tiles remain dense.'
         ),
     ]
-    if selected != 'sparse_sage' and reason:
+    if backend_request != SPARSE_BACKEND_AUTO:
+        lines.insert(1, 'Requested sparse backend: %s' % backend_request)
+    elif selected != 'sparse_sage' and reason:
         lines.insert(1, 'Sparse fallback: %s' % reason)
     if qkv.get('provider') in (
         'convrot_int8_sparse_sage',
@@ -108,6 +123,7 @@ def format_sparse_status(model):
         lines[qkv_index] += ' (%d-row chunks)' % int(
             qkv.get('chunk_rows') or 4096
         )
+        lines[qkv_index] = _mark_runtime_fallback(qkv, lines[qkv_index])
 
     early_steps = sparse.get('early_steps')
     if early_steps is None:

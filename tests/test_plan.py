@@ -11,6 +11,8 @@ sys.path.insert(0, str(PACK))
 from h3_optimizations.plan import (  # noqa: E402
     H3OptimizationPlan,
     MemoryRequest,
+    SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_TRITON,
     SparseRequest,
 )
 
@@ -22,17 +24,33 @@ class PlanTests(unittest.TestCase):
     def test_sparse_request_defaults_to_thirty_percent_video_budget(self):
         request = SparseRequest()
         self.assertEqual(request.video_budget, 0.3)
+        self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
         self.assertFalse(request.advanced_schedule)
+
+    def test_legacy_sparse_request_positional_shape_is_preserved(self):
+        request = SparseRequest(0.3, False, 2, 0.5, 2, 0.5)
+        self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
+        self.assertEqual(
+            (
+                request.early_steps,
+                request.early_kv,
+                request.late_steps,
+                request.late_kv,
+            ),
+            (2, 0.5, 2, 0.5),
+        )
 
     def test_explicit_sparse_schedule_is_part_of_request_identity(self):
         request = SparseRequest(
             video_budget=0.3,
+            backend=SPARSE_BACKEND_TRITON,
             early_steps=2,
             early_kv=0.5,
             late_steps=2,
             late_kv=0.5,
         )
         self.assertTrue(request.advanced_schedule)
+        self.assertIn(SPARSE_BACKEND_TRITON, request.signature)
         self.assertEqual(request.signature[-4:], (2, 0.5, 2, 0.5))
 
     def test_node_order_does_not_change_the_plan(self):
@@ -67,6 +85,8 @@ class PlanTests(unittest.TestCase):
         for budget in (0.0, 1.01, math.inf, math.nan):
             with self.assertRaises(ValueError):
                 SparseRequest(video_budget=budget)
+        with self.assertRaisesRegex(ValueError, 'unknown sparse backend'):
+            SparseRequest(backend='dense')
 
         SparseRequest(
             early_steps=0,

@@ -8,20 +8,26 @@ does not import or depend on ComfyUI-H3-Extended.
 
 ## Nodes
 
-- H3 Memory Optimization selects Comfy Kitchen dense INT8 attention and, when
-  Kitchen exposes a compatible producer contract, projects ConvRot INT8 QKV in
-  4K token chunks directly into Kitchen-owned carriers. It also bounds MLP
-  activation memory with token chunking.
+- H3 Memory Optimization selects the resolved dense H3 attention path and
+  applies compatible memory/execution providers. ConvRot INT8 QKV can project
+  in 4K token chunks directly into Comfy Kitchen carriers. Native FP8 uses held
+  chunked FP8 execution, and ordinary BF16/FP16 QKV/MLP weights may be converted
+  to FP8 E4M3 when accelerated FP8 is available. NVFP4 and unsupported
+  quantized formats preserve upstream Comfy execution.
 - H3 Sparse Attention enables fixed-density Sparse Sage attention while
   keeping text, reference conditioning, audio, non-video queries, and mixed
   boundary tiles dense. Its default video KV budget is 30 percent. The optional
   legacy early/late policy adds 30 percentage points to the first two and last
   two sampler steps, capped at 100 percent.
 - H3 Sparse Attention (Advanced) exposes explicit early and late density
-  windows. Video KV budget controls the middle steps; Early steps/Early KV and
-  Late steps/Late KV independently control the edges. The defaults are two
-  early steps at 50 percent KV and two late steps at 50 percent KV. If the two
-  windows overlap, the denser of the two requested edge budgets is used.
+  windows plus a sparse-backend selector. Video KV budget controls the middle
+  steps; Early steps/Early KV and Late steps/Late KV independently control the
+  edges. The defaults are two early steps at 50 percent KV and two late steps at
+  50 percent KV. If the two windows overlap, the denser of the two requested
+  edge budgets is used. Backend `auto` keeps the normal Sparse Sage -> INT8
+  Triton -> FP8 FlexAttention -> dense fallback chain. Explicit Sparse Sage,
+  INT8 Triton, or FP8 FlexAttention selections are hard requirements and error
+  if unavailable; bypass the node to force dense attention.
 
 All three nodes are grouped under H3-Optimizations > Model Patches.
 
@@ -71,18 +77,24 @@ with Torch 2.9 or newer. The Linux build requires Torch 2.3 or newer and CUDA
 
 ROCm, MPS, XPU, CPU, future GPU architectures, NVIDIA installations without a
 matching wheel/build toolchain, and failed Sparse Sage builds are left
-untouched. The nodes still load and H3 Sparse Attention uses FP8 FlexAttention
-when the active NVIDIA GPU supports it, then the resolved dense H3 attention
-path otherwise. A manual `spas_sage_attn` build is needed only to obtain Sparse
-Sage acceleration on an otherwise unsupported NVIDIA combination; it is not
-required to run workflows containing these nodes.
+untouched. The nodes still load. In backend `auto`, H3 Sparse Attention tries
+INT8 Triton when Sparse Sage cannot run, then FP8 FlexAttention when supported,
+then the resolved dense H3 attention path. A manual `spas_sage_attn` build is
+needed only to obtain Sparse Sage acceleration on an otherwise unsupported
+NVIDIA combination; it is not required to run workflows containing these
+nodes.
 
-Dense execution uses ComfyUI's public `comfy_kitchen_int8` attention backend.
-Chunked dense QKV additionally requires a Comfy Kitchen release exposing its
-external INT8-attention producer contract and ConvRot-256 TensorWise INT8 QKV
-weights. Sparse Attention requires a compatible spas_sage_attn build; its
-native-carrier 4K chunked QKV and the ConvRot MLP path additionally require
-Triton.
+Dense execution uses ComfyUI's public `comfy_kitchen_int8` attention backend
+when that backend is selected. Chunked dense QKV additionally requires a Comfy
+Kitchen release exposing its external INT8-attention producer contract.
+Compatible ConvRot-256 TensorWise INT8 QKV uses the specialized INT8 producer;
+checkpoint-native FP8 and ordinary BF16/FP16 QKV can use held FP8 projection
+when Comfy reports accelerated FP8 support. Unsupported quantized QKV formats
+remain on native Comfy projection. Sparse Attention requires a compatible
+spas_sage_attn build for Sparse Sage; its specialized chunked projected-QKV
+paths and the ConvRot MLP path additionally depend on their validated runtime
+contracts.
+
 Missing dense capabilities return to upstream H3 QKV and normal Comfy
 attention. Missing Sparse Sage dependency, device, architecture, or compiled
 ABI capabilities select the package INT8 Triton sparse backend on NVIDIA
@@ -94,9 +106,13 @@ Q/K scale before softmax, converts the FP8 output back to the original floating
 dtype, and consumes the same route. Hopper and Blackwell request the FA4
 backend when its CuTe package is installed; other supported runtimes use the
 Triton Flex kernel. If neither sparse fallback is available, the resolved dense
-H3 path remains the final fallback. Errors raised after a validated sparse
-backend begins execution remain hard errors instead of silently changing
-attention behavior mid-run.
+H3 path remains the final fallback. Explicit backend selections in the Advanced
+node do not traverse this chain.
+
+The node status reports the provider selected at plan time. Held FP8 QKV
+projection can still decline at runtime if the effective patched weight cannot
+satisfy its binding contract; in that case QKV returns to standard projection
+without changing the already selected attention backend.
 
 spas_sage_attn is not a normal package dependency because its compiled backend
 must match Torch, CUDA, and the GPU architecture. The guarded pre-startup
@@ -121,7 +137,8 @@ accepts the exact ABI exported by a compatible spas_sage_attn build. Its
 chunked QKV producer is selected only when the active kernel's Q/K tiles, scale
 layouts, V carrier, accumulator, summaries, and callables all match. A
 mismatched QKV format uses standard sparse QKV. An unvalidated Sparse Sage
-architecture uses dense H3 attention.
+architecture uses the next backend only in `auto`; an explicit Sparse Sage
+request errors instead.
 
 Node IDs are H3MemoryOptimization, H3SparseAttention, and
 H3SparseAttentionAdvanced. H3-Extended is not required.
@@ -129,13 +146,14 @@ H3SparseAttentionAdvanced. H3-Extended is not required.
 ## Validation
 
 CPU tests cover node schemas, plan composition, backend classification, dense
-and Sparse Sage capability fallback, stale-install repair selection, chunk
-boundaries and RoPE slices, non-H3 no-op behavior, sparse contract and route
-geometry, runtime step/layout publication, explicit early/middle/late density
-schedules, and source isolation. GPU kernel validation is intentionally
-separate because it requires the matching hardware and compiled backend
-packages. FP8 Flex CPU contracts cover all-FP8 carrier layouts, explicit
-Triton/FA4 selection, and first-call dense fallback.
+and Sparse Sage capability fallback, explicit sparse-backend selection,
+stale-install repair selection, chunk boundaries and RoPE slices, non-H3 no-op
+behavior, sparse contract and route geometry, runtime step/layout publication,
+explicit early/middle/late density schedules, and source isolation. GPU kernel
+validation is intentionally separate because it requires the matching hardware
+and compiled backend packages. FP8 Flex CPU contracts cover all-FP8 carrier
+layouts, explicit Triton/FA4 selection, and first-call dense fallback in
+backend `auto`.
 
 Run the CPU suite from the ComfyUI root:
 
