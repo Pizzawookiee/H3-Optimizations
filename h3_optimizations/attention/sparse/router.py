@@ -283,6 +283,35 @@ class SparseTileRouter:
         *,
         sink=None,
     ):
+        route_plan, metadata = self.prepare_lut_chunks_from_summaries(
+            q_summary,
+            k_summary,
+            layout,
+            video_budget,
+            sink=sink,
+        )
+        geometry = route_plan[2]
+        pieces = list(
+            self.iter_lut_chunks(
+                route_plan,
+                q_chunk_tiles=geometry.q_tiles,
+            )
+        )
+        if len(pieces) != 1:
+            raise SparseRouterError('full LUT route unexpectedly split')
+        _, _, lut, valid = pieces[0]
+        return lut, valid, metadata
+
+    def prepare_lut_chunks_from_summaries(
+        self,
+        q_summary,
+        k_summary,
+        layout,
+        video_budget,
+        *,
+        sink=None,
+    ):
+        """Validate summaries and return a zero-copy streamed routing plan."""
         if q_summary.ndim != 4 or k_summary.ndim != 4:
             raise SparseRouterError(
                 'tile router summaries must be rank-4 HND tensors'
@@ -310,13 +339,116 @@ class SparseTileRouter:
                 'K router summary shape %s does not match %s'
                 % (tuple(k_summary.shape[-2:]), expected_k)
             )
-        return self._build_lut_from_summaries(
+        retained = self._retained(video_budget, geometry)
+        metadata = self._metadata(geometry, video_budget, retained)
+        return [
             q_summary,
             k_summary,
             geometry,
-            video_budget,
-            sink=sink,
+            retained,
+            metadata,
+            sink,
+        ], metadata
+
+    def iter_lut_chunks(self, route_plan, *, q_chunk_tiles):
+        """Yield contiguous Sparge LUT/valid tensors one Q chunk at a time."""
+        (
+            q_summary,
+            k_summary,
+            geometry,
+            retained,
+            metadata,
+            sink,
+        ) = route_plan
+        del metadata
+        q_chunk_tiles = int(q_chunk_tiles)
+        if q_chunk_tiles <= 0:
+            raise SparseRouterError('q_chunk_tiles must be positive')
+
+        batch, heads = q_summary.shape[:2]
+        dense = torch.arange(
+            geometry.kv_tiles,
+            device=q_summary.device,
+            dtype=torch.int32,
         )
+        dense_delta = torch.cat((dense[:1], dense[1:] - dense[:-1]))
+        sparse_k = k_summary[..., geometry.pure_video_kv_start:, :]
+        k_t = sparse_k.transpose(-1, -2)
+        selected_for_sink = [] if sink is not None else None
+        completed = False
+
+        try:
+            for tile_start in range(0, geometry.q_tiles, q_chunk_tiles):
+                tile_end = min(tile_start + q_chunk_tiles, geometry.q_tiles)
+                tile_count = tile_end - tile_start
+                lut = dense_delta.view(1, 1, 1, -1).expand(
+                    batch,
+                    heads,
+                    tile_count,
+                    -1,
+                ).clone()
+                valid = torch.full(
+                    (batch, heads, tile_count),
+                    geometry.kv_tiles,
+                    dtype=torch.int32,
+                    device=q_summary.device,
+                )
+
+                if retained < geometry.pure_video_kv_tiles:
+                    sparse_start = max(
+                        tile_start,
+                        geometry.pure_video_q_start,
+                    )
+                    if sparse_start < tile_end:
+                        local_start = sparse_start - tile_start
+                        scores = torch.matmul(
+                            q_summary[..., sparse_start:tile_end, :],
+                            k_t,
+                        )
+                        indices = torch.topk(
+                            scores,
+                            retained,
+                            dim=-1,
+                        ).indices
+                        del scores
+                        if selected_for_sink is not None:
+                            selected_for_sink.append(indices)
+                        sparse_rows = self._pack_rows(
+                            indices,
+                            geometry,
+                            dense,
+                            dense_delta,
+                        )
+                        lut[
+                            ...,
+                            local_start:,
+                            :sparse_rows.shape[-1],
+                        ].copy_(sparse_rows)
+                        valid[..., local_start:] = (
+                            geometry.pure_video_kv_start + retained
+                        )
+                        del sparse_rows
+                        if selected_for_sink is None:
+                            del indices
+
+                yield (
+                    tile_start,
+                    tile_end,
+                    lut.contiguous(),
+                    valid.contiguous(),
+                )
+            completed = True
+        finally:
+            if sink is not None and completed:
+                if retained == geometry.pure_video_kv_tiles:
+                    self._notify(sink, geometry, None)
+                else:
+                    indices = (
+                        selected_for_sink[0]
+                        if len(selected_for_sink) == 1
+                        else torch.cat(selected_for_sink, dim=-2)
+                    )
+                    self._notify(sink, geometry, indices)
 
     @staticmethod
     def _pack_rows(indices, geometry, dense, dense_delta):
@@ -327,7 +459,7 @@ class SparseTileRouter:
         context = dense_delta[:context_count].view(1, 1, 1, -1).expand(
             batch,
             heads,
-            geometry.pure_video_q_tiles,
+            indices.shape[-2],
             -1,
         )
         previous = dense[context_count - 1] if context_count else 0

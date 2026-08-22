@@ -23,6 +23,7 @@ from .fp8_v_stream import (
     pack_v_chunk,
     update_v_amax,
 )
+from . import fused_qkv as _fused_qkv_mod
 from .fused_qkv import (
     FusedQKVError,
     HEAD_DIM,
@@ -36,6 +37,205 @@ from ...mlp_sharing.route import router_kwargs as _route_kwargs
 
 DEFAULT_PROJECT_CHUNK_ROWS = 1024
 DEFAULT_QUERY_CHUNK_ROWS = 4096
+OUT_PROJ_CHUNK_ROWS = 2048
+
+
+@dataclass
+class _HeldQOnlyState:
+    module: object
+    qdata: torch.Tensor
+    weight_scale: torch.Tensor
+    q_norm: torch.Tensor
+    handle: object
+    held_weight: object
+    bias: object
+    heads: int
+    hidden: int
+    epsilon: float
+    released: bool = False
+
+
+def _acquire_q_only_state(module, x):
+    """Hold existing ConvRot QKV state across every streamed Q chunk."""
+    import comfy.model_management
+    import comfy.ops
+
+    qdata, weight_scale, handle, held_weight, bias = (
+        _fused_qkv_mod._plain_qkv_weight(module, x)
+    )
+    try:
+        heads = int(module.heads)
+        hidden = int(x.shape[1])
+        inner = heads * HEAD_DIM
+        expected_weight = (inner * 3, hidden)
+        if (
+            tuple(qdata.shape) != expected_weight
+            or qdata.dtype != torch.int8
+            or qdata.device != x.device
+        ):
+            raise FusedQKVError(
+                "held Q-only fused H3 weight shape is %s; expected %s"
+                % (tuple(qdata.shape), expected_weight)
+            )
+        weight_scale = weight_scale.reshape(-1).contiguous()
+        if (
+            weight_scale.numel() != inner * 3
+            or weight_scale.dtype != torch.float32
+            or weight_scale.device != x.device
+        ):
+            raise FusedQKVError("held Q-only fused H3 weight scale is invalid")
+        q_norm = comfy.model_management.cast_to(
+            module.q_norm.weight,
+            device=x.device,
+            dtype=x.dtype,
+        ).contiguous()
+        if q_norm.numel() != HEAD_DIM or q_norm.dtype != x.dtype:
+            raise FusedQKVError("held Q-only fused H3 RMSNorm weight is invalid")
+        return _HeldQOnlyState(
+            module=module,
+            qdata=qdata,
+            weight_scale=weight_scale,
+            q_norm=q_norm,
+            handle=handle,
+            held_weight=held_weight,
+            bias=bias,
+            heads=heads,
+            hidden=hidden,
+            epsilon=float(module.q_norm.eps),
+        )
+    except Exception:
+        comfy.ops.uncast_bias_weight(
+            module.qkv_proj,
+            held_weight,
+            bias,
+            handle,
+        )
+        raise
+
+
+def _release_q_only_state(state):
+    if state is None or state.released:
+        return
+    import comfy.ops
+
+    comfy.ops.uncast_bias_weight(
+        state.module.qkv_proj,
+        state.held_weight,
+        state.bias,
+        state.handle,
+    )
+    state.released = True
+
+
+def _quantize_projection_input_into(x, q_out, scale_out):
+    """Reuse caller-owned buffers with Kitchen's already-installed CUDA op."""
+    if (
+        tuple(q_out.shape) != tuple(x.shape)
+        or q_out.dtype != torch.int8
+        or q_out.device != x.device
+        or not q_out.is_contiguous()
+        or tuple(scale_out.shape) != (x.shape[0], 1)
+        or scale_out.dtype != torch.float32
+        or scale_out.device != x.device
+        or not scale_out.is_contiguous()
+    ):
+        raise FusedQKVError("reused ConvRot activation scratch is invalid")
+
+    try:
+        import comfy_kitchen.backends.cuda as cuda_backend
+
+        extension = getattr(cuda_backend, "_C", None)
+        wrap = getattr(cuda_backend, "_wrap_for_dlpack", None)
+        op = getattr(extension, "quantize_int8_rowwise_convrot64", None)
+        if callable(op) and callable(wrap):
+            stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+            op(
+                wrap(x),
+                wrap(q_out),
+                wrap(scale_out),
+                256,
+                False,
+                0,
+                0,
+                stream_ptr,
+            )
+            return q_out, scale_out
+    except (AttributeError, ImportError, RuntimeError, TypeError):
+        pass
+
+    q_tmp, scale_tmp = _fused_qkv_mod._quantize_projection_input(x)
+    q_out.copy_(q_tmp)
+    scale_out.copy_(scale_tmp.reshape_as(scale_out))
+    del q_tmp, scale_tmp
+    return q_out, scale_out
+
+
+def _run_q_only_held(
+    state,
+    x,
+    rope_freqs,
+    q_int8,
+    q_scale,
+    q_summary_scratch,
+    x_int8_scratch,
+    x_scale_scratch,
+):
+    """Run the existing Q-only Triton kernel with held state and reused scratch."""
+    sequence = int(x.shape[0])
+    heads = int(state.heads)
+
+    if rope_freqs is None:
+        rope = x.new_empty((1, 1, 1, 16, 2, 2))
+        rope_strides = (0, 0, 0, 0)
+        has_rope = False
+    else:
+        rope = rope_freqs
+        rope_strides = (
+            rope.stride(1),
+            rope.stride(3),
+            rope.stride(4),
+            rope.stride(5),
+        )
+        has_rope = True
+
+    x_int8, x_scale = _quantize_projection_input_into(
+        x,
+        x_int8_scratch,
+        x_scale_scratch,
+    )
+    grid = (_fused_qkv_mod.triton.cdiv(sequence, _fused_qkv_mod.Q_TILE), heads)
+    _fused_qkv_mod._fused_qk_kernel[grid](
+        x_int8,
+        state.qdata,
+        x_scale,
+        state.weight_scale,
+        state.q_norm,
+        state.q_norm,
+        rope,
+        q_int8,
+        q_scale,
+        q_int8,
+        q_scale,
+        q_summary_scratch,
+        q_summary_scratch,
+        sequence=sequence,
+        hidden=state.hidden,
+        heads=heads,
+        weight_stride_output=state.qdata.stride(0),
+        weight_stride_inner=state.qdata.stride(1),
+        rope_stride_seq=rope_strides[0],
+        rope_stride_dim=rope_strides[1],
+        rope_stride_rot=rope_strides[2],
+        rope_stride_pair=rope_strides[3],
+        epsilon=state.epsilon,
+        has_rope=has_rope,
+        KIND=0,
+        BLOCK_M=_fused_qkv_mod.Q_TILE,
+        BLOCK_N=HEAD_DIM,
+        BLOCK_K=128,
+        num_warps=8,
+        num_stages=3,
+    )
 
 
 @dataclass
@@ -62,8 +262,7 @@ class StreamedSparseSageQKV:
 @dataclass
 class PreparedStreamedSparseSage:
     projected: StreamedSparseSageQKV
-    lut: torch.Tensor
-    valid_block_num: torch.Tensor
+    route_plan: list
     metadata: dict
 
 
@@ -494,7 +693,7 @@ def _make_local_q(
     finally:
         del q, k_unused, v_unused
 
-def _execute_streamed(module, backend, prepared):
+def _execute_streamed_legacy(module, backend, prepared):
     projected = _validate_projected(
         prepared.projected,
         backend.executor.spec,
@@ -682,6 +881,191 @@ def _execute_streamed(module, backend, prepared):
     return result
 
 
+def _execute_streamed(module, backend, prepared):
+    """Low-VRAM streamed Sparse Sage with held Q state and lazy route chunks."""
+    projected = _validate_projected(
+        prepared.projected,
+        backend.executor.spec,
+    )
+    spec = backend.executor.spec
+    if module is not projected.module:
+        raise SparseSageError(
+            "streamed Sparse Sage module changed between prepare and execute"
+        )
+
+    sequence = int(projected.sequence)
+    heads = int(projected.heads)
+    hidden = int(projected.x.shape[1])
+    q_tile = int(spec.q_tile)
+    max_rows = min(int(projected.query_chunk_rows), sequence)
+    max_q_tiles = (max_rows + q_tile - 1) // q_tile
+    result = projected.x
+
+    pv_threshold = torch.full(
+        (heads,),
+        50.0,
+        dtype=torch.float32,
+        device=projected.x.device,
+    )
+    q_int8_buffer = torch.empty(
+        (1, heads, max_rows, HEAD_DIM),
+        dtype=torch.int8,
+        device=projected.x.device,
+    )
+    q_scale_buffer = torch.empty(
+        (1, heads, max_q_tiles),
+        dtype=torch.float32,
+        device=projected.x.device,
+    )
+    q_summary_buffer = torch.empty(
+        (1, heads, max_q_tiles, HEAD_DIM),
+        dtype=projected.output_dtype,
+        device=projected.x.device,
+    )
+    output_buffer = torch.empty(
+        (1, heads, max_rows, HEAD_DIM),
+        dtype=projected.output_dtype,
+        device=projected.x.device,
+    )
+
+    held_q_state = None
+    x_int8_buffer = None
+    x_scale_buffer = None
+    if projected.q_only_convrot:
+        held_q_state = _acquire_q_only_state(
+            projected.module,
+            projected.x,
+        )
+        x_int8_buffer = torch.empty(
+            (max_rows, hidden),
+            dtype=torch.int8,
+            device=projected.x.device,
+        )
+        x_scale_buffer = torch.empty(
+            (max_rows, 1),
+            dtype=torch.float32,
+            device=projected.x.device,
+        )
+
+    route_iter = backend.router.iter_lut_chunks(
+        prepared.route_plan,
+        q_chunk_tiles=max_q_tiles,
+    )
+    try:
+        for tile_start, tile_end, lut_chunk, valid_chunk in route_iter:
+            row_start = int(tile_start) * q_tile
+            row_end = min(int(tile_end) * q_tile, sequence)
+            rows = row_end - row_start
+            local_q_tiles = int(tile_end) - int(tile_start)
+            if rows <= 0:
+                raise SparseSageError("streamed Sparse Sage produced empty Q chunk")
+
+            full_chunk = rows == max_rows and local_q_tiles == max_q_tiles
+            if full_chunk:
+                q_int8 = q_int8_buffer
+                q_scale = q_scale_buffer
+                q_summary_scratch = q_summary_buffer
+                output = output_buffer
+            else:
+                q_int8 = torch.empty(
+                    (1, heads, rows, HEAD_DIM),
+                    dtype=torch.int8,
+                    device=projected.x.device,
+                )
+                q_scale = torch.empty(
+                    (1, heads, local_q_tiles),
+                    dtype=torch.float32,
+                    device=projected.x.device,
+                )
+                q_summary_scratch = torch.empty(
+                    (1, heads, local_q_tiles, HEAD_DIM),
+                    dtype=projected.output_dtype,
+                    device=projected.x.device,
+                )
+                output = torch.empty(
+                    (1, heads, rows, HEAD_DIM),
+                    dtype=projected.output_dtype,
+                    device=projected.x.device,
+                )
+
+            if held_q_state is not None:
+                chunk_rope = (
+                    None
+                    if projected.rope_freqs is None
+                    else projected.rope_freqs[:, row_start:row_end]
+                )
+                _run_q_only_held(
+                    held_q_state,
+                    projected.x[row_start:row_end],
+                    chunk_rope,
+                    q_int8,
+                    q_scale,
+                    q_summary_scratch,
+                    x_int8_buffer[:rows],
+                    x_scale_buffer[:rows],
+                )
+            else:
+                _make_local_q(
+                    projected,
+                    spec,
+                    row_start,
+                    row_end,
+                    q_int8=q_int8,
+                    q_scale=q_scale,
+                    q_summary_scratch=q_summary_scratch,
+                )
+
+            spec.dispatch(
+                q_int8,
+                projected.k_int8,
+                projected.v_carrier,
+                output,
+                lut_chunk,
+                valid_chunk,
+                pv_threshold,
+                q_scale,
+                projected.k_scale,
+                projected.v_scale,
+                projected.output_dtype,
+            )
+            del lut_chunk, valid_chunk
+
+            for local_start in range(0, rows, OUT_PROJ_CHUNK_ROWS):
+                local_end = min(local_start + OUT_PROJ_CHUNK_ROWS, rows)
+                proj_rows = local_end - local_start
+                attention_rows = (
+                    output[..., local_start:local_end, :]
+                    .transpose(1, 2)
+                    .reshape(proj_rows, heads * HEAD_DIM)
+                )
+                projected_rows = module.out_proj(attention_rows)
+                expected_output = (proj_rows, hidden)
+                if tuple(projected_rows.shape) != expected_output:
+                    raise SparseSageError(
+                        "streamed Sparse Sage out_proj shape %s does not match %s"
+                        % (tuple(projected_rows.shape), expected_output)
+                    )
+                result[
+                    row_start + local_start:row_start + local_end
+                ].copy_(projected_rows)
+                del attention_rows, projected_rows
+
+            if not full_chunk:
+                del q_int8, q_scale, q_summary_scratch, output
+    finally:
+        close = getattr(route_iter, "close", None)
+        if callable(close):
+            close()
+        _release_q_only_state(held_q_state)
+        if prepared.route_plan is not None and len(prepared.route_plan) >= 2:
+            prepared.route_plan[0] = None
+            prepared.route_plan[1] = None
+        projected.q_summary = None
+        projected.k_summary = None
+
+    return result
+
+
 class StreamedSparseSageBackend(HybridSparseBackend):
     """Sparse Sage backend using global K/V with streamed Q/output."""
 
@@ -710,8 +1094,8 @@ class StreamedSparseSageBackend(HybridSparseBackend):
             layer_index,
         )
         try:
-            lut, valid_block_num, mask_metadata = (
-                self.router.build_lut_from_summaries(
+            route_plan, mask_metadata = (
+                self.router.prepare_lut_chunks_from_summaries(
                     projected.q_summary,
                     projected.k_summary,
                     snapshot.layout,
@@ -731,16 +1115,17 @@ class StreamedSparseSageBackend(HybridSparseBackend):
             {
                 "qkv_lifetime": "streamed_q_global_k_fp8v",
                 "attention_output": "chunked_out_proj_inplace",
+                "router_lifetime": "lazy_contiguous_query_chunks",
                 "project_chunk_rows": projected.project_chunk_rows,
                 "query_chunk_rows": projected.query_chunk_rows,
+                "out_proj_chunk_rows": OUT_PROJ_CHUNK_ROWS,
             }
         )
 
         return PreparedStreamedHybrid(
             sparse=PreparedStreamedSparseSage(
                 projected=projected,
-                lut=lut,
-                valid_block_num=valid_block_num,
+                route_plan=route_plan,
                 metadata=metadata,
             )
         )
