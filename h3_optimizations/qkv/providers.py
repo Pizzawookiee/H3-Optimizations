@@ -82,8 +82,8 @@ def resolve_qkv_provider(
             request, 'H3 QKV layers use mixed weight formats'
         )
 
-    if memory_optimize and inventory.qkv_w4a8:
-        if backend_kind == 'comfy_kitchen_int8':
+    if inventory.qkv_w4a8:
+        if backend_kind == 'comfy_kitchen_int8' and memory_optimize:
             if not kitchen_producer_available:
                 return _required_or_standard(
                     request, 'Comfy Kitchen external producer API is unavailable'
