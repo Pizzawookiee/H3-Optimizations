@@ -216,10 +216,16 @@ def _resolve_sparse(plan, environment, inventory):
             StreamedSparseSageQKVProjector,
         )
 
+        query_chunk_rows = (
+            4096
+            if plan.memory is None
+            else int(plan.memory.query_chunk_rows)
+        )
         projector = StreamedSparseSageQKVProjector(
             kernel_spec,
             project_chunk_rows=1024,
-            query_chunk_rows=1024,
+            query_chunk_rows=query_chunk_rows,
+            q_only_convrot=(qkv.provider_id == QKV_SPARSE_CONVROT_INT8),
         )
         backend_cls = StreamedSparseSageBackend
     elif qkv.provider_id == QKV_SPARSE_CONVROT_INT8:

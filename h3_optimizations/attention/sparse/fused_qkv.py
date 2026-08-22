@@ -784,6 +784,168 @@ def _fused_qkv_module_fake(
     )
 
 
+
+def run_fused_q_only_into(
+    module,
+    x,
+    rope_freqs,
+    q_int8,
+    q_scale,
+    q_summary_scratch,
+):
+    """Project only Q from a ConvRot-256 INT8 H3 QKV weight into caller buffers.
+
+    Unlike project_chunk_hnd(), this launches KIND=0 only: no K GEMM, no V
+    GEMM, and no K/V output tensors. q_summary_scratch is reused storage needed
+    by the existing fused Q kernel; its values are not consumed in pass two.
+    """
+    import comfy.model_management
+    import comfy.ops
+
+    if not TRITON_AVAILABLE:
+        raise FusedQKVError("Q-only fused H3 projection requires Triton")
+    if not x.is_cuda or x.dtype != torch.bfloat16 or x.ndim != 2:
+        raise FusedQKVError(
+            "Q-only fused H3 projection requires rank-2 CUDA BF16 input"
+        )
+    if comfy.model_management.in_training:
+        raise FusedQKVError("Q-only fused H3 projection is inference-only")
+    if int(module.head_dim) != HEAD_DIM:
+        raise FusedQKVError("Q-only fused H3 projection requires head_dim 128")
+
+    sequence, hidden = x.shape
+    heads = int(module.heads)
+    q_blocks = (sequence + Q_TILE - 1) // Q_TILE
+    expected_q = (1, heads, sequence, HEAD_DIM)
+    expected_scale = (1, heads, q_blocks)
+    expected_summary = (1, heads, q_blocks, HEAD_DIM)
+    if (
+        tuple(q_int8.shape) != expected_q
+        or q_int8.dtype != torch.int8
+        or not q_int8.is_contiguous()
+        or q_int8.device != x.device
+    ):
+        raise FusedQKVError("Q-only fused H3 Q destination is invalid")
+    if (
+        tuple(q_scale.shape) != expected_scale
+        or q_scale.dtype != torch.float32
+        or not q_scale.is_contiguous()
+        or q_scale.device != x.device
+    ):
+        raise FusedQKVError("Q-only fused H3 Q-scale destination is invalid")
+    if (
+        tuple(q_summary_scratch.shape) != expected_summary
+        or q_summary_scratch.dtype != x.dtype
+        or not q_summary_scratch.is_contiguous()
+        or q_summary_scratch.device != x.device
+    ):
+        raise FusedQKVError("Q-only fused H3 summary scratch is invalid")
+    if hidden % 256:
+        raise FusedQKVError(
+            "Q-only fused H3 projection requires ConvRot-256 hidden dimension"
+        )
+    if float(module.q_norm.eps) != float(module.k_norm.eps):
+        raise FusedQKVError("Q-only fused H3 projection requires matching Q/K eps")
+
+    if rope_freqs is None:
+        rope = x.new_empty((1, 1, 1, 16, 2, 2))
+        rope_strides = (0, 0, 0, 0)
+        has_rope = False
+    else:
+        if (
+            rope_freqs.ndim != 6
+            or tuple(rope_freqs.shape[:3]) != (1, sequence, 1)
+            or int(rope_freqs.shape[-3]) * 2 != ROT_DIM
+            or tuple(rope_freqs.shape[-2:]) != (2, 2)
+            or rope_freqs.device != x.device
+        ):
+            raise FusedQKVError(
+                "Q-only fused H3 projection requires H3 split-half RoPE"
+            )
+        rope = rope_freqs
+        rope_strides = (
+            rope.stride(1),
+            rope.stride(3),
+            rope.stride(4),
+            rope.stride(5),
+        )
+        has_rope = True
+
+    qdata, weight_scale, handle, held_weight, bias = _plain_qkv_weight(module, x)
+    try:
+        inner = heads * HEAD_DIM
+        expected_weight = (inner * 3, hidden)
+        if (
+            tuple(qdata.shape) != expected_weight
+            or qdata.dtype != torch.int8
+            or qdata.device != x.device
+        ):
+            raise FusedQKVError(
+                "Q-only fused H3 weight shape is %s; expected %s"
+                % (tuple(qdata.shape), expected_weight)
+            )
+        weight_scale = weight_scale.reshape(-1).contiguous()
+        if (
+            weight_scale.numel() != inner * 3
+            or weight_scale.dtype != torch.float32
+            or weight_scale.device != x.device
+        ):
+            raise FusedQKVError("Q-only fused H3 weight scale shape is invalid")
+
+        q_norm = comfy.model_management.cast_to(
+            module.q_norm.weight,
+            device=x.device,
+            dtype=x.dtype,
+        ).contiguous()
+        if q_norm.numel() != HEAD_DIM or q_norm.dtype != x.dtype:
+            raise FusedQKVError("Q-only fused H3 RMSNorm weight is invalid")
+
+        x_int8, x_scale = _quantize_projection_input(x)
+        grid = (triton.cdiv(sequence, Q_TILE), heads)
+
+        # KIND=0 touches only the Q weight rows and Q output destinations.
+        # K pointers are valid dummy aliases but are compile-time-dead here.
+        _fused_qk_kernel[grid](
+            x_int8,
+            qdata,
+            x_scale,
+            weight_scale,
+            q_norm,
+            q_norm,
+            rope,
+            q_int8,
+            q_scale,
+            q_int8,
+            q_scale,
+            q_summary_scratch,
+            q_summary_scratch,
+            sequence=sequence,
+            hidden=hidden,
+            heads=heads,
+            weight_stride_output=qdata.stride(0),
+            weight_stride_inner=qdata.stride(1),
+            rope_stride_seq=rope_strides[0],
+            rope_stride_dim=rope_strides[1],
+            rope_stride_rot=rope_strides[2],
+            rope_stride_pair=rope_strides[3],
+            epsilon=float(module.q_norm.eps),
+            has_rope=has_rope,
+            KIND=0,
+            BLOCK_M=Q_TILE,
+            BLOCK_N=HEAD_DIM,
+            BLOCK_K=128,
+            num_warps=8,
+            num_stages=3,
+        )
+        return q_int8, q_scale
+    finally:
+        comfy.ops.uncast_bias_weight(
+            module.qkv_proj,
+            held_weight,
+            bias,
+            handle,
+        )
+
 def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
     import comfy.model_management
     import comfy.ops

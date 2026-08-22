@@ -20,6 +20,9 @@ from .plan import (
     FUSED_QKV_OFF,
     MAX_CHUNK_ROWS,
     MIN_CHUNK_ROWS,
+    DEFAULT_QUERY_CHUNK_ROWS,
+    MAX_QUERY_CHUNK_ROWS,
+    MIN_QUERY_CHUNK_ROWS,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_OFF,
     SPARSE_BACKEND_AUTO,
@@ -125,6 +128,21 @@ class H3MemoryOptimization(io.ComfyNode):
                         'chunks may be faster but use more activation memory.'
                     ),
                 ),
+                io.Int.Input(
+                    'query_chunk_rows',
+                    display_name='Sparse Sage query chunk rows',
+                    default=DEFAULT_QUERY_CHUNK_ROWS,
+                    min=MIN_QUERY_CHUNK_ROWS,
+                    max=MAX_QUERY_CHUNK_ROWS,
+                    step=128,
+                    advanced=True,
+                    tooltip=(
+                        'Rows per streamed Sparse Sage query call. Larger chunks '
+                        'reduce launch/projection overhead but use more Q and '
+                        'attention-output memory. 4096 is the recommended default; '
+                        '1024 is the conservative low-VRAM setting.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -136,12 +154,14 @@ class H3MemoryOptimization(io.ComfyNode):
         fused_qkv=FUSED_QKV_AUTO,
         mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
+        query_chunk_rows=DEFAULT_QUERY_CHUNK_ROWS,
     ):
         plan = read_plan(model).with_memory(
             MemoryRequest(
                 fused_qkv=fused_qkv,
                 mlp_memory=mlp_memory,
                 chunk_rows=int(chunk_rows),
+                query_chunk_rows=int(query_chunk_rows),
             )
         )
         patched = apply_plan(model, plan)

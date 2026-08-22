@@ -23,14 +23,19 @@ from .fp8_v_stream import (
     pack_v_chunk,
     update_v_amax,
 )
-from .fused_qkv import FusedQKVError, HEAD_DIM, sparse_fused_qkv_contract_mismatch
+from .fused_qkv import (
+    FusedQKVError,
+    HEAD_DIM,
+    run_fused_q_only_into,
+    sparse_fused_qkv_contract_mismatch,
+)
 from .router import SparseRouterError
 from .sparse_sage import SparseSageError
 from ...mlp_sharing.route import router_kwargs as _route_kwargs
 
 
 DEFAULT_PROJECT_CHUNK_ROWS = 1024
-DEFAULT_QUERY_CHUNK_ROWS = 1024
+DEFAULT_QUERY_CHUNK_ROWS = 4096
 
 
 @dataclass
@@ -51,6 +56,7 @@ class StreamedSparseSageQKV:
     layer_index: int
     project_chunk_rows: int
     query_chunk_rows: int
+    q_only_convrot: bool
 
 
 @dataclass
@@ -217,6 +223,7 @@ def run_streamed_sparse_sage_qkv(
     spec,
     project_chunk_rows=DEFAULT_PROJECT_CHUNK_ROWS,
     query_chunk_rows=DEFAULT_QUERY_CHUNK_ROWS,
+    q_only_convrot=False,
 ):
     import comfy.model_management
 
@@ -374,6 +381,7 @@ def run_streamed_sparse_sage_qkv(
             layer_index=int(layer_index),
             project_chunk_rows=project_chunk_rows,
             query_chunk_rows=query_chunk_rows,
+            q_only_convrot=bool(q_only_convrot),
         ),
         spec,
     )
@@ -389,6 +397,7 @@ class StreamedSparseSageQKVProjector:
         *,
         project_chunk_rows=DEFAULT_PROJECT_CHUNK_ROWS,
         query_chunk_rows=DEFAULT_QUERY_CHUNK_ROWS,
+        q_only_convrot=False,
     ):
         self.spec = spec
         self.chunk_rows = _validate_chunk_rows(
@@ -403,6 +412,7 @@ class StreamedSparseSageQKVProjector:
             spec.kv_tile,
             name="query_chunk_rows",
         )
+        self.q_only_convrot = bool(q_only_convrot)
 
     @property
     def installation_signature(self):
@@ -411,6 +421,7 @@ class StreamedSparseSageQKVProjector:
             self.qk_format,
             self.chunk_rows,
             self.query_chunk_rows,
+            self.q_only_convrot,
             self.spec.signature,
         )
 
@@ -432,10 +443,38 @@ class StreamedSparseSageQKVProjector:
             spec=self.spec,
             project_chunk_rows=self.chunk_rows,
             query_chunk_rows=self.query_chunk_rows,
+            q_only_convrot=self.q_only_convrot,
         )
 
 
-def _make_local_q(projected, spec, row_start, row_end):
+def _make_local_q(
+    projected,
+    spec,
+    row_start,
+    row_end,
+    *,
+    q_int8,
+    q_scale,
+    q_summary_scratch,
+):
+    rows = row_end - row_start
+    if projected.q_only_convrot:
+        chunk_rope = (
+            None
+            if projected.rope_freqs is None
+            else projected.rope_freqs[:, row_start:row_end]
+        )
+        run_fused_q_only_into(
+            projected.module,
+            projected.x[row_start:row_end],
+            chunk_rope,
+            q_int8,
+            q_scale,
+            q_summary_scratch,
+        )
+        return
+
+    # Compatibility fallback for non-ConvRot projected providers.
     q, k_unused, v_unused = project_chunk_hnd(
         projected.module,
         projected.x,
@@ -444,38 +483,16 @@ def _make_local_q(projected, spec, row_start, row_end):
         row_end,
     )
     try:
-        rows = row_end - row_start
-        heads = projected.heads
-        q_blocks = (rows + int(spec.q_tile) - 1) // int(spec.q_tile)
-        q_int8 = torch.empty(
-            (1, heads, rows, HEAD_DIM),
-            dtype=torch.int8,
-            device=projected.x.device,
-        )
-        q_scale = torch.empty(
-            (1, heads, q_blocks),
-            dtype=torch.float32,
-            device=projected.x.device,
-        )
-        q_summary_unused = torch.empty(
-            (1, heads, q_blocks, HEAD_DIM),
-            dtype=projected.output_dtype,
-            device=projected.x.device,
-        )
         pack_sparse_qk_chunk_into(
             q,
             q_int8,
             q_scale,
-            q_summary_unused,
+            q_summary_scratch,
             row_start=0,
             block_size=spec.q_tile,
         )
     finally:
         del q, k_unused, v_unused
-
-    del q_summary_unused
-    return q_int8, q_scale
-
 
 def _execute_streamed(module, backend, prepared):
     projected = _validate_projected(
@@ -490,14 +507,50 @@ def _execute_streamed(module, backend, prepared):
         )
 
     sequence = projected.sequence
+    heads = projected.heads
     q_tile = int(spec.q_tile)
     kv_tiles = (sequence + int(spec.kv_tile) - 1) // int(spec.kv_tile)
+    max_rows = min(int(projected.query_chunk_rows), sequence)
+    max_q_tiles = (max_rows + q_tile - 1) // q_tile
     result = projected.x
 
     pv_threshold = torch.full(
-        (projected.heads,),
+        (heads,),
         50.0,
         dtype=torch.float32,
+        device=projected.x.device,
+    )
+
+    # Reused by every full-size query chunk. This removes the allocator churn
+    # from Q, Q-scale, routing slices, valid counts, and attention output.
+    q_int8_buffer = torch.empty(
+        (1, heads, max_rows, HEAD_DIM),
+        dtype=torch.int8,
+        device=projected.x.device,
+    )
+    q_scale_buffer = torch.empty(
+        (1, heads, max_q_tiles),
+        dtype=torch.float32,
+        device=projected.x.device,
+    )
+    q_summary_buffer = torch.empty(
+        (1, heads, max_q_tiles, HEAD_DIM),
+        dtype=projected.output_dtype,
+        device=projected.x.device,
+    )
+    output_buffer = torch.empty(
+        (1, heads, max_rows, HEAD_DIM),
+        dtype=projected.output_dtype,
+        device=projected.x.device,
+    )
+    lut_buffer = torch.empty(
+        (1, heads, max_q_tiles, kv_tiles),
+        dtype=torch.int32,
+        device=projected.x.device,
+    )
+    valid_buffer = torch.empty(
+        (1, heads, max_q_tiles),
+        dtype=torch.int32,
         device=projected.x.device,
     )
 
@@ -512,32 +565,77 @@ def _execute_streamed(module, backend, prepared):
             )
 
         rows = row_end - row_start
-        q_int8, q_scale = _make_local_q(
+        tile_start = row_start // q_tile
+        local_q_tiles = (rows + q_tile - 1) // q_tile
+        tile_end = tile_start + local_q_tiles
+        full_chunk = rows == max_rows and local_q_tiles == max_q_tiles
+
+        if full_chunk:
+            q_int8 = q_int8_buffer
+            q_scale = q_scale_buffer
+            q_summary_scratch = q_summary_buffer
+            output = output_buffer
+            lut_chunk = lut_buffer
+            valid_chunk = valid_buffer
+        else:
+            # One exact-size tail allocation is preferable to presenting a
+            # strided Q carrier to the Q-only Triton projection kernel.
+            q_int8 = torch.empty(
+                (1, heads, rows, HEAD_DIM),
+                dtype=torch.int8,
+                device=projected.x.device,
+            )
+            q_scale = torch.empty(
+                (1, heads, local_q_tiles),
+                dtype=torch.float32,
+                device=projected.x.device,
+            )
+            q_summary_scratch = torch.empty(
+                (1, heads, local_q_tiles, HEAD_DIM),
+                dtype=projected.output_dtype,
+                device=projected.x.device,
+            )
+            output = output_buffer[..., :rows, :]
+            lut_chunk = torch.empty(
+                (1, heads, local_q_tiles, kv_tiles),
+                dtype=torch.int32,
+                device=projected.x.device,
+            )
+            valid_chunk = torch.empty(
+                (1, heads, local_q_tiles),
+                dtype=torch.int32,
+                device=projected.x.device,
+            )
+
+        _make_local_q(
             projected,
             spec,
             row_start,
             row_end,
+            q_int8=q_int8,
+            q_scale=q_scale,
+            q_summary_scratch=q_summary_scratch,
         )
 
-        tile_start = row_start // q_tile
-        local_q_tiles = (rows + q_tile - 1) // q_tile
-        tile_end = tile_start + local_q_tiles
-
-        # SpargeAttn interprets bx locally using qo_len. Slicing these route
-        # rows makes local bx=0 consume the original global tile's route.
-        lut_chunk = prepared.lut[
-            ...,
-            tile_start:tile_end,
-            :,
-        ].contiguous()
-        valid_chunk = prepared.valid_block_num[
-            ...,
-            tile_start:tile_end,
-        ].contiguous()
+        # SpargeAttn requires contiguous LUT/valid carriers. Copy into reusable
+        # fixed-size buffers instead of allocating .contiguous() every chunk.
+        lut_chunk.copy_(
+            prepared.lut[
+                ...,
+                tile_start:tile_end,
+                :,
+            ]
+        )
+        valid_chunk.copy_(
+            prepared.valid_block_num[
+                ...,
+                tile_start:tile_end,
+            ]
+        )
 
         expected_lut = (
             1,
-            projected.heads,
+            heads,
             local_q_tiles,
             kv_tiles,
         )
@@ -547,15 +645,8 @@ def _execute_streamed(module, backend, prepared):
                 % (tuple(lut_chunk.shape), expected_lut)
             )
 
-        output = torch.empty(
-            (1, projected.heads, rows, HEAD_DIM),
-            dtype=projected.output_dtype,
-            device=projected.x.device,
-        )
-
-        # This is the normal compiled SpargeAttn kernel. Its wrapper derives
-        # qo_len from q_int8 and kv_len from full K, so qo_len != kv_len is
-        # a supported native execution mode.
+        # Normal compiled SpargeAttn kernel: qo_len is the local Q chunk,
+        # while kv_len remains the full sequence.
         spec.dispatch(
             q_int8,
             projected.k_int8,
@@ -572,7 +663,7 @@ def _execute_streamed(module, backend, prepared):
 
         attention_rows = output.transpose(1, 2).reshape(
             rows,
-            projected.heads * HEAD_DIM,
+            heads * HEAD_DIM,
         )
         projected_rows = module.out_proj(attention_rows)
         expected_output = (rows, projected.x.shape[1])
@@ -582,20 +673,11 @@ def _execute_streamed(module, backend, prepared):
                 % (tuple(projected_rows.shape), expected_output)
             )
 
-        # norm1(x) is a temporary separate from the residual stream. By the
-        # time a Q chunk is consumed its source rows are no longer needed, so
-        # reuse them for the final out-projected attention result.
         result[row_start:row_end].copy_(projected_rows)
 
-        del (
-            q_int8,
-            q_scale,
-            lut_chunk,
-            valid_chunk,
-            output,
-            attention_rows,
-            projected_rows,
-        )
+        del attention_rows, projected_rows
+        if not full_chunk:
+            del q_int8, q_scale, q_summary_scratch, lut_chunk, valid_chunk
 
     return result
 
@@ -690,6 +772,9 @@ class StreamedSparseSageBackend(HybridSparseBackend):
                     self.projector,
                     "query_chunk_rows",
                     None,
+                ),
+                "q_only_second_pass": bool(
+                    getattr(self.projector, "q_only_convrot", False)
                 ),
             }
         )

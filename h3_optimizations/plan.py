@@ -47,6 +47,10 @@ SPARSE_BACKEND_REQUESTS = (
 MIN_CHUNK_ROWS = 256
 MAX_CHUNK_ROWS = 65_536
 CHUNK_ALIGNMENT = 256
+DEFAULT_QUERY_CHUNK_ROWS = 4096
+MIN_QUERY_CHUNK_ROWS = 128
+MAX_QUERY_CHUNK_ROWS = 65_536
+QUERY_CHUNK_ALIGNMENT = 128
 DENSITY_FIXED = 'fixed'
 DEFAULT_VIDEO_BUDGET = 0.3
 DEFAULT_EDGE_STEPS = 2
@@ -101,6 +105,7 @@ class MemoryRequest:
     fused_qkv: str = FUSED_QKV_AUTO
     mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 4096
+    query_chunk_rows: int = DEFAULT_QUERY_CHUNK_ROWS
     prefer_held_weights: bool = True
     mlp_strict: bool = False
 
@@ -121,6 +126,17 @@ class MemoryRequest:
             raise ValueError(
                 'chunk_rows must be a multiple of %d' % CHUNK_ALIGNMENT
             )
+        query_chunk_rows = int(self.query_chunk_rows)
+        if not MIN_QUERY_CHUNK_ROWS <= query_chunk_rows <= MAX_QUERY_CHUNK_ROWS:
+            raise ValueError(
+                'query_chunk_rows must be between %d and %d'
+                % (MIN_QUERY_CHUNK_ROWS, MAX_QUERY_CHUNK_ROWS)
+            )
+        if query_chunk_rows % QUERY_CHUNK_ALIGNMENT:
+            raise ValueError(
+                'query_chunk_rows must be a multiple of %d'
+                % QUERY_CHUNK_ALIGNMENT
+            )
 
     @property
     def signature(self):
@@ -129,6 +145,7 @@ class MemoryRequest:
             self.fused_qkv,
             self.mlp_memory,
             int(self.chunk_rows),
+            int(self.query_chunk_rows),
             bool(self.prefer_held_weights),
             bool(self.mlp_strict),
         )
