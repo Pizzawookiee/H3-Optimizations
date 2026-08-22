@@ -27,7 +27,10 @@ from h3_optimizations.attention.sparse.config import (  # noqa: E402
     HybridSparseConfig,
     resolve_video_budget,
 )
-from h3_optimizations.nodes import H3SparseAttention  # noqa: E402
+from h3_optimizations.nodes import (  # noqa: E402
+    H3SparseAttention,
+    H3SparseAttentionAdvanced,
+)
 from h3_optimizations.runtime.context import (  # noqa: E402
     H3RuntimeSession,
     RUNTIME_KEY,
@@ -135,14 +138,14 @@ def test_node_schema_and_request():
             'video_budget',
             'denser_early_late_steps',
         ],
-        'schema exposes only controls that affect sparse execution',
+        'standard schema preserves the legacy sparse controls',
     )
     denser = input_by_id(schema, 'denser_early_late_steps')
     check(
         denser.display_name == 'Denser Early/Late steps'
         and denser.default is False
         and '30 percentage points' in denser.tooltip,
-        'density toggle is explicit and defaults off',
+        'legacy density toggle is explicit and defaults off',
     )
 
     model = SimpleNamespace(model_options={})
@@ -160,13 +163,64 @@ def test_node_schema_and_request():
     check(
         result.args[0] is patched
         and request.video_budget == 0.5
-        and request.denser_early_late_steps is True,
-        'node carries the denser-step policy into the sparse request',
+        and request.denser_early_late_steps is True
+        and request.advanced_schedule is False,
+        'standard node carries the legacy denser-step policy',
+    )
+
+
+def test_advanced_node_schema_and_request():
+    print('H3 Sparse Attention Advanced node policy')
+    schema = H3SparseAttentionAdvanced.define_schema()
+    check(
+        [item.id for item in schema.inputs]
+        == [
+            'model',
+            'video_budget',
+            'early_steps',
+            'early_kv',
+            'late_steps',
+            'late_kv',
+        ],
+        'advanced schema exposes explicit early and late controls',
+    )
+    check(
+        input_by_id(schema, 'early_steps').default == 2
+        and input_by_id(schema, 'early_kv').default == 0.5
+        and input_by_id(schema, 'late_steps').default == 2
+        and input_by_id(schema, 'late_kv').default == 0.5,
+        'advanced early and late defaults match the public contract',
+    )
+
+    model = SimpleNamespace(model_options={})
+    patched = SimpleNamespace(model_options={})
+    with mock.patch(
+        'h3_optimizations.nodes.apply_plan',
+        return_value=patched,
+    ) as apply:
+        result = H3SparseAttentionAdvanced.execute(
+            model,
+            video_budget=0.3,
+            early_steps=3,
+            early_kv=0.6,
+            late_steps=4,
+            late_kv=0.7,
+        )
+    request = apply.call_args.args[1].sparse
+    check(
+        result.args[0] is patched
+        and request.video_budget == 0.3
+        and request.early_steps == 3
+        and request.early_kv == 0.6
+        and request.late_steps == 4
+        and request.late_kv == 0.7
+        and request.denser_early_late_steps is False,
+        'advanced node carries the complete explicit schedule',
     )
 
 
 def test_step_budgets():
-    print('H3 Sparse Attention step budgets')
+    print('H3 Sparse Attention legacy step budgets')
     config = HybridSparseConfig(
         video_budget=0.5,
         denser_early_late_steps=True,
@@ -225,12 +279,70 @@ def test_step_budgets():
             20,
         )
         == 1.0,
-        'early/late video budget is capped at 100%',
+        'legacy early/late video budget is capped at 100%',
     )
     check(
         resolve_video_budget(HybridSparseConfig(video_budget=0.5), 0, 20)
         == 0.5,
-        'disabled policy preserves the configured budget',
+        'disabled legacy policy preserves the configured budget',
+    )
+
+
+def test_advanced_step_budgets():
+    print('H3 Sparse Attention explicit step budgets')
+    config = HybridSparseConfig(
+        video_budget=0.3,
+        early_steps=2,
+        early_kv=0.5,
+        late_steps=3,
+        late_kv=0.7,
+    )
+    expected = {
+        -1: 0.3,
+        0: 0.5,
+        1: 0.5,
+        2: 0.3,
+        16: 0.3,
+        17: 0.7,
+        18: 0.7,
+        19: 0.7,
+    }
+    for step_index, budget in expected.items():
+        check(
+            resolve_video_budget(config, step_index, 20) == budget,
+            'explicit step %d resolves to %.0f%% video budget'
+            % (step_index, budget * 100.0),
+        )
+
+    check(
+        resolve_video_budget(
+            HybridSparseConfig(
+                video_budget=0.7,
+                early_steps=1,
+                early_kv=0.2,
+                late_steps=0,
+                late_kv=0.4,
+            ),
+            0,
+            20,
+        )
+        == 0.2,
+        'explicit early KV may be lower than the middle-step budget',
+    )
+    check(
+        resolve_video_budget(
+            HybridSparseConfig(
+                video_budget=0.3,
+                early_steps=2,
+                early_kv=0.4,
+                late_steps=2,
+                late_kv=0.6,
+            ),
+            1,
+            3,
+        )
+        == 0.6,
+        'overlapping early and late windows use the denser requested budget',
     )
 
 
@@ -280,7 +392,9 @@ def test_runtime_step_resolution():
 
 def main():
     test_node_schema_and_request()
+    test_advanced_node_schema_and_request()
     test_step_budgets()
+    test_advanced_step_budgets()
     test_runtime_step_resolution()
     print('\nall H3 sparse density tests passed')
 

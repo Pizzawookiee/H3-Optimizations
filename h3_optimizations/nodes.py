@@ -1,9 +1,11 @@
-'''Two composable production nodes for MiniMax H3 optimization.'''
+'''Composable production nodes for MiniMax H3 optimization.'''
 
 from comfy_api.latest import ComfyExtension, io, ui
 
 from .apply import apply_plan
 from .plan import (
+    DEFAULT_EDGE_KV,
+    DEFAULT_EDGE_STEPS,
     DEFAULT_VIDEO_BUDGET,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
@@ -22,6 +24,24 @@ from .status import (
 
 DEFAULT_CHUNK_ROWS = 4096
 NODE_CATEGORY = 'H3-Optimizations/Model Patches'
+
+
+def _video_budget_input():
+    return io.Float.Input(
+        'video_budget',
+        display_name='Video KV budget',
+        default=DEFAULT_VIDEO_BUDGET,
+        min=0.01,
+        max=1.0,
+        step=0.01,
+        tooltip=(
+            'Fraction of pure target-video KV tiles retained per head and '
+            'pure-video query tile. The request rounds up to a whole KV-tile '
+            'count. Non-video context and mixed boundary tiles stay dense. '
+            '1.0 keeps the full route while still executing through the '
+            'selected sparse backend.'
+        ),
+    )
 
 
 class H3MemoryOptimization(io.ComfyNode):
@@ -144,21 +164,7 @@ class H3SparseAttention(io.ComfyNode):
             ],
             inputs=[
                 io.Model.Input('model'),
-                io.Float.Input(
-                    'video_budget',
-                    display_name='Video KV budget',
-                    default=DEFAULT_VIDEO_BUDGET,
-                    min=0.01,
-                    max=1.0,
-                    step=0.01,
-                    tooltip=(
-                        'Fraction of pure target-video KV tiles retained per '
-                        'head and pure-video query tile. The request rounds up '
-                        'to a whole KV-tile count. Non-video context and mixed '
-                        'boundary tiles stay dense. 1.0 keeps the full route '
-                        'while still executing through Sparse Sage.'
-                    ),
-                ),
+                _video_budget_input(),
                 io.Boolean.Input(
                     'denser_early_late_steps',
                     display_name='Denser Early/Late steps',
@@ -192,6 +198,101 @@ class H3SparseAttention(io.ComfyNode):
         )
 
 
+class H3SparseAttentionAdvanced(io.ComfyNode):
+    '''Sparse attention with explicit early, middle, and late KV budgets.'''
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3SparseAttentionAdvanced',
+            display_name='H3 Sparse Attention (Advanced)',
+            category=NODE_CATEGORY,
+            description=(
+                'Advanced fixed-density sparse attention for MiniMax H3. '
+                'Video KV budget controls middle sampling steps; Early KV and '
+                'Late KV override the first and last configured step counts. '
+                'It uses the same checkpoint-format selection and sparse '
+                'fallback backends as H3 Sparse Attention.'
+            ),
+            search_aliases=[
+                'H3 sparse advanced',
+                'H3 sparse schedule',
+                'Sparse Sage advanced',
+                'H3 early late KV',
+            ],
+            inputs=[
+                io.Model.Input('model'),
+                _video_budget_input(),
+                io.Int.Input(
+                    'early_steps',
+                    display_name='Early steps',
+                    default=DEFAULT_EDGE_STEPS,
+                    min=0,
+                    max=1000,
+                    step=1,
+                    tooltip='Number of first sampling steps that use Early KV.',
+                ),
+                io.Float.Input(
+                    'early_kv',
+                    display_name='Early KV',
+                    default=DEFAULT_EDGE_KV,
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                    tooltip='Video KV budget used during the early-step window.',
+                ),
+                io.Int.Input(
+                    'late_steps',
+                    display_name='Late steps',
+                    default=DEFAULT_EDGE_STEPS,
+                    min=0,
+                    max=1000,
+                    step=1,
+                    tooltip='Number of final sampling steps that use Late KV.',
+                ),
+                io.Float.Input(
+                    'late_kv',
+                    display_name='Late KV',
+                    default=DEFAULT_EDGE_KV,
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                    tooltip='Video KV budget used during the late-step window.',
+                ),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        video_budget=DEFAULT_VIDEO_BUDGET,
+        early_steps=DEFAULT_EDGE_STEPS,
+        early_kv=DEFAULT_EDGE_KV,
+        late_steps=DEFAULT_EDGE_STEPS,
+        late_kv=DEFAULT_EDGE_KV,
+    ):
+        plan = read_plan(model).with_sparse(
+            SparseRequest(
+                video_budget=float(video_budget),
+                early_steps=int(early_steps),
+                early_kv=float(early_kv),
+                late_steps=int(late_steps),
+                late_kv=float(late_kv),
+            )
+        )
+        patched = apply_plan(model, plan)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(format_sparse_status(patched)),
+        )
+
+
 class H3OptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
-        return [H3MemoryOptimization, H3SparseAttention]
+        return [
+            H3MemoryOptimization,
+            H3SparseAttention,
+            H3SparseAttentionAdvanced,
+        ]

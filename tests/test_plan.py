@@ -1,4 +1,4 @@
-'''Pure tests for the order-independent two-node optimization plan.'''
+'''Pure tests for the order-independent optimization plan.'''
 
 import math
 from pathlib import Path
@@ -20,7 +20,20 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(MemoryRequest().chunk_rows, 4096)
 
     def test_sparse_request_defaults_to_thirty_percent_video_budget(self):
-        self.assertEqual(SparseRequest().video_budget, 0.3)
+        request = SparseRequest()
+        self.assertEqual(request.video_budget, 0.3)
+        self.assertFalse(request.advanced_schedule)
+
+    def test_explicit_sparse_schedule_is_part_of_request_identity(self):
+        request = SparseRequest(
+            video_budget=0.3,
+            early_steps=2,
+            early_kv=0.5,
+            late_steps=2,
+            late_kv=0.5,
+        )
+        self.assertTrue(request.advanced_schedule)
+        self.assertEqual(request.signature[-4:], (2, 0.5, 2, 0.5))
 
     def test_node_order_does_not_change_the_plan(self):
         memory = MemoryRequest()
@@ -54,6 +67,37 @@ class PlanTests(unittest.TestCase):
         for budget in (0.0, 1.01, math.inf, math.nan):
             with self.assertRaises(ValueError):
                 SparseRequest(video_budget=budget)
+
+        SparseRequest(
+            early_steps=0,
+            early_kv=0.01,
+            late_steps=1000,
+            late_kv=1.0,
+        )
+        with self.assertRaises(ValueError):
+            SparseRequest(early_steps=2)
+        with self.assertRaises(ValueError):
+            SparseRequest(
+                early_steps=-1,
+                early_kv=0.5,
+                late_steps=2,
+                late_kv=0.5,
+            )
+        with self.assertRaises(ValueError):
+            SparseRequest(
+                early_steps=2,
+                early_kv=0.0,
+                late_steps=2,
+                late_kv=0.5,
+            )
+        with self.assertRaises(ValueError):
+            SparseRequest(
+                denser_early_late_steps=True,
+                early_steps=2,
+                early_kv=0.5,
+                late_steps=2,
+                late_kv=0.5,
+            )
 
 
 if __name__ == '__main__':

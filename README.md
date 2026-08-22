@@ -15,19 +15,25 @@ does not import or depend on ComfyUI-H3-Extended.
 - H3 Sparse Attention enables fixed-density Sparse Sage attention while
   keeping text, reference conditioning, audio, non-video queries, and mixed
   boundary tiles dense. Its default video KV budget is 30 percent. The optional
-  early/late policy adds 30 percentage points to the first two and last two
-  sampler steps, capped at 100 percent.
+  legacy early/late policy adds 30 percentage points to the first two and last
+  two sampler steps, capped at 100 percent.
+- H3 Sparse Attention (Advanced) exposes explicit early and late density
+  windows. Video KV budget controls the middle steps; Early steps/Early KV and
+  Late steps/Late KV independently control the edges. The defaults are two
+  early steps at 50 percent KV and two late steps at 50 percent KV. If the two
+  windows overlap, the denser of the two requested edge budgets is used.
 
-Both nodes are grouped under H3-Optimizations > Model Patches.
+All three nodes are grouped under H3-Optimizations > Model Patches.
 
-Both nodes are order-independent. Unsupported model families pass through
+The nodes are order-independent. Unsupported model families pass through
 unchanged. Auto modes retain the existing implementation when a specialized
 provider cannot satisfy its complete format and runtime contract. A saved
-workflow containing H3 Sparse Attention also remains runnable when Sparse Sage
-is unavailable: FP8-capable NVIDIA GPUs use the same fixed-density router
-through PyTorch FlexAttention, and other unsupported combinations keep the
+workflow containing either H3 Sparse Attention node also remains runnable when
+Sparse Sage is unavailable: supported NVIDIA GPUs first use the package INT8
+Triton sparse backend, then FP8 FlexAttention when available, before keeping the
 resolved dense H3 path. The selected fallback and reason appear in the node
-status text.
+status text. Explicit advanced early/middle/late budgets are preserved across
+all sparse fallback backends.
 
 ## Install
 
@@ -35,7 +41,7 @@ From the ComfyUI custom-nodes directory:
 
     git clone https://github.com/Zironic/H3-Optimizations
 
-Restart ComfyUI after cloning. The two nodes then appear under
+Restart ComfyUI after cloning. The three nodes then appear under
 H3-Optimizations > Model Patches; ComfyUI-Manager is not required.
 
 Before node registration, startup checks the active Torch backend in a child
@@ -117,18 +123,19 @@ layouts, V carrier, accumulator, summaries, and callables all match. A
 mismatched QKV format uses standard sparse QKV. An unvalidated Sparse Sage
 architecture uses dense H3 attention.
 
-Node IDs are H3MemoryOptimization and H3SparseAttention. H3-Extended is not
-required.
+Node IDs are H3MemoryOptimization, H3SparseAttention, and
+H3SparseAttentionAdvanced. H3-Extended is not required.
 
 ## Validation
 
 CPU tests cover node schemas, plan composition, backend classification, dense
 and Sparse Sage capability fallback, stale-install repair selection, chunk
-boundaries and RoPE slices, non-H3 no-op behavior, sparse contract and
-route geometry, runtime step/layout publication, and source isolation. GPU
-kernel validation is intentionally separate because it requires the matching
-hardware and compiled backend packages. FP8 Flex CPU contracts cover all-FP8
-carrier layouts, explicit Triton/FA4 selection, and first-call dense fallback.
+boundaries and RoPE slices, non-H3 no-op behavior, sparse contract and route
+geometry, runtime step/layout publication, explicit early/middle/late density
+schedules, and source isolation. GPU kernel validation is intentionally
+separate because it requires the matching hardware and compiled backend
+packages. FP8 Flex CPU contracts cover all-FP8 carrier layouts, explicit
+Triton/FA4 selection, and first-call dense fallback.
 
 Run the CPU suite from the ComfyUI root:
 
