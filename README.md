@@ -38,7 +38,7 @@ workflow containing either H3 Sparse Attention node also remains runnable when
 Sparse Sage is unavailable: supported NVIDIA GPUs first use the package INT8
 Triton sparse backend, then FP8 FlexAttention when available, before keeping the
 resolved dense H3 path. The selected fallback and reason appear in the node
-status text. Explicit advanced early/middle/late budgets are preserved across
+status text. Explicit advanced early/middle/late densities are preserved across
 all sparse fallback backends.
 
 ## Install
@@ -102,6 +102,52 @@ Restart ComfyUI after the build. A minimal import check is:
 For reproducible automated installs, H3-Optimizations uses a pinned upstream
 commit rather than following upstream `main`; the command above is intended as
 the simplest manual recovery path for users troubleshooting an installation.
+
+### Manual Sparse Sage install on Windows
+
+Windows does not need `nvcc` when a verified wheel matches the active Torch and
+CUDA versions. Use the same Python interpreter that launches ComfyUI. From a
+normal ComfyUI venv that is commonly `.venv\Scripts\python.exe`; from the
+Windows portable package use its `python_embeded\python.exe` interpreter.
+First print the versions used by that interpreter:
+
+    <python> -c "import torch; print('torch:', torch.__version__); print('cuda:', torch.version.cuda)"
+
+Then install the matching verified wheel with that same interpreter:
+
+- Torch 2.5.1 / CUDA 12.4:
+
+      <python> -m pip install --no-deps "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post3/spas_sage_attn-0.1.0%2Bcu124torch2.5.1.post3-cp39-abi3-win_amd64.whl"
+
+- Torch 2.6.0 / CUDA 12.6:
+
+      <python> -m pip install --no-deps "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post3/spas_sage_attn-0.1.0%2Bcu126torch2.6.0.post3-cp39-abi3-win_amd64.whl"
+
+- Torch 2.7.1 / CUDA 12.8:
+
+      <python> -m pip install --no-deps "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post3/spas_sage_attn-0.1.0%2Bcu128torch2.7.1.post3-cp39-abi3-win_amd64.whl"
+
+- Torch 2.8.0 / CUDA 12.8:
+
+      <python> -m pip install --no-deps "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post3/spas_sage_attn-0.1.0%2Bcu128torch2.8.0.post3-cp39-abi3-win_amd64.whl"
+
+- Torch 2.9.0 or newer / CUDA 12.8:
+
+      <python> -m pip install --no-deps "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post4/spas_sage_attn-0.1.0%2Bcu128torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl"
+
+- Torch 2.9.0 or newer / CUDA 13.0:
+
+      <python> -m pip install --no-deps "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post4/spas_sage_attn-0.1.0%2Bcu130torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl"
+
+If an incompatible `spas_sage_attn` is already installed, add
+`--force-reinstall` to the matching command. Restart ComfyUI afterwards. A
+minimal import check is:
+
+    <python> -c "import spas_sage_attn; print('SpargeAttn installed OK')"
+
+If no wheel above matches the active Torch/CUDA pair, do not install a nearby
+wheel: its compiled ABI may not match. The sparse node can still fall back to
+INT8 Triton, FP8 FlexAttention, or dense attention.
 
 ROCm, MPS, XPU, CPU, future GPU architectures, NVIDIA installations without a
 matching wheel/build toolchain, and failed Sparse Sage builds are left
