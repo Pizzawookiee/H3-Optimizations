@@ -161,7 +161,7 @@ class ChunkedKitchenQKVProjector:
         format_ok = (
             fmt.fp8 or fmt.plain_float
             if self.fp8_projection
-            else fmt.convrot_int8_256
+            else (fmt.convrot_int8_256 or fmt.w4a8)
         )
         if (
             not is_installed_dense_attention(transformer_options)
@@ -200,7 +200,7 @@ class ChunkedKitchenQKVProjector:
                 fp8_projection=self.fp8_projection,
             )
         except (FP8BindingError, RuntimeError, TypeError, ValueError):
-            if not self.fp8_projection:
+            if not self.fp8_projection and not fmt.w4a8:
                 raise
             return None
 
