@@ -44,6 +44,24 @@ def _gate_add(x, other, gate, selector):
     return x
 
 
+def _iter_modulation_chunks(segments, max_rows):
+    '''Bound only per-token selector gathers; scalar segments stay unsplit.'''
+    max_rows = int(max_rows)
+    for start, stop, selector in segments:
+        if not torch.is_tensor(selector):
+            yield start, stop, selector
+            continue
+        offset = 0
+        while start + offset < stop:
+            size = min(max_rows, stop - start - offset)
+            yield (
+                start + offset,
+                start + offset + size,
+                selector[offset:offset + size],
+            )
+            offset += size
+
+
 def _open_generic_held(block, sample, config):
     held = HeldMLP(block.mlp, sample)
     try:
@@ -140,29 +158,35 @@ def make_forward(block, layer_index, config, original_forward=None):
             )
         )
 
-        # ComfyUI may attach a per-token modulation-row selector to masked H3
-        # video/audio segments. Apply those gathers in the same bounded slabs as
-        # the MLP so a long masked sequence does not materialize full-sequence
-        # [tokens, hidden] shift/scale/gate tensors.
+        # Scalar modulation keeps the original whole-segment fast path. Only
+        # ComfyUI's per-token noise-mask selectors are gathered in bounded slabs
+        # so long masked sequences do not materialize full [tokens, hidden]
+        # shift/scale/gate tensors.
         h = block.norm1(x)
-        for chunk in chunks:
+        for start, stop, selector in _iter_modulation_chunks(
+            segments,
+            config.chunk_rows,
+        ):
             _scale_shift(
-                h[chunk.start:chunk.stop],
+                h[start:stop],
                 shift_msa,
                 scale_msa,
-                chunk.mod_row,
+                selector,
             )
         attn_out = block.attn(
             h,
             rope_freqs=rope_freqs,
             transformer_options=transformer_options,
         )
-        for chunk in chunks:
+        for start, stop, selector in _iter_modulation_chunks(
+            segments,
+            config.chunk_rows,
+        ):
             _gate_add(
-                x[chunk.start:chunk.stop],
-                attn_out[chunk.start:chunk.stop],
+                x[start:stop],
+                attn_out[start:stop],
                 gate_msa,
-                chunk.mod_row,
+                selector,
             )
         del h, attn_out
 
