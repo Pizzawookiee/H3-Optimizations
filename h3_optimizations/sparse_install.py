@@ -1,4 +1,4 @@
-'''Install a verified Sparse Sage wheel before ComfyUI loads this pack.'''
+'''Install a verified Sparse Sage build before ComfyUI loads this pack.'''
 
 from contextlib import contextmanager
 import importlib
@@ -21,12 +21,19 @@ INSTALL_TIMEOUT_SECONDS = 600
 BUILD_TIMEOUT_SECONDS = 1800
 PROBE_TIMEOUT_SECONDS = 120
 PROBE_RESULT_PREFIX = 'H3_SPARSE_PROBE='
-RELEASE_ROOT = (
+WINDOWS_RELEASE_ROOT = (
     'https://github.com/woct0rdho/SpargeAttn/releases/download'
 )
-SPARGE_SOURCE_REF = '067d80cb6b76345c7b8be40e86c7d19a3cf7c4eb'
-SPARGE_REPOSITORY = 'https://github.com/woct0rdho/SpargeAttn.git'
-SPARGE_SOURCE = 'git+' + SPARGE_REPOSITORY + '@' + SPARGE_SOURCE_REF
+UPSTREAM_SPARGE_SOURCE_REF = 'ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a'
+UPSTREAM_SPARGE_REPOSITORY = 'https://github.com/thu-ml/SpargeAttn.git'
+UPSTREAM_SPARGE_SOURCE = (
+    'git+' + UPSTREAM_SPARGE_REPOSITORY + '@' + UPSTREAM_SPARGE_SOURCE_REF
+)
+FORK_SPARGE_SOURCE_REF = '067d80cb6b76345c7b8be40e86c7d19a3cf7c4eb'
+FORK_SPARGE_REPOSITORY = 'https://github.com/woct0rdho/SpargeAttn.git'
+FORK_SPARGE_SOURCE = (
+    'git+' + FORK_SPARGE_REPOSITORY + '@' + FORK_SPARGE_SOURCE_REF
+)
 _SPARGE_NINJA_DISABLED = 'BuildExtension.with_options(use_ninja=False)'
 _SPARGE_NINJA_ENABLED = 'BuildExtension.with_options(use_ninja=True)'
 _SPARGE_NVCC_ALL_CORES = 'f"--threads={os.cpu_count()}"'
@@ -44,6 +51,13 @@ _SUPPORTED_CAPABILITIES = {
     (8, 9),
     (9, 0),
     (12, 0),
+}
+_UPSTREAM_LINUX_CAPABILITIES = {
+    (8, 0),
+    (8, 6),
+    (8, 7),
+    (8, 9),
+    (9, 0),
 }
 
 _EXACT_WINDOWS_WHEELS = {
@@ -106,25 +120,32 @@ def _wheel_for(system, machine, torch_version, cuda_version):
         return None
     release, filename, digest = wheel
     return '%s/%s/%s#sha256=%s' % (
-        RELEASE_ROOT,
+        WINDOWS_RELEASE_ROOT,
         release,
         filename,
         digest,
     )
 
 
-def _linux_source_for(system, machine, torch_version, cuda_version):
+def _linux_source_for(system, machine, torch_version, cuda_version, capability):
     if system != 'Linux' or machine.lower() not in ('amd64', 'x86_64'):
         return None
     torch_key = _version_tuple(torch_version)
     cuda_key = _version_tuple(cuda_version)
-    if torch_key is None:
-        return None
-    if torch_key < (2, 3, 0):
+    capability = tuple(capability or ())
+    if torch_key is None or torch_key < (2, 3, 0):
         return None
     if cuda_key is not None and cuda_key[:2] < (12, 0):
         return None
-    return SPARGE_SOURCE
+    if capability == (8, 9) and cuda_key is not None and cuda_key[:2] < (12, 4):
+        return None
+    if capability == (9, 0) and cuda_key is not None and cuda_key[:2] < (12, 4):
+        return None
+    if capability in _UPSTREAM_LINUX_CAPABILITIES:
+        return UPSTREAM_SPARGE_SOURCE
+    if capability == (12, 0) and cuda_key is not None and cuda_key[:2] >= (12, 8):
+        return FORK_SPARGE_SOURCE
+    return None
 
 
 def _is_installed():
@@ -136,10 +157,7 @@ def _is_installed():
 
 def _skip_requested():
     return os.environ.get(SKIP_ENV, '').strip().lower() in (
-        '1',
-        'true',
-        'yes',
-        'on',
+        '1', 'true', 'yes', 'on',
     )
 
 
@@ -228,17 +246,11 @@ def _run_command(command, *, timeout, operation):
 
 
 def _install_windows_wheel(wheel, *, force_reinstall=False):
-    arguments = [
-        '--no-deps',
-        '--only-binary=:all:',
-    ]
+    arguments = ['--no-deps', '--only-binary=:all:']
     if force_reinstall:
         arguments.append('--force-reinstall')
     arguments.append(wheel)
-    return _run_pip(
-        arguments,
-        timeout=INSTALL_TIMEOUT_SECONDS,
-    )
+    return _run_pip(arguments, timeout=INSTALL_TIMEOUT_SECONDS)
 
 
 def _missing_linux_build_requirements():
@@ -281,18 +293,28 @@ def _nvcc_version(nvcc):
     return tuple(int(part) for part in match.groups())
 
 
-def _checkout_pinned_sparge(destination):
+def _source_details(source):
+    if source == UPSTREAM_SPARGE_SOURCE:
+        return UPSTREAM_SPARGE_REPOSITORY, UPSTREAM_SPARGE_SOURCE_REF, False
+    if source == FORK_SPARGE_SOURCE:
+        return FORK_SPARGE_REPOSITORY, FORK_SPARGE_SOURCE_REF, True
+    return None
+
+
+def _checkout_pinned_sparge(destination, source):
+    details = _source_details(source)
     git = shutil.which('git')
-    if git is None:
+    if details is None or git is None:
         return False
+    repository, source_ref, _ = details
     if _run_command(
-        [git, 'clone', '--quiet', '--no-checkout', SPARGE_REPOSITORY, str(destination)],
+        [git, 'clone', '--quiet', '--no-checkout', repository, str(destination)],
         timeout=INSTALL_TIMEOUT_SECONDS,
         operation='Sparse Sage source checkout',
     ) is None:
         return False
     if _run_command(
-        [git, '-C', str(destination), 'checkout', '--quiet', '--detach', SPARGE_SOURCE_REF],
+        [git, '-C', str(destination), 'checkout', '--quiet', '--detach', source_ref],
         timeout=INSTALL_TIMEOUT_SECONDS,
         operation='Sparse Sage source checkout',
     ) is None:
@@ -304,13 +326,13 @@ def _checkout_pinned_sparge(destination):
     )
     if result is None:
         return False
-    if (result.stdout or '').strip().lower() != SPARGE_SOURCE_REF:
+    if (result.stdout or '').strip().lower() != source_ref:
         logging.error('%s Sparse Sage source checkout did not resolve the pinned commit', LOG_PREFIX)
         return False
     return True
 
 
-def _patch_sparge_setup(path):
+def _patch_fork_setup(path):
     try:
         source = path.read_text(encoding='utf-8')
     except OSError as exc:
@@ -322,7 +344,7 @@ def _patch_sparge_setup(path):
     )
     for original, replacement in replacements:
         if source.count(original) != 1:
-            logging.error('%s pinned Sparse Sage build setup no longer matches', LOG_PREFIX)
+            logging.error('%s pinned Sparse Sage fork build setup no longer matches', LOG_PREFIX)
             return False
         source = source.replace(original, replacement)
     try:
@@ -335,36 +357,50 @@ def _patch_sparge_setup(path):
 
 @contextmanager
 def _prepared_linux_source(source):
-    if source != SPARGE_SOURCE:
+    details = _source_details(source)
+    if details is None:
         logging.error('%s refused an unpinned Sparse Sage source', LOG_PREFIX)
         yield None
         return
+    _, _, needs_fork_patch = details
     with TemporaryDirectory(prefix='h3-sparge-build-') as temporary:
         checkout = Path(temporary) / 'SpargeAttn'
-        if not _checkout_pinned_sparge(checkout):
+        if not _checkout_pinned_sparge(checkout, source):
             yield None
             return
-        if not _patch_sparge_setup(checkout / 'setup.py'):
+        if needs_fork_patch and not _patch_fork_setup(checkout / 'setup.py'):
             yield None
             return
         yield checkout
 
 
-def _linux_build_environment(nvcc):
+def _linux_build_environment(nvcc, capability, source):
     environment = os.environ.copy()
     environment['CUDA_HOME'] = str(Path(nvcc).resolve().parent.parent)
     logical_cores = max(1, os.cpu_count() or 1)
     environment.setdefault('MAX_JOBS', str(max(1, logical_cores // 2)))
-    environment.setdefault('NVCC_THREADS', str(min(2, logical_cores)))
-    # Avoid cuda_fp*.hpp's unresolved __assert_fail path in Linux nvcc builds.
-    nvcc_flags = environment.get('NVCC_APPEND_FLAGS', '').split()
-    if '-DNDEBUG' not in nvcc_flags:
-        nvcc_flags.append('-DNDEBUG')
-    environment['NVCC_APPEND_FLAGS'] = ' '.join(nvcc_flags)
+    capability = tuple(capability or ())
+    if capability:
+        environment.setdefault('TORCH_CUDA_ARCH_LIST', '%d.%d' % capability)
+    if source == FORK_SPARGE_SOURCE:
+        environment.setdefault('NVCC_THREADS', str(min(2, logical_cores)))
+        nvcc_flags = environment.get('NVCC_APPEND_FLAGS', '').split()
+        if '-DNDEBUG' not in nvcc_flags:
+            nvcc_flags.append('-DNDEBUG')
+        environment['NVCC_APPEND_FLAGS'] = ' '.join(nvcc_flags)
     return environment
 
 
-def _install_linux_source(source, *, force_reinstall=False):
+def _minimum_nvcc_for(capability):
+    capability = tuple(capability or ())
+    if capability in ((8, 9), (9, 0)):
+        return (12, 4)
+    if capability == (12, 0):
+        return (12, 8)
+    return (12, 0)
+
+
+def _install_linux_source(source, *, capability, force_reinstall=False):
     if shutil.which('git') is None:
         logging.warning('%s Linux Sparse Sage installation requires git', LOG_PREFIX)
         return False
@@ -376,8 +412,13 @@ def _install_linux_source(source, *, force_reinstall=False):
         )
         return False
     nvcc_version = _nvcc_version(nvcc)
-    if nvcc_version is None or nvcc_version < (12, 0):
-        logging.warning('%s Linux Sparse Sage installation requires nvcc 12.0 or newer', LOG_PREFIX)
+    minimum_nvcc = _minimum_nvcc_for(capability)
+    if nvcc_version is None or nvcc_version < minimum_nvcc:
+        logging.warning(
+            '%s Linux Sparse Sage installation for SM%d%d requires nvcc %d.%d or newer',
+            LOG_PREFIX,
+            capability[0], capability[1], minimum_nvcc[0], minimum_nvcc[1],
+        )
         return False
     missing = _missing_linux_build_requirements()
     if missing and not _run_pip(
@@ -385,17 +426,13 @@ def _install_linux_source(source, *, force_reinstall=False):
         timeout=INSTALL_TIMEOUT_SECONDS,
     ):
         return False
-    environment = _linux_build_environment(nvcc)
+    environment = _linux_build_environment(nvcc, capability, source)
     logging.info(
-        '%s building Sparse Sage with %s parallel jobs and %s nvcc threads per job',
+        '%s building Sparse Sage for SM%d%d with %s parallel jobs',
         LOG_PREFIX,
-        environment['MAX_JOBS'],
-        environment['NVCC_THREADS'],
+        capability[0], capability[1], environment['MAX_JOBS'],
     )
-    arguments = [
-        '--no-build-isolation',
-        '--no-deps',
-    ]
+    arguments = ['--no-build-isolation', '--no-deps']
     if force_reinstall:
         arguments.append('--force-reinstall')
     with _prepared_linux_source(source) as prepared_source:
@@ -449,27 +486,24 @@ def ensure_sparse_sage():
     cuda_version = runtime.get('cuda_version')
     system = platform.system()
     machine = platform.machine()
-    wheel = _wheel_for(
-        system,
-        machine,
-        torch_version,
-        cuda_version or '',
-    )
+    wheel = _wheel_for(system, machine, torch_version, cuda_version or '')
     source = _linux_source_for(
         system,
         machine,
         torch_version,
         cuda_version or '',
+        capability,
     )
     if wheel is None and source is None:
         logging.warning(
             '%s Sparse Sage is not installed and no verified automatic install '
-            'matches %s %s, Torch %s, CUDA %s',
+            'matches %s %s, Torch %s, CUDA %s, SM%s',
             LOG_PREFIX,
             system,
             machine,
             torch_version,
             cuda_version or 'unknown',
+            ''.join(str(part) for part in capability) or 'unknown',
         )
         return False
 
@@ -492,15 +526,20 @@ def ensure_sparse_sage():
             force_reinstall=force_reinstall,
         )
     else:
+        details = _source_details(source)
+        source_ref = details[1]
+        source_name = 'upstream' if source == UPSTREAM_SPARGE_SOURCE else 'SM120 fork'
         logging.info(
-            '%s building pinned Sparse Sage %s for Torch %s, CUDA %s',
+            '%s building pinned %s Sparse Sage %s for Torch %s, CUDA %s',
             LOG_PREFIX,
-            SPARGE_SOURCE_REF,
+            source_name,
+            source_ref,
             torch_version,
             cuda_version or 'detected by nvcc',
         )
         installed = _install_linux_source(
             source,
+            capability=capability,
             force_reinstall=force_reinstall,
         )
     if not installed:
