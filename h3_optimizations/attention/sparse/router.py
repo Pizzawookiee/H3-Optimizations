@@ -35,6 +35,27 @@ def sort_selected_indices(indices):
     return indices.sort(dim=-1).values
 
 
+def _chunked_topk_scores(q, k, retained, *, q_chunk_tiles=64):
+    """Exact top-k routing without materializing the full score matrix."""
+    if q.ndim != 4 or k.ndim != 4:
+        raise SparseRouterError("chunked router scoring requires rank-4 summaries")
+    if q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]:
+        raise SparseRouterError("chunked router Q/K summary shapes differ")
+    q_chunk_tiles = int(q_chunk_tiles)
+    retained = int(retained)
+    if q_chunk_tiles <= 0 or retained <= 0:
+        raise SparseRouterError("chunked router parameters must be positive")
+
+    k_t = k.transpose(-1, -2)
+    pieces = []
+    for start in range(0, q.shape[-2], q_chunk_tiles):
+        stop = min(start + q_chunk_tiles, q.shape[-2])
+        scores = torch.matmul(q[..., start:stop, :], k_t)
+        pieces.append(torch.topk(scores, retained, dim=-1).indices)
+        del scores
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
+
+
 @dataclass(frozen=True)
 class SparseTileGeometry:
     signature: tuple
@@ -354,13 +375,12 @@ class SparseTileRouter:
             dtype=torch.int32,
             device=q_means.device,
         )
-        scores = torch.matmul(
+        indices = _chunked_topk_scores(
             q_means[..., geometry.pure_video_q_start:, :],
-            k_means[
-                ..., geometry.pure_video_kv_start:, :
-            ].transpose(-1, -2),
+            k_means[..., geometry.pure_video_kv_start:, :],
+            retained,
+            q_chunk_tiles=64,
         )
-        indices = torch.topk(scores, retained, dim=-1).indices
         self._notify(sink, geometry, indices)
         sparse_rows = self._pack_rows(
             indices,

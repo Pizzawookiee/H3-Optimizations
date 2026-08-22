@@ -564,10 +564,43 @@ class SparseSageExecutor:
                     "Sparse Sage resolved %s but execution device is %d.%d"
                     % (self.spec.architecture, capability[0], capability[1])
                 )
-        v_carrier, v_scale = self._prepare_v(projected.v)
-        self._validate_v(projected.v, v_carrier, v_scale, sequence)
+        if projected.v_carrier is not None:
+            if not self.spec.uses_fp8_v:
+                raise SparseSageError(
+                    "prepacked FP8 V supplied to a non-FP8 Sparse Sage kernel"
+                )
+            v_carrier = projected.v_carrier
+            v_scale = projected.v_scale
+            padded = (sequence + 127) // 128 * 128
+            if (
+                tuple(v_carrier.shape)
+                != (1, heads, projected.head_dim, padded)
+                or v_carrier.dtype != torch.float8_e4m3fn
+                or v_carrier.device != projected.q_int8.device
+                or not v_carrier.is_contiguous()
+            ):
+                raise SparseSageError("prepacked Sparse Sage V carrier is invalid")
+            if (
+                v_scale is None
+                or tuple(v_scale.shape) != (1, heads, projected.head_dim)
+                or v_scale.dtype != torch.float32
+                or v_scale.device != projected.q_int8.device
+                or not v_scale.is_contiguous()
+            ):
+                raise SparseSageError("prepacked Sparse Sage V scale is invalid")
+        else:
+            if projected.v is None:
+                raise SparseSageError(
+                    "projected H3 QKV has neither floating nor prepacked V"
+                )
+            v_carrier, v_scale = self._prepare_v(projected.v)
+            self._validate_v(projected.v, v_carrier, v_scale, sequence)
         details = self._metadata(metadata)
-        details.update({"qkv_projection": "fused_int8", "smooth_k": bool(projected.smooth_k)})
+        details.update({
+            "qkv_projection": "fused_int8",
+            "smooth_k": bool(projected.smooth_k),
+            "prepacked_fp8_v": projected.v_carrier is not None,
+        })
         return PreparedSparseSage(
             q_int8=projected.q_int8,
             k_int8=projected.k_int8,

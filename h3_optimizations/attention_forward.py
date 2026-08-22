@@ -97,6 +97,20 @@ def _project_or_none(
 
 
 def _finish_projected(module, backend, prepared):
+    execute_projected = getattr(backend, 'execute_projected', None)
+    if execute_projected is not None:
+        direct = execute_projected(module, prepared)
+        if direct is not None:
+            if direct.ndim != 2:
+                raise RuntimeError(
+                    '%s returned rank-%d direct projected output; expected rank 2'
+                    % (
+                        getattr(backend, 'name', type(backend).__name__),
+                        direct.ndim,
+                    )
+                )
+            return direct
+
     out_hnd = backend.execute(prepared)
     if out_hnd.ndim != 4:
         raise RuntimeError(

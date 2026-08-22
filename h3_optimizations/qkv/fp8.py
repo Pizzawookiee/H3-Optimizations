@@ -250,6 +250,24 @@ class HeldFP8QKV:
         chunk_rope = None if rope_freqs is None else rope_freqs[:, start:end]
         return self._finish(x[start:end], chunk_rope)
 
+    def project_v_hnd(self, x, start, end):
+        rows = x[start:end]
+        projected = self.binding.linear(rows)
+        heads = int(self.attention.heads)
+        head_dim = int(self.attention.head_dim)
+        inner = heads * head_dim
+        if projected.shape[-1] != 3 * inner:
+            raise FP8BindingError(
+                "H3 QKV projection width does not match 3 * heads * head_dim"
+            )
+        v = projected[:, 2 * inner:3 * inner]
+        return (
+            v.view(end - start, heads, head_dim)
+            .transpose(0, 1)
+            .unsqueeze(0)
+            .contiguous()
+        )
+
     def project_rows(self, x, rope_freqs, rows):
         sample_x = x.index_select(0, rows)
         sample_rope = (

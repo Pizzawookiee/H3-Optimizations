@@ -33,7 +33,7 @@ class PreparedFusedQKV:
     q_scale: torch.Tensor
     k_int8: torch.Tensor
     k_scale: torch.Tensor
-    v: torch.Tensor
+    v: torch.Tensor | None
     q_summary: torch.Tensor
     k_summary: torch.Tensor
     output_dtype: torch.dtype
@@ -42,6 +42,8 @@ class PreparedFusedQKV:
     head_dim: int
     layer_index: int
     smooth_k: bool = False
+    v_carrier: torch.Tensor | None = None
+    v_scale: torch.Tensor | None = None
 
 
 def sparse_fused_qkv_contract_mismatch(spec):
@@ -104,8 +106,23 @@ def validate_prepared_fused_qkv(prepared):
         raise FusedQKVError("fused H3 Q/K carrier shape is invalid")
     if prepared.q_int8.dtype != torch.int8 or prepared.k_int8.dtype != torch.int8:
         raise FusedQKVError("fused H3 Q/K carriers must be INT8")
-    if tuple(prepared.v.shape) != q_shape or prepared.v.dtype != prepared.output_dtype:
-        raise FusedQKVError("fused H3 V carrier is invalid")
+    if prepared.v_carrier is None:
+        if prepared.v is None:
+            raise FusedQKVError("fused H3 V is missing")
+        if tuple(prepared.v.shape) != q_shape or prepared.v.dtype != prepared.output_dtype:
+            raise FusedQKVError("fused H3 V carrier is invalid")
+    else:
+        padded = (sequence + 127) // 128 * 128
+        if tuple(prepared.v_carrier.shape) != (1, heads, head_dim, padded):
+            raise FusedQKVError("prepacked H3 FP8 V carrier shape is invalid")
+        if prepared.v_carrier.dtype != torch.float8_e4m3fn:
+            raise FusedQKVError("prepacked H3 V carrier must be E4M3 FP8")
+        if prepared.v_scale is None:
+            raise FusedQKVError("prepacked H3 FP8 V requires V scale")
+        if tuple(prepared.v_scale.shape) != (1, heads, head_dim):
+            raise FusedQKVError("prepacked H3 V scale shape is invalid")
+        if prepared.v_scale.dtype != torch.float32:
+            raise FusedQKVError("prepacked H3 V scale must be FP32")
     if tuple(prepared.q_scale.shape) != (1, heads, q_blocks):
         raise FusedQKVError("fused H3 Q scale shape is invalid")
     if tuple(prepared.k_scale.shape) != (1, heads, k_blocks):
@@ -116,15 +133,20 @@ def validate_prepared_fused_qkv(prepared):
         raise FusedQKVError("fused H3 Q router summary shape is invalid")
     if tuple(prepared.k_summary.shape) != (1, heads, k_blocks, head_dim):
         raise FusedQKVError("fused H3 K router summary shape is invalid")
-    tensors = (
+    tensors = [
         prepared.q_int8,
         prepared.q_scale,
         prepared.k_int8,
         prepared.k_scale,
-        prepared.v,
         prepared.q_summary,
         prepared.k_summary,
-    )
+    ]
+    if prepared.v is not None:
+        tensors.append(prepared.v)
+    if prepared.v_carrier is not None:
+        tensors.append(prepared.v_carrier)
+    if prepared.v_scale is not None:
+        tensors.append(prepared.v_scale)
     if any(t.device != prepared.q_int8.device for t in tensors):
         raise FusedQKVError("fused H3 QKV carrier devices differ")
     if any(not t.is_contiguous() for t in tensors):

@@ -203,15 +203,35 @@ def _resolve_sparse(plan, environment, inventory):
         **_sparse_config_kwargs(plan),
     )
     projector = None
-    if qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
+    backend_cls = HybridSparseBackend
+    if (
+        kernel_spec.uses_fp8_v
+        and qkv.provider_id in (
+            QKV_SPARSE_CONVROT_INT8,
+            QKV_SPARSE_FP8_CHUNKED,
+        )
+    ):
+        from .attention.sparse.sparse_sage_streamed import (
+            StreamedSparseSageBackend,
+            StreamedSparseSageQKVProjector,
+        )
+
+        projector = StreamedSparseSageQKVProjector(
+            kernel_spec,
+            project_chunk_rows=1024,
+            query_chunk_rows=1024,
+        )
+        backend_cls = StreamedSparseSageBackend
+    elif qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
         from .qkv.projectors import SparseFusedQKVProjector
 
-        projector = SparseFusedQKVProjector(kernel_spec, chunk_rows=4096)
+        projector = SparseFusedQKVProjector(kernel_spec, chunk_rows=1024)
     elif qkv.provider_id == QKV_SPARSE_FP8_CHUNKED:
         from .attention.sparse.fp8_qkv import FP8SparseQKVProjector
 
-        projector = FP8SparseQKVProjector(kernel_spec, chunk_rows=4096)
-    backend = HybridSparseBackend(
+        projector = FP8SparseQKVProjector(kernel_spec, chunk_rows=1024)
+
+    backend = backend_cls(
         config,
         kernel_spec=kernel_spec,
         projector=projector,

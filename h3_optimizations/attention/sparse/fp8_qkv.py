@@ -17,8 +17,14 @@ from .fused_qkv import (
     sparse_fused_qkv_contract_mismatch,
     validate_prepared_fused_qkv,
 )
+from .fp8_v_stream import (
+    allocate_v_carrier,
+    finalize_v_scale,
+    pack_v_chunk,
+    update_v_amax,
+)
 
-CHUNK_ROWS = 4096
+CHUNK_ROWS = 1024
 
 
 def run_fp8_sparse_qkv(
@@ -36,11 +42,11 @@ def run_fp8_sparse_qkv(
         )
     if comfy.model_management.in_training:
         raise FusedQKVError("chunked Sparse Sage QKV is inference-only")
+
     mismatch = sparse_fused_qkv_contract_mismatch(spec)
     if mismatch is not None:
         raise FusedQKVError(
-            "QKV does not match the Sparse Sage carrier contract: %s"
-            % mismatch
+            "QKV does not match the Sparse Sage carrier contract: %s" % mismatch
         )
     if rope_freqs is not None and (
         rope_freqs.ndim != 6
@@ -49,11 +55,7 @@ def run_fp8_sparse_qkv(
     ):
         raise FusedQKVError("chunked Sparse Sage QKV received invalid RoPE")
 
-    chunk_rows = _validate_chunk_rows(
-        chunk_rows,
-        spec.q_tile,
-        spec.kv_tile,
-    )
+    chunk_rows = _validate_chunk_rows(chunk_rows, spec.q_tile, spec.kv_tile)
     sequence = int(x.shape[0])
     heads = int(module.heads)
     head_dim = int(module.head_dim)
@@ -69,6 +71,7 @@ def run_fp8_sparse_qkv(
             x[:1],
             allow_float_conversion=fmt.plain_float,
         )
+
     held.__enter__()
     try:
         shape = (1, heads, sequence, head_dim)
@@ -76,13 +79,8 @@ def run_fp8_sparse_qkv(
         k_blocks = (sequence + int(spec.kv_tile) - 1) // int(spec.kv_tile)
         q_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
         k_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
-        v = torch.empty(shape, dtype=x.dtype, device=x.device)
-        q_scale = torch.empty(
-            (1, heads, q_blocks), dtype=torch.float32, device=x.device
-        )
-        k_scale = torch.empty(
-            (1, heads, k_blocks), dtype=torch.float32, device=x.device
-        )
+        q_scale = torch.empty((1, heads, q_blocks), dtype=torch.float32, device=x.device)
+        k_scale = torch.empty((1, heads, k_blocks), dtype=torch.float32, device=x.device)
         q_summary = torch.empty(
             (1, heads, q_blocks, head_dim), dtype=x.dtype, device=x.device
         )
@@ -90,24 +88,89 @@ def run_fp8_sparse_qkv(
             (1, heads, k_blocks, head_dim), dtype=x.dtype, device=x.device
         )
 
+        # Preserve the existing W4A8 path for now. Streaming V is enabled
+        # for FP8 / float-converted FP8 projection only.
+        if spec.uses_fp8_v and not fmt.w4a8:
+            if spec.fused_v_ops is None:
+                raise FusedQKVError(
+                    "streaming FP8 V requires Sparse Sage fused V ops"
+                )
+
+            v_amax = torch.zeros(
+                (1, heads, head_dim),
+                dtype=torch.float32,
+                device=x.device,
+            )
+
+            for start in range(0, sequence, chunk_rows):
+                end = min(start + chunk_rows, sequence)
+                q, k, chunk_v = held.project_hnd(x, rope_freqs, start, end)
+                pack_sparse_qk_chunk_into(
+                    q, q_int8, q_scale, q_summary,
+                    row_start=start, block_size=spec.q_tile,
+                )
+                pack_sparse_qk_chunk_into(
+                    k, k_int8, k_scale, k_summary,
+                    row_start=start, block_size=spec.kv_tile,
+                )
+                update_v_amax(v_amax, chunk_v)
+                del q, k, chunk_v
+
+            v_scale = finalize_v_scale(v_amax, spec.v_quant_bound)
+            del v_amax
+
+            v_carrier = allocate_v_carrier(
+                sequence=sequence,
+                heads=heads,
+                head_dim=head_dim,
+                device=x.device,
+            )
+
+            for start in range(0, sequence, chunk_rows):
+                end = min(start + chunk_rows, sequence)
+                chunk_v = held.project_v_hnd(x, start, end)
+                pack_v_chunk(
+                    chunk_v,
+                    v_carrier,
+                    v_scale,
+                    row_start=start,
+                    sequence=sequence,
+                    fused_v_ops=spec.fused_v_ops,
+                    scale_max=spec.v_quant_bound,
+                )
+                del chunk_v
+
+            return validate_prepared_fused_qkv(
+                PreparedFusedQKV(
+                    q_int8=q_int8,
+                    q_scale=q_scale,
+                    k_int8=k_int8,
+                    k_scale=k_scale,
+                    v=None,
+                    q_summary=q_summary,
+                    k_summary=k_summary,
+                    output_dtype=x.dtype,
+                    sequence=sequence,
+                    heads=heads,
+                    head_dim=head_dim,
+                    layer_index=int(layer_index),
+                    smooth_k=False,
+                    v_carrier=v_carrier,
+                    v_scale=v_scale,
+                )
+            )
+
+        v = torch.empty(shape, dtype=x.dtype, device=x.device)
         for start in range(0, sequence, chunk_rows):
             end = min(start + chunk_rows, sequence)
             q, k, chunk_v = held.project_hnd(x, rope_freqs, start, end)
             pack_sparse_qk_chunk_into(
-                q,
-                q_int8,
-                q_scale,
-                q_summary,
-                row_start=start,
-                block_size=spec.q_tile,
+                q, q_int8, q_scale, q_summary,
+                row_start=start, block_size=spec.q_tile,
             )
             pack_sparse_qk_chunk_into(
-                k,
-                k_int8,
-                k_scale,
-                k_summary,
-                row_start=start,
-                block_size=spec.kv_tile,
+                k, k_int8, k_scale, k_summary,
+                row_start=start, block_size=spec.kv_tile,
             )
             v[:, :, start:end, :].copy_(chunk_v)
             del q, k, chunk_v
