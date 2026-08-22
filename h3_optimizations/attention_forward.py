@@ -5,6 +5,7 @@ import comfy.model_management
 import comfy.quant_ops
 
 from .attention import AttentionBackendUnavailable
+from .ordering_probe import has_ordering_observer, observe_attention
 
 
 def finish_qkv_projection(module, projected, rope_freqs):
@@ -135,7 +136,8 @@ def make_forward(
         transformer_options = (
             transformer_options if transformer_options is not None else {}
         )
-        if projector is not None:
+        ordering_probe = has_ordering_observer(transformer_options)
+        if projector is not None and not ordering_probe:
             projected = _project_or_none(
                 projector,
                 module,
@@ -164,6 +166,14 @@ def make_forward(
 
         q, k, v = project_qkv(module, x, rope_freqs)
         q, k, v = to_hnd(q, k, v)
+        if ordering_probe:
+            observe_attention(
+                layer_index,
+                transformer_options,
+                q,
+                k,
+                v,
+            )
 
         if backend is None:
             out = _legacy_attention(

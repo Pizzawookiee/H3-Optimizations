@@ -208,7 +208,7 @@ class AttentionEnergyTests(unittest.TestCase):
             self.segments,
             4096,
         )
-        energy = recorder.route(0).energy
+        energy = recorder.route(0).tile_energy
 
         reference = torch.empty(rows, dtype=torch.float32)
         for start, stop, row in self.segments:
@@ -235,8 +235,8 @@ class AttentionEnergyTests(unittest.TestCase):
         split.record_attention_energy(0, attn_out, gate, segments, 37)
         self.assertTrue(
             torch.allclose(
-                whole.route(0).energy,
-                split.route(0).energy,
+                whole.route(0).tile_energy,
+                split.route(0).tile_energy,
                 atol=1e-6,
             )
         )
@@ -253,7 +253,7 @@ class AttentionEnergyTests(unittest.TestCase):
             [(0, rows, 0)],
             4096,
         )
-        energy = recorder.route(0).energy
+        energy = recorder.route(0).tile_energy
         self.assertEqual(energy.shape, (2,))
         self.assertTrue(torch.allclose(energy, torch.full((2,), 4.0)))
 
@@ -315,7 +315,7 @@ class RowScoreTests(unittest.TestCase):
             for index, (start, stop, _kind) in enumerate(self.layout.segments)
         ]
         self.recorder.record_attention_energy(0, attn_out, gate, segments, 4096)
-        scores = row_scores(self.route, 0, rows, signal='energy')
+        scores = row_scores(self.route, 0, rows, signal='attention_update_energy')
         video_start = self.geometry.pure_video_kv_start * KV_TILE
         self.assertTrue(bool(torch.isnan(scores[:video_start]).all()))
         self.assertTrue(bool((scores[video_start:] > 0.0).all()))
@@ -327,8 +327,8 @@ class RowScoreTests(unittest.TestCase):
     def test_missing_route_returns_none(self):
         self.assertIsNone(row_scores(None, 0, 64))
         self.assertIsNone(
-            row_scores(self.recorder.route(0), 0, 64, signal='energy')
-            if self.recorder.route(0).energy is not None
+            row_scores(self.recorder.route(0), 0, 64, signal='attention_update_energy')
+            if self.recorder.route(0).tile_energy is not None
             else None
         )
 
