@@ -50,8 +50,7 @@ Restart ComfyUI after cloning. The nodes then appear under H3-Optimizations;
 ComfyUI-Manager is not required.
 
 The repository contains the Windows x64 DLL and Linux x86-64 shared library.
-Before node registration, startup loads the local binary, checks its ABI, and
-runs a cached dense-versus-SDPA plus full-route self-test on the active GPU.
+When the native backend is first resolved, the local binary is loaded, its ABI is checked, and a cached per-GPU self-test is run.
 Nothing is downloaded, compiled, or installed during startup. If the binary is
 missing, cannot load, or fails the self-test, the nodes still load and `auto`
 uses the remaining fallback chain.
