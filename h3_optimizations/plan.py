@@ -37,7 +37,8 @@ SPARSE_BACKEND_AUTO = 'auto'
 SPARSE_BACKEND_SAGE = 'Sparse Sage'
 SPARSE_BACKEND_TRITON = 'INT8 Triton'
 SPARSE_BACKEND_FLEX = 'FP8 FlexAttention'
-SPARSE_BACKEND_KITCHEN = 'Kitchen INT8 (experimental)'
+SPARSE_BACKEND_KITCHEN = 'Kitchen INT8'
+_SPARSE_BACKEND_KITCHEN_LEGACY = 'Kitchen INT8 (experimental)'
 SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_SAGE,
@@ -151,6 +152,8 @@ class SparseRequest:
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
+        if self.backend == _SPARSE_BACKEND_KITCHEN_LEGACY:
+            object.__setattr__(self, 'backend', SPARSE_BACKEND_KITCHEN)
         if self.backend not in SPARSE_BACKEND_REQUESTS:
             raise ValueError('unknown sparse backend request %r' % self.backend)
         _validate_edge_schedule(
