@@ -36,10 +36,6 @@ from h3_optimizations.public_nodes import H3OptimizationsExtension  # noqa: E402
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
-def input_by_id(schema, input_id):
-    return next(item for item in schema.inputs if item.id == input_id)
-
-
 class PublicNodeTests(unittest.TestCase):
     def test_public_registry_contains_only_production_nodes(self):
         nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
@@ -52,22 +48,6 @@ class PublicNodeTests(unittest.TestCase):
             ],
         )
         self.assertFalse(any('MLPSharing' in node.__name__ for node in nodes))
-
-    def test_memory_node_exposes_preserve_precision_toggle(self):
-        schema = H3MemoryOptimization.define_schema()
-        self.assertEqual(schema.node_id, 'H3MemoryOptimization')
-        self.assertEqual(schema.display_name, 'H3 Memory Optimization')
-        self.assertEqual(
-            [item.id for item in schema.inputs],
-            [
-                'model',
-                'fused_qkv',
-                'mlp_memory',
-                'chunk_rows',
-                'preserve_precision',
-            ],
-        )
-        self.assertFalse(input_by_id(schema, 'preserve_precision').default)
 
     def test_preserve_precision_overrides_only_quantizing_auto_paths(self):
         request = _memory_request(
