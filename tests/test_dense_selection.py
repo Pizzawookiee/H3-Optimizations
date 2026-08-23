@@ -66,6 +66,9 @@ class DenseSelectionTests(unittest.TestCase):
         return SimpleNamespace(
             qkv=(object(),),
             qkv_convrot_int8_256=True,
+            qkv_w4a8=False,
+            qkv_fp8=False,
+            qkv_plain_float=False,
             homogeneous=lambda name: name == 'qkv',
             labels=lambda _name: ('TensorWiseINT8Layout+convrot256',),
         )

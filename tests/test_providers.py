@@ -17,8 +17,10 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     MLP_FLOAT_CHUNKED,
     MLP_FP8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
+    MLP_W4A8_CHUNKED,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
+    QKV_DENSE_W4A8_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     QKV_STANDARD,
     QKV_TRITON_SPARSE_CHUNKED,
@@ -232,7 +234,7 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(qkv.provider_id, QKV_STANDARD)
 
-    def test_dense_w4a8_qkv_stays_standard(self):
+    def test_dense_w4a8_qkv_uses_bounded_kitchen_projection(self):
         w4a8 = FakeWeight(layout='AsymW4A8Int8Layout', dtype='bfloat16', storage_dtype='int8')
         inventory = inspect_h3_linears([block(w4a8)])
         qkv = resolve_qkv_provider(
@@ -243,10 +245,10 @@ class ProviderTests(unittest.TestCase):
             memory_optimize=True,
             fp8_available=True,
         )
-        self.assertEqual(qkv.provider_id, QKV_STANDARD)
+        self.assertEqual(qkv.provider_id, QKV_DENSE_W4A8_CHUNKED)
         self.assertEqual(
             resolve_mlp_provider(inventory, request='auto', fp8_available=True).provider_id,
-            MLP_PRESERVE_UPSTREAM,
+            MLP_W4A8_CHUNKED,
         )
 
     def test_sparse_fusion_declines_mismatched_geometry(self):

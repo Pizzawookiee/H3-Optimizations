@@ -4,10 +4,9 @@ The binary self-test may not stop ComfyUI from starting. A missing or invalid
 accelerator means the normal fallback chain is used instead.
 '''
 
-from pathlib import Path
 import logging
+from pathlib import Path
 import sys
-
 
 _HERE = Path(__file__).resolve().parent
 

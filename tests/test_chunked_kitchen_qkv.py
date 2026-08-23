@@ -109,7 +109,7 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
 
     def test_anchor_prepass_rope_slices_chunks_and_retains_one_v(self):
         fake = FakeKitchen()
-        module = SimpleNamespace(heads=2, head_dim=4)
+        module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=4)
         x = torch.arange(10, dtype=torch.float32).unsqueeze(1).expand(10, 6)
         rope = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1, 1, 1, 1)
         calls = []
@@ -136,6 +136,10 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             kitchen_qkv,
             'resolve_kitchen',
             return_value=fake,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'describe_linear',
+            return_value=SimpleNamespace(plain_float=False, w4a8=False),
         ), mock.patch.object(
             kitchen_qkv,
             'project_qkv',
@@ -177,7 +181,7 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
 
     def test_sparse_producer_retains_only_tile_summaries(self):
         fake = FakeKitchen()
-        module = SimpleNamespace(heads=2, head_dim=4)
+        module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=4)
         x = torch.arange(10, dtype=torch.float32).unsqueeze(1).expand(10, 6)
 
         def project(_module, values, _rope_rows):
@@ -190,6 +194,10 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             kitchen_qkv,
             'resolve_kitchen',
             return_value=fake,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'describe_linear',
+            return_value=SimpleNamespace(plain_float=False, w4a8=False),
         ), mock.patch.object(
             kitchen_qkv,
             'project_qkv',

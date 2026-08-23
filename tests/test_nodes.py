@@ -1,6 +1,5 @@
 '''CPU-only schema, disabled-node, and non-H3 no-op tests.'''
 
-import asyncio
 import os
 from pathlib import Path
 import sys
@@ -29,7 +28,6 @@ from h3_optimizations.nodes import (  # noqa: E402
     H3MLPSharingProbeOutput,
     H3MLPStage0,
     H3MemoryOptimization,
-    H3OptimizationsExtension,
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
@@ -206,17 +204,6 @@ class NodeTests(unittest.TestCase):
         )
         self.assertEqual(input_by_id(ordering, 'video_budgets').default, '20,30,50')
         self.assertEqual(input_by_id(ordering, 'query_samples').default, 64)
-
-    def test_extension_exposes_public_nodes(self):
-        nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
-        self.assertEqual(
-            nodes,
-            [
-                H3MemoryOptimization,
-                H3SparseAttention,
-                H3SparseAttentionAdvanced,
-            ],
-        )
 
     def test_non_h3_models_do_not_probe_the_runtime(self):
         class OtherModel:

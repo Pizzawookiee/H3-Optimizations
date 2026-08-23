@@ -1,6 +1,6 @@
 '''Composable production nodes for MiniMax H3 optimization.'''
 
-from comfy_api.latest import ComfyExtension, io, ui
+from comfy_api.latest import io, ui
 
 from .apply import apply_plan
 from .mlp_sharing import MLPSharingProbeConfig
@@ -76,10 +76,12 @@ class H3MemoryOptimization(io.ComfyNode):
             category=NODE_CATEGORY,
             description=(
                 'Production memory and execution optimizations for MiniMax H3. '
-                'ConvRot INT8 uses the specialized paths. Native FP8 uses held '
-                'chunked FP8 execution, and ordinary BF16/FP16 H3 QKV/MLP '
-                'weights may be converted to FP8 E4M3 when accelerated FP8 is '
-                'available. NVFP4 and unsupported quantized formats preserve '
+                'Compatible quantized checkpoints keep their checkpoint weight '
+                'precision while using specialized or chunked execution paths. '
+                'For ordinary BF16/FP16 checkpoints, Auto may convert supported '
+                'QKV and MLP weights to FP8 E4M3 when accelerated FP8 is '
+                'available. This FP8 conversion is lossy and may change generated '
+                'output. NVFP4 and unsupported quantized formats preserve '
                 'upstream Comfy execution.'
             ),
             search_aliases=[
@@ -99,10 +101,11 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=FUSED_QKV_AUTO,
                     tooltip=(
                         'auto uses compatible chunked QKV projection providers. '
-                        'ConvRot INT8 keeps its specialized path; FP8 uses held '
-                        'FP8 projection; BF16/FP16 may be converted to FP8 E4M3. '
-                        'Unsupported quantized formats use standard Comfy QKV. '
-                        'off always uses standard H3 QKV.'
+                        'ConvRot INT8 keeps its specialized path; checkpoint-native '
+                        'FP8 uses held FP8 projection. BF16/FP16 may be converted '
+                        'to FP8 E4M3; this conversion is lossy and may change '
+                        'generated output. Unsupported quantized formats use '
+                        'standard Comfy QKV. off always uses standard H3 QKV.'
                     ),
                 ),
                 io.Combo.Input(
@@ -111,10 +114,11 @@ class H3MemoryOptimization(io.ComfyNode):
                     options=[MLP_MEMORY_AUTO, MLP_MEMORY_OFF],
                     default=MLP_MEMORY_AUTO,
                     tooltip=(
-                        'auto uses the ConvRot two-slice path when compatible, '
-                        'held chunked FP8 for FP8 checkpoints, and FP8 E4M3 '
-                        'execution for ordinary BF16/FP16 weights when supported. '
-                        'NVFP4 and unsupported quantized formats remain upstream.'
+                        'auto uses the ConvRot two-slice path when compatible and '
+                        'held chunked FP8 for FP8 checkpoints. Ordinary BF16/FP16 '
+                        'weights may be converted to FP8 E4M3 when supported; this '
+                        'conversion is lossy and may change generated output. NVFP4 '
+                        'and unsupported quantized formats remain upstream.'
                     ),
                 ),
                 io.Int.Input(
@@ -757,12 +761,3 @@ class H3MLPStage0(io.ComfyNode):
                 )
             ),
         )
-
-
-class H3OptimizationsExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [
-            H3MemoryOptimization,
-            H3SparseAttention,
-            H3SparseAttentionAdvanced,
-        ]
