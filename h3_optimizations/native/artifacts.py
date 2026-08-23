@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import platform
 
-# Bump when the native sources change. The tag of the GitHub Release holding
-# the matching assets, and what a bug report should quote.
+# Bump when the native sources or committed binaries change. This marker is
+# also what a bug report should quote.
 NATIVE_BUILD = 'native-v1'
 
 REQUIRED_ABI = 1

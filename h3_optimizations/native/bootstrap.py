@@ -47,10 +47,10 @@ def ensure_native_backend():
         return False
 
 
-def _verify(selftest, *, force_reload=False):
+def _verify(selftest):
     """Load, check the ABI, then prove the kernels on this actual GPU."""
     try:
-        loader.load(force_reload=force_reload)
+        loader.load()
     except loader.NativeUnavailableError as error:
         logging.warning(
             '%s NATIVE BACKEND UNAVAILABLE - %s. Sparse attention will fall '

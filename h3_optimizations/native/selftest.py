@@ -1,9 +1,8 @@
 """Prove the native kernels work on *this* GPU before trusting them.
 
 The library is compiled for several architectures and validated directly on
-one. A downloaded binary is exactly the case where "it was built for this
-card" is an assumption rather than something anyone checked, so check it here,
-once, and cache the verdict.
+one. A prebuilt binary makes "it was built for this card" an assumption rather
+than something anyone checked, so check it here once and cache the verdict.
 
 Two legs, because either alone passes while broken:
 
