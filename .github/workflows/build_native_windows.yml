@@ -24,35 +24,119 @@ jobs:
   build-sm89:
     name: Build h3_int8_attention.dll (SM89)
     runs-on: windows-2022
+    env:
+      CUDA_VERSION: "13.0.0"
+      CUDA_CACHE_DIR: .ci-cache/cuda-13.0.0
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Install CUDA toolkit
-        id: cuda-toolkit
+      - name: Restore installed CUDA toolkit
+        id: cuda-toolkit-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CUDA_CACHE_DIR }}
+          key: windows-2022-cuda-13.0.0-nvcc-crt-cudart-v1
+
+      - name: Validate cached CUDA toolkit
+        id: cuda-cache-validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolkit = Join-Path $env:GITHUB_WORKSPACE $env:CUDA_CACHE_DIR
+          $requiredFiles = @(
+            "bin/nvcc.exe"
+            "include/cuda_runtime.h"
+            "include/cuda_fp8.h"
+            "include/cuda_fp4.h"
+            "lib/x64/cudart_static.lib"
+            "nvvm/bin/cicc.exe"
+          )
+
+          $valid = $true
+          foreach ($relativePath in $requiredFiles) {
+            $path = Join-Path $toolkit $relativePath
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              Write-Warning "Cached CUDA toolkit is missing $relativePath"
+              $valid = $false
+            }
+          }
+
+          if ($valid) {
+            & (Join-Path $toolkit "bin/nvcc.exe") --version
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Cached nvcc failed with exit code $LASTEXITCODE"
+              $valid = $false
+            }
+          }
+
+          "valid=$($valid.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Install minimal CUDA toolkit
+        if: steps.cuda-cache-validation.outputs.valid != 'true'
+        id: install-cuda
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "13.0.0"
+          method: network
+          sub-packages: '["nvcc", "crt", "cudart"]'
+          use-github-cache: "true"
+          use-local-cache: "true"
+          log-file-suffix: windows-2022.txt
+
+      - name: Populate installed CUDA toolkit cache
+        if: steps.cuda-cache-validation.outputs.valid != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolkitCache = Join-Path $env:GITHUB_WORKSPACE $env:CUDA_CACHE_DIR
+          New-Item -ItemType Directory -Path $toolkitCache -Force | Out-Null
+          Copy-Item -Path (Join-Path $env:CUDA_PATH "*") -Destination $toolkitCache -Recurse -Force
+
+      - name: Activate cached CUDA toolkit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toolkit = (Resolve-Path (Join-Path $env:GITHUB_WORKSPACE $env:CUDA_CACHE_DIR)).Path
+          "CUDA_PATH=$toolkit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_HOME=$toolkit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $toolkit "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $toolkit "bin/nvcc.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "nvcc validation failed with exit code $LASTEXITCODE" }
+
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Restore incremental native build
+        uses: actions/cache@v5
+        with:
+          path: native/build
+          key: windows-2022-ninja-cuda-13.0.0-sm89-native-v1-${{ hashFiles('native/CMakeLists.txt', 'native/src/**/*.cu', 'native/src/**/*.cuh') }}
+          restore-keys: |
+            windows-2022-ninja-cuda-13.0.0-sm89-native-v1-
 
       - name: Configure CMake
         shell: pwsh
-        run: cmake -S native -B native/build -DH3_CUDA_ARCHS=89
+        run: >-
+          cmake -S native -B native/build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DH3_CUDA_ARCHS=89
+          "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe"
 
       - name: Build release DLL
         shell: pwsh
-        run: cmake --build native/build --config Release --parallel
+        run: cmake --build native/build --parallel
 
       - name: Package DLL, checksum, and provenance
         shell: pwsh
-        env:
-          CUDA_VERSION: ${{ steps.cuda-toolkit.outputs.cuda }}
         run: |
           $ErrorActionPreference = "Stop"
           $artifactDir = Join-Path $env:RUNNER_TEMP "h3-int8-attention-sm89"
           New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
 
-          $dll = Resolve-Path "native/build/Release/h3_int8_attention.dll"
+          $dll = Resolve-Path "native/build/h3_int8_attention.dll"
           Copy-Item -LiteralPath $dll -Destination $artifactDir
 
           $hash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -69,6 +153,7 @@ jobs:
             "cuda=$env:CUDA_VERSION"
             "cuda_architectures=89"
             "configuration=Release"
+            "generator=Ninja"
             "vendored_source=$vendoredSource"
             "dll_sha256=$hash"
           ) | Set-Content -LiteralPath (Join-Path $artifactDir "BUILD_PROVENANCE.txt") -Encoding utf8
