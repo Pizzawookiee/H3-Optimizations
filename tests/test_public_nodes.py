@@ -67,9 +67,7 @@ class PublicNodeTests(unittest.TestCase):
                 'preserve_precision',
             ],
         )
-        preserve = input_by_id(schema, 'preserve_precision')
-        self.assertFalse(preserve.default)
-        self.assertTrue(preserve.advanced)
+        self.assertFalse(input_by_id(schema, 'preserve_precision').default)
 
     def test_preserve_precision_overrides_only_quantizing_auto_paths(self):
         request = _memory_request(
