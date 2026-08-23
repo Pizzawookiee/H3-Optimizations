@@ -31,17 +31,31 @@ from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
 )
 from h3_optimizations.runtime.context import RUNTIME_KEY, RuntimeSnapshot  # noqa: E402
 
-try:
-    import comfy_kitchen as ck
+# Gate on what the backend actually uses, not on which module supplies it:
+# the vendored library first, an installed comfy-kitchen carrying the sparse
+# kernel otherwise. Gating on comfy_kitchen alone silently skipped everything
+# once the backend started preferring the vendored build.
+from h3_optimizations.native import int8_attention as _vendored  # noqa: E402
 
-    _KITCHEN_SPARSE = hasattr(ck, "block_sparse_int8_attention_from_prequantized")
-except ImportError:  # pragma: no cover - environment dependent
-    ck = None
-    _KITCHEN_SPARSE = False
+if _vendored.int8_attention_is_available():
+    ck = _vendored
+    _SPARSE_READY = True
+else:
+    try:
+        import comfy_kitchen as ck
+
+        _SPARSE_READY = bool(
+            hasattr(ck, "block_sparse_int8_attention_from_prequantized")
+            and torch.cuda.is_available()
+            and ck.int8_attention_is_available()
+        )
+    except ImportError:  # pragma: no cover - environment dependent
+        ck = None
+        _SPARSE_READY = False
 
 requires_kitchen_sparse = pytest.mark.skipif(
-    not (_KITCHEN_SPARSE and torch.cuda.is_available() and ck.int8_attention_is_available()),
-    reason="requires a comfy-kitchen build carrying the block-sparse INT8 kernel",
+    not _SPARSE_READY,
+    reason="needs the vendored INT8 library or a comfy-kitchen with the sparse kernel",
 )
 
 TEXT_LEN = 226

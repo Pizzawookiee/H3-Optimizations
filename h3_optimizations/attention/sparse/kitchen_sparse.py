@@ -41,16 +41,30 @@ HEAD_DIM = 128
 
 
 def _kitchen():
+    """The vendored kernels, or an installed comfy-kitchen that carries them.
+
+    Vendored first. ComfyUI pins comfy-kitchen==0.2.31, which has no
+    block-sparse attention, so relying on the installed package means this
+    backend is unavailable for everyone -- the same way the chunked QKV
+    producer was integrated here for months without running once.
+    """
+    from ...native import int8_attention as vendored
+
+    if vendored.int8_attention_is_available():
+        return vendored
+
+    reason = vendored.loader.unavailable_reason() or 'unknown'
     try:
         import comfy_kitchen
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise SparseKitchenError(
-            'Kitchen sparse attention requires the comfy-kitchen package'
+            'Kitchen sparse attention needs the vendored library or a '
+            'comfy-kitchen carrying the sparse kernel. Vendored: %s' % reason
         ) from exc
     if not hasattr(comfy_kitchen, 'block_sparse_int8_attention_from_prequantized'):
         raise SparseKitchenError(
-            'the installed comfy-kitchen has no block-sparse INT8 attention; '
-            'this backend needs a build carrying the sparse kernel'
+            'the installed comfy-kitchen has no block-sparse INT8 attention, '
+            'and the vendored library is unavailable: %s' % reason
         )
     return comfy_kitchen
 
