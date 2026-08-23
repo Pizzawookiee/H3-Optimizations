@@ -31,6 +31,8 @@ PRODUCER_API = (
     'finalize_int8_attention_producer',
     'int8_attention_from_prequantized',
 )
+H3_ATTENTION_BACKEND_KEY = 'h3_optimizations_attention_backend'
+DENSE_KITCHEN_BACKEND = 'comfy_kitchen_int8_prequantized'
 
 
 class FusedQKVError(RuntimeError):
@@ -241,8 +243,13 @@ class ChunkedKitchenQKVProjector:
             if self.fp8_projection
             else (fmt.convrot_int8_256 or fmt.w4a8)
         )
+        owns_dense_h3 = (
+            (transformer_options or {}).get(H3_ATTENTION_BACKEND_KEY)
+            == DENSE_KITCHEN_BACKEND
+        )
         if (
-            comfy.model_management.in_training
+            (not self.routing_summaries and not owns_dense_h3)
+            or comfy.model_management.in_training
             or x.ndim != 2
             or not x.is_cuda
             or not format_ok
@@ -290,7 +297,7 @@ class ChunkedKitchenQKVProjector:
 
 
 class ChunkedKitchenAttentionBackend:
-    name = 'comfy_kitchen_int8_prequantized'
+    name = DENSE_KITCHEN_BACKEND
 
     @property
     def installation_signature(self):
