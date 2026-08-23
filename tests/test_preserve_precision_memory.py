@@ -8,12 +8,7 @@ import unittest
 PACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACK))
 
-from h3_optimizations.plan import (  # noqa: E402
-    ATTENTION_EXISTING,
-    FUSED_QKV_OFF,
-    MLP_MEMORY_PRESERVE,
-    MemoryRequest,
-)
+from h3_optimizations.plan import MLP_MEMORY_PRESERVE  # noqa: E402
 from h3_optimizations.qkv.formats import inspect_h3_linears  # noqa: E402
 from h3_optimizations.qkv.providers import (  # noqa: E402
     MLP_FLOAT_CHUNKED,
@@ -49,16 +44,6 @@ def block(weight):
 
 
 class PreservePrecisionMemoryTests(unittest.TestCase):
-    def test_request_preserves_dense_attention_and_qkv(self):
-        request = MemoryRequest(
-            attention=ATTENTION_EXISTING,
-            fused_qkv=FUSED_QKV_OFF,
-            mlp_memory=MLP_MEMORY_PRESERVE,
-        )
-        self.assertEqual(request.attention, ATTENTION_EXISTING)
-        self.assertEqual(request.fused_qkv, FUSED_QKV_OFF)
-        self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
-
     def test_bf16_stays_float_chunked_even_when_fp8_is_available(self):
         inventory = inspect_h3_linears([block(FakeWeight())])
         resolved = resolve_mlp_provider(
@@ -84,6 +69,20 @@ class PreservePrecisionMemoryTests(unittest.TestCase):
         )
         self.assertEqual(resolved.provider_id, MLP_FP8_CHUNKED)
         self.assertIn('checkpoint-native FP8', resolved.reason)
+
+    def test_checkpoint_native_fp8_preserves_upstream_without_fp8_compute(self):
+        inventory = inspect_h3_linears([
+            block(FakeWeight(
+                layout='TensorCoreFP8E4M3Layout',
+                storage_dtype='float8_e4m3fn',
+            ))
+        ])
+        resolved = resolve_mlp_provider(
+            inventory,
+            request=MLP_MEMORY_PRESERVE,
+            fp8_available=False,
+        )
+        self.assertEqual(resolved.provider_id, MLP_PRESERVE_UPSTREAM)
 
     def test_checkpoint_native_w4a8_remains_native(self):
         inventory = inspect_h3_linears([
