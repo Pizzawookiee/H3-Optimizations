@@ -140,11 +140,12 @@ class NodeTests(unittest.TestCase):
                 'Sparse Sage',
                 'INT8 Triton',
                 'FP8 FlexAttention',
-                'Kitchen INT8 (experimental)',
+                'Kitchen INT8',
             ],
         )
         self.assertIn('hard requirements', advanced.description)
         self.assertIn('Bypass this node', backend.tooltip)
+        self.assertNotIn('experimental', ' '.join(backend.options).lower())
         self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.3)
         self.assertEqual(input_by_id(advanced, 'early_steps').default, 2)
         self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)
