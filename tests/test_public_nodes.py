@@ -49,6 +49,16 @@ class PublicNodeTests(unittest.TestCase):
         )
         self.assertFalse(any('MLPSharing' in node.__name__ for node in nodes))
 
+    def test_default_memory_policy_is_unchanged(self):
+        request = _memory_request(
+            fused_qkv='auto',
+            mlp_memory='auto',
+            preserve_precision=False,
+        )
+        self.assertEqual(request.attention, 'auto')
+        self.assertEqual(request.fused_qkv, 'auto')
+        self.assertEqual(request.mlp_memory, 'auto')
+
     def test_preserve_precision_overrides_only_quantizing_auto_paths(self):
         request = _memory_request(
             fused_qkv='auto',
