@@ -1,0 +1,84 @@
+name: Build Windows native DLL
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - streaming
+    paths:
+      - ".github/workflows/build_native_windows.yml"
+      - "native/CMakeLists.txt"
+      - "native/src/h3_int8_attention_api.cu"
+      - "native/src/sage_attention/sage_attn_launcher.cu"
+      - "native/src/sage_attention/sage_attn_sparse_launcher.cu"
+      - "native/src/sage_attention/quant_qk_int8.cu"
+      - "native/src/sage_attention/quant_v_int8.cu"
+      - "native/src/sage_attention/v_staging.cu"
+      - "native/src/**/*.cuh"
+      - "native/src/PROVENANCE"
+
+permissions:
+  contents: read
+
+jobs:
+  build-sm89:
+    name: Build h3_int8_attention.dll (SM89)
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.0.0"
+
+      - name: Configure CMake
+        shell: pwsh
+        run: cmake -S native -B native/build -DH3_CUDA_ARCHS=89
+
+      - name: Build release DLL
+        shell: pwsh
+        run: cmake --build native/build --config Release --parallel
+
+      - name: Package DLL, checksum, and provenance
+        shell: pwsh
+        env:
+          CUDA_VERSION: ${{ steps.cuda-toolkit.outputs.cuda }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifactDir = Join-Path $env:RUNNER_TEMP "h3-int8-attention-sm89"
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+
+          $dll = Resolve-Path "native/build/Release/h3_int8_attention.dll"
+          Copy-Item -LiteralPath $dll -Destination $artifactDir
+
+          $hash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  h3_int8_attention.dll" |
+            Set-Content -LiteralPath (Join-Path $artifactDir "SHA256.txt") -Encoding ascii
+
+          $vendoredSource = (Get-Content -LiteralPath "native/src/PROVENANCE" -Raw).Trim()
+          @(
+            "repository=$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+            "commit=$env:GITHUB_SHA"
+            "ref=$env:GITHUB_REF"
+            "workflow_run=$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "runner_image=windows-2022"
+            "cuda=$env:CUDA_VERSION"
+            "cuda_architectures=89"
+            "configuration=Release"
+            "vendored_source=$vendoredSource"
+            "dll_sha256=$hash"
+          ) | Set-Content -LiteralPath (Join-Path $artifactDir "BUILD_PROVENANCE.txt") -Encoding utf8
+
+          "ARTIFACT_DIR=$artifactDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload Windows DLL artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: h3-int8-attention-windows-sm89-${{ github.sha }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
+          compression-level: 0
