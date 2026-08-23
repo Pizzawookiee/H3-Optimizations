@@ -11,6 +11,7 @@ sys.path.insert(0, str(PACK))
 from h3_optimizations.plan import MLP_MEMORY_PRESERVE  # noqa: E402
 from h3_optimizations.qkv.formats import inspect_h3_linears  # noqa: E402
 from h3_optimizations.qkv.providers import (  # noqa: E402
+    MLP_CONVROT_INT8_TWO_SLICE,
     MLP_FLOAT_CHUNKED,
     MLP_FP8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
@@ -20,11 +21,19 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
 
 
 class FakeWeight:
-    def __init__(self, layout=None, dtype='bfloat16', storage_dtype=None):
+    def __init__(
+        self,
+        layout=None,
+        dtype='bfloat16',
+        storage_dtype=None,
+        *,
+        convrot=False,
+        convrot_groupsize=0,
+    ):
         self._layout_cls = layout
         self._params = SimpleNamespace(
-            convrot=False,
-            convrot_groupsize=0,
+            convrot=convrot,
+            convrot_groupsize=convrot_groupsize,
             transposed=False,
         )
         self.dtype = dtype
@@ -97,6 +106,23 @@ class PreservePrecisionMemoryTests(unittest.TestCase):
             fp8_available=True,
         )
         self.assertEqual(resolved.provider_id, MLP_W4A8_CHUNKED)
+        self.assertIn('without requantization', resolved.reason)
+
+    def test_checkpoint_native_convrot_remains_native(self):
+        inventory = inspect_h3_linears([
+            block(FakeWeight(
+                layout='TensorWiseINT8Layout',
+                storage_dtype='int8',
+                convrot=True,
+                convrot_groupsize=256,
+            ))
+        ])
+        resolved = resolve_mlp_provider(
+            inventory,
+            request=MLP_MEMORY_PRESERVE,
+            fp8_available=True,
+        )
+        self.assertEqual(resolved.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
         self.assertIn('without requantization', resolved.reason)
 
     def test_unsupported_quantized_format_preserves_upstream(self):
