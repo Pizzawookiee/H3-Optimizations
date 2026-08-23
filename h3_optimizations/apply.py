@@ -59,10 +59,12 @@ from .plan import (
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
 )
+from .qkv.bf16 import ChunkedBF16QKVProjector
 from .qkv.formats import inspect_h3_linears
 from .qkv.providers import (
     MLP_OFF,
     MLP_PRESERVE_UPSTREAM,
+    QKV_BF16_CHUNKED,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
@@ -202,7 +204,13 @@ def _resolve_dense(plan, model, inventory, environment=None):
     )
     backend = None
     projector = None
-    if qkv.provider_id in (
+    if qkv.provider_id == QKV_BF16_CHUNKED:
+        # Reuse the package-owned attention-forward slot without changing the
+        # selected dense attention. attention_forward recognizes the BF16
+        # payload and delegates it to the existing Comfy/upstream backend.
+        backend = ChunkedKitchenAttentionBackend()
+        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+    elif qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
         QKV_DENSE_FP8_CHUNKED,
     ):
@@ -252,7 +260,9 @@ def _resolve_sparse(plan, environment, inventory):
         **_sparse_config_kwargs(plan),
     )
     projector = None
-    if qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
+    if qkv.provider_id == QKV_BF16_CHUNKED:
+        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+    elif qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
         from .qkv.projectors import SparseFusedQKVProjector
 
         projector = SparseFusedQKVProjector(kernel_spec, chunk_rows=4096)
@@ -300,6 +310,11 @@ def _resolve_fp8_flex(
         **_sparse_config_kwargs(plan),
     )
     backend = FP8FlexBackend(config, spec=spec)
+    projector = (
+        ChunkedBF16QKVProjector(chunk_rows=4096)
+        if qkv.provider_id == QKV_BF16_CHUNKED
+        else None
+    )
     if fallback_reason is None:
         reason = 'explicit FP8 FlexAttention selection'
         dense_resolution = None
@@ -313,6 +328,7 @@ def _resolve_fp8_flex(
             backend=backend,
             reason=reason,
             backend_kind=ATTENTION_FP8_FLEX,
+            projector=projector,
             dense_resolution=dense_resolution,
         ),
         qkv,
@@ -335,7 +351,9 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
         **_sparse_config_kwargs(plan),
     )
     projector = None
-    if qkv.provider_id == QKV_TRITON_SPARSE_CHUNKED:
+    if qkv.provider_id == QKV_BF16_CHUNKED:
+        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+    elif qkv.provider_id == QKV_TRITON_SPARSE_CHUNKED:
         from .qkv.projectors import TritonSparseQKVProjector
 
         projector = TritonSparseQKVProjector(chunk_rows=4096)
@@ -386,13 +404,14 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
         **_sparse_config_kwargs(plan),
     )
-    projector = (
-        ChunkedKitchenQKVProjector(
+    if qkv.provider_id == QKV_BF16_CHUNKED:
+        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+    elif use_projected:
+        projector = ChunkedKitchenQKVProjector(
             routing_summaries=True, strided_qk_input=True
         )
-        if use_projected
-        else None
-    )
+    else:
+        projector = None
     # Sequence-major output storage and releasing the carrier before the
     # output projection are only worth anything together: measured separately
     # the layout alone moved nothing and the release alone cost 10 ms, while
@@ -687,6 +706,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
             install_dense_attention(patched, attention.dense_resolution)
     elif plan.memory is not None:
         if qkv.provider_id in (
+            QKV_BF16_CHUNKED,
             QKV_DENSE_KITCHEN_CHUNKED,
             QKV_DENSE_FP8_CHUNKED,
         ):
