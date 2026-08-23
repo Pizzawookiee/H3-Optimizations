@@ -50,6 +50,15 @@ def _required_or_standard(request, reason):
     return _standard_qkv(reason)
 
 
+def standard_qkv_provider(request, reason):
+    """The unfused QKV path, for a backend with no fused producer.
+
+    Raises when the plan explicitly required fused QKV, so a backend that
+    cannot consume it fails loudly instead of silently downgrading.
+    """
+    return _required_or_standard(request, reason)
+
+
 def _sparse_contract_ok(sparse_spec):
     from ..attention.sparse.fused_qkv import sparse_fused_qkv_contract_mismatch
 

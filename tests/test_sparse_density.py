@@ -212,7 +212,13 @@ def test_advanced_node_schema_and_request():
     check(
         backend.default == 'auto'
         and backend.options
-        == ['auto', 'Sparse Sage', 'INT8 Triton', 'FP8 FlexAttention'],
+        == [
+            'auto',
+            'Sparse Sage',
+            'INT8 Triton',
+            'FP8 FlexAttention',
+            'Kitchen INT8 (experimental)',
+        ],
         'advanced backend selector exposes the supported sparse backends',
     )
     check(

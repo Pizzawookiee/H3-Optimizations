@@ -37,11 +37,15 @@ SPARSE_BACKEND_AUTO = 'auto'
 SPARSE_BACKEND_SAGE = 'Sparse Sage'
 SPARSE_BACKEND_TRITON = 'INT8 Triton'
 SPARSE_BACKEND_FLEX = 'FP8 FlexAttention'
+SPARSE_BACKEND_KITCHEN = 'Kitchen INT8 (experimental)'
 SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     SPARSE_BACKEND_FLEX,
+    # Explicit only. It stays out of the auto chain until the real H3 A/B has
+    # run; adding an option is safe for saved workflows, changing auto is not.
+    SPARSE_BACKEND_KITCHEN,
 )
 
 MIN_CHUNK_ROWS = 256

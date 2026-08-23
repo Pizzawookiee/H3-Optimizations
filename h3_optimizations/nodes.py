@@ -608,7 +608,10 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'FlexAttention, then the resolved dense fallback. '
                         'Explicit backend choices fail if that backend is '
                         'unavailable and do not switch to another backend. '
-                        'Bypass this node to force dense attention.'
+                        'Kitchen INT8 is experimental, needs a comfy-kitchen '
+                        'build carrying the block-sparse kernel, and does not '
+                        'support fused QKV yet. Bypass this node to force '
+                        'dense attention.'
                     ),
                 ),
             ],

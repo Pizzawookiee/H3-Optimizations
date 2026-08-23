@@ -28,6 +28,7 @@ from h3_optimizations.plan import (  # noqa: E402
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_SAGE,
+    SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
     SparseRequest,
@@ -149,6 +150,72 @@ class SparseBackendSelectionTests(unittest.TestCase):
             None,
         )
         flex.assert_not_called()
+
+    def test_forced_kitchen_bypasses_every_other_backend(self):
+        """Kitchen INT8 is explicit-only and must not reach the auto chain."""
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN)
+        )
+        target = (resolved(apply_module.ATTENTION_KITCHEN_SPARSE), self.qkv)
+        with mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+        ) as dense, mock.patch.object(
+            apply_module,
+            '_resolve_sparse',
+        ) as sage, mock.patch.object(
+            apply_module,
+            '_resolve_triton_sparse',
+        ) as triton, mock.patch.object(
+            apply_module,
+            '_resolve_fp8_flex',
+        ) as flex, mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            return_value=target,
+        ) as kitchen:
+            self.assertIs(
+                apply_module._resolve_attention(
+                    plan,
+                    self.model,
+                    self.inventory,
+                    self.environment,
+                ),
+                target,
+            )
+        dense.assert_not_called()
+        sage.assert_not_called()
+        triton.assert_not_called()
+        flex.assert_not_called()
+        kitchen.assert_called_once_with(
+            plan,
+            self.environment,
+            self.inventory,
+        )
+
+    def test_auto_never_selects_kitchen(self):
+        """auto stays Sage -> Triton -> Flex -> dense until the A/B has run."""
+        plan = H3OptimizationPlan(sparse=SparseRequest())
+        target = (resolved(apply_module.ATTENTION_SPARSE), self.qkv)
+        with mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+            return_value=(resolved('dense'), self.qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_sparse',
+            return_value=target,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+        ) as kitchen:
+            apply_module._resolve_attention(
+                plan,
+                self.model,
+                self.inventory,
+                self.environment,
+            )
+        kitchen.assert_not_called()
 
     def test_forced_flex_bypasses_sage_triton_and_dense(self):
         plan = H3OptimizationPlan(

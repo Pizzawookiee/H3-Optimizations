@@ -137,7 +137,13 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(backend.default, 'auto')
         self.assertEqual(
             backend.options,
-            ['auto', 'Sparse Sage', 'INT8 Triton', 'FP8 FlexAttention'],
+            [
+                'auto',
+                'Sparse Sage',
+                'INT8 Triton',
+                'FP8 FlexAttention',
+                'Kitchen INT8 (experimental)',
+            ],
         )
         self.assertIn('hard requirements', advanced.description)
         self.assertIn('Bypass this node', backend.tooltip)

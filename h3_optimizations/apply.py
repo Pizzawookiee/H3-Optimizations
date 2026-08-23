@@ -53,6 +53,7 @@ from .plan import (
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
+    SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
@@ -68,6 +69,7 @@ from .qkv.providers import (
     QKV_TRITON_SPARSE_CHUNKED,
     resolve_mlp_provider,
     resolve_qkv_provider,
+    standard_qkv_provider,
 )
 from .runtime.context import (
     H3RuntimeSession,
@@ -83,6 +85,7 @@ LOG_PREFIX = '[H3 Optimizations]'
 ATTENTION_SPARSE = 'sparse_sage'
 ATTENTION_TRITON_SPARSE = 'triton_sparse_int8'
 ATTENTION_FP8_FLEX = 'flex_attention_fp8'
+ATTENTION_KITCHEN_SPARSE = 'sparse_kitchen_int8'
 
 
 @dataclass(frozen=True)
@@ -316,6 +319,42 @@ def _resolve_triton_sparse(plan, environment, inventory, sparse_error):
     )
 
 
+def _resolve_kitchen_sparse(plan, environment, inventory):
+    """Explicit Kitchen block-sparse INT8, with no Sparge anywhere in it."""
+    from .attention.sparse.kitchen_sparse import (
+        SparseKitchenBackend,
+        preflight_sparse_kitchen,
+    )
+
+    preflight_sparse_kitchen(
+        cuda_available=lambda: environment.cuda_available,
+        capability_getter=lambda: environment.capability,
+    )
+    # No fused producer exists for Kitchen's carrier yet, so this is the
+    # unfused path. A plan that *requires* fused QKV fails here rather than
+    # being quietly downgraded.
+    qkv = standard_qkv_provider(
+        _qkv_request(plan),
+        'Kitchen sparse attention has no fused QKV producer yet',
+    )
+    config = HybridSparseConfig(
+        mode=MODE_SAGE128,
+        **_sparse_config_kwargs(plan),
+    )
+    backend = SparseKitchenBackend(config)
+    return (
+        ResolvedAttention(
+            requested=ATTENTION_KITCHEN_SPARSE,
+            selected=ATTENTION_KITCHEN_SPARSE,
+            backend=backend,
+            reason='explicit Kitchen block-sparse INT8 attention',
+            backend_kind=ATTENTION_KITCHEN_SPARSE,
+            projector=None,
+        ),
+        qkv,
+    )
+
+
 def _resolve_attention(plan, model, inventory, environment):
     if plan.sparse is not None:
         backend_request = plan.sparse.backend
@@ -323,6 +362,8 @@ def _resolve_attention(plan, model, inventory, environment):
             return _resolve_sparse(plan, environment, inventory)
         if backend_request == SPARSE_BACKEND_TRITON:
             return _resolve_triton_sparse(plan, environment, inventory, None)
+        if backend_request == SPARSE_BACKEND_KITCHEN:
+            return _resolve_kitchen_sparse(plan, environment, inventory)
         if backend_request == SPARSE_BACKEND_FLEX:
             return _resolve_fp8_flex(
                 plan,
