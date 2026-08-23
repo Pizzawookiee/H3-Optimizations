@@ -10,6 +10,8 @@ sys.path.insert(0, str(PACK))
 
 from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_EXISTING,
+    FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
     H3OptimizationPlan,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
@@ -35,6 +37,15 @@ class PlanTests(unittest.TestCase):
         request = MemoryRequest(mlp_memory=MLP_MEMORY_PRESERVE)
         self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
         self.assertIn(MLP_MEMORY_PRESERVE, request.signature)
+
+    def test_existing_attention_plus_qkv_off_normalizes_to_preserved_bf16(self):
+        request = MemoryRequest(
+            attention=ATTENTION_EXISTING,
+            fused_qkv=FUSED_QKV_OFF,
+        )
+        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
+        self.assertIn(FUSED_QKV_PRESERVE_BF16, request.signature)
+        self.assertEqual(MemoryRequest(fused_qkv=FUSED_QKV_OFF).fused_qkv, FUSED_QKV_OFF)
 
     def test_legacy_adapter_options_are_part_of_memory_identity(self):
         request = MemoryRequest(
