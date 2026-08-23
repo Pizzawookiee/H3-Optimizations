@@ -48,21 +48,24 @@ def resolve_dense_attention(model_patcher):
         .get('transformer_options', {})
         or {}
     )
+    backend = get_attention_function(ATTENTION_COMFY_KITCHEN_INT8, None)
+
     if 'optimized_attention_override' in options:
-        if is_installed_dense_attention(options):
-            return DenseResolution(
+        if backend is None:
+            return _existing_resolution(
                 ATTENTION_AUTO,
-                ATTENTION_COMFY_KITCHEN_INT8,
-                None,
-                'Comfy Kitchen INT8 is already installed through ModelPatcher',
-                ATTENTION_COMFY_KITCHEN_INT8,
+                'preserved an explicit optimized-attention override; '
+                'Comfy Kitchen INT8 is unavailable for the private H3 path',
             )
-        return _existing_resolution(
+        return DenseResolution(
             ATTENTION_AUTO,
-            'preserved an explicit optimized-attention override',
+            ATTENTION_COMFY_KITCHEN_INT8,
+            None,
+            'preserved an explicit optimized-attention override; '
+            'using Comfy Kitchen INT8 only for the private H3 memory path',
+            ATTENTION_COMFY_KITCHEN_INT8,
         )
 
-    backend = get_attention_function(ATTENTION_COMFY_KITCHEN_INT8, None)
     if backend is None:
         return _existing_resolution(
             ATTENTION_AUTO,
