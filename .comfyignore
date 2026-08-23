@@ -1,0 +1,20 @@
+# Development and validation files are not needed at runtime.
+.github/
+benchmarks/
+tests/
+.agent/
+
+# Native sources/build tooling are kept in GitHub; Registry installs use the
+# shipped binaries in native/bin. Keep native/LICENSE and native/NOTICE.upstream.
+native/src/
+native/CMakeLists.txt
+native/Dockerfile.linux
+native/build_linux.sh
+native/build_v_staging.ps1
+native/README.md
+
+# Repository-only metadata and local caches.
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
