@@ -26,7 +26,7 @@ jobs:
     runs-on: windows-2022
     env:
       CUDA_VERSION: "13.0.0"
-      CUDA_CACHE_DIR: .ci-cache/cuda-13.0.0
+      CUDA_CACHE_DIR: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0'
 
     steps:
       - name: Check out source
@@ -37,14 +37,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.CUDA_CACHE_DIR }}
-          key: windows-2022-cuda-13.0.0-nvcc-crt-cudart-v1
+          key: windows-2022-cuda-13.0.0-nvcc-crt-cudart-v2
 
       - name: Validate cached CUDA toolkit
         id: cuda-cache-validation
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $toolkit = Join-Path $env:GITHUB_WORKSPACE $env:CUDA_CACHE_DIR
+          $toolkit = $env:CUDA_CACHE_DIR
           $requiredFiles = @(
             "bin/nvcc.exe"
             "include/cuda_runtime.h"
@@ -86,20 +86,11 @@ jobs:
           use-local-cache: "true"
           log-file-suffix: windows-2022.txt
 
-      - name: Populate installed CUDA toolkit cache
-        if: steps.cuda-cache-validation.outputs.valid != 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $toolkitCache = Join-Path $env:GITHUB_WORKSPACE $env:CUDA_CACHE_DIR
-          New-Item -ItemType Directory -Path $toolkitCache -Force | Out-Null
-          Copy-Item -Path (Join-Path $env:CUDA_PATH "*") -Destination $toolkitCache -Recurse -Force
-
       - name: Activate cached CUDA toolkit
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $toolkit = (Resolve-Path (Join-Path $env:GITHUB_WORKSPACE $env:CUDA_CACHE_DIR)).Path
+          $toolkit = (Resolve-Path $env:CUDA_CACHE_DIR).Path
           "CUDA_PATH=$toolkit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "CUDA_HOME=$toolkit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           (Join-Path $toolkit "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
