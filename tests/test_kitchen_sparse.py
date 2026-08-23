@@ -1,5 +1,17 @@
 """Contracts for the Kitchen block-sparse INT8 attention backend.
 
+These need a GPU, and the rest of this suite is a CPU contract suite: most of
+its files call ``os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')`` at
+import, and one of them sorts before this file. Running the whole directory
+therefore hides the GPU and everything here skips -- passing, silently, while
+testing nothing.
+
+Because it is ``setdefault``, an explicit value wins:
+
+    CUDA_VISIBLE_DEVICES=0 pytest tests/
+
+or run this file on its own.
+
 The gate that matters is the same one the kernel itself is built on: at a 100%
 video budget the routed traversal must reproduce Kitchen's dense INT8 output
 bit-for-bit. Here it runs through the whole backend -- runtime snapshot, the
