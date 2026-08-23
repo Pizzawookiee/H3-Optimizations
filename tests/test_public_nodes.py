@@ -20,11 +20,9 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations.nodes import (  # noqa: E402
+    H3MemoryOptimization,
     H3SparseAttention,
     H3SparseAttentionAdvanced,
-)
-from h3_optimizations.precision_nodes import (  # noqa: E402
-    H3MemoryOptimization,
     _memory_request,
 )
 from h3_optimizations.plan import (  # noqa: E402
