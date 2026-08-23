@@ -74,10 +74,11 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.chunk_rows, 2048)
 
         mlp_off = _memory_request(
-            fused_qkv='auto',
+            fused_qkv='off',
             mlp_memory=MLP_MEMORY_OFF,
             preserve_precision=True,
         )
+        self.assertEqual(mlp_off.fused_qkv, FUSED_QKV_OFF)
         self.assertEqual(mlp_off.mlp_memory, MLP_MEMORY_OFF)
 
 
