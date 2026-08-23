@@ -3,10 +3,10 @@
 from comfy_api.latest import ComfyExtension
 
 from .nodes import (
+    H3MemoryOptimization,
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
-from .precision_nodes import H3MemoryOptimization
 
 
 class H3OptimizationsExtension(ComfyExtension):
