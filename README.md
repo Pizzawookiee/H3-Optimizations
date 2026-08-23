@@ -42,12 +42,14 @@ across all sparse backends.
 
 ## Install
 
-From the ComfyUI custom-nodes directory:
+The package is published as `h3-optimizations` in the Comfy Registry and is
+intended for installation through ComfyUI-Manager on current ComfyUI builds.
+
+Manual installation remains available from the ComfyUI custom-nodes directory:
 
     git clone https://github.com/Zironic/H3-Optimizations
 
-Restart ComfyUI after cloning. The nodes then appear under H3-Optimizations;
-ComfyUI-Manager is not required.
+Restart ComfyUI after cloning. The nodes then appear under H3-Optimizations.
 
 The repository contains the Windows x64 DLL and Linux x86-64 shared library.
 When the native backend is first resolved, the local binary is loaded, its ABI is checked, and a cached per-GPU self-test is run.
@@ -103,8 +105,9 @@ without changing the already selected attention backend.
 
 ## Compatibility
 
-- Current ComfyUI with MiniMax H3 support
+- Current ComfyUI with MiniMax H3 support and the `comfy_api.latest` extension API
 - Python 3.10 or newer
+- Windows x64 or Linux x86-64 for the shipped native Kitchen binaries
 - Any backend supported by ComfyUI's MiniMax H3 implementation for the final
   dense fallback
 - NVIDIA SM80 or newer for the shipped native Kitchen default
