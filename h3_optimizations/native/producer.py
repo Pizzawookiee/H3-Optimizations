@@ -6,7 +6,7 @@ The single-shot path has to see all of Q, K and V at once; this one only ever
 holds a chunk plus the carriers being filled.
 
 Chunking costs one thing. The single-shot quantizer discovers the K anchor by
-scanning the whole tensor, and a chunk cannot. So the anchor is chosen up
+scanning, so it is chosen up
 front from nine sampled rows and passed in, and the spec's
 ``sequence_alignment`` keeps chunk boundaries on tile boundaries so the
 per-thread scales come out identical to the whole-tensor path. Identical is
@@ -35,6 +35,7 @@ from .int8_attention import (
     _pad_to,
     _ptr,
     _stream,
+    int8_attention_is_available,
     select_cta_k,
 )
 
@@ -87,9 +88,8 @@ class Int8AttentionProducer:
 
 
 def int8_attention_producer_is_available(device=None):
-    if not torch.cuda.is_available() or not loader.is_available():
-        return False
-    return tuple(torch.cuda.get_device_capability(device)) >= (7, 5)
+    """The producer is usable only when the consuming native kernel is proven."""
+    return int8_attention_is_available(device)
 
 
 def int8_attention_k_anchor_positions(kv_length):
