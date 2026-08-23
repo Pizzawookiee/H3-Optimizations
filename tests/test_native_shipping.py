@@ -21,7 +21,8 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations import __version__  # noqa: E402
-from h3_optimizations.native import artifacts, int8_attention  # noqa: E402
+from h3_optimizations.attention.sparse.kitchen_sparse import KV_TILE  # noqa: E402
+from h3_optimizations.native import artifacts, int8_attention, selftest  # noqa: E402
 
 
 BIN_DIR = PACK / 'native' / 'bin'
@@ -50,20 +51,47 @@ class NativeShippingTests(unittest.TestCase):
             mock.patch.object(int8_attention.torch.cuda, 'is_available', return_value=True),
             mock.patch.object(int8_attention.loader, 'is_available', return_value=True),
             mock.patch.object(int8_attention.torch.cuda, 'get_device_capability', return_value=(8, 9)),
-            mock.patch('h3_optimizations.native.selftest.check', return_value=True) as selftest,
+            mock.patch('h3_optimizations.native.selftest.check', return_value=True) as selftest_check,
         ):
             self.assertTrue(int8_attention.int8_attention_is_available('cuda'))
-            selftest.assert_called_once_with('cuda')
+            selftest_check.assert_called_once_with('cuda')
 
     def test_native_availability_rejects_unsupported_capability_before_selftest(self):
         with (
             mock.patch.object(int8_attention.torch.cuda, 'is_available', return_value=True),
             mock.patch.object(int8_attention.loader, 'is_available', return_value=True),
             mock.patch.object(int8_attention.torch.cuda, 'get_device_capability', return_value=(7, 5)),
-            mock.patch('h3_optimizations.native.selftest.check') as selftest,
+            mock.patch('h3_optimizations.native.selftest.check') as selftest_check,
         ):
             self.assertFalse(int8_attention.int8_attention_is_available('cuda'))
-            selftest.assert_not_called()
+            selftest_check.assert_not_called()
+
+    def test_selftest_sparse_parity_uses_production_kv_tile(self):
+        self.assertEqual(selftest._SPARSE_PARITY_CTA_K, KV_TILE)
+        self.assertEqual(selftest._SPARSE_PARITY_CTA_K, 128)
+
+    def test_selftest_cache_key_includes_revision(self):
+        with (
+            mock.patch.object(
+                selftest.torch.cuda, 'get_device_capability', return_value=(12, 0)
+            ),
+            mock.patch.object(
+                selftest.torch.cuda,
+                'get_device_name',
+                return_value='NVIDIA GeForce RTX 5070 Ti',
+            ),
+            mock.patch(
+                'h3_optimizations.native.bootstrap.installed_build_id',
+                return_value='native-v1',
+            ),
+        ):
+            key = selftest._cache_key('cuda')
+
+        self.assertEqual(
+            key,
+            'sm120|native-v1|%s|NVIDIA GeForce RTX 5070 Ti'
+            % selftest._SELFTEST_REVISION,
+        )
 
 
 if __name__ == '__main__':
