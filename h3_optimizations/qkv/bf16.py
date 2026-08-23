@@ -1,8 +1,8 @@
 """Reusable held-weight BF16 H3 QKV projection.
 
-This module deliberately stops at normalized/post-RoPE BF16 Q/K/V.  It does
+This module deliberately stops at normalized/post-RoPE BF16 Q/K/V. It does
 not know whether the consumer is Sage, Sol, dense attention, or a future
-backend.  Consumers that can ingest one sequence slab at a time should use
+backend. Consumers that can ingest one sequence slab at a time should use
 ``stream`` so no full-sequence fused QKV temporary is ever materialized.
 Consumers that still require complete Q/K/V tensors can use ``project``;
 that path keeps the projection chunked but necessarily allocates the final
@@ -62,6 +62,8 @@ class HeldBF16QKV:
         self.sample = sample
         self.weight = None
         self.bias = None
+        self.acquired_weight = None
+        self.acquired_bias = None
         self.handle = None
 
     def __enter__(self):
@@ -81,6 +83,9 @@ class HeldBF16QKV:
             compute_dtype=torch.bfloat16,
             want_requant=False,
         )
+        self.acquired_weight = weight
+        self.acquired_bias = bias
+        self.handle = handle
         try:
             if isinstance(weight, QuantizedTensor):
                 raise BF16QKVBindingError(
@@ -92,30 +97,29 @@ class HeldBF16QKV:
                     % getattr(weight, "dtype", None)
                 )
             if bias is not None and getattr(bias, "dtype", None) != torch.bfloat16:
-                bias = bias.to(dtype=torch.bfloat16)
+                raise BF16QKVBindingError(
+                    "held BF16 QKV acquired %s bias instead of bfloat16"
+                    % getattr(bias, "dtype", None)
+                )
             self.weight = weight
             self.bias = bias
-            self.handle = handle
             return self
         except Exception:
-            comfy.ops.uncast_bias_weight(
-                self.attention.qkv_proj,
-                weight,
-                bias,
-                handle,
-            )
+            self.release()
             raise
 
     def release(self):
         if self.handle is not None:
             comfy.ops.uncast_bias_weight(
                 self.attention.qkv_proj,
-                self.weight,
-                self.bias,
+                self.acquired_weight,
+                self.acquired_bias,
                 self.handle,
             )
         self.weight = None
         self.bias = None
+        self.acquired_weight = None
+        self.acquired_bias = None
         self.handle = None
         self.sample = None
 
@@ -150,7 +154,7 @@ class ChunkedBF16QKVProjector:
     """Project native floating H3 QKV in bounded BF16 sequence slabs.
 
     ``stream`` is the preferred interface: each projected chunk is handed to a
-    backend-owned callback and then released.  ``project`` is a compatibility
+    backend-owned callback and then released. ``project`` is a compatibility
     helper for backends that need complete HND Q/K/V tensors.
     """
 
@@ -190,7 +194,9 @@ class ChunkedBF16QKVProjector:
         module,
         x,
         rope_freqs,
-        consume_chunk: Callable[[int, int, torch.Tensor, torch.Tensor, torch.Tensor], None],
+        consume_chunk: Callable[
+            [int, int, torch.Tensor, torch.Tensor, torch.Tensor], None
+        ],
     ):
         """Project each post-RoPE HND chunk and immediately hand it to a consumer."""
         self._validate(module, x, rope_freqs)
