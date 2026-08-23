@@ -27,7 +27,7 @@ from h3_optimizations.nodes import (  # noqa: E402
 )
 from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_EXISTING,
-    FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
     MLP_MEMORY_OFF,
     MLP_MEMORY_PRESERVE,
 )
@@ -61,7 +61,7 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.mlp_memory, 'auto')
         self.assertEqual(request.chunk_rows, 2048)
 
-    def test_preserve_precision_overrides_quantizing_auto_paths(self):
+    def test_preserve_precision_keeps_bf16_qkv_chunking_without_requantization(self):
         request = _memory_request(
             fused_qkv='auto',
             mlp_memory='auto',
@@ -69,7 +69,7 @@ class PublicNodeTests(unittest.TestCase):
             preserve_precision=True,
         )
         self.assertEqual(request.attention, ATTENTION_EXISTING)
-        self.assertEqual(request.fused_qkv, FUSED_QKV_OFF)
+        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
         self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
         self.assertEqual(request.chunk_rows, 2048)
 
@@ -79,7 +79,7 @@ class PublicNodeTests(unittest.TestCase):
             mlp_memory=MLP_MEMORY_OFF,
             preserve_precision=True,
         )
-        self.assertEqual(request.fused_qkv, FUSED_QKV_OFF)
+        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
         self.assertEqual(request.mlp_memory, MLP_MEMORY_OFF)
 
 
