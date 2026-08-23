@@ -7,6 +7,7 @@ from .nodes import (
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
+from .precision_nodes import H3MemoryOptimizationPreservePrecision
 
 
 class H3OptimizationsExtension(ComfyExtension):
@@ -15,6 +16,7 @@ class H3OptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             H3MemoryOptimization,
+            H3MemoryOptimizationPreservePrecision,
             H3SparseAttention,
             H3SparseAttentionAdvanced,
         ]
