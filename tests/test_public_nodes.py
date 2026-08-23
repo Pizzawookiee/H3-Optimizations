@@ -24,6 +24,9 @@ from h3_optimizations.nodes import (  # noqa: E402
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
+from h3_optimizations.precision_nodes import (  # noqa: E402
+    H3MemoryOptimizationPreservePrecision,
+)
 from h3_optimizations.public_nodes import H3OptimizationsExtension  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -36,6 +39,7 @@ class PublicNodeTests(unittest.TestCase):
             nodes,
             [
                 H3MemoryOptimization,
+                H3MemoryOptimizationPreservePrecision,
                 H3SparseAttention,
                 H3SparseAttentionAdvanced,
             ],
