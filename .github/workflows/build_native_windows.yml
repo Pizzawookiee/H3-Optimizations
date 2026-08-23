@@ -37,7 +37,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.CUDA_CACHE_DIR }}
-          key: windows-2022-cuda-13.0.0-nvcc-crt-cudart-v2
+          key: windows-2022-cuda-13.0.0-nvcc-nvvm-crt-cudart-v3
 
       - name: Validate cached CUDA toolkit
         id: cuda-cache-validation
@@ -81,7 +81,7 @@ jobs:
         with:
           cuda: "13.0.0"
           method: network
-          sub-packages: '["nvcc", "crt", "cudart"]'
+          sub-packages: '["nvcc", "nvvm", "crt", "cudart"]'
           use-github-cache: "true"
           use-local-cache: "true"
           log-file-suffix: windows-2022.txt
