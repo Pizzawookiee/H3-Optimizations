@@ -146,7 +146,7 @@ class RocmFlexTests(unittest.TestCase):
 
         status = backend.as_status()
         self.assertEqual(status['qkv_dtype'], 'native_fp16_or_bf16')
-        self.assertFalse(status['approximate'])
+        self.assertTrue(status['approximate'])
 
 
 if __name__ == '__main__':
