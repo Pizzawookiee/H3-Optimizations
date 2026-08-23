@@ -131,6 +131,10 @@ class TritonSparseSelectionTests(unittest.TestCase):
             return_value=(dense_attention, dense_qkv),
         ), mock.patch.object(
             apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError('native missing'),
+        ), mock.patch.object(
+            apply_module,
             '_resolve_sparse',
             side_effect=SparseSageError('missing sparge'),
         ), mock.patch.object(
@@ -176,6 +180,10 @@ class TritonSparseSelectionTests(unittest.TestCase):
             return_value=(dense_attention, dense_qkv),
         ), mock.patch.object(
             apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError('native missing'),
+        ), mock.patch.object(
+            apply_module,
             '_resolve_sparse',
             side_effect=SparseSageError('missing sparge'),
         ), mock.patch.object(
@@ -212,6 +220,10 @@ class TritonSparseSelectionTests(unittest.TestCase):
             apply_module,
             '_resolve_dense',
             return_value=(dense_attention, dense_qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError('native missing'),
         ), mock.patch.object(
             apply_module,
             '_resolve_sparse',

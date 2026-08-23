@@ -604,14 +604,15 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     options=list(SPARSE_BACKEND_REQUESTS),
                     default=SPARSE_BACKEND_AUTO,
                     tooltip=(
-                        'auto uses Sparse Sage, then INT8 Triton, then FP8 '
-                        'FlexAttention, then the resolved dense fallback. '
+                        'auto uses native Kitchen INT8, then Sparse Sage, '
+                        'INT8 Triton, FP8 FlexAttention, and finally the '
+                        'resolved dense fallback. '
                         'Explicit backend choices fail if that backend is '
                         'unavailable and do not switch to another backend. '
-                        'Kitchen INT8 is experimental, needs a comfy-kitchen '
-                        'build carrying the block-sparse kernel, and does not '
-                        'support fused QKV yet. Bypass this node to force '
-                        'dense attention.'
+                        'Kitchen INT8 uses the native block-sparse kernel and '
+                        'consumes compatible chunked Kitchen QKV carriers '
+                        'directly. '
+                        'Bypass this node to force dense attention.'
                     ),
                 ),
             ],
@@ -762,11 +763,6 @@ class H3OptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             H3MemoryOptimization,
-            H3AttentionOrderingProbe,
-            H3MLPSharing,
-            H3MLPSharingProbe,
-            H3MLPSharingProbeOutput,
-            H3MLPStage0,
             H3SparseAttention,
             H3SparseAttentionAdvanced,
         ]

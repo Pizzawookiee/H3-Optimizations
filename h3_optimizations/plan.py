@@ -43,8 +43,6 @@ SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     SPARSE_BACKEND_FLEX,
-    # Explicit only. It stays out of the auto chain until the real H3 A/B has
-    # run; adding an option is safe for saved workflows, changing auto is not.
     SPARSE_BACKEND_KITCHEN,
 )
 

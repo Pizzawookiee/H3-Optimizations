@@ -84,7 +84,10 @@ set_target_properties(h3_int8_attention PROPERTIES
     CUDA_RUNTIME_LIBRARY Static
     CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON
-    PREFIX ""
 )
+
+if(WIN32)
+    set_target_properties(h3_int8_attention PROPERTIES PREFIX "")
+endif()
 
 install(TARGETS h3_int8_attention LIBRARY DESTINATION . RUNTIME DESTINATION .)

@@ -27,6 +27,7 @@ from .attention.sparse import (
 from .attention.sparse.fused_qkv import (
     TRITON_AVAILABLE as SPARSE_TRITON_AVAILABLE,
 )
+from .attention.sparse.kitchen_sparse import SparseKitchenError
 from .dense_resolver import (
     install_dense_attention,
     preserve_dense_attention,
@@ -70,7 +71,6 @@ from .qkv.providers import (
     QKV_TRITON_SPARSE_CHUNKED,
     resolve_mlp_provider,
     resolve_qkv_provider,
-    standard_qkv_provider,
 )
 from .runtime.context import (
     H3RuntimeSession,
@@ -318,7 +318,7 @@ def _resolve_fp8_flex(
     )
 
 
-def _resolve_triton_sparse(plan, environment, inventory, sparse_error):
+def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
     spec = preflight_triton_sparse(
         cuda_available=lambda: environment.cuda_available,
         capability_getter=lambda: environment.capability,
@@ -345,11 +345,8 @@ def _resolve_triton_sparse(plan, environment, inventory, sparse_error):
     )
     reason = (
         'explicit INT8 Triton sparse attention selection'
-        if sparse_error is None
-        else (
-            'Sparse Sage unavailable: %s; using INT8 Triton sparse attention'
-            % sparse_error
-        )
+        if fallback_reason is None
+        else '%s; using INT8 Triton sparse attention' % fallback_reason
     )
     return (
         ResolvedAttention(
@@ -371,22 +368,33 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         preflight_sparse_kitchen,
     )
 
-    preflight_sparse_kitchen(
+    kitchen = preflight_sparse_kitchen(
         cuda_available=lambda: environment.cuda_available,
         capability_getter=lambda: environment.capability,
     )
-    # No fused producer exists for Kitchen's carrier yet, so this is the
-    # unfused path. A plan that *requires* fused QKV fails here rather than
-    # being quietly downgraded.
-    qkv = standard_qkv_provider(
-        _qkv_request(plan),
-        'Kitchen sparse attention has no fused QKV producer yet',
+    qkv = resolve_qkv_provider(
+        inventory,
+        request=_qkv_request(plan),
+        backend_kind=ATTENTION_KITCHEN_SPARSE,
+        kitchen_producer_available=producer_api_available(
+            device=getattr(environment, 'device_index', None),
+        ),
     )
+    use_projected = qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED
     config = HybridSparseConfig(
-        mode=MODE_SAGE128,
+        mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
         **_sparse_config_kwargs(plan),
     )
-    backend = SparseKitchenBackend(config)
+    projector = (
+        ChunkedKitchenQKVProjector(routing_summaries=True)
+        if use_projected
+        else None
+    )
+    backend = SparseKitchenBackend(
+        config,
+        kitchen=kitchen,
+        projector=projector,
+    )
     return (
         ResolvedAttention(
             requested=ATTENTION_KITCHEN_SPARSE,
@@ -394,7 +402,7 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             backend=backend,
             reason='explicit Kitchen block-sparse INT8 attention',
             backend_kind=ATTENTION_KITCHEN_SPARSE,
-            projector=None,
+            projector=projector,
         ),
         qkv,
     )
@@ -430,48 +438,55 @@ def _resolve_attention(plan, model, inventory, environment):
         return dense_attention, dense_qkv
 
     try:
-        return _resolve_sparse(plan, environment, inventory)
-    except SparseSageError as sparse_exc:
+        return _resolve_kitchen_sparse(plan, environment, inventory)
+    except SparseKitchenError as kitchen_exc:
         try:
-            return _resolve_triton_sparse(
-                plan,
-                environment,
-                inventory,
-                sparse_exc,
-            )
-        except TritonSparseError as triton_exc:
+            return _resolve_sparse(plan, environment, inventory)
+        except SparseSageError as sparse_exc:
             fallback_reason = (
-                'Sparse Sage unavailable: %s; INT8 Triton unavailable: %s'
-                % (sparse_exc, triton_exc)
+                'Kitchen INT8 unavailable: %s; Sparse Sage unavailable: %s'
+                % (kitchen_exc, sparse_exc)
             )
             try:
-                return _resolve_fp8_flex(
+                return _resolve_triton_sparse(
                     plan,
                     environment,
                     inventory,
                     fallback_reason,
-                    dense_attention,
                 )
-            except FP8FlexError as flex_exc:
-                return (
-                    ResolvedAttention(
-                        requested=ATTENTION_SPARSE,
-                        selected=dense_attention.selected,
-                        backend=dense_attention.backend,
-                        reason=(
-                            '%s; FP8 FlexAttention unavailable: %s; %s'
-                            % (
-                                fallback_reason,
-                                flex_exc,
-                                dense_attention.reason,
-                            )
+            except TritonSparseError as triton_exc:
+                fallback_reason = (
+                    '%s; INT8 Triton unavailable: %s'
+                    % (fallback_reason, triton_exc)
+                )
+                try:
+                    return _resolve_fp8_flex(
+                        plan,
+                        environment,
+                        inventory,
+                        fallback_reason,
+                        dense_attention,
+                    )
+                except FP8FlexError as flex_exc:
+                    return (
+                        ResolvedAttention(
+                            requested=ATTENTION_SPARSE,
+                            selected=dense_attention.selected,
+                            backend=dense_attention.backend,
+                            reason=(
+                                '%s; FP8 FlexAttention unavailable: %s; %s'
+                                % (
+                                    fallback_reason,
+                                    flex_exc,
+                                    dense_attention.reason,
+                                )
+                            ),
+                            backend_kind=dense_attention.backend_kind,
+                            projector=dense_attention.projector,
+                            dense_resolution=dense_attention.dense_resolution,
                         ),
-                        backend_kind=dense_attention.backend_kind,
-                        projector=dense_attention.projector,
-                        dense_resolution=dense_attention.dense_resolution,
-                    ),
-                    dense_qkv,
-                )
+                        dense_qkv,
+                    )
 
 
 def _install_mlp(model_patcher, plan, inventory, environment):
@@ -643,6 +658,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
         ATTENTION_SPARSE,
         ATTENTION_TRITON_SPARSE,
         ATTENTION_FP8_FLEX,
+        ATTENTION_KITCHEN_SPARSE,
     )
     flex_dense_fallback = (
         attention.backend_kind == ATTENTION_FP8_FLEX

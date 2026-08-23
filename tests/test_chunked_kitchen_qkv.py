@@ -25,9 +25,20 @@ comfy.options.enable_args_parsing()
 import h3_optimizations.kitchen_qkv as kitchen_qkv  # noqa: E402
 import h3_optimizations.qkv.chunked as chunked_qkv  # noqa: E402
 from h3_optimizations.attention_forward import make_forward  # noqa: E402
+from h3_optimizations.attention.sparse.config import (  # noqa: E402
+    HybridSparseConfig,
+    MODE_SAGE128_FUSED_QKV,
+)
+from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
+    SparseKitchenBackend,
+)
 from h3_optimizations.dense_resolver import (  # noqa: E402
     ATTENTION_COMFY_KITCHEN_INT8,
     OVERRIDE_MARKER,
+)
+from h3_optimizations.runtime.context import (  # noqa: E402
+    RUNTIME_KEY,
+    RuntimeSnapshot,
 )
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -53,6 +64,8 @@ class FakeKitchen:
             abi_version=1,
             k_anchor_positions=tuple(range(9)),
             sequence_alignment=4,
+            q_tile=4,
+            k_tile=4,
         )
 
     def select_int8_attention_k_anchor(self, _spec, samples):
@@ -159,6 +172,58 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
                 torch.arange(10, dtype=torch.float32) + 200,
             )
         )
+        self.assertIsNone(prepared.q_summary)
+        self.assertIsNone(prepared.k_summary)
+
+    def test_sparse_producer_retains_only_tile_summaries(self):
+        fake = FakeKitchen()
+        module = SimpleNamespace(heads=2, head_dim=4)
+        x = torch.arange(10, dtype=torch.float32).unsqueeze(1).expand(10, 6)
+
+        def project(_module, values, _rope_rows):
+            rows = values[:, 0].to(torch.int64)
+            base = rows.to(torch.float32).view(-1, 1, 1)
+            q = base.expand(-1, 2, 4).clone()
+            return q, q + 100, q + 200
+
+        with mock.patch.object(
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'project_qkv',
+            side_effect=project,
+        ), mock.patch.object(
+            chunked_qkv,
+            'project_qkv',
+            side_effect=project,
+        ):
+            prepared = kitchen_qkv.run_chunked_kitchen_qkv(
+                module,
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+                spec=fake.int8_attention_producer_spec(),
+                chunk_rows=4,
+                routing_summaries=True,
+            )
+
+        self.assertEqual(tuple(prepared.q_summary.shape), (1, 2, 3, 4))
+        self.assertEqual(tuple(prepared.k_summary.shape), (1, 2, 3, 4))
+        self.assertTrue(
+            torch.equal(
+                prepared.q_summary[0, 0, :, 0],
+                torch.tensor([1.5, 5.5, 8.5]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared.k_summary[0, 0, :, 0],
+                torch.tensor([101.5, 105.5, 108.5]),
+            )
+        )
         self.assertTrue(
             torch.equal(
                 fake.anchor_samples[0, 0, :, 0],
@@ -190,6 +255,106 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             self.assertEqual(backend.execute(prepared), 'carrier')
         with self.assertRaises(TypeError):
             backend.execute(object())
+
+    def test_sparse_backend_consumes_projected_carrier_and_summaries(self):
+        class Route:
+            def __init__(self, **kwargs):
+                vars(self).update(kwargs)
+
+        class SparseKitchen:
+            BlockSparseRoute = Route
+            __version__ = 'test'
+
+        class Layout:
+            seq_len = 256
+            video_range = (128, 256)
+            segments = ((0, 128, 'text'), (128, 256, 'video'))
+            video_shape = (1, 8, 16)
+            audio_t = 0
+
+        projector = kitchen_qkv.ChunkedKitchenQKVProjector(
+            routing_summaries=True
+        )
+        backend = SparseKitchenBackend(
+            HybridSparseConfig(mode=MODE_SAGE128_FUSED_QKV),
+            kitchen=SparseKitchen(),
+            projector=projector,
+            allow_cpu_for_tests=True,
+        )
+        carrier = SimpleNamespace(
+            q=torch.empty((1, 2, 256, 128), dtype=torch.int8),
+            k=torch.empty((1, 2, 256, 128), dtype=torch.int8),
+            original_head_dim=128,
+            cta_k=128,
+        )
+        projected = kitchen_qkv.PreparedChunkedKitchenQKV(
+            carrier,
+            q_summary=torch.ones((1, 2, 2, 128)),
+            k_summary=torch.ones((1, 2, 2, 128)),
+        )
+        options = {
+            RUNTIME_KEY: RuntimeSnapshot(
+                request_id=1,
+                step_index=0,
+                total_steps=4,
+                layout=Layout(),
+                compute_dtype=torch.bfloat16,
+                device=torch.device('cpu'),
+            )
+        }
+
+        prepared = backend.prepare_projected(
+            projected,
+            layer_index=3,
+            transformer_options=options,
+        )
+
+        self.assertIs(prepared.quantized, carrier)
+        self.assertEqual(prepared.route.q_tile, 128)
+        self.assertEqual(prepared.route.kv_tile, 128)
+        self.assertEqual(prepared.layer_index, 3)
+        self.assertTrue(backend.as_status()['fused_qkv'])
+
+    def test_sparse_projector_does_not_require_a_dense_override(self):
+        fake = FakeKitchen()
+        module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=4)
+        x = SimpleNamespace(
+            ndim=2,
+            is_cuda=True,
+            shape=(8, 8),
+            dtype=torch.bfloat16,
+            device=torch.device('cuda:0'),
+        )
+        projector = kitchen_qkv.ChunkedKitchenQKVProjector(
+            routing_summaries=True
+        )
+        expected = object()
+        with mock.patch.object(
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
+        ), mock.patch.object(
+            kitchen_qkv.comfy.model_management,
+            'in_training',
+            False,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'describe_linear',
+            return_value=SimpleNamespace(convrot_int8_256=True),
+        ), mock.patch.object(
+            kitchen_qkv,
+            'run_chunked_kitchen_qkv',
+            return_value=expected,
+        ):
+            actual = projector.try_project(
+                module,
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+            )
+
+        self.assertIs(actual, expected)
 
     def test_runtime_capability_decline_returns_to_upstream_forward(self):
         fake = FakeKitchen()

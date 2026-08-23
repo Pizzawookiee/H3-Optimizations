@@ -33,6 +33,10 @@ PRODUCER_API = (
 )
 
 
+class FusedQKVError(RuntimeError):
+    pass
+
+
 def resolve_kitchen(device=None):
     """The module providing the producer API, vendored first.
 
@@ -72,6 +76,8 @@ def producer_api_available(kitchen=None, device=None):
 @dataclass(frozen=True)
 class PreparedChunkedKitchenQKV:
     carrier: object
+    q_summary: torch.Tensor | None = None
+    k_summary: torch.Tensor | None = None
 
 
 def _rope_rows(rope_freqs, rows):
@@ -91,6 +97,21 @@ def _project_anchor_samples(module, x, rope_freqs, positions, projector=None):
     return k.transpose(0, 1).unsqueeze(0)
 
 
+def _tile_mean(x, tile):
+    full = x.shape[-2] // tile
+    remainder = x.shape[-2] % tile
+    pieces = []
+    if full:
+        pieces.append(
+            x[..., :full * tile, :]
+            .reshape(*x.shape[:-2], full, tile, x.shape[-1])
+            .mean(dim=-2)
+        )
+    if remainder:
+        pieces.append(x[..., full * tile:, :].mean(dim=-2, keepdim=True))
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
+
+
 def run_chunked_kitchen_qkv(
     module,
     x,
@@ -101,6 +122,7 @@ def run_chunked_kitchen_qkv(
     spec,
     chunk_rows=CHUNK_ROWS,
     fp8_projection=False,
+    routing_summaries=False,
 ):
     del layer_index, transformer_options
     kitchen = resolve_kitchen(x.device)
@@ -131,6 +153,8 @@ def run_chunked_kitchen_qkv(
 
         sequence = int(x.shape[0])
         retained_v = None
+        q_summaries = []
+        k_summaries = []
         for start in range(0, sequence, int(chunk_rows)):
             end = min(start + int(chunk_rows), sequence)
             q, k, v = project_chunk_hnd(
@@ -145,6 +169,9 @@ def run_chunked_kitchen_qkv(
                 retained_v = v.new_empty(
                     (1, int(module.heads), sequence, int(module.head_dim))
                 )
+            if routing_summaries:
+                q_summaries.append(_tile_mean(q, int(spec.q_tile)))
+                k_summaries.append(_tile_mean(k, int(spec.k_tile)))
             kitchen.quantize_int8_attention_qk_chunk(
                 producer,
                 q,
@@ -158,7 +185,13 @@ def run_chunked_kitchen_qkv(
         kitchen.quantize_int8_attention_v(producer, retained_v)
         del retained_v
         return PreparedChunkedKitchenQKV(
-            kitchen.finalize_int8_attention_producer(producer)
+            kitchen.finalize_int8_attention_producer(producer),
+            q_summary=(
+                torch.cat(q_summaries, dim=-2) if q_summaries else None
+            ),
+            k_summary=(
+                torch.cat(k_summaries, dim=-2) if k_summaries else None
+            ),
         )
     finally:
         if held is not None:
@@ -168,13 +201,24 @@ def run_chunked_kitchen_qkv(
 class ChunkedKitchenQKVProjector:
     name = 'chunked_kitchen_qkv'
 
-    def __init__(self, chunk_rows=CHUNK_ROWS, fp8_projection=False):
+    def __init__(
+        self,
+        chunk_rows=CHUNK_ROWS,
+        fp8_projection=False,
+        routing_summaries=False,
+    ):
         self.chunk_rows = int(chunk_rows)
         self.fp8_projection = bool(fp8_projection)
+        self.routing_summaries = bool(routing_summaries)
 
     @property
     def installation_signature(self):
-        return (self.name, self.chunk_rows, self.fp8_projection)
+        return (
+            self.name,
+            self.chunk_rows,
+            self.fp8_projection,
+            self.routing_summaries,
+        )
 
     def try_project(
         self,
@@ -195,7 +239,10 @@ class ChunkedKitchenQKVProjector:
             else fmt.convrot_int8_256
         )
         if (
-            not is_installed_dense_attention(transformer_options)
+            (
+                not self.routing_summaries
+                and not is_installed_dense_attention(transformer_options)
+            )
             or comfy.model_management.in_training
             or x.ndim != 2
             or not x.is_cuda
@@ -229,6 +276,7 @@ class ChunkedKitchenQKVProjector:
                 spec=spec,
                 chunk_rows=self.chunk_rows,
                 fp8_projection=self.fp8_projection,
+                routing_summaries=self.routing_summaries,
             )
         except (FP8BindingError, RuntimeError, TypeError, ValueError):
             if not self.fp8_projection:

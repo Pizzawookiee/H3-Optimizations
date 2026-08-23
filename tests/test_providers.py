@@ -129,6 +129,18 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(dense.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
 
+        kitchen_sparse = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='sparse_kitchen_int8',
+            kitchen_producer_available=True,
+        )
+        self.assertEqual(
+            kitchen_sparse.provider_id,
+            QKV_DENSE_KITCHEN_CHUNKED,
+        )
+        self.assertTrue(kitchen_sparse.fused)
+
         sparse = resolve_qkv_provider(
             inventory,
             request='auto',

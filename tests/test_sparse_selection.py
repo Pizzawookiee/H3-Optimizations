@@ -154,6 +154,10 @@ class SparseSelectionTests(unittest.TestCase):
             return_value=dense,
         ), mock.patch.object(
             apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError('native missing'),
+        ), mock.patch.object(
+            apply_module,
             '_resolve_sparse',
             side_effect=apply_module.SparseSageError('Sparge missing'),
         ), mock.patch.object(

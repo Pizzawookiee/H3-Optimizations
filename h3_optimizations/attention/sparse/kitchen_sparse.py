@@ -16,9 +16,9 @@ Q/K/V are quantized by Kitchen rather than by the Triton per-tile quantizer.
 Kitchen's carrier is four transforms -- K-anchor detection, anchor subtraction,
 a randomized Walsh-Hadamard rotation shared by Q and K, then per-thread abs-max
 scaling -- and that is what makes it more accurate than Sparge's FP8 V path.
-The fused-QKV projector cannot feed this yet, because it emits Sparge-shaped
-per-tile carriers; that is the next piece of work, and until it lands this
-backend serves the unfused mode only.
+The chunked Kitchen QKV producer emits this carrier directly and retains only
+tile-mean Q/K summaries for routing. The Sparge fused projector remains
+incompatible because it emits a different per-tile carrier.
 '''
 
 from dataclasses import dataclass
@@ -27,6 +27,7 @@ from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
 from ...mlp_sharing.route import router_kwargs as _route_kwargs
+from ...kitchen_qkv import PreparedChunkedKitchenQKV
 
 
 class SparseKitchenError(RuntimeError):
@@ -163,6 +164,41 @@ class SparseKitchenExecutor:
         # The router emits Sparge's delta encoding. Declaring it rather than
         # converting keeps this a zero-conversion path: the route knows how to
         # reach whatever encoding the compiled kernel walks.
+        return self.prepare_projected(
+            quantized,
+            lut,
+            valid_block_num,
+            layer_index=layer_index,
+            metadata=metadata,
+        )
+
+    def prepare_projected(
+        self,
+        quantized,
+        lut,
+        valid_block_num,
+        *,
+        layer_index,
+        metadata,
+    ):
+        if quantized.q.ndim != 4 or quantized.k.ndim != 4:
+            raise SparseKitchenError(
+                'Kitchen sparse attention received invalid Q/K carriers'
+            )
+        if quantized.q.shape != quantized.k.shape:
+            raise SparseKitchenError(
+                'Kitchen sparse attention requires equal Q/K carrier shapes'
+            )
+        if int(quantized.original_head_dim) != HEAD_DIM:
+            raise SparseKitchenError(
+                'Kitchen sparse attention is built for head_dim %d, got %d'
+                % (HEAD_DIM, quantized.original_head_dim)
+            )
+        if int(quantized.cta_k) != self.kv_tile:
+            raise SparseKitchenError(
+                'Kitchen QKV carrier uses KV tile %d, expected %d'
+                % (quantized.cta_k, self.kv_tile)
+            )
         route = self.kitchen.BlockSparseRoute(
             indices=lut,
             counts=valid_block_num,
@@ -173,7 +209,7 @@ class SparseKitchenExecutor:
         return PreparedSparseKitchen(
             quantized=quantized,
             route=route,
-            original_head_dim=int(q.shape[-1]),
+            original_head_dim=int(quantized.original_head_dim),
             layer_index=int(layer_index),
             metadata=metadata,
         )
@@ -196,16 +232,16 @@ class SparseKitchenBackend:
         kitchen=None,
         router=None,
         executor=None,
+        projector=None,
         allow_cpu_for_tests=False,
     ):
         self.config = config or HybridSparseConfig()
         if not isinstance(self.config, HybridSparseConfig):
             raise TypeError('config must be HybridSparseConfig')
-        if self.config.mode == MODE_SAGE128_FUSED_QKV:
+        if self.config.mode == MODE_SAGE128_FUSED_QKV and projector is None:
             raise SparseKitchenError(
                 'Kitchen sparse attention cannot consume the fused QKV '
-                'projector yet: it emits Sparge-shaped per-tile carriers, not '
-                "Kitchen's per-thread carrier"
+                'mode without the chunked Kitchen producer'
             )
         module = _kitchen() if kitchen is None else kitchen
         self.executor = executor or SparseKitchenExecutor(
@@ -217,6 +253,7 @@ class SparseKitchenBackend:
             q_tile=Q_TILE,
             kv_tile=self.executor.kv_tile,
         )
+        self.projector = projector
         if (self.router.q_tile, self.router.kv_tile) != (
             Q_TILE,
             self.executor.kv_tile,
@@ -231,9 +268,6 @@ class SparseKitchenBackend:
                 )
             )
 
-    # No projector: the fused QKV path is Sparge-shaped and cannot feed this.
-    projector = None
-
     @property
     def installation_signature(self):
         return (
@@ -242,9 +276,14 @@ class SparseKitchenBackend:
             (type(self.router).__module__, type(self.router).__qualname__),
             int(self.executor.kv_tile),
             str(getattr(self.executor.kitchen, '__version__', 'unknown')),
+            (
+                None
+                if self.projector is None
+                else self.projector.installation_signature
+            ),
         )
 
-    def prepare(self, q, k, v, *, layer_index, transformer_options):
+    def _route(self, q, k, *, layer_index, transformer_options):
         snapshot = snapshot_for(transformer_options, q.shape[-2])
         video_budget = resolve_video_budget(
             self.config,
@@ -253,7 +292,7 @@ class SparseKitchenBackend:
             layer_index,
         )
         try:
-            lut, valid_block_num, mask_metadata = self.router.build_lut(
+            return self.router.build_lut(
                 q,
                 k,
                 snapshot.layout,
@@ -262,6 +301,14 @@ class SparseKitchenBackend:
             )
         except SparseRouterError as exc:
             raise SparseKitchenError('sparse routing failed: %s' % exc) from exc
+
+    def prepare(self, q, k, v, *, layer_index, transformer_options):
+        lut, valid_block_num, mask_metadata = self._route(
+            q,
+            k,
+            layer_index=layer_index,
+            transformer_options=transformer_options,
+        )
         return self.executor.prepare(
             q,
             k,
@@ -270,6 +317,57 @@ class SparseKitchenBackend:
             valid_block_num,
             layer_index=layer_index,
             metadata=route_metadata(mask_metadata, layer_index, q.shape[1]),
+        )
+
+    def prepare_projected(
+        self,
+        projected,
+        *,
+        layer_index,
+        transformer_options,
+    ):
+        if self.projector is None:
+            raise SparseKitchenError(
+                'Kitchen sparse attention has no chunked QKV producer'
+            )
+        if not isinstance(projected, PreparedChunkedKitchenQKV):
+            raise SparseKitchenError(
+                'Kitchen sparse attention received an invalid projected carrier'
+            )
+        if projected.q_summary is None or projected.k_summary is None:
+            raise SparseKitchenError(
+                'Kitchen sparse QKV carrier has no routing summaries'
+            )
+        sequence = int(projected.carrier.q.shape[-2])
+        snapshot = snapshot_for(transformer_options, sequence)
+        video_budget = resolve_video_budget(
+            self.config,
+            snapshot.step_index,
+            snapshot.total_steps,
+            layer_index,
+        )
+        try:
+            lut, valid_block_num, mask_metadata = (
+                self.router.build_lut_from_summaries(
+                    projected.q_summary,
+                    projected.k_summary,
+                    snapshot.layout,
+                    video_budget,
+                    **_route_kwargs(transformer_options, layer_index),
+                )
+            )
+        except SparseRouterError as exc:
+            raise SparseKitchenError('sparse routing failed: %s' % exc) from exc
+        return self.executor.prepare_projected(
+            projected.carrier,
+            lut,
+            valid_block_num,
+            layer_index=layer_index,
+            metadata=route_metadata(
+                mask_metadata,
+                layer_index,
+                projected.q_summary.shape[1],
+            ),
         )
 
     def execute(self, prepared):
@@ -287,7 +385,9 @@ class SparseKitchenBackend:
             'sparse_v_format': 'int8',
             'route_encoding': 'delta',
             'approximate': True,
-            'fused_qkv': False,
-            'qkv_projector': None,
+            'fused_qkv': self.projector is not None,
+            'qkv_projector': (
+                None if self.projector is None else self.projector.name
+            ),
             'smooth_k': False,
         }

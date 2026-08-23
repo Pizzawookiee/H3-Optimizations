@@ -43,7 +43,7 @@ def input_by_id(schema, input_id):
 
 
 class NodeTests(unittest.TestCase):
-    def test_public_schemas_are_small_and_stable(self):
+    def test_node_schemas_are_small_and_stable(self):
         memory = H3MemoryOptimization.define_schema()
         ordering = H3AttentionOrderingProbe.define_schema()
         sharing = H3MLPSharing.define_schema()
@@ -207,17 +207,12 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(input_by_id(ordering, 'video_budgets').default, '20,30,50')
         self.assertEqual(input_by_id(ordering, 'query_samples').default, 64)
 
-    def test_extension_exposes_production_and_experiment_nodes(self):
+    def test_extension_exposes_public_nodes(self):
         nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
         self.assertEqual(
             nodes,
             [
                 H3MemoryOptimization,
-                H3AttentionOrderingProbe,
-                H3MLPSharing,
-                H3MLPSharingProbe,
-                H3MLPSharingProbeOutput,
-                H3MLPStage0,
                 H3SparseAttention,
                 H3SparseAttentionAdvanced,
             ],

@@ -137,6 +137,16 @@ def resolve_qkv_provider(
             False,
             '4K ConvRot QKV chunks into Comfy Kitchen INT8 carriers',
         )
+    if backend_kind == 'sparse_kitchen_int8':
+        if not kitchen_producer_available:
+            return _required_or_standard(
+                request, 'Comfy Kitchen external producer API is unavailable'
+            )
+        return QKVProviderResolution(
+            QKV_DENSE_KITCHEN_CHUNKED,
+            True,
+            '4K ConvRot QKV chunks into routed Comfy Kitchen INT8 carriers',
+        )
     if backend_kind == 'triton_sparse_int8':
         if not triton_available:
             return _required_or_standard(request, 'Triton is unavailable')

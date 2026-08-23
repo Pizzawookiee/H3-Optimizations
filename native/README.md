@@ -53,11 +53,12 @@ cmake -S native -B native/build
 cmake --build native/build --config Release
 ```
 
-The loader finds `native/build/Release/`, `native/build/`, or `native/lib/`,
-and `H3_INT8_ATTENTION_LIBRARY` overrides all of them.
+The loader first uses the platform binary committed under `native/bin/`, then
+checks local `native/build/Release/`, `native/build/`, and `native/lib/` paths.
+`H3_INT8_ATTENTION_LIBRARY` overrides all of them.
 
-Architectures default to `75-real;80-real;89;120f` on Windows and add
-`90a-real` on Linux: real SASS for the older parts and PTX on the newest, so
+Architectures default to `80-real;89;120f` on Windows and add `90a-real` on
+Linux: real SASS for the older parts and PTX on the newest, so
 hardware that does not exist yet degrades to a JIT rather than failing to load.
 Override with `-DH3_CUDA_ARCHS=89` to build just one while iterating.
 

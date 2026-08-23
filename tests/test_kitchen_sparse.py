@@ -118,10 +118,9 @@ def _qkv(seq_len, seed=0):
 # --------------------------------------------------------------------------
 
 
-def test_rejects_the_fused_qkv_mode():
-    """The fused projector emits Sparge-shaped carriers, not Kitchen's."""
+def test_fused_qkv_mode_requires_the_chunked_kitchen_producer():
     config = HybridSparseConfig(mode=MODE_SAGE128_FUSED_QKV)
-    with pytest.raises(SparseKitchenError, match="fused QKV projector"):
+    with pytest.raises(SparseKitchenError, match="chunked Kitchen producer"):
         SparseKitchenBackend(config, kitchen=object())
 
 

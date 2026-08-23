@@ -479,6 +479,10 @@ class FP8FlexTests(unittest.TestCase):
             return_value=(dense, dense_qkv),
         ), mock.patch.object(
             apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError('native missing'),
+        ), mock.patch.object(
+            apply_module,
             '_resolve_sparse',
             side_effect=apply_module.SparseSageError('ABI missing'),
         ), mock.patch.object(
@@ -508,6 +512,10 @@ class FP8FlexTests(unittest.TestCase):
             apply_module,
             '_resolve_dense',
             return_value=(dense, dense_qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError('native missing'),
         ), mock.patch.object(
             apply_module,
             '_resolve_sparse',
@@ -554,6 +562,10 @@ class FP8FlexTests(unittest.TestCase):
             apply_module,
             '_resolve_dense',
             return_value=resolved,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError('native missing'),
         ), mock.patch.object(
             apply_module,
             '_resolve_sparse',

@@ -22,6 +22,9 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 import h3_optimizations.apply as apply_module  # noqa: E402
+from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
+    SparseKitchenError,
+)
 from h3_optimizations.plan import (  # noqa: E402
     H3OptimizationPlan,
     PLAN_KEY,
@@ -152,7 +155,7 @@ class SparseBackendSelectionTests(unittest.TestCase):
         flex.assert_not_called()
 
     def test_forced_kitchen_bypasses_every_other_backend(self):
-        """Kitchen INT8 is explicit-only and must not reach the auto chain."""
+        """Explicit Kitchen remains a hard requirement without fallbacks."""
         plan = H3OptimizationPlan(
             sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN)
         )
@@ -193,8 +196,76 @@ class SparseBackendSelectionTests(unittest.TestCase):
             self.inventory,
         )
 
-    def test_auto_never_selects_kitchen(self):
-        """auto stays Sage -> Triton -> Flex -> dense until the A/B has run."""
+    def test_kitchen_resolver_selects_chunked_producer(self):
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN)
+        )
+        inventory = SimpleNamespace(
+            qkv=(object(),),
+            qkv_convrot_int8_256=True,
+            homogeneous=lambda name: name == 'qkv',
+            labels=lambda _name: ('TensorWiseINT8Layout+convrot256',),
+        )
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(8, 9),
+            device_index=0,
+        )
+        kitchen = SimpleNamespace(__version__='test')
+
+        with mock.patch(
+            'h3_optimizations.attention.sparse.kitchen_sparse.preflight_sparse_kitchen',
+            return_value=kitchen,
+        ), mock.patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=True,
+        ):
+            attention, qkv = apply_module._resolve_kitchen_sparse(
+                plan,
+                environment,
+                inventory,
+            )
+
+        self.assertEqual(qkv.provider_id, 'chunked_kitchen_qkv')
+        self.assertTrue(qkv.fused)
+        self.assertTrue(attention.projector.routing_summaries)
+        self.assertIs(attention.backend.projector, attention.projector)
+
+    def test_auto_prefers_kitchen(self):
+        plan = H3OptimizationPlan(sparse=SparseRequest())
+        target = (resolved(apply_module.ATTENTION_KITCHEN_SPARSE), self.qkv)
+        with mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+            return_value=(resolved('dense'), self.qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_sparse',
+        ) as sage, mock.patch.object(
+            apply_module,
+            '_resolve_triton_sparse',
+        ) as triton, mock.patch.object(
+            apply_module,
+            '_resolve_fp8_flex',
+        ) as flex, mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            return_value=target,
+        ) as kitchen:
+            actual = apply_module._resolve_attention(
+                plan,
+                self.model,
+                self.inventory,
+                self.environment,
+            )
+        self.assertIs(actual, target)
+        kitchen.assert_called_once_with(plan, self.environment, self.inventory)
+        sage.assert_not_called()
+        triton.assert_not_called()
+        flex.assert_not_called()
+
+    def test_auto_uses_sparse_sage_after_kitchen_failure(self):
         plan = H3OptimizationPlan(sparse=SparseRequest())
         target = (resolved(apply_module.ATTENTION_SPARSE), self.qkv)
         with mock.patch.object(
@@ -203,19 +274,25 @@ class SparseBackendSelectionTests(unittest.TestCase):
             return_value=(resolved('dense'), self.qkv),
         ), mock.patch.object(
             apply_module,
-            '_resolve_sparse',
-            return_value=target,
+            '_resolve_kitchen_sparse',
+            side_effect=SparseKitchenError('native self-test failed'),
         ), mock.patch.object(
             apply_module,
-            '_resolve_kitchen_sparse',
-        ) as kitchen:
-            apply_module._resolve_attention(
+            '_resolve_sparse',
+            return_value=target,
+        ) as sage, mock.patch.object(
+            apply_module,
+            '_resolve_triton_sparse',
+        ) as triton:
+            actual = apply_module._resolve_attention(
                 plan,
                 self.model,
                 self.inventory,
                 self.environment,
             )
-        kitchen.assert_not_called()
+        self.assertIs(actual, target)
+        sage.assert_called_once_with(plan, self.environment, self.inventory)
+        triton.assert_not_called()
 
     def test_forced_flex_bypasses_sage_triton_and_dense(self):
         plan = H3OptimizationPlan(
@@ -339,6 +416,80 @@ class SparseBackendSelectionTests(unittest.TestCase):
                     )
                 else:
                     install_dense.assert_not_called()
+
+    def test_kitchen_sparse_is_installed_as_sparse_execution(self):
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN)
+        )
+        inventory = SimpleNamespace(labels=lambda _name: ())
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(8, 9),
+            device_index=0,
+            device_name='fake',
+            backend='nvidia_cuda',
+            architecture='sm89',
+        )
+        mlp = MLPProviderResolution('off', 'off', 'synthetic')
+        projector = object()
+        attention = apply_module.ResolvedAttention(
+            requested=apply_module.ATTENTION_KITCHEN_SPARSE,
+            selected=apply_module.ATTENTION_KITCHEN_SPARSE,
+            backend=SimpleNamespace(name=apply_module.ATTENTION_KITCHEN_SPARSE),
+            reason='synthetic',
+            backend_kind=apply_module.ATTENTION_KITCHEN_SPARSE,
+            projector=projector,
+        )
+
+        with mock.patch.object(
+            apply_module,
+            'is_minimax_h3',
+            return_value=True,
+        ), mock.patch.object(
+            apply_module,
+            'get_h3_blocks',
+            return_value=(object(),),
+        ), mock.patch.object(
+            apply_module,
+            'inspect_h3_linears',
+            return_value=inventory,
+        ), mock.patch.object(
+            apply_module.RuntimeEnvironment,
+            'detect',
+            return_value=environment,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_attention',
+            return_value=(attention, self.qkv),
+        ), mock.patch.object(
+            apply_module,
+            'configure_backend',
+            return_value=(object(), 50),
+        ) as configure, mock.patch.object(
+            apply_module,
+            '_install_mlp',
+            return_value=(mlp, 0),
+        ), mock.patch.object(
+            apply_module,
+            '_ensure_sparse_runtime',
+            return_value=(object(), True),
+        ) as ensure_runtime, mock.patch.object(
+            apply_module,
+            'not_applicable_v_layout',
+            return_value=SimpleNamespace(
+                state='not_applicable',
+                reason='synthetic',
+                patched_blocks=0,
+            ),
+        ):
+            apply_module.apply_plan(FakeModel(), plan)
+
+        configure.assert_called_once_with(
+            mock.ANY,
+            attention.backend,
+            projector=projector,
+        )
+        ensure_runtime.assert_called_once()
 
     def test_explicit_backend_status_is_not_called_a_fallback(self):
         plan = H3OptimizationPlan(
