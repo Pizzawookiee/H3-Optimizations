@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds the Linux shared library. No GPU is needed to compile -- nvcc emits
+# SASS for the architectures named in CMakeLists without one -- so this runs
+# anywhere Docker does, including a Windows host.
+#
+# Ubuntu 24.04 ships glibc 2.39. Building against an older base widens the
+# range of distributions the .so will load on, at the cost of an older
+# toolchain; 24.04 matches what current ComfyUI installs target. If someone
+# reports a GLIBC_2.3x error, rebuild on 22.04 rather than shipping two.
+
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY src ./src
+
+# Ninja rather than Make: the flags land literally, which matters here because
+# the exception-handling settings are load-bearing (see the extern "C" note in
+# h3_int8_attention_api.cu).
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --parallel
+
+# The caller copies this out; see build_linux.sh.
+RUN test -f build/libh3_int8_attention.so \
+    && echo "built:" && ls -la build/libh3_int8_attention.so

@@ -20,10 +20,17 @@ if(NOT DEFINED H3_CUDA_ARCHS)
     # Real SASS for the older parts and PTX on the newest, so hardware that
     # does not exist yet degrades to a JIT rather than failing to load. This
     # mirrors Kitchen's own arch policy; Windows toolkits often lack 90a.
+    #
+    # No sm_75. Turing reaches the INT8 tensor cores through a different path
+    # -- larger fragments assembled from m8n8k16 rather than the native
+    # m16n8k32 -- so "it compiled" exercises code the SM89 validation never
+    # touches, and nobody has run it. It also costs ~9 MB in every shipped
+    # binary. Ampere upward covers anyone realistically running a 56-head
+    # video model; add it back only with a Turing card to test on.
     if(WIN32)
-        set(H3_CUDA_ARCHS "75-real;80-real;89;120f")
+        set(H3_CUDA_ARCHS "80-real;89;120f")
     else()
-        set(H3_CUDA_ARCHS "75-real;80-real;89;90a-real;120f")
+        set(H3_CUDA_ARCHS "80-real;89;90a-real;120f")
     endif()
 endif()
 message(STATUS "H3 INT8 attention architectures: ${H3_CUDA_ARCHS}")
