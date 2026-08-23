@@ -155,6 +155,18 @@ def test_incomplete_coverage_is_refused():
         P.finalize_int8_attention_producer(producer)
 
 
+def test_producer_availability_uses_validated_attention_gate(monkeypatch):
+    calls = []
+
+    def gate(device=None):
+        calls.append(device)
+        return False
+
+    monkeypatch.setattr(P, "int8_attention_is_available", gate)
+    assert not P.int8_attention_producer_is_available("cuda:0")
+    assert calls == ["cuda:0"]
+
+
 def test_the_producer_path_is_available_without_a_kitchen_release():
     """The failure this whole exercise exists to fix.
 
