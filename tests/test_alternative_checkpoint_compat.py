@@ -124,6 +124,33 @@ class AlternativeCheckpointCompatibilityTests(unittest.TestCase):
         self.assertTrue(inventory.mlp_w4a8)
         self.assertFalse(inventory.qkv[0].other_quantized)
 
+        kitchen_sparse = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='sparse_kitchen_int8',
+            kitchen_producer_available=True,
+            memory_optimize=False,
+            fp8_available=False,
+        )
+        self.assertEqual(
+            kitchen_sparse.provider_id,
+            QKV_DENSE_W4A8_CHUNKED,
+        )
+        self.assertTrue(kitchen_sparse.fused)
+
+        kitchen_sparse_without_producer = resolve_qkv_provider(
+            inventory,
+            request='auto',
+            backend_kind='sparse_kitchen_int8',
+            kitchen_producer_available=False,
+            memory_optimize=False,
+            fp8_available=False,
+        )
+        self.assertEqual(
+            kitchen_sparse_without_producer.provider_id,
+            QKV_STANDARD,
+        )
+
         sparse = resolve_qkv_provider(
             inventory,
             request='auto',
