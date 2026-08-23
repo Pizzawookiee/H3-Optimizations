@@ -53,21 +53,25 @@ class PublicNodeTests(unittest.TestCase):
         request = _memory_request(
             fused_qkv='auto',
             mlp_memory='auto',
+            chunk_rows=2048,
             preserve_precision=False,
         )
         self.assertEqual(request.attention, 'auto')
         self.assertEqual(request.fused_qkv, 'auto')
         self.assertEqual(request.mlp_memory, 'auto')
+        self.assertEqual(request.chunk_rows, 2048)
 
     def test_preserve_precision_overrides_only_quantizing_auto_paths(self):
         request = _memory_request(
             fused_qkv='auto',
             mlp_memory='auto',
+            chunk_rows=2048,
             preserve_precision=True,
         )
         self.assertEqual(request.attention, ATTENTION_EXISTING)
         self.assertEqual(request.fused_qkv, FUSED_QKV_OFF)
         self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
+        self.assertEqual(request.chunk_rows, 2048)
 
         mlp_off = _memory_request(
             fused_qkv='auto',
