@@ -18,11 +18,11 @@ sparse routing, and bounded MLP execution.
   remain native where a compatible bounded MLP provider exists; unsupported
   quantized formats preserve upstream Comfy execution. The toggle defaults off,
   so existing workflows retain the current auto policy.
-- H3 Sparse Attention enables fixed-density native Kitchen INT8 attention while
-  keeping text, reference conditioning, audio, non-video queries, and mixed
-  boundary tiles dense. Its default video KV budget is 30 percent. The optional
-  legacy early/late policy adds 30 percentage points to the first two and last
-  two sampler steps, capped at 100 percent.
+- H3 Sparse Attention enables fixed-density sparse attention while keeping text,
+  reference conditioning, audio, non-video queries, and mixed boundary tiles
+  dense. Its default video KV budget is 30 percent. The optional legacy
+  early/late policy adds 30 percentage points to the first two and last two
+  sampler steps, capped at 100 percent.
 - H3 Sparse Attention (Advanced) exposes explicit early and late density
   windows plus a sparse-backend selector. Video KV budget controls the middle
   steps; Early steps/Early KV and Late steps/Late KV independently control the
@@ -34,6 +34,13 @@ sparse routing, and bounded MLP execution.
   supported NVIDIA runtimes and native BF16/FP16 Q/K/V through Triton on ROCm.
   Explicit backend selections are hard requirements and error if unavailable;
   bypass the node to force dense attention.
+
+> **Sparse attention changes model computation. It is not free acceleration.**
+> Lower Video KV budgets retain fewer target-video attention connections and can
+> reduce prompt adherence, change motion/detail, or otherwise change the result.
+> There is no attention percentage that is lossless for every prompt. The quality
+> cost also depends on where attention is removed in the denoising schedule; H3
+> is especially sensitive to reduced attention in the early sampling steps.
 
 The production nodes are grouped under H3-Optimizations > Model Patches.
 
@@ -93,9 +100,10 @@ can consume the sparse route efficiently.
 
 Sparse attention is therefore not free speed. `KV` density is a
 quality/prompt-adherence budget as well as a performance setting, and its
-visible effect depends on where in the diffusion schedule the removed
-attention occurs. The default is intended as a practical speed/quality tradeoff,
-not a claim that 30 percent density is lossless for every prompt.
+visible effect depends on the prompt and on where in the diffusion schedule the
+removed attention occurs. Some prompts tolerate very low budgets while others
+require substantially more. The default is intended as a practical
+speed/quality tradeoff, not a claim that 30 percent density is lossless.
 
 These numbers are measurements from one test setup, not universal performance
 claims. GPU architecture, checkpoint format, sequence length, ComfyUI version,
