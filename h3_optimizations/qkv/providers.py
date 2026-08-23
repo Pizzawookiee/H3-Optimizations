@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from ..plan import (
     FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_LEGACY_BF16,
@@ -70,6 +71,62 @@ def _sparse_contract_ok(sparse_spec):
     return sparse_fused_qkv_contract_mismatch(sparse_spec) is None
 
 
+def _qkv_is_native_bf16(inventory):
+    if not inventory.qkv:
+        return False
+    for item in inventory.qkv:
+        dtype = str(item.logical_dtype).lower()
+        if not item.plain_float or not (
+            'bfloat16' in dtype or 'bf16' in dtype
+        ):
+            return False
+    return True
+
+
+def _resolve_preserved_bf16_qkv(inventory, backend_kind):
+    """Select the existing projector slot that can carry BF16 chunks.
+
+    The actual projector classes detect native BF16 and return the generic
+    PreparedBF16QKV object instead of their backend-specific carrier. This
+    keeps the apply-plan dispatch table stable while Preserve precision gets a
+    real bounded BF16 path.
+    """
+    if not _qkv_is_native_bf16(inventory):
+        labels = ', '.join(sorted(set(inventory.labels('qkv'))))
+        return _standard_qkv(
+            'Preserve precision keeps non-BF16 QKV format %s on upstream Comfy execution'
+            % (labels or 'unknown')
+        )
+
+    if backend_kind in ('existing', 'comfy_kitchen_int8'):
+        return QKVProviderResolution(
+            QKV_DENSE_KITCHEN_CHUNKED,
+            False,
+            'checkpoint-native BF16 QKV uses held 4K projection chunks and preserves the existing attention backend',
+        )
+    if backend_kind == 'sparse_kitchen_int8':
+        return QKVProviderResolution(
+            QKV_DENSE_KITCHEN_CHUNKED,
+            True,
+            'checkpoint-native BF16 QKV uses held 4K projection chunks before Kitchen sparse attention',
+        )
+    if backend_kind == 'sparse_sage':
+        return QKVProviderResolution(
+            QKV_SPARSE_CONVROT_INT8,
+            True,
+            'checkpoint-native BF16 QKV uses held 4K projection chunks before Sparse Sage attention',
+        )
+    if backend_kind == 'triton_sparse_int8':
+        return QKVProviderResolution(
+            QKV_TRITON_SPARSE_CHUNKED,
+            True,
+            'checkpoint-native BF16 QKV uses held 4K projection chunks before Triton sparse attention',
+        )
+    return _standard_qkv(
+        'the resolved attention backend has no Preserve-precision BF16 QKV consumer'
+    )
+
+
 def resolve_qkv_provider(
     inventory,
     *,
@@ -91,6 +148,8 @@ def resolve_qkv_provider(
         return _required_or_standard(
             request, 'H3 QKV layers use mixed weight formats'
         )
+    if request == FUSED_QKV_PRESERVE_BF16:
+        return _resolve_preserved_bf16_qkv(inventory, backend_kind)
 
     if inventory.qkv_w4a8:
         if backend_kind == 'comfy_kitchen_int8' and memory_optimize:
