@@ -52,17 +52,19 @@ NODE_CATEGORY = 'H3-Optimizations/Model Patches'
 def _video_budget_input():
     return io.Float.Input(
         'video_budget',
-        display_name='Video KV budget',
+        display_name='Video attention budget',
         default=DEFAULT_VIDEO_BUDGET,
         min=0.01,
         max=1.0,
         step=0.01,
         tooltip=(
-            'Fraction of pure target-video KV tiles retained per head and '
-            'pure-video query tile. The request rounds up to a whole KV-tile '
-            'count. Non-video context and mixed boundary tiles stay dense. '
-            '1.0 keeps the full route while still executing through the '
-            'selected sparse backend.'
+            'Controls the speed/quality tradeoff for target-video attention. '
+            'Lower values are faster but retain fewer video attention connections '
+            'and can reduce prompt adherence, change motion/detail, or otherwise '
+            'change the result. There is no universally safe value: some prompts '
+            'tolerate very low budgets while others require substantially more. '
+            'The request rounds up to whole KV tiles; non-video context and mixed '
+            'boundary tiles stay dense. 1.0 retains the full video route.'
         ),
     )
 
@@ -515,7 +517,7 @@ class H3MLPSharingProbeOutput(io.ComfyNode):
 
 
 class H3SparseAttention(io.ComfyNode):
-    '''Fixed-density Sparse Sage attention for MiniMax H3.'''
+    '''Fixed-density sparse attention for MiniMax H3.'''
 
     @classmethod
     def define_schema(cls):
@@ -524,14 +526,14 @@ class H3SparseAttention(io.ComfyNode):
             display_name='H3 Sparse Attention',
             category=NODE_CATEGORY,
             description=(
-                'Fixed-density Sparse Sage attention for MiniMax H3. Sparse '
-                'Attention is checkpoint-format independent: compatible ConvRot '
-                'weights may use fused projection, while FP8, BF16, NVFP4, and '
-                'other Comfy-supported checkpoints can use native QKV projection. '
-                'Text, reference conditioning, audio, non-video queries, and mixed '
-                'boundary tiles remain dense. If Sparse Sage is unavailable, '
-                'supported NVIDIA GPUs use INT8 Triton sparse attention, then '
-                'FP8 FlexAttention, before falling back to resolved dense attention.'
+                'Fixed-density sparse attention for MiniMax H3. Lower video '
+                'attention budgets are faster but can reduce prompt adherence, '
+                'change motion/detail, or otherwise change the generated result; '
+                'no percentage is lossless for every prompt. Text, reference '
+                'conditioning, audio, non-video queries, and mixed boundary tiles '
+                'remain dense. Backend auto prefers native Kitchen INT8, then '
+                'Sparse Sage, INT8 Triton, FP8 FlexAttention, and finally the '
+                'resolved dense attention path.'
             ),
             search_aliases=[
                 'H3 sparse',
@@ -549,8 +551,11 @@ class H3SparseAttention(io.ComfyNode):
                     display_name='Denser Early/Late steps',
                     default=False,
                     tooltip=(
-                        'Add 30 percentage points to the Video KV budget for '
-                        'the first 2 and last 2 sampling steps, capped at 100%.'
+                        'Adds 30 percentage points to the video attention budget '
+                        'for the first 2 and last 2 sampling steps, capped at 100%. '
+                        'H3 is especially sensitive to reduced attention in early '
+                        'denoising, so this can preserve prompt/timeline adherence '
+                        'better than using the same low budget throughout.'
                     ),
                 ),
                 io.String.Input(
@@ -604,10 +609,12 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
             category=NODE_CATEGORY,
             description=(
                 'Advanced fixed-density sparse attention for MiniMax H3. '
-                'Video KV budget controls middle sampling steps; Early KV and '
-                'Late KV override the first and last configured step counts. '
-                'Backend auto uses the normal fallback chain; explicit backend '
-                'selections are hard requirements.'
+                'Video attention budget controls middle sampling steps; Early KV '
+                'and Late KV override the first and last configured step counts. '
+                'Lower budgets are faster but can change the generated result, and '
+                'the quality cost depends on the prompt and where attention is '
+                'removed in the denoising schedule. Backend auto uses the normal '
+                'fallback chain; explicit backend selections are hard requirements.'
             ),
             search_aliases=[
                 'H3 sparse advanced',
@@ -626,7 +633,10 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     min=0,
                     max=1000,
                     step=1,
-                    tooltip='Number of first sampling steps that use Early KV.',
+                    tooltip=(
+                        'Number of first sampling steps that use Early KV. H3 is '
+                        'especially sensitive to reduced attention early in denoising.'
+                    ),
                 ),
                 io.Float.Input(
                     'early_kv',
@@ -635,7 +645,11 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     min=0.01,
                     max=1.0,
                     step=0.01,
-                    tooltip='Video KV budget used during the early-step window.',
+                    tooltip=(
+                        'Video attention budget used during the early-step window. '
+                        'Increasing this can preserve prompt/timeline adherence at '
+                        'the cost of speed; lowering it is especially risky for H3.'
+                    ),
                 ),
                 io.Int.Input(
                     'late_steps',
@@ -653,7 +667,11 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     min=0.01,
                     max=1.0,
                     step=0.01,
-                    tooltip='Video KV budget used during the late-step window.',
+                    tooltip=(
+                        'Video attention budget used during the late-step window. '
+                        'Higher values retain more exact video attention at the '
+                        'cost of speed.'
+                    ),
                 ),
                 io.Combo.Input(
                     'backend',
