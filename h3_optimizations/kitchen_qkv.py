@@ -9,6 +9,7 @@ import torch
 import comfy.model_management
 import comfy.quant_ops
 
+from . import diagnostics
 from .attention_forward import project_qkv
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
@@ -17,6 +18,10 @@ from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 
 
 CHUNK_ROWS = 4096
+STRIDED_QK_CAPABILITY = 'SUPPORTS_STRIDED_QK_CHUNK'
+V_MODE_RETAIN = 'retain'
+V_MODE_TWO_PASS = 'two_pass'
+V_MODES = (V_MODE_RETAIN, V_MODE_TWO_PASS)
 PRODUCER_ABI_VERSION = 1
 PRODUCER_ABI = 'external_v%d' % PRODUCER_ABI_VERSION
 PRODUCER_API = (
@@ -99,6 +104,25 @@ def _project_anchor_samples(module, x, rope_freqs, positions, projector=None):
     return k.transpose(0, 1).unsqueeze(0)
 
 
+def _qk_chunk_kwargs(kitchen, strided_qk_input):
+    '''Ask for strided Q/K only from a producer that advertises it.
+
+    `resolve_kitchen` can return an installed comfy-kitchen whose chunk
+    quantizer has no such parameter. Passing the keyword blindly would raise a
+    TypeError that the projector's own except clause would then swallow into a
+    silent fallback -- the exact failure mode this pack keeps trying to
+    eliminate.
+    '''
+    if not strided_qk_input:
+        return {}
+    if not getattr(kitchen, STRIDED_QK_CAPABILITY, False):
+        raise FusedQKVError(
+            'strided Q/K chunk input was requested but %r does not support it'
+            % getattr(kitchen, '__name__', kitchen)
+        )
+    return {'allow_strided_input': True}
+
+
 def _tile_mean(x, tile):
     full = x.shape[-2] // tile
     remainder = x.shape[-2] % tile
@@ -114,6 +138,99 @@ def _tile_mean(x, tile):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
 
 
+def _project_v_chunk(module, x, rope_freqs, start, end, projector):
+    """One chunk's V, with Q and K discarded.
+
+    The prototype deliberately re-runs the whole QKV projection and throws two
+    thirds of it away. That is the wrong shape for production -- V is the last
+    `heads * head_dim` rows of the fused weight and a row slice of a
+    TensorWise INT8 ConvRot weight carries the same scalar scale, so a V-only
+    projection should cost a third of this -- but it is the honest way to
+    measure what removing `retained_v` buys before building that slice. The
+    time it costs is reported, not hidden.
+    """
+    _q, _k, v = project_chunk_hnd(
+        module, x, rope_freqs, start, end, projector=projector
+    )
+    del _q, _k
+    return v
+
+
+def run_two_pass_v_kitchen_qkv(
+    module,
+    x,
+    rope_freqs,
+    *,
+    kitchen,
+    held,
+    spec,
+    chunk_rows,
+    routing_summaries,
+    v_backend,
+    strided_qk_input,
+):
+    """Produce the carrier without ever holding a full-sequence BF16 V.
+
+    Pass one streams Q and K into their carriers and folds each chunk's V into
+    a [B, H, D] maximum. Pass two regenerates V and writes it straight into the
+    final INT8 carrier under the finalized scale. Q and K are packed exactly
+    once, in pass one, so nothing about their carrier changes.
+    """
+    from .native.v_staging import TwoPassVCarrier
+
+    with diagnostics.stage('anchor_projection'):
+        samples = _project_anchor_samples(
+            module, x, rope_freqs, spec.k_anchor_positions, projector=held
+        )
+    with diagnostics.stage('anchor_selection'):
+        anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
+    del samples
+    with diagnostics.stage('producer_create'):
+        producer = kitchen.create_int8_attention_producer(spec, anchor)
+    del anchor
+
+    sequence = int(x.shape[0])
+    chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
+    staging = TwoPassVCarrier(spec, backend=v_backend)
+    q_summaries = []
+    k_summaries = []
+    for start in range(0, sequence, int(chunk_rows)):
+        end = min(start + int(chunk_rows), sequence)
+        q, k, v = project_chunk_hnd(
+            module, x, rope_freqs, start, end, projector=held
+        )
+        if routing_summaries:
+            with diagnostics.stage('routing_summary_generation'):
+                q_summaries.append(_tile_mean(q, int(spec.q_tile)))
+                k_summaries.append(_tile_mean(k, int(spec.k_tile)))
+        kitchen.quantize_int8_attention_qk_chunk(
+            producer, q, k, q_start=start, k_start=start, **chunk_kwargs
+        )
+        with diagnostics.stage('v_amax_update'):
+            staging.update(v)
+        del q, k, v
+
+    with diagnostics.stage('v_scale_finalize'):
+        staging.finalize_scale()
+    for start in range(0, sequence, int(chunk_rows)):
+        end = min(start + int(chunk_rows), sequence)
+        with diagnostics.stage('v_reprojection'):
+            v = _project_v_chunk(module, x, rope_freqs, start, end, held)
+        with diagnostics.stage('v_carrier_pack'):
+            staging.quantize(v, start)
+        del v
+
+    with diagnostics.stage('carrier_finalize'):
+        v_int8, v_scale = staging.finish()
+        producer.v = v_int8
+        producer.v_scale = v_scale
+        return PreparedChunkedKitchenQKV(
+            kitchen.finalize_int8_attention_producer(producer),
+            q_summary=torch.cat(q_summaries, dim=-2) if q_summaries else None,
+            k_summary=torch.cat(k_summaries, dim=-2) if k_summaries else None,
+        )
+
+
 def run_chunked_kitchen_qkv(
     module,
     x,
@@ -125,8 +242,13 @@ def run_chunked_kitchen_qkv(
     chunk_rows=CHUNK_ROWS,
     fp8_projection=False,
     routing_summaries=False,
+    v_mode=V_MODE_RETAIN,
+    v_backend=None,
+    strided_qk_input=False,
 ):
     del layer_index, transformer_options
+    if v_mode not in V_MODES:
+        raise FusedQKVError('unknown V mode %r' % v_mode)
     kitchen = resolve_kitchen(x.device)
     if kitchen is None:
         raise FusedQKVError('no INT8 attention producer is available')
@@ -144,19 +266,36 @@ def run_chunked_kitchen_qkv(
             held = HeldW4A8QKV(module, x[:1])
             held.__enter__()
 
-        samples = _project_anchor_samples(
-            module,
-            x,
-            rope_freqs,
-            spec.k_anchor_positions,
-            projector=held,
-        )
+        if v_mode == V_MODE_TWO_PASS:
+            return run_two_pass_v_kitchen_qkv(
+                module,
+                x,
+                rope_freqs,
+                kitchen=kitchen,
+                held=held,
+                spec=spec,
+                chunk_rows=chunk_rows,
+                routing_summaries=routing_summaries,
+                v_backend=v_backend,
+                strided_qk_input=strided_qk_input,
+            )
+
+        with diagnostics.stage('anchor_projection'):
+            samples = _project_anchor_samples(
+                module,
+                x,
+                rope_freqs,
+                spec.k_anchor_positions,
+                projector=held,
+            )
         anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
         del samples
-        producer = kitchen.create_int8_attention_producer(spec, anchor)
+        with diagnostics.stage('producer_create'):
+            producer = kitchen.create_int8_attention_producer(spec, anchor)
         del anchor
 
         sequence = int(x.shape[0])
+        chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
         retained_v = None
         q_summaries = []
         k_summaries = []
@@ -175,29 +314,33 @@ def run_chunked_kitchen_qkv(
                     (1, int(module.heads), sequence, int(module.head_dim))
                 )
             if routing_summaries:
-                q_summaries.append(_tile_mean(q, int(spec.q_tile)))
-                k_summaries.append(_tile_mean(k, int(spec.k_tile)))
+                with diagnostics.stage('routing_summary_generation'):
+                    q_summaries.append(_tile_mean(q, int(spec.q_tile)))
+                    k_summaries.append(_tile_mean(k, int(spec.k_tile)))
             kitchen.quantize_int8_attention_qk_chunk(
                 producer,
                 q,
                 k,
                 q_start=start,
                 k_start=start,
+                **chunk_kwargs,
             )
-            retained_v[:, :, start:end, :].copy_(v)
+            with diagnostics.stage('v_retention_copy'):
+                retained_v[:, :, start:end, :].copy_(v)
             del q, k, v
 
         kitchen.quantize_int8_attention_v(producer, retained_v)
         del retained_v
-        return PreparedChunkedKitchenQKV(
-            kitchen.finalize_int8_attention_producer(producer),
-            q_summary=(
-                torch.cat(q_summaries, dim=-2) if q_summaries else None
-            ),
-            k_summary=(
-                torch.cat(k_summaries, dim=-2) if k_summaries else None
-            ),
-        )
+        with diagnostics.stage('carrier_finalize'):
+            return PreparedChunkedKitchenQKV(
+                kitchen.finalize_int8_attention_producer(producer),
+                q_summary=(
+                    torch.cat(q_summaries, dim=-2) if q_summaries else None
+                ),
+                k_summary=(
+                    torch.cat(k_summaries, dim=-2) if k_summaries else None
+                ),
+            )
     finally:
         if held is not None:
             held.__exit__(None, None, None)
@@ -211,10 +354,18 @@ class ChunkedKitchenQKVProjector:
         chunk_rows=CHUNK_ROWS,
         fp8_projection=False,
         routing_summaries=False,
+        v_mode=V_MODE_RETAIN,
+        v_backend=None,
+        strided_qk_input=False,
     ):
         self.chunk_rows = int(chunk_rows)
         self.fp8_projection = bool(fp8_projection)
         self.routing_summaries = bool(routing_summaries)
+        if v_mode not in V_MODES:
+            raise ValueError('v_mode must be one of %s' % ', '.join(V_MODES))
+        self.v_mode = str(v_mode)
+        self.v_backend = v_backend
+        self.strided_qk_input = bool(strided_qk_input)
 
     @property
     def installation_signature(self):
@@ -223,6 +374,9 @@ class ChunkedKitchenQKVProjector:
             self.chunk_rows,
             self.fp8_projection,
             self.routing_summaries,
+            self.v_mode,
+            self.v_backend,
+            self.strided_qk_input,
         )
 
     def try_project(
@@ -273,17 +427,21 @@ class ChunkedKitchenQKVProjector:
         ):
             return None
         try:
-            return run_chunked_kitchen_qkv(
-                module,
-                x,
-                rope_freqs,
-                layer_index=layer_index,
-                transformer_options=transformer_options,
-                spec=spec,
-                chunk_rows=self.chunk_rows,
-                fp8_projection=self.fp8_projection,
-                routing_summaries=self.routing_summaries,
-            )
+            with diagnostics.stage('qkv_producer_total'):
+                return run_chunked_kitchen_qkv(
+                    module,
+                    x,
+                    rope_freqs,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                    spec=spec,
+                    chunk_rows=self.chunk_rows,
+                    fp8_projection=self.fp8_projection,
+                    routing_summaries=self.routing_summaries,
+                    v_mode=self.v_mode,
+                    v_backend=self.v_backend,
+                    strided_qk_input=self.strided_qk_input,
+                )
         except (
             FP8BindingError,
             W4A8BindingError,

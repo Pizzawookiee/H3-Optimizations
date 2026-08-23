@@ -74,9 +74,28 @@ class SparseMaskMetadata:
 class SparseTileRouter:
     '''Build a per-head route using the resolved Sparse Sage geometry.'''
 
-    def __init__(self, config=None, *, spec=None, q_tile=None, kv_tile=None):
+    def __init__(
+        self,
+        config=None,
+        *,
+        spec=None,
+        q_tile=None,
+        kv_tile=None,
+        score_chunk_tiles=None,
+    ):
         self.config = config
         self.spec = spec
+        # None keeps the whole [B, H, q_tiles, kv_tiles] score slab live at
+        # once. A chunk count scores that many query tiles at a time and drops
+        # each slab before the next, which is selection-equivalent because a
+        # query tile's top-K depends on no other query tile -- but see
+        # `_select_indices`: equivalent is not automatically bit-identical,
+        # because a matmul may reduce in a different order at a different M.
+        if score_chunk_tiles is not None:
+            score_chunk_tiles = int(score_chunk_tiles)
+            if score_chunk_tiles <= 0:
+                raise ValueError('score_chunk_tiles must be positive')
+        self.score_chunk_tiles = score_chunk_tiles
         self.q_tile = int(
             q_tile if q_tile is not None else getattr(spec, 'q_tile', Q_TILE)
         )
@@ -297,6 +316,27 @@ class SparseTileRouter:
             sink=sink,
         )
 
+    def _select_indices(self, q_video, k_video, retained):
+        '''Top-K video KV tiles per query tile, optionally chunk by chunk.
+
+        The unchunked branch is kept verbatim rather than expressed as a
+        one-chunk special case, so enabling chunking cannot quietly change the
+        shipped route: whatever cuBLAS does for the full M is what production
+        still gets.
+        '''
+        keys = k_video.transpose(-1, -2)
+        if self.score_chunk_tiles is None:
+            return torch.topk(torch.matmul(q_video, keys), retained, dim=-1).indices
+
+        query_tiles = q_video.shape[-2]
+        pieces = []
+        for start in range(0, query_tiles, self.score_chunk_tiles):
+            stop = min(start + self.score_chunk_tiles, query_tiles)
+            scores = torch.matmul(q_video[..., start:stop, :], keys)
+            pieces.append(torch.topk(scores, retained, dim=-1).indices)
+            del scores
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
+
     @staticmethod
     def _pack_rows(indices, geometry, dense, dense_delta):
         batch, heads = indices.shape[:2]
@@ -354,13 +394,11 @@ class SparseTileRouter:
             dtype=torch.int32,
             device=q_means.device,
         )
-        scores = torch.matmul(
+        indices = self._select_indices(
             q_means[..., geometry.pure_video_q_start:, :],
-            k_means[
-                ..., geometry.pure_video_kv_start:, :
-            ].transpose(-1, -2),
+            k_means[..., geometry.pure_video_kv_start:, :],
+            retained,
         )
-        indices = torch.topk(scores, retained, dim=-1).indices
         self._notify(sink, geometry, indices)
         sparse_rows = self._pack_rows(
             indices,

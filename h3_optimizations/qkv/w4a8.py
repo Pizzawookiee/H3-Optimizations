@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import comfy.ops
 from comfy.quant_ops import QuantizedTensor
 
+from .. import diagnostics
 from .formats import W4A8_LAYOUT, describe_linear
 
 
@@ -97,10 +98,12 @@ class HeldW4A8QKV:
     def _finish(self, rows, rope):
         from ..attention_forward import finish_qkv_projection, to_hnd
 
-        projected = self.binding.linear(rows)
-        return to_hnd(
-            *finish_qkv_projection(self.attention, projected, rope)
-        )
+        with diagnostics.stage('qkv_linear'):
+            projected = self.binding.linear(rows)
+        with diagnostics.stage('qk_norm_rope'):
+            return to_hnd(
+                *finish_qkv_projection(self.attention, projected, rope)
+            )
 
     def project_hnd(self, x, rope_freqs, start, end):
         chunk_rope = None if rope_freqs is None else rope_freqs[:, start:end]

@@ -17,7 +17,12 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from .. import diagnostics
 from . import loader
+
+OUTPUT_HND = 'hnd'
+OUTPUT_NHD = 'nhd'
+OUTPUT_LAYOUTS = (OUTPUT_HND, OUTPUT_NHD)
 
 Q_TILE = 128
 CTA_K = 64
@@ -134,6 +139,20 @@ class BlockSparseRoute:
         )
 
 
+def _check_quantize_qk(*arguments):
+    loader.check(loader.load().h3_int8_quantize_qk(*arguments), 'quantize_qk')
+
+
+def _check_quantize_v(*arguments):
+    loader.check(loader.load().h3_int8_quantize_v(*arguments), 'quantize_v')
+
+
+def _check_sparse_attention(*arguments):
+    loader.check(
+        loader.load().h3_int8_sparse_attention(*arguments), 'sparse attention'
+    )
+
+
 def _kernel_head_dim(head_dim):
     if head_dim <= 64:
         return 64
@@ -205,8 +224,8 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
 
     dtype_code = _DTYPE_TO_CODE[input_dtype]
     warp_q = 16 if kernel_head_dim == 256 else 32
-    loader.check(
-        library.h3_int8_quantize_qk(
+    with diagnostics.stage('qk_carrier_pack'):
+        _check_quantize_qk(
             _ptr(q), _ptr(q_int8), _ptr(q_scale),
             _ptr(k), _ptr(k_int8), _ptr(k_scale),
             batch, q_heads, q_length, kv_heads, kv_length, kernel_head_dim,
@@ -214,18 +233,14 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
             q.stride(0), q.stride(1), q.stride(2),
             k.stride(0), k.stride(1), k.stride(2),
             dtype_code, _ptr(anchor_indices), _stream(),
-        ),
-        'quantize_qk',
-    )
-    loader.check(
-        library.h3_int8_quantize_v(
+        )
+    with diagnostics.stage('v_carrier_pack'):
+        _check_quantize_v(
             _ptr(v), _ptr(v_int8), _ptr(v_scale),
             batch, kv_heads, kv_length, kernel_head_dim, padded_k_length,
             v.stride(0), v.stride(1), v.stride(2),
             dtype_code, _stream(),
-        ),
-        'quantize_v',
-    )
+        )
     return PrequantizedInt8Attention(
         q=q_int8, k=k_int8, v=v_int8,
         q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
@@ -237,7 +252,29 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
     )
 
 
-def _attention_geometry(quantized):
+def _attention_geometry(quantized, output_layout=OUTPUT_HND):
+    """Allocate the output and describe every tensor to the kernel by stride.
+
+    The kernel addresses O purely through ``stride_bz_o/stride_seq_o/
+    stride_h_o``, so the two layouts differ only in the numbers passed here --
+    no kernel branch, no second code path, and the same 16-byte store
+    granularity within a head either way.
+
+    Both layouts return a ``[batch, heads, sequence, head_dim]`` tensor. Only
+    the physical storage differs, and that is the whole point: every caller
+    ends up wanting ``[sequence, heads * head_dim]``, which it reaches with
+    ``transpose(1, 2).reshape(...)``. Out of head-major storage those two
+    dimensions cannot merge, so the reshape materializes a second
+    full-sequence buffer -- 738 MiB at the production shape. Out of
+    sequence-major storage the transpose lands back on contiguous memory and
+    the reshape is a view. The returned tensor is a permuted view either way,
+    so nothing downstream has to know which it got.
+    """
+    if output_layout not in OUTPUT_LAYOUTS:
+        raise ValueError(
+            'output_layout must be one of %s, got %r'
+            % (', '.join(OUTPUT_LAYOUTS), output_layout)
+        )
     batch, q_heads, q_length, kernel_head_dim = quantized.q.shape
     kv_heads, kv_length = quantized.k.shape[1], quantized.k.shape[2]
     padded_k_length = _pad_to(kv_length, quantized.cta_k)
@@ -246,10 +283,29 @@ def _attention_geometry(quantized):
         if quantized.input_dtype == torch.float32
         else quantized.input_dtype
     )
-    output = torch.empty(
-        batch, q_heads, q_length, kernel_head_dim,
-        dtype=output_dtype, device=quantized.q.device,
-    )
+    if output_layout == OUTPUT_NHD:
+        storage = torch.empty(
+            batch, q_length, q_heads, kernel_head_dim,
+            dtype=output_dtype, device=quantized.q.device,
+        )
+        # Logical BHND over sequence-major storage. The kernel is told the
+        # storage strides; the caller sees the shape it always saw.
+        output = storage.permute(0, 2, 1, 3)
+        output_strides = (
+            q_length * q_heads * kernel_head_dim,
+            q_heads * kernel_head_dim,
+            kernel_head_dim,
+        )
+    else:
+        output = torch.empty(
+            batch, q_heads, q_length, kernel_head_dim,
+            dtype=output_dtype, device=quantized.q.device,
+        )
+        output_strides = (
+            q_heads * q_length * kernel_head_dim,
+            kernel_head_dim,
+            q_length * kernel_head_dim,
+        )
     strides = (
         q_heads * q_length * kernel_head_dim, kernel_head_dim,
         q_length * kernel_head_dim,
@@ -257,9 +313,7 @@ def _attention_geometry(quantized):
         kv_length * kernel_head_dim,
         kv_heads * kernel_head_dim * padded_k_length,
         kernel_head_dim * padded_k_length, padded_k_length,
-        q_heads * q_length * kernel_head_dim, kernel_head_dim,
-        q_length * kernel_head_dim,
-    )
+    ) + output_strides
     return output, output_dtype, (
         batch, q_length, kv_length, q_heads, kv_heads, kernel_head_dim
     ), strides
@@ -270,10 +324,12 @@ def _finish(quantized, output):
     return output.float() if quantized.input_dtype == torch.float32 else output
 
 
-def int8_attention_from_prequantized(quantized):
+def int8_attention_from_prequantized(quantized, *, output_layout=OUTPUT_HND):
     """Dense INT8 attention over every KV tile."""
     library = loader.load()
-    output, output_dtype, geometry, strides = _attention_geometry(quantized)
+    output, output_dtype, geometry, strides = _attention_geometry(
+        quantized, output_layout
+    )
     loader.check(
         library.h3_int8_dense_attention(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
@@ -286,7 +342,9 @@ def int8_attention_from_prequantized(quantized):
     return _finish(quantized, output)
 
 
-def block_sparse_int8_attention_from_prequantized(quantized, route):
+def block_sparse_int8_attention_from_prequantized(
+    quantized, route, *, output_layout=OUTPUT_HND
+):
     """INT8 attention over the KV tiles the route selects."""
     if not isinstance(route, BlockSparseRoute):
         raise TypeError(
@@ -309,19 +367,20 @@ def block_sparse_int8_attention_from_prequantized(quantized, route):
     if kernel_route.indices.dtype != torch.int32 or kernel_route.counts.dtype != torch.int32:
         raise TypeError('route indices and counts must be int32')
 
-    output, output_dtype, geometry, strides = _attention_geometry(quantized)
+    output, output_dtype, geometry, strides = _attention_geometry(
+        quantized, output_layout
+    )
     kv_tiles = kernel_route.indices.shape[-1]
-    loader.check(
-        library.h3_int8_sparse_attention(
+    with diagnostics.stage('sparse_attention_kernel'):
+        _check_sparse_attention(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
             _ptr(quantized.v_scale), _ptr(kernel_route.indices),
             _ptr(kernel_route.counts), kv_tiles, quantized.cta_k,
             *geometry, *strides,
-            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype], _stream(),
-        ),
-        'sparse attention',
-    )
+            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
+            _stream(),
+        )
     return _finish(quantized, output)
 
 

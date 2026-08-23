@@ -27,6 +27,7 @@ from .int8_attention import (
 )
 from .producer import (
     INT8_ATTENTION_PRODUCER_ABI_VERSION,
+    SUPPORTS_STRIDED_QK_CHUNK,
     Int8AttentionKAnchor,
     Int8AttentionProducer,
     Int8AttentionProducerSpec,
@@ -42,6 +43,7 @@ from .producer import (
 )
 
 __all__ = [
+    'SUPPORTS_STRIDED_QK_CHUNK',
     'ABI_VERSION',
     'BlockSparseRoute',
     'INT8_ATTENTION_PRODUCER_ABI_VERSION',

@@ -5,3 +5,8 @@ __pycache__/
 native/build*/
 native/lib/
 native/selftest.json
+
+# Side-car experiment build (native/build_v_staging.ps1). The shipped
+# library is committed; this local one is not.
+native/bin/h3_v_staging.*
+native/bin/libh3_v_staging.*

@@ -4,6 +4,7 @@ import comfy.ldm.minimax.model as h3_model
 import comfy.model_management
 import comfy.quant_ops
 
+from . import diagnostics
 from .attention import AttentionBackendUnavailable
 from .ordering_probe import has_ordering_observer, observe_attention
 
@@ -50,7 +51,10 @@ def finish_qkv_projection(module, projected, rope_freqs):
 
 
 def project_qkv(module, x, rope_freqs):
-    return finish_qkv_projection(module, module.qkv_proj(x), rope_freqs)
+    with diagnostics.stage('qkv_linear'):
+        projected = module.qkv_proj(x)
+    with diagnostics.stage('qk_norm_rope'):
+        return finish_qkv_projection(module, projected, rope_freqs)
 
 
 def to_hnd(q, k, v):
@@ -97,22 +101,47 @@ def _project_or_none(
     )
 
 
-def _finish_projected(module, backend, prepared):
-    out_hnd = backend.execute(prepared)
-    if out_hnd.ndim != 4:
+def flatten_attention_output(module, out, source):
+    """Reach [batch, sequence, heads * head_dim] from whatever the kernel wrote.
+
+    An ``nhd`` kernel output already has sequence ahead of heads, so the
+    flatten is a view. An ``hnd`` output needs a transpose whose last two
+    dimensions cannot merge, so ``reshape`` copies a second full-sequence BF16
+    tensor -- at the production shape that is the single largest avoidable
+    allocation in the block.
+    """
+    if out.ndim != 4:
         raise RuntimeError(
             '%s returned rank-%d output; expected HND rank 4'
-            % (
-                getattr(backend, 'name', type(backend).__name__),
-                out_hnd.ndim,
-            )
+            % (source, out.ndim)
         )
-    out = out_hnd.transpose(1, 2).reshape(
-        out_hnd.shape[0],
-        out_hnd.shape[2],
-        module.heads * module.head_dim,
+    # One expression for both storage layouts. Over head-major storage the
+    # dimensions cannot merge and `reshape` copies; over sequence-major
+    # storage the transpose lands on contiguous memory and this is a view.
+    return out.transpose(1, 2).reshape(
+        out.shape[0], out.shape[2], module.heads * module.head_dim
     )
-    return module.out_proj(out.squeeze(0))
+
+
+def _finish_projected(module, backend, prepared):
+    name = getattr(backend, 'name', type(backend).__name__)
+    raw = backend.execute(prepared)
+    out = flatten_attention_output(module, raw, name)
+    # Only the flattened view is needed from here. Under `hnd` the reshape
+    # already copied, so this returns a full-sequence buffer to the allocator
+    # before the projection asks for one; under `nhd` `out` aliases `raw` and
+    # this is a no-op.
+    del raw
+    if getattr(backend, 'release_carrier_before_out_proj', False):
+        release = getattr(prepared, 'release', None)
+        if release is None:
+            raise RuntimeError(
+                '%s asked to release its carrier but %s cannot release one'
+                % (name, type(prepared).__name__)
+            )
+        release()
+    with diagnostics.stage('attention_out'):
+        return module.out_proj(out.squeeze(0))
 
 
 def make_forward(
@@ -133,6 +162,10 @@ def make_forward(
         bind_projector(module)
 
     def forward(x, rope_freqs=None, transformer_options=None):
+        with diagnostics.stage('attention_total'):
+            return _forward(x, rope_freqs, transformer_options)
+
+    def _forward(x, rope_freqs, transformer_options):
         transformer_options = (
             transformer_options if transformer_options is not None else {}
         )
@@ -219,21 +252,15 @@ def make_forward(
                     v,
                     transformer_options,
                 )
-            if out_hnd.ndim != 4:
-                raise RuntimeError(
-                    '%s returned rank-%d output; expected HND rank 4'
-                    % (
-                        getattr(backend, 'name', type(backend).__name__),
-                        out_hnd.ndim,
-                    )
-                )
-            out = out_hnd.transpose(1, 2).reshape(
-                out_hnd.shape[0],
-                out_hnd.shape[2],
-                module.heads * module.head_dim,
+            out = flatten_attention_output(
+                module,
+                out_hnd,
+                getattr(backend, 'name', type(backend).__name__),
             )
+            del out_hnd
 
-        return module.out_proj(out.squeeze(0))
+        with diagnostics.stage('attention_out'):
+            return module.out_proj(out.squeeze(0))
 
     forward._h3_optimizations_attention = True
     forward._h3_optimizations_layer_index = int(layer_index)

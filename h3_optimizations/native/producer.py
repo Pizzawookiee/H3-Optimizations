@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .. import diagnostics
 from . import loader
 from .int8_attention import (
     CTA_K,
@@ -40,6 +41,11 @@ from .int8_attention import (
 )
 
 INT8_ATTENTION_PRODUCER_ABI_VERSION = 1
+# The chunk quantizer takes explicit Q/K strides, so a caller holding an
+# already-correct strided view does not have to materialize a contiguous copy
+# first. Declared so kitchen_qkv can tell this module apart from an installed
+# comfy-kitchen that has no such option.
+SUPPORTS_STRIDED_QK_CHUNK = True
 _K_ANCHOR_SAMPLES = 9
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -160,6 +166,35 @@ def _pad_last_dim(tensor, width):
     ).contiguous()
 
 
+def _kernel_accepts_strided(tensor, width):
+    """Whether the chunk quantizer can read this tensor where it already is.
+
+    Mirrors the launcher's own predicate rather than approximating it: the
+    head dimension must be exactly the kernel width and contiguous, and the
+    base pointer and B/H/N strides must preserve 4-element vector alignment.
+    An extent below two is exempt because its index never reaches an address.
+    Getting this wrong does not corrupt anything -- the launcher raises -- but
+    checking here keeps the fast path from depending on that.
+    """
+    if tensor.shape[-1] != width or tensor.stride(-1) != 1:
+        return False
+    element_size = tensor.element_size()
+    if tensor.data_ptr() % (4 * element_size):
+        return False
+    for dimension in range(3):
+        extent = tensor.shape[dimension]
+        stride = tensor.stride(dimension)
+        if extent >= 2 and (stride <= 0 or stride % 4):
+            return False
+    return True
+
+
+def _prepare_chunk_input(tensor, width, allow_strided):
+    if allow_strided and _kernel_accepts_strided(tensor, width):
+        return tensor
+    return _pad_last_dim(tensor, width)
+
+
 def select_int8_attention_k_anchor(spec, k_samples):
     """Choose the K row to centre on, from the sampled rows."""
     expected = (
@@ -173,6 +208,11 @@ def select_int8_attention_k_anchor(spec, k_samples):
     if k_samples.dtype != spec.input_dtype:
         raise TypeError('k_samples must have dtype %r' % spec.input_dtype)
 
+    with diagnostics.stage('anchor_selection'):
+        return _select_k_anchor(spec, k_samples)
+
+
+def _select_k_anchor(spec, k_samples):
     library = loader.load()
     samples = _pad_last_dim(k_samples, spec.kernel_head_dim)
     positions = torch.tensor(
@@ -251,7 +291,9 @@ def _check_chunk(name, start, length, full, alignment):
         )
 
 
-def quantize_int8_attention_qk_chunk(producer, q, k, *, q_start, k_start):
+def quantize_int8_attention_qk_chunk(
+    producer, q, k, *, q_start, k_start, allow_strided_input=False
+):
     """Quantize one aligned slice of Q and K into the carriers."""
     if producer._finalized:
         raise RuntimeError('the producer has already been finalized')
@@ -263,8 +305,16 @@ def quantize_int8_attention_qk_chunk(producer, q, k, *, q_start, k_start):
         raise TypeError('chunks must have dtype %r' % spec.input_dtype)
 
     library = loader.load()
-    q = _pad_last_dim(q, spec.kernel_head_dim)
-    k = _pad_last_dim(k, spec.kernel_head_dim)
+    with diagnostics.stage('qk_pack_input_contiguous'):
+        q = _prepare_chunk_input(q, spec.kernel_head_dim, allow_strided_input)
+        k = _prepare_chunk_input(k, spec.kernel_head_dim, allow_strided_input)
+    with diagnostics.stage('qk_carrier_pack'):
+        _quantize_qk_chunk(library, producer, spec, q, k, q_start, k_start)
+    producer._q_ranges.append((q_start, q_start + q.shape[2]))
+    producer._k_ranges.append((k_start, k_start + k.shape[2]))
+
+
+def _quantize_qk_chunk(library, producer, spec, q, k, q_start, k_start):
     loader.check(
         library.h3_int8_quantize_qk_chunk(
             _ptr(q), _ptr(k), _ptr(producer.q), _ptr(producer.q_scale),
@@ -280,8 +330,6 @@ def quantize_int8_attention_qk_chunk(producer, q, k, *, q_start, k_start):
         ),
         'quantize_qk_chunk',
     )
-    producer._q_ranges.append((q_start, q_start + q.shape[2]))
-    producer._k_ranges.append((k_start, k_start + k.shape[2]))
 
 
 def quantize_int8_attention_v(producer, v):
@@ -295,6 +343,11 @@ def quantize_int8_attention_v(producer, v):
             % (spec.k_input_shape[2], v.shape[2])
         )
 
+    with diagnostics.stage('v_carrier_pack'):
+        _quantize_v(producer, spec, v)
+
+
+def _quantize_v(producer, spec, v):
     library = loader.load()
     v = _pad_last_dim(v, spec.kernel_head_dim)
     batch, kv_heads = spec.k_input_shape[0], spec.k_input_shape[1]

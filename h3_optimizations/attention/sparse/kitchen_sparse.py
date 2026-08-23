@@ -23,6 +23,7 @@ incompatible because it emits a different per-tile carrier.
 
 from dataclasses import dataclass
 
+from ... import diagnostics
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
@@ -33,6 +34,10 @@ from ...kitchen_qkv import PreparedChunkedKitchenQKV
 class SparseKitchenError(RuntimeError):
     pass
 
+
+OUTPUT_HND = 'hnd'
+OUTPUT_NHD = 'nhd'
+OUTPUT_LAYOUTS = (OUTPUT_HND, OUTPUT_NHD)
 
 Q_TILE = 128
 # Measured on SM89: the 128-wide KV tile beats the 64-wide one by 17-19% in
@@ -138,14 +143,40 @@ class PreparedSparseKitchen:
     layer_index: int
     metadata: dict
 
+    def release(self):
+        """Drop the carriers and route once the kernel no longer needs them.
+
+        The kernel launch is asynchronous, but the caching allocator is
+        stream-ordered: a block freed here can only be handed back to an
+        allocation on the same stream, which is ordered after the launch that
+        reads it. Dropping the references from the wrapper rather than from a
+        caller's local means every holder loses them at once -- the projected
+        carrier outlives its usefulness by a full output projection otherwise.
+        """
+        self.quantized = None
+        self.route = None
+
 
 class SparseKitchenExecutor:
     '''Quantize with Kitchen, then attend over the routed KV tiles.'''
 
-    def __init__(self, kitchen, *, kv_tile=KV_TILE, allow_cpu_for_tests=False):
+    def __init__(
+        self,
+        kitchen,
+        *,
+        kv_tile=KV_TILE,
+        allow_cpu_for_tests=False,
+        output_layout=OUTPUT_HND,
+    ):
         self.kitchen = kitchen
         self.kv_tile = int(kv_tile)
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
+        if output_layout not in OUTPUT_LAYOUTS:
+            raise SparseKitchenError(
+                'output_layout must be one of %s, got %r'
+                % (', '.join(OUTPUT_LAYOUTS), output_layout)
+            )
+        self.output_layout = str(output_layout)
 
     def prepare(self, q, k, v, lut, valid_block_num, *, layer_index, metadata):
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -158,9 +189,10 @@ class SparseKitchenExecutor:
         if not self.allow_cpu_for_tests and not q.is_cuda:
             raise SparseKitchenError('Kitchen sparse attention requires CUDA tensors')
 
-        quantized = self.kitchen.prequantize_int8_attention(
-            q, k, v, cta_k=self.kv_tile
-        )
+        with diagnostics.stage('full_carrier_pack'):
+            quantized = self.kitchen.prequantize_int8_attention(
+                q, k, v, cta_k=self.kv_tile
+            )
         # The router emits Sparge's delta encoding. Declaring it rather than
         # converting keeps this a zero-conversion path: the route knows how to
         # reach whatever encoding the compiled kernel walks.
@@ -199,13 +231,14 @@ class SparseKitchenExecutor:
                 'Kitchen QKV carrier uses KV tile %d, expected %d'
                 % (quantized.cta_k, self.kv_tile)
             )
-        route = self.kitchen.BlockSparseRoute(
-            indices=lut,
-            counts=valid_block_num,
-            q_tile=Q_TILE,
-            kv_tile=self.kv_tile,
-            encoding='delta',
-        )
+        with diagnostics.stage('sparse_carrier_prepare'):
+            route = self.kitchen.BlockSparseRoute(
+                indices=lut,
+                counts=valid_block_num,
+                q_tile=Q_TILE,
+                kv_tile=self.kv_tile,
+                encoding='delta',
+            )
         return PreparedSparseKitchen(
             quantized=quantized,
             route=route,
@@ -215,8 +248,12 @@ class SparseKitchenExecutor:
         )
 
     def execute(self, prepared):
+        if self.output_layout == OUTPUT_HND:
+            return self.kitchen.block_sparse_int8_attention_from_prequantized(
+                prepared.quantized, prepared.route
+            )
         return self.kitchen.block_sparse_int8_attention_from_prequantized(
-            prepared.quantized, prepared.route
+            prepared.quantized, prepared.route, output_layout=self.output_layout
         )
 
 
@@ -234,6 +271,9 @@ class SparseKitchenBackend:
         executor=None,
         projector=None,
         allow_cpu_for_tests=False,
+        output_layout=OUTPUT_HND,
+        release_carrier_before_out_proj=False,
+        score_chunk_tiles=None,
     ):
         self.config = config or HybridSparseConfig()
         if not isinstance(self.config, HybridSparseConfig):
@@ -247,11 +287,16 @@ class SparseKitchenBackend:
         self.executor = executor or SparseKitchenExecutor(
             module,
             allow_cpu_for_tests=allow_cpu_for_tests,
+            output_layout=output_layout,
+        )
+        self.release_carrier_before_out_proj = bool(
+            release_carrier_before_out_proj
         )
         self.router = router or SparseTileRouter(
             self.config,
             q_tile=Q_TILE,
             kv_tile=self.executor.kv_tile,
+            score_chunk_tiles=score_chunk_tiles,
         )
         self.projector = projector
         if (self.router.q_tile, self.router.kv_tile) != (
@@ -275,6 +320,9 @@ class SparseKitchenBackend:
             self.config.signature,
             (type(self.router).__module__, type(self.router).__qualname__),
             int(self.executor.kv_tile),
+            str(self.output_layout),
+            bool(self.release_carrier_before_out_proj),
+            getattr(self.router, 'score_chunk_tiles', None),
             str(getattr(self.executor.kitchen, '__version__', 'unknown')),
             (
                 None
@@ -292,13 +340,14 @@ class SparseKitchenBackend:
             layer_index,
         )
         try:
-            return self.router.build_lut(
-                q,
-                k,
-                snapshot.layout,
-                video_budget,
-                **_route_kwargs(transformer_options, layer_index),
-            )
+            with diagnostics.stage('sparse_route'):
+                return self.router.build_lut(
+                    q,
+                    k,
+                    snapshot.layout,
+                    video_budget,
+                    **_route_kwargs(transformer_options, layer_index),
+                )
         except SparseRouterError as exc:
             raise SparseKitchenError('sparse routing failed: %s' % exc) from exc
 
@@ -347,15 +396,16 @@ class SparseKitchenBackend:
             layer_index,
         )
         try:
-            lut, valid_block_num, mask_metadata = (
-                self.router.build_lut_from_summaries(
-                    projected.q_summary,
-                    projected.k_summary,
-                    snapshot.layout,
-                    video_budget,
-                    **_route_kwargs(transformer_options, layer_index),
+            with diagnostics.stage('sparse_route'):
+                lut, valid_block_num, mask_metadata = (
+                    self.router.build_lut_from_summaries(
+                        projected.q_summary,
+                        projected.k_summary,
+                        snapshot.layout,
+                        video_budget,
+                        **_route_kwargs(transformer_options, layer_index),
+                    )
                 )
-            )
         except SparseRouterError as exc:
             raise SparseKitchenError('sparse routing failed: %s' % exc) from exc
         return self.executor.prepare_projected(
@@ -369,6 +419,10 @@ class SparseKitchenBackend:
                 projected.q_summary.shape[1],
             ),
         )
+
+    @property
+    def output_layout(self):
+        return self.executor.output_layout
 
     def execute(self, prepared):
         return self.executor.execute(prepared)
@@ -384,6 +438,13 @@ class SparseKitchenBackend:
             'sparse_kv_tile': int(self.executor.kv_tile),
             'sparse_v_format': 'int8',
             'route_encoding': 'delta',
+            'output_layout': self.output_layout,
+            'score_chunk_tiles': getattr(
+                self.router, 'score_chunk_tiles', None
+            ),
+            'release_carrier_before_out_proj': bool(
+                self.release_carrier_before_out_proj
+            ),
             'approximate': True,
             'fused_qkv': self.projector is not None,
             'qkv_projector': (
