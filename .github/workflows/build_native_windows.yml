@@ -98,28 +98,75 @@ jobs:
           & (Join-Path $toolkit "bin/nvcc.exe") --version
           if ($LASTEXITCODE -ne 0) { throw "nvcc validation failed with exit code $LASTEXITCODE" }
 
-      - name: Initialize MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Locate MSVC environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+          $installation = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installation) { throw "Visual Studio C++ build tools were not found" }
+          "VS_INSTALL=$($installation.Trim())" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Restore incremental native build
         uses: actions/cache@v5
         with:
           path: native/build
-          key: windows-2022-ninja-cuda-13.0.0-sm89-native-v1-${{ hashFiles('native/CMakeLists.txt', 'native/src/**/*.cu', 'native/src/**/*.cuh') }}
+          key: windows-2022-ninja-cuda-13.0.0-sm89-native-v2-${{ hashFiles('native/CMakeLists.txt', 'native/src/**/*.cu', 'native/src/**/*.cuh') }}
           restore-keys: |
+            windows-2022-ninja-cuda-13.0.0-sm89-native-v2-
             windows-2022-ninja-cuda-13.0.0-sm89-native-v1-
 
-      - name: Configure CMake
+      - name: Prepare incremental native build
         shell: pwsh
-        run: >-
-          cmake -S native -B native/build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DH3_CUDA_ARCHS=89
-          "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifestPath = "native/build/.native-source-hashes.json"
+          $previousHashes = @{}
+          if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+            $savedHashes = Get-Content -LiteralPath $manifestPath -Raw |
+              ConvertFrom-Json -AsHashtable
+            if ($savedHashes) { $previousHashes = $savedHashes }
+          }
+
+          $currentHashes = @{}
+          $unchangedTimestamp = [DateTime]::SpecifyKind(
+            [DateTime]::Parse("2000-01-01T00:00:00"),
+            [DateTimeKind]::Utc
+          )
+          $changedTimestamp = [DateTime]::UtcNow
+
+          $inputs = @(git ls-files -- native/CMakeLists.txt native/src)
+          foreach ($path in $inputs) {
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $currentHashes[$path] = $hash
+            $timestamp = $changedTimestamp
+            if ($previousHashes.ContainsKey($path) -and $previousHashes[$path] -eq $hash) {
+              $timestamp = $unchangedTimestamp
+            }
+            [System.IO.File]::SetLastWriteTimeUtc((Resolve-Path $path).Path, $timestamp)
+          }
+
+          New-Item -ItemType Directory -Path (Split-Path $manifestPath) -Force | Out-Null
+          $currentHashes | ConvertTo-Json |
+            Set-Content -LiteralPath $manifestPath -Encoding utf8
+
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          call "%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S native -B native/build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DH3_CUDA_ARCHS=89 ^
+            "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe"
 
       - name: Build release DLL
-        shell: pwsh
-        run: cmake --build native/build --parallel
+        shell: cmd
+        run: |
+          call "%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build native/build --parallel
 
       - name: Package DLL, checksum, and provenance
         shell: pwsh
