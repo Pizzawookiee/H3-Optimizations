@@ -10,7 +10,6 @@ import comfy.model_management
 import comfy.quant_ops
 
 from .attention_forward import project_qkv
-from .dense_resolver import is_installed_dense_attention
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.fp8 import FP8BindingError, HeldFP8QKV
@@ -243,11 +242,7 @@ class ChunkedKitchenQKVProjector:
             else (fmt.convrot_int8_256 or fmt.w4a8)
         )
         if (
-            (
-                not self.routing_summaries
-                and not is_installed_dense_attention(transformer_options)
-            )
-            or comfy.model_management.in_training
+            comfy.model_management.in_training
             or x.ndim != 2
             or not x.is_cuda
             or not format_ok
