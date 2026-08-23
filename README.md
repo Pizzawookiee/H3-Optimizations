@@ -11,12 +11,13 @@ sparse routing, and bounded MLP execution.
   applies compatible memory/execution providers. ConvRot INT8 QKV can project
   in 4K token chunks directly into Comfy Kitchen carriers. Native FP8 uses held
   chunked FP8 execution, and ordinary BF16/FP16 QKV/MLP weights may be converted
-  to FP8 E4M3 when accelerated FP8 is available. Enable the advanced `Preserve
-  precision` toggle to forbid new quantization: dense attention and QKV stay on
-  the upstream Comfy path, while floating MLP weights remain floating and still
-  use bounded token chunking. Checkpoint-native quantization remains native
-  where a compatible bounded MLP provider exists. NVFP4 and unsupported
-  quantized formats preserve upstream Comfy execution.
+  to FP8 E4M3 when accelerated FP8 is available. The advanced `Preserve
+  precision` toggle forbids new quantization: dense attention and QKV stay on
+  the upstream Comfy path, while MLP auto keeps BF16/FP16 weights floating and
+  still uses bounded token chunking. Checkpoint-native ConvRot, FP8, and W4A8
+  remain native where a compatible bounded MLP provider exists; unsupported
+  quantized formats preserve upstream Comfy execution. The toggle defaults off,
+  so existing workflows retain the current auto policy.
 - H3 Sparse Attention enables fixed-density native Kitchen INT8 attention while
   keeping text, reference conditioning, audio, non-video queries, and mixed
   boundary tiles dense. Its default video KV budget is 30 percent. The optional
