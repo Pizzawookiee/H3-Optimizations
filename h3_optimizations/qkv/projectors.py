@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from .bf16 import ChunkedBF16QKVProjector
 from .formats import (
     describe_linear,
     is_fused_weight_format_error,
@@ -16,11 +15,6 @@ def _unsupported(required, message):
             % message
         )
     return None
-
-
-def _native_bf16(fmt):
-    dtype = str(fmt.logical_dtype).lower()
-    return fmt.plain_float and ('bfloat16' in dtype or 'bf16' in dtype)
 
 
 class SparseFusedQKVProjector:
@@ -40,7 +34,6 @@ class SparseFusedQKVProjector:
             spec,
             chunk_rows=self.chunk_rows,
         )
-        self._bf16 = ChunkedBF16QKVProjector(self.chunk_rows)
 
     @property
     def installation_signature(self):
@@ -61,14 +54,6 @@ class SparseFusedQKVProjector:
         transformer_options,
     ):
         actual = describe_linear(module.qkv_proj)
-        if _native_bf16(actual):
-            return self._bf16.try_project(
-                module,
-                x,
-                rope_freqs,
-                layer_index=layer_index,
-                transformer_options=transformer_options,
-            )
         if not actual.convrot_int8_256:
             return _unsupported(
                 self.required,
@@ -114,7 +99,6 @@ class TritonSparseQKVProjector:
             chunk_rows=self.chunk_rows,
             v_scale_group_size=self.v_scale_group_size,
         )
-        self._bf16 = ChunkedBF16QKVProjector(self.chunk_rows)
 
     @property
     def v_format(self):
@@ -141,14 +125,6 @@ class TritonSparseQKVProjector:
         transformer_options,
     ):
         actual = describe_linear(module.qkv_proj)
-        if _native_bf16(actual):
-            return self._bf16.try_project(
-                module,
-                x,
-                rope_freqs,
-                layer_index=layer_index,
-                transformer_options=transformer_options,
-            )
         if not (actual.convrot_int8_256 or actual.w4a8):
             return _unsupported(
                 self.required,
