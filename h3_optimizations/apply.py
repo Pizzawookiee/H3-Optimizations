@@ -66,6 +66,7 @@ from .qkv.providers import (
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     QKV_SPARSE_FP8_CHUNKED,
+    QKV_STANDARD,
     QKV_TRITON_SPARSE_CHUNKED,
     resolve_mlp_provider,
     resolve_qkv_provider,
@@ -97,6 +98,50 @@ class ResolvedAttention:
     backend_kind: str
     projector: object | None = None
     dense_resolution: object | None = None
+
+
+# Backends that are materially slower than the one that was asked for. A
+# fallback here is not a detail: it roughly halves attention throughput, and it
+# used to be visible only to someone who went looking at the status output.
+_SLOW_SPARSE_FALLBACKS = {
+    ATTENTION_TRITON_SPARSE: 'INT8 Triton sparse is roughly half the speed of the native sparse kernel',
+    ATTENTION_FP8_FLEX: 'FP8 FlexAttention is far slower than the native sparse kernel',
+}
+
+
+def _warn_about_slow_paths(attention, qkv):
+    """Say loudly when a fast path was wanted and something slower was used.
+
+    Only fires when the resolution actually degraded. Choosing a backend
+    explicitly is not a fallback and stays quiet.
+    """
+    requested_sparse = attention.requested in (
+        ATTENTION_SPARSE,
+        ATTENTION_KITCHEN_SPARSE,
+    )
+    if requested_sparse and attention.selected != attention.requested:
+        cost = _SLOW_SPARSE_FALLBACKS.get(
+            attention.selected,
+            'this path is substantially slower than the native sparse kernel',
+        )
+        logging.warning(
+            '%s SPARSE ATTENTION FELL BACK to %s. %s. Reason: %s',
+            LOG_PREFIX,
+            attention.selected,
+            cost,
+            attention.reason or 'unknown',
+        )
+
+    # The chunked Comfy Kitchen QKV producer is the fast QKV path. When its
+    # Kitchen-side API is missing the pack silently projects the slow way,
+    # which is what made a missing dependency look like a working install.
+    if qkv.provider_id == QKV_STANDARD and 'Kitchen' in (qkv.reason or ''):
+        logging.warning(
+            '%s FUSED QKV IS NOT RUNNING - falling back to standard projection, '
+            'which is roughly half the speed. Reason: %s',
+            LOG_PREFIX,
+            qkv.reason,
+        )
 
 
 def _qkv_request(plan):
@@ -685,6 +730,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
         inventory=inventory,
         v_layout=v_layout,
     )
+    _warn_about_slow_paths(attention, qkv)
     logging.info(
         '%s armed: attention=%s v_layout=%s qkv=%s mlp=%s device=%s',
         LOG_PREFIX,
