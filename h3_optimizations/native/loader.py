@@ -8,9 +8,9 @@ came to be integrated here but never actually running for a single user.
 
 ctypes rather than a Python extension module on purpose. The native side is
 plain C: pointers, ints, and a stream handle. That means no nanobind, no
-DLPack, and no Python ABI dimension, so one binary per OS and architecture set
-serves every interpreter that can call ctypes -- instead of separate cp310,
-cp311 and abi3 builds.
+DLPack, and no Python ABI dimension to build for, so one binary per OS and
+architecture set serves every interpreter that can call ctypes -- instead of
+separate cp310, cp311 and abi3 builds.
 
 Every entry point returns a status code and leaves its message for
 ``h3_int8_last_error``; :func:`_check` turns that into a normal exception.
@@ -25,6 +25,8 @@ import os
 import pathlib
 import platform
 import threading
+
+import torch
 
 ABI_VERSION = 1
 
@@ -133,6 +135,11 @@ def _bind(library):
     return library
 
 
+def _is_rocm_runtime():
+    """PyTorch exposes ROCm GPUs through torch.cuda, so test HIP explicitly."""
+    return bool(getattr(torch.version, 'hip', None))
+
+
 def load(force_reload=False):
     """Return the loaded library, raising NativeUnavailableError if it is not."""
     global _library, _load_error
@@ -140,6 +147,14 @@ def load(force_reload=False):
         if _library is not None and not force_reload:
             return _library
         if _load_error is not None and not force_reload:
+            raise NativeUnavailableError(_load_error)
+
+        # ROCm deliberately mirrors much of torch.cuda. In particular,
+        # is_available(), device names and capability queries can all succeed on
+        # AMD. The vendored library is CUDA-only, so reject HIP before loading
+        # the shared object or reaching any CUDA driver entry point.
+        if _is_rocm_runtime():
+            _load_error = 'the vendored INT8 attention library requires NVIDIA CUDA; ROCm/HIP detected'
             raise NativeUnavailableError(_load_error)
 
         searched = _candidate_paths()

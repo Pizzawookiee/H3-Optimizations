@@ -1,4 +1,9 @@
-'''FP8 FlexAttention fallback for fixed-density H3 sparse routing.'''
+'''FlexAttention fallback for fixed-density H3 sparse routing.
+
+NVIDIA uses the existing FP8 carrier path. ROCm uses native BF16/FP16 Q/K/V
+through PyTorch FlexAttention's Triton lowering so AMD can retain the same H3
+block-sparse routing without depending on CUDA or FP8 support.
+'''
 
 from dataclasses import dataclass
 import importlib
@@ -36,6 +41,7 @@ class FP8FlexSpec:
     fp8_dtype: torch.dtype = FP8_DTYPE
     q_tile: int = Q_TILE
     kv_tile: int = KV_TILE
+    quantize_fp8: bool = True
 
     @property
     def signature(self):
@@ -45,41 +51,39 @@ class FP8FlexSpec:
             self.q_tile,
             self.kv_tile,
             self.kernel_backend,
+            self.quantize_fp8,
             id(self.attention),
             id(self.block_mask_type),
         )
 
 
-def load_fp8_flex_spec(kernel_backend=FLEX_BACKEND_TRITON):
+def load_fp8_flex_spec(
+    kernel_backend=FLEX_BACKEND_TRITON,
+    *,
+    quantize_fp8=True,
+):
     try:
         from torch.nn.attention.flex_attention import BlockMask, flex_attention
     except ImportError as exc:
-        raise FP8FlexError(
-            'PyTorch FlexAttention is unavailable'
-        ) from exc
+        raise FP8FlexError('PyTorch FlexAttention is unavailable') from exc
 
     from_kv_blocks = getattr(BlockMask, 'from_kv_blocks', None)
     if not callable(from_kv_blocks):
-        raise FP8FlexError(
-            'PyTorch FlexAttention has no precomputed BlockMask API'
-        )
+        raise FP8FlexError('PyTorch FlexAttention has no precomputed BlockMask API')
     parameters = inspect.signature(from_kv_blocks).parameters
     required = {'BLOCK_SIZE', 'seq_lengths', 'compute_q_blocks'}
     if not required.issubset(parameters):
-        raise FP8FlexError(
-            'PyTorch FlexAttention BlockMask API is too old'
-        )
+        raise FP8FlexError('PyTorch FlexAttention BlockMask API is too old')
     try:
         attention = torch.compile(flex_attention, fullgraph=True)
     except Exception as exc:
-        raise FP8FlexError(
-            'PyTorch FlexAttention compilation is unavailable'
-        ) from exc
+        raise FP8FlexError('PyTorch FlexAttention compilation is unavailable') from exc
     return FP8FlexSpec(
         version=str(torch.__version__),
         attention=attention,
         block_mask_type=BlockMask,
         kernel_backend=str(kernel_backend),
+        quantize_fp8=bool(quantize_fp8),
     )
 
 
@@ -110,34 +114,43 @@ def preflight_fp8_flex(
     fp8_supported=None,
     dynamo_supported=None,
     flash_available=None,
+    rocm_available=None,
     loader=None,
 ):
+    if rocm_available is None:
+        rocm_available = lambda: bool(getattr(torch.version, 'hip', None))
+    is_rocm = bool(rocm_available())
+
+    if dynamo_supported is None:
+        dynamo_supported = torch._dynamo.is_dynamo_supported
+
+    if is_rocm:
+        if not dynamo_supported():
+            raise FP8FlexError('PyTorch Dynamo is unavailable for FlexAttention')
+        if loader is not None:
+            return loader(FLEX_BACKEND_TRITON, False)
+        return load_fp8_flex_spec(FLEX_BACKEND_TRITON, quantize_fp8=False)
+
     if not cuda_available():
-        raise FP8FlexError('FP8 FlexAttention requires NVIDIA CUDA')
+        raise FP8FlexError('FP8 FlexAttention requires NVIDIA CUDA or ROCm')
     capability = capability_getter()
     if capability is None:
         raise FP8FlexError('FP8 FlexAttention GPU capability is unavailable')
 
     if fp8_supported is None:
-        fp8_supported = lambda: comfy.model_management.supports_fp8_compute(
-            device
-        )
+        fp8_supported = lambda: comfy.model_management.supports_fp8_compute(device)
     try:
         supported = bool(fp8_supported())
     except Exception as exc:
-        raise FP8FlexError(
-            'FP8 FlexAttention capability probe failed: %s' % exc
-        ) from exc
+        raise FP8FlexError('FP8 FlexAttention capability probe failed: %s' % exc) from exc
     if not supported:
         raise FP8FlexError(
             'FP8 compute is unsupported on device capability %d.%d'
             % (int(capability[0]), int(capability[1]))
         )
-
-    if dynamo_supported is None:
-        dynamo_supported = torch._dynamo.is_dynamo_supported
     if not dynamo_supported():
         raise FP8FlexError('PyTorch Dynamo is unavailable for FlexAttention')
+
     kernel_backend = select_flex_kernel_backend(
         capability,
         flash_available=flash_available,
@@ -181,11 +194,7 @@ def block_mask_from_delta_lut(spec, lut, valid_block_num, sequence):
 
 
 def _per_head_scale(x, chunk_rows):
-    maximum = torch.zeros(
-        x.shape[:2],
-        dtype=torch.float32,
-        device=x.device,
-    )
+    maximum = torch.zeros(x.shape[:2], dtype=torch.float32, device=x.device)
     for start in range(0, x.shape[-2], chunk_rows):
         end = min(start + chunk_rows, x.shape[-2])
         chunk_maximum = x[..., start:end, :].abs().amax(
@@ -204,11 +213,7 @@ def _quantize_fp8(x, scale, chunk_rows, *, column_major=False):
         )
         output = storage.transpose(-2, -1)
     else:
-        output = torch.empty(
-            x.shape,
-            dtype=FP8_DTYPE,
-            device=x.device,
-        )
+        output = torch.empty(x.shape, dtype=FP8_DTYPE, device=x.device)
     input_scale = scale.to(dtype=x.dtype)[..., None, None]
     for start in range(0, x.shape[-2], chunk_rows):
         end = min(start + chunk_rows, x.shape[-2])
@@ -256,6 +261,11 @@ class FP8FlexBackend:
         if not isinstance(self.config, HybridSparseConfig):
             raise TypeError('config must be HybridSparseConfig')
         self.spec = spec if spec is not None else load_fp8_flex_spec()
+        self.name = (
+            'flex_attention_fp8'
+            if self.spec.quantize_fp8
+            else 'flex_attention_rocm_bf16'
+        )
         self.router = router or SparseTileRouter(
             self.config,
             q_tile=self.spec.q_tile,
@@ -276,7 +286,7 @@ class FP8FlexBackend:
             )
         self.chunk_rows = int(chunk_rows)
         if self.chunk_rows <= 0:
-            raise ValueError('FP8 Flex chunk rows must be positive')
+            raise ValueError('FlexAttention chunk rows must be positive')
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
         self._validated_signatures = set()
         self._unavailable_signatures = {}
@@ -295,12 +305,10 @@ class FP8FlexBackend:
     def _snapshot(transformer_options, sequence):
         snapshot = get_runtime_snapshot(transformer_options)
         if snapshot is None:
-            raise FP8FlexError(
-                'FP8 FlexAttention requires an H3 runtime snapshot'
-            )
+            raise FP8FlexError('FlexAttention requires an H3 runtime snapshot')
         if not snapshot.valid_layout:
             raise FP8FlexError(
-                'FP8 FlexAttention requires a valid packed layout: %s'
+                'FlexAttention requires a valid packed layout: %s'
                 % (snapshot.error or 'layout unavailable')
             )
         if int(snapshot.layout.seq_len) != int(sequence):
@@ -312,32 +320,24 @@ class FP8FlexBackend:
 
     def _validate(self, q, k, v):
         if q.shape != k.shape or q.shape != v.shape or q.ndim != 4:
-            raise FP8FlexError(
-                'FP8 FlexAttention requires equal HND rank-4 Q/K/V shapes'
-            )
+            raise FP8FlexError('FlexAttention requires equal HND rank-4 Q/K/V shapes')
         batch, heads, sequence, head_dim = q.shape
         if batch != 1 or head_dim != 128:
-            raise FP8FlexError(
-                'FP8 FlexAttention requires batch 1 and head_dim 128'
-            )
+            raise FP8FlexError('FlexAttention requires batch 1 and head_dim 128')
         if (
             q.dtype not in (torch.float16, torch.bfloat16)
             or q.dtype != k.dtype
             or q.dtype != v.dtype
         ):
-            raise FP8FlexError(
-                'FP8 FlexAttention Q/K/V require matching fp16 or bf16 dtypes'
-            )
+            raise FP8FlexError('FlexAttention Q/K/V require matching fp16 or bf16 dtypes')
         if q.device != k.device or q.device != v.device:
-            raise FP8FlexError('FP8 FlexAttention Q/K/V devices differ')
+            raise FP8FlexError('FlexAttention Q/K/V devices differ')
         if any(tensor.stride(-1) != 1 for tensor in (q, k, v)):
-            raise FP8FlexError(
-                'FP8 FlexAttention Q/K/V last dimension must be contiguous'
-            )
+            raise FP8FlexError('FlexAttention Q/K/V last dimension must be contiguous')
         if comfy.model_management.in_training:
-            raise FP8FlexError('FP8 FlexAttention is inference-only')
+            raise FP8FlexError('FlexAttention is inference-only')
         if not self.allow_cpu_for_tests and not q.is_cuda:
-            raise FP8FlexError('FP8 FlexAttention requires CUDA')
+            raise FP8FlexError('FlexAttention requires a CUDA or ROCm GPU tensor')
         return heads, sequence
 
     def prepare(self, q, k, v, *, layer_index, transformer_options):
@@ -347,6 +347,7 @@ class FP8FlexBackend:
             q.dtype,
             tuple(q.shape),
             self.spec.kernel_backend,
+            self.spec.quantize_fp8,
         )
         unavailable = self._unavailable_signatures.get(compile_signature)
         if unavailable is not None:
@@ -375,30 +376,39 @@ class FP8FlexBackend:
             valid_block_num,
             sequence,
         )
-        q_scale = _per_head_scale(q, self.chunk_rows)
-        k_scale = _per_head_scale(k, self.chunk_rows)
-        v_scale = _per_head_scale(v, self.chunk_rows)
-        q_fp8 = _quantize_fp8(q, q_scale, self.chunk_rows)
-        k_fp8 = _quantize_fp8(k, k_scale, self.chunk_rows)
-        v_fp8 = _quantize_fp8(
-            v,
-            v_scale,
-            self.chunk_rows,
-            column_major=True,
-        )
+        if self.spec.quantize_fp8:
+            q_scale = _per_head_scale(q, self.chunk_rows)
+            k_scale = _per_head_scale(k, self.chunk_rows)
+            v_scale = _per_head_scale(v, self.chunk_rows)
+            prepared_q = _quantize_fp8(q, q_scale, self.chunk_rows)
+            prepared_k = _quantize_fp8(k, k_scale, self.chunk_rows)
+            prepared_v = _quantize_fp8(
+                v,
+                v_scale,
+                self.chunk_rows,
+                column_major=True,
+            )
+            qk_scale = q_scale * k_scale
+            projection = 'standard_qkv_fp8'
+        else:
+            prepared_q, prepared_k, prepared_v = q, k, v
+            qk_scale = torch.ones(q.shape[:2], dtype=torch.float32, device=q.device)
+            v_scale = torch.ones_like(qk_scale)
+            projection = 'standard_qkv_bf16_or_fp16'
+
         metadata = mask_metadata.as_dict()
         metadata.update(
             {
                 'layer': int(layer_index),
                 'flex_attention_heads': int(heads),
-                'qkv_projection': 'standard_qkv_fp8',
+                'qkv_projection': projection,
             }
         )
         return PreparedFP8Flex(
-            q_fp8=q_fp8,
-            k_fp8=k_fp8,
-            v_fp8=v_fp8,
-            qk_scale=q_scale * k_scale,
+            q_fp8=prepared_q,
+            k_fp8=prepared_k,
+            v_fp8=prepared_v,
+            qk_scale=qk_scale,
             v_scale=v_scale,
             block_mask=block_mask,
             output_dtype=q.dtype,
@@ -430,30 +440,31 @@ class FP8FlexBackend:
                 prepared.q_fp8,
                 prepared.k_fp8,
                 prepared.v_fp8,
-                score_mod=restore_qk_scale,
+                score_mod=(restore_qk_scale if self.spec.quantize_fp8 else None),
                 block_mask=prepared.block_mask,
                 scale=prepared.q_fp8.shape[-1] ** -0.5,
                 kernel_options=kernel_options,
             )
+            expected_dtype = (
+                self.spec.fp8_dtype if self.spec.quantize_fp8 else prepared.output_dtype
+            )
             if (
                 tuple(output.shape) != prepared.output_shape
-                or output.dtype != self.spec.fp8_dtype
+                or output.dtype != expected_dtype
                 or output.device != prepared.q_fp8.device
             ):
-                raise FP8FlexError(
-                    'FlexAttention returned an invalid output contract'
-                )
-            output = output.to(prepared.output_dtype)
-            output.mul_(
-                prepared.v_scale.to(dtype=output.dtype)[..., None, None]
-            )
+                raise FP8FlexError('FlexAttention returned an invalid output contract')
+            if self.spec.quantize_fp8:
+                output = output.to(prepared.output_dtype)
+                output.mul_(prepared.v_scale.to(dtype=output.dtype)[..., None, None])
         except Exception as exc:
             if prepared.compile_signature in self._validated_signatures:
                 raise
             detail = str(exc).splitlines()[0]
-            reason = (
-                'FP8 FlexAttention %s failed before validation: %s'
-                % (self.spec.kernel_backend, detail)
+            reason = '%s %s failed before validation: %s' % (
+                self.name,
+                self.spec.kernel_backend,
+                detail,
             )
             self._unavailable_signatures[prepared.compile_signature] = reason
             logging.warning('[H3 Optimizations] %s; using dense attention', reason)
@@ -468,16 +479,20 @@ class FP8FlexBackend:
         return {
             'mode': self.name,
             'video_budget': float(self.config.video_budget),
-            'denser_early_late_steps': bool(
-                self.config.denser_early_late_steps
-            ),
+            'denser_early_late_steps': bool(self.config.denser_early_late_steps),
             'density_mode': self.config.density_mode,
             'flex_attention': self.spec.version,
             'sparse_q_tile': self.spec.q_tile,
             'sparse_kv_tile': self.spec.kv_tile,
             'kernel_backend': self.spec.kernel_backend,
-            'qkv_dtype': str(self.spec.fp8_dtype),
-            'qkv_scale_layout': 'per_head_float32',
+            'qkv_dtype': (
+                str(self.spec.fp8_dtype)
+                if self.spec.quantize_fp8
+                else 'native_fp16_or_bf16'
+            ),
+            'qkv_scale_layout': (
+                'per_head_float32' if self.spec.quantize_fp8 else 'none'
+            ),
             'output_dtype': 'fp16_or_bf16',
             'approximate': True,
         }
