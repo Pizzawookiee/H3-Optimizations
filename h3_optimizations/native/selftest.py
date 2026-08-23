@@ -11,9 +11,11 @@ Two legs, because either alone passes while broken:
                               faithfully reproduces a broken dense kernel
                               passes leg two and ships corrupt video.
 
-    100% route vs dense       catches a broken traversal. Bit-identical, at a
-                              pinned tile -- the carrier's own cta_k, not a
-                              heuristic that might pick the other one.
+    100% route vs dense       catches a broken traversal. Bit-identical at the
+                              128-wide KV tile used by H3's production sparse
+                              Kitchen backend, rather than an auto-selected
+                              short-sequence tile that may dispatch different
+                              dense and sparse math on some architectures.
 
 Then synchronize and look for asynchronous faults, because a bad launch on an
 unseen architecture surfaces later at an unrelated point. "It did not raise"
@@ -37,9 +39,18 @@ _CACHE = pathlib.Path(__file__).resolve().parent.parent.parent / 'native' / 'sel
 _lock = threading.Lock()
 _result = None
 
+# Bump whenever the meaning of a cached pass/fail changes without changing the
+# native binary build ID. Otherwise an old failure can survive a Python-only fix.
+_SELFTEST_REVISION = 'v2'
+
 # Small enough to be free, large enough for a full q tile, a ragged tail,
 # several heads and more than one KV tile.
 _BATCH, _HEADS, _Q_LEN, _KV_LEN, _HEAD_DIM = 1, 4, 300, 300, 128
+
+# H3's sparse Kitchen backend is deliberately pinned to 128-wide KV tiles.
+# Keep this local to the native startup layer: importing the high-level sparse
+# backend here would pull Comfy runtime modules into pre-startup initialization.
+_SPARSE_PARITY_CTA_K = 128
 
 # Healthy INT8 error is ~0.016 relative L2; the mildest corruption injected in
 # testing produced 0.42. This sits between, well clear of both.
@@ -55,10 +66,11 @@ def _cache_key(device):
     major, minor = torch.cuda.get_device_capability(device)
     from .bootstrap import installed_build_id
 
-    return 'sm%d%d|%s|%s' % (
+    return 'sm%d%d|%s|%s|%s' % (
         major,
         minor,
         installed_build_id() or 'local',
+        _SELFTEST_REVISION,
         torch.cuda.get_device_name(device),
     )
 
@@ -94,8 +106,10 @@ def run(device=None, *, verbose=False):
             for _ in range(3)
         )
 
-        carrier = native.prequantize_int8_attention(q, k, v)
-        dense = native.int8_attention_from_prequantized(carrier)
+        # Leg one intentionally keeps the normal tile heuristic: this is the
+        # broad dense-kernel sanity check, not an H3-production-path check.
+        dense_carrier = native.prequantize_int8_attention(q, k, v)
+        dense = native.int8_attention_from_prequantized(dense_carrier)
 
         reference = torch.nn.functional.scaled_dot_product_attention(
             q.float(), k.float(), v.float()
@@ -104,7 +118,19 @@ def run(device=None, *, verbose=False):
         detail['int8_vs_sdpa_rel_l2'] = round(int8_error, 6)
         leg1 = int8_error < _INT8_TOLERANCE and bool(torch.isfinite(dense).all())
 
-        kv_tiles = (_KV_LEN + carrier.cta_k - 1) // carrier.cta_k
+        # Leg two must compare like with like. H3 production sparse attention
+        # uses CTA_K=128. On Blackwell and any future architecture that chooses
+        # architecture-specific probability math, the auto-selected CTA_K=64
+        # short-sequence dense path may legitimately use a different kernel
+        # specialization from sparse. Pinning both sides to production geometry
+        # keeps bit identity a valid traversal invariant on every architecture.
+        parity_carrier = native.prequantize_int8_attention(
+            q, k, v, cta_k=_SPARSE_PARITY_CTA_K
+        )
+        parity_dense = native.int8_attention_from_prequantized(parity_carrier)
+        detail['sparse_parity_cta_k'] = int(parity_carrier.cta_k)
+
+        kv_tiles = (_KV_LEN + parity_carrier.cta_k - 1) // parity_carrier.cta_k
         q_tiles = (_Q_LEN + native.Q_TILE - 1) // native.Q_TILE
         indices = torch.arange(kv_tiles, dtype=torch.int32, device=device)
         route = native.BlockSparseRoute(
@@ -116,11 +142,13 @@ def run(device=None, *, verbose=False):
                 dtype=torch.int32, device=device,
             ),
             q_tile=native.Q_TILE,
-            kv_tile=carrier.cta_k,
+            kv_tile=parity_carrier.cta_k,
             encoding='absolute',
         )
-        routed = native.block_sparse_int8_attention_from_prequantized(carrier, route)
-        leg2 = torch.equal(routed, dense)
+        routed = native.block_sparse_int8_attention_from_prequantized(
+            parity_carrier, route
+        )
+        leg2 = torch.equal(routed, parity_dense)
         detail['full_route_bit_identical'] = leg2
 
         # Asynchronous faults land here, not at the call that caused them.
@@ -133,12 +161,13 @@ def run(device=None, *, verbose=False):
     if verbose:
         print('  dense INT8 vs FP32 SDPA : rel_l2 %.6f (tolerance %s) %s'
               % (int8_error, _INT8_TOLERANCE, 'ok' if leg1 else 'FAIL'))
-        print('  100%% route vs dense     : bit-identical %s' % leg2)
+        print('  100%% route vs dense     : CTA_K=%d bit-identical %s'
+              % (parity_carrier.cta_k, leg2))
     return passed, detail
 
 
 def check(device=None, *, force=False):
-    """Cached gate. Runs once per (architecture, build, device name)."""
+    """Cached gate. Runs once per (architecture, build, revision, device)."""
     global _result
     with _lock:
         if _result is not None and not force:
