@@ -3,8 +3,7 @@
 Standalone production optimization nodes for MiniMax H3 in ComfyUI.
 
 This pack owns its native Kitchen INT8 attention kernels, chunked QKV producer,
-sparse routing, and bounded MLP execution. It does not import or depend on
-ComfyUI-H3-Extended.
+sparse routing, and bounded MLP execution. 
 
 ## Nodes
 
