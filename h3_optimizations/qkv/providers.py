@@ -102,6 +102,16 @@ def resolve_qkv_provider(
                 False,
                 'checkpoint-native W4A8 QKV is projected in bounded token chunks into Kitchen carriers',
             )
+        if backend_kind == 'sparse_kitchen_int8':
+            if not kitchen_producer_available:
+                return _required_or_standard(
+                    request, 'Comfy Kitchen external producer API is unavailable'
+                )
+            return QKVProviderResolution(
+                QKV_DENSE_W4A8_CHUNKED,
+                True,
+                'checkpoint-native W4A8 QKV is projected in bounded token chunks into routed Kitchen INT8 carriers',
+            )
         if backend_kind == 'sparse_sage':
             if not triton_available:
                 return _required_or_standard(request, 'Triton is unavailable')
