@@ -10,6 +10,7 @@ from ..plan import (
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_OFF,
+    MLP_MEMORY_PRESERVE,
 )
 
 QKV_STANDARD = 'standard_h3_qkv'
@@ -236,6 +237,68 @@ def _convrot_compatible(inventory):
     )
 
 
+def _resolve_preserve_precision_mlp(inventory, fp8_available):
+    """Use bounded MLP execution without introducing new quantization."""
+    if _convrot_compatible(inventory):
+        return MLPProviderResolution(
+            MLP_CONVROT_INT8_TWO_SLICE,
+            'mlp_chunked_convrot_2slice',
+            (
+                'checkpoint-native ConvRot-256 TensorWise INT8 MLP uses token '
+                'chunks and two feature slices without requantization'
+            ),
+        )
+    if inventory.mlp_w4a8:
+        return MLPProviderResolution(
+            MLP_W4A8_CHUNKED,
+            'mlp_chunked_native',
+            (
+                'checkpoint-native W4A8 MLP uses held quantized weights and '
+                'bounded token chunks without requantization'
+            ),
+        )
+    if inventory.mlp_fp8:
+        if fp8_available:
+            return MLPProviderResolution(
+                MLP_FP8_CHUNKED,
+                'mlp_chunked_fp8',
+                (
+                    'checkpoint-native FP8 MLP uses held weights and bounded '
+                    'token chunks without changing checkpoint precision'
+                ),
+            )
+        return MLPProviderResolution(
+            MLP_PRESERVE_UPSTREAM,
+            'off',
+            (
+                'checkpoint-native FP8 MLP is preserved upstream because '
+                'accelerated FP8 execution is unavailable'
+            ),
+        )
+    if inventory.mlp_plain_float:
+        return MLPProviderResolution(
+            MLP_FLOAT_CHUNKED,
+            'mlp_chunked_native',
+            (
+                'floating H3 MLP keeps its checkpoint precision and uses '
+                'bounded held-weight token chunking'
+            ),
+        )
+
+    labels = sorted(
+        set(inventory.labels('fc1')) | set(inventory.labels('fc2'))
+    )
+    return MLPProviderResolution(
+        MLP_PRESERVE_UPSTREAM,
+        'off',
+        (
+            'preserve-precision mode has no chunked provider for MLP format %s; '
+            'preserving upstream Comfy execution'
+            % (', '.join(labels) or 'unknown')
+        ),
+    )
+
+
 def resolve_mlp_provider(inventory, *, request, fp8_available=False):
     if request == MLP_MEMORY_OFF:
         return MLPProviderResolution(
@@ -254,6 +317,8 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
             'off',
             'the H3 model has no MLP inventory',
         )
+    if request == MLP_MEMORY_PRESERVE:
+        return _resolve_preserve_precision_mlp(inventory, fp8_available)
     if _convrot_compatible(inventory):
         if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
             return MLPProviderResolution(

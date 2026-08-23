@@ -62,6 +62,7 @@ class NodeTests(unittest.TestCase):
                 'fused_qkv',
                 'mlp_memory',
                 'chunk_rows',
+                'preserve_precision',
             ],
         )
         self.assertEqual(
@@ -76,6 +77,9 @@ class NodeTests(unittest.TestCase):
             ['auto', 'off'],
         )
         self.assertEqual(input_by_id(memory, 'chunk_rows').default, 4096)
+        preserve_precision = input_by_id(memory, 'preserve_precision')
+        self.assertFalse(preserve_precision.default)
+        self.assertIn('Do not introduce new quantization', preserve_precision.tooltip)
         self.assertEqual(sparse.node_id, 'H3SparseAttention')
         self.assertEqual(sparse.display_name, 'H3 Sparse Attention')
         self.assertEqual(

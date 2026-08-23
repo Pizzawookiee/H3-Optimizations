@@ -13,6 +13,7 @@ from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_REQUIRED,
     H3OptimizationPlan,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_PRESERVE,
     MemoryRequest,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_KITCHEN,
@@ -29,6 +30,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.chunk_rows, 4096)
         self.assertTrue(request.prefer_held_weights)
         self.assertFalse(request.mlp_strict)
+
+    def test_preserve_precision_is_a_valid_memory_request(self):
+        request = MemoryRequest(mlp_memory=MLP_MEMORY_PRESERVE)
+        self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
+        self.assertIn(MLP_MEMORY_PRESERVE, request.signature)
 
     def test_legacy_adapter_options_are_part_of_memory_identity(self):
         request = MemoryRequest(
