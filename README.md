@@ -42,8 +42,9 @@ across all sparse backends.
 
 ## Install
 
-The package is published as `h3-optimizations` in the Comfy Registry and is
-intended for installation through ComfyUI-Manager on current ComfyUI builds.
+The package is configured for publication as `h3-optimizations` in the Comfy
+Registry and is intended for installation through ComfyUI-Manager on current
+ComfyUI builds.
 
 Manual installation remains available from the ComfyUI custom-nodes directory:
 
