@@ -1,14 +1,23 @@
 [project]
-name = 'comfyui-h3-optimizations'
+name = 'h3-optimizations'
 version = '0.2.0'
 description = 'Production Sparse Attention and memory optimization nodes for MiniMax H3 in ComfyUI'
 readme = 'README.md'
 requires-python = '>=3.10'
 dependencies = []
+classifiers = [
+    'Operating System :: Microsoft :: Windows',
+    'Operating System :: POSIX :: Linux',
+    'Environment :: GPU :: NVIDIA CUDA',
+]
 
 [project.urls]
 Repository = 'https://github.com/Zironic/H3-Optimizations'
 Issues = 'https://github.com/Zironic/H3-Optimizations/issues'
+
+[tool.comfy]
+PublisherId = 'zironic'
+DisplayName = 'H3 Optimizations'
 
 [tool.ruff]
 line-length = 100
