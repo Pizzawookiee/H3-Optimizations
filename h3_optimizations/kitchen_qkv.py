@@ -33,13 +33,40 @@ PRODUCER_API = (
 )
 
 
+def resolve_kitchen(device=None):
+    """The module providing the producer API, vendored first.
+
+    The vendored library ships with this pack. comfy_kitchen is whatever pip
+    installed, and ComfyUI pins 0.2.31, which has no producer API at all --
+    which is why this whole path was integrated and then never ran.
+    """
+    from .native import int8_attention as _  # noqa: F401 - import check
+
+    from . import native
+
+    if _supports_producer(native, device):
+        return native
+    kitchen = comfy.quant_ops.ck
+    return kitchen if _supports_producer(kitchen, device) else None
+
+
+def _supports_producer(module, device):
+    if module is None:
+        return False
+    if not all(hasattr(module, name) for name in PRODUCER_API):
+        return False
+    if module.INT8_ATTENTION_PRODUCER_ABI_VERSION != PRODUCER_ABI_VERSION:
+        return False
+    try:
+        return bool(module.int8_attention_producer_is_available(device))
+    except Exception:  # noqa: BLE001 - an unavailable backend is not an error
+        return False
+
+
 def producer_api_available(kitchen=None, device=None):
-    kitchen = comfy.quant_ops.ck if kitchen is None else kitchen
-    return (
-        all(hasattr(kitchen, name) for name in PRODUCER_API)
-        and kitchen.INT8_ATTENTION_PRODUCER_ABI_VERSION == PRODUCER_ABI_VERSION
-        and bool(kitchen.int8_attention_producer_is_available(device))
-    )
+    if kitchen is not None:
+        return _supports_producer(kitchen, device)
+    return resolve_kitchen(device) is not None
 
 
 @dataclass(frozen=True)
@@ -76,7 +103,9 @@ def run_chunked_kitchen_qkv(
     fp8_projection=False,
 ):
     del layer_index, transformer_options
-    kitchen = comfy.quant_ops.ck
+    kitchen = resolve_kitchen(x.device)
+    if kitchen is None:
+        raise FusedQKVError('no INT8 attention producer is available')
     held = None
     try:
         if fp8_projection:
@@ -156,7 +185,9 @@ class ChunkedKitchenQKVProjector:
         layer_index,
         transformer_options,
     ):
-        kitchen = comfy.quant_ops.ck
+        kitchen = resolve_kitchen(x.device)
+        if kitchen is None:
+            return None
         fmt = describe_linear(module.qkv_proj)
         format_ok = (
             fmt.fp8 or fmt.plain_float
@@ -230,6 +261,10 @@ class ChunkedKitchenAttentionBackend:
     def execute(self, prepared):
         if not isinstance(prepared, PreparedChunkedKitchenQKV):
             raise TypeError('chunked Kitchen attention received an invalid carrier')
-        return comfy.quant_ops.ck.int8_attention_from_prequantized(
-            prepared.carrier
-        )
+        # The carrier has to be consumed by the module that produced it:
+        # the two implementations agree byte for byte, but only one of them is
+        # guaranteed to be present.
+        kitchen = resolve_kitchen()
+        if kitchen is None:
+            raise FusedQKVError('no INT8 attention producer is available')
+        return kitchen.int8_attention_from_prequantized(prepared.carrier)

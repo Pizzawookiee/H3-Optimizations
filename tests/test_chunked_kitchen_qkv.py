@@ -116,10 +116,13 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             return q, k, v
 
         spec = fake.int8_attention_producer_spec()
+        # Steer the resolver, not comfy_kitchen: the producer now comes from
+        # the vendored library first, so patching the installed package no
+        # longer decides which module is used.
         with mock.patch.object(
-            kitchen_qkv.comfy.quant_ops,
-            'ck',
-            fake,
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
         ), mock.patch.object(
             kitchen_qkv,
             'project_qkv',
@@ -181,7 +184,9 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
         fake = FakeKitchen()
         backend = kitchen_qkv.ChunkedKitchenAttentionBackend()
         prepared = kitchen_qkv.PreparedChunkedKitchenQKV('carrier')
-        with mock.patch.object(kitchen_qkv.comfy.quant_ops, 'ck', fake):
+        # Steer the resolver: the producer comes from the vendored library
+        # first, so patching the installed package no longer decides this.
+        with mock.patch.object(kitchen_qkv, 'resolve_kitchen', return_value=fake):
             self.assertEqual(backend.execute(prepared), 'carrier')
         with self.assertRaises(TypeError):
             backend.execute(object())
@@ -202,10 +207,13 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             device=torch.device('cuda:0'),
         )
         projector = kitchen_qkv.ChunkedKitchenQKVProjector()
+        # Steer the resolver, not comfy_kitchen: the producer now comes from
+        # the vendored library first, so patching the installed package no
+        # longer decides which module is used.
         with mock.patch.object(
-            kitchen_qkv.comfy.quant_ops,
-            'ck',
-            fake,
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
         ), mock.patch.object(
             kitchen_qkv.comfy.model_management,
             'in_training',
@@ -236,10 +244,13 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             device=torch.device('cuda:0'),
         )
         projector = kitchen_qkv.ChunkedKitchenQKVProjector()
+        # Steer the resolver, not comfy_kitchen: the producer now comes from
+        # the vendored library first, so patching the installed package no
+        # longer decides which module is used.
         with mock.patch.object(
-            kitchen_qkv.comfy.quant_ops,
-            'ck',
-            fake,
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
         ), mock.patch.object(
             kitchen_qkv,
             'producer_api_available',
