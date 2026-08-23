@@ -23,9 +23,7 @@ from h3_optimizations.qkv.bf16 import (  # noqa: E402
     PreparedBF16QKV,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
-    QKV_DENSE_KITCHEN_CHUNKED,
-    QKV_SPARSE_CONVROT_INT8,
-    QKV_TRITON_SPARSE_CHUNKED,
+    QKV_BF16_CHUNKED,
     QKV_STANDARD,
     resolve_qkv_provider,
 )
@@ -116,23 +114,16 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         explicit_off = MemoryRequest(fused_qkv=FUSED_QKV_OFF)
         self.assertEqual(explicit_off.fused_qkv, FUSED_QKV_OFF)
 
-    def test_preserve_bf16_routes_to_existing_attention_projector_slot(self):
-        resolved = resolve_qkv_provider(
-            FakeInventory(),
-            request=FUSED_QKV_PRESERVE_BF16,
-            backend_kind='existing',
-            memory_optimize=True,
+    def test_preserve_bf16_has_one_distinct_provider_for_all_consumers(self):
+        backend_kinds = (
+            'existing',
+            'comfy_kitchen_int8',
+            'sparse_kitchen_int8',
+            'sparse_sage',
+            'triton_sparse_int8',
+            'flex_attention_fp8',
         )
-        self.assertEqual(resolved.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
-        self.assertIn('existing attention backend', resolved.reason)
-
-    def test_preserve_bf16_routes_to_all_production_sparse_slots(self):
-        cases = (
-            ('sparse_kitchen_int8', QKV_DENSE_KITCHEN_CHUNKED),
-            ('sparse_sage', QKV_SPARSE_CONVROT_INT8),
-            ('triton_sparse_int8', QKV_TRITON_SPARSE_CHUNKED),
-        )
-        for backend_kind, expected in cases:
+        for backend_kind in backend_kinds:
             with self.subTest(backend_kind=backend_kind):
                 resolved = resolve_qkv_provider(
                     FakeInventory(),
@@ -141,7 +132,9 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
                     triton_available=True,
                     memory_optimize=True,
                 )
-                self.assertEqual(resolved.provider_id, expected)
+                self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
+                self.assertFalse(resolved.fused)
+                self.assertIn('held 4K', resolved.reason)
 
     def test_preserve_bf16_does_not_convert_fp16(self):
         resolved = resolve_qkv_provider(
@@ -158,22 +151,19 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         ).read_text(encoding='utf-8')
         self.assertIn('isinstance(projected, PreparedBF16QKV)', text)
         self.assertIn('backend.prepare(', text)
-        self.assertIn("DENSE_KITCHEN_PREQUANTIZED", text)
+        self.assertIn('DENSE_KITCHEN_PREQUANTIZED', text)
         self.assertIn('_legacy_attention(', text)
 
-    def test_projector_slots_switch_to_bf16_before_backend_specific_packing(self):
-        kitchen = (PACK / 'h3_optimizations' / 'kitchen_qkv.py').read_text(
+    def test_apply_dispatches_bf16_to_dense_and_sparse_consumers(self):
+        text = (PACK / 'h3_optimizations' / 'apply.py').read_text(
             encoding='utf-8'
         )
-        sparse = (
-            PACK / 'h3_optimizations' / 'qkv' / 'projectors.py'
-        ).read_text(encoding='utf-8')
-        self.assertIn('native_bf16 and not self.fp8_projection', kitchen)
-        self.assertIn('ChunkedBF16QKVProjector(self.chunk_rows)', kitchen)
+        self.assertIn('QKV_BF16_CHUNKED', text)
         self.assertGreaterEqual(
-            sparse.count('ChunkedBF16QKVProjector(self.chunk_rows)'),
-            2,
+            text.count('ChunkedBF16QKVProjector(chunk_rows=4096)'),
+            5,
         )
+        self.assertIn('projector=attention.projector', text)
 
 
 if __name__ == '__main__':
