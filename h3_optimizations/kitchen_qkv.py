@@ -11,6 +11,7 @@ import comfy.quant_ops
 
 from . import diagnostics
 from .attention_forward import project_qkv
+from .qkv.bf16 import ChunkedBF16QKVProjector
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.fp8 import FP8BindingError, HeldFP8QKV
@@ -388,10 +389,23 @@ class ChunkedKitchenQKVProjector:
         layer_index,
         transformer_options,
     ):
+        fmt = describe_linear(module.qkv_proj)
+        dtype = str(fmt.logical_dtype).lower()
+        native_bf16 = fmt.plain_float and (
+            'bfloat16' in dtype or 'bf16' in dtype
+        )
+        if native_bf16 and not self.fp8_projection:
+            return ChunkedBF16QKVProjector(self.chunk_rows).try_project(
+                module,
+                x,
+                rope_freqs,
+                layer_index=layer_index,
+                transformer_options=transformer_options,
+            )
+
         kitchen = resolve_kitchen(x.device)
         if kitchen is None:
             return None
-        fmt = describe_linear(module.qkv_proj)
         format_ok = (
             fmt.fp8 or fmt.plain_float
             if self.fp8_projection
