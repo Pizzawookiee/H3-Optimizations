@@ -10,7 +10,6 @@ import comfy.model_management
 import comfy.quant_ops
 
 from .attention_forward import project_qkv
-from .dense_resolver import is_installed_dense_attention
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.fp8 import FP8BindingError, HeldFP8QKV
@@ -32,6 +31,8 @@ PRODUCER_API = (
     'finalize_int8_attention_producer',
     'int8_attention_from_prequantized',
 )
+H3_ATTENTION_BACKEND_KEY = 'h3_optimizations_attention_backend'
+DENSE_KITCHEN_BACKEND = 'comfy_kitchen_int8_prequantized'
 
 
 class FusedQKVError(RuntimeError):
@@ -242,11 +243,12 @@ class ChunkedKitchenQKVProjector:
             if self.fp8_projection
             else (fmt.convrot_int8_256 or fmt.w4a8)
         )
+        owns_dense_h3 = (
+            (transformer_options or {}).get(H3_ATTENTION_BACKEND_KEY)
+            == DENSE_KITCHEN_BACKEND
+        )
         if (
-            (
-                not self.routing_summaries
-                and not is_installed_dense_attention(transformer_options)
-            )
+            (not self.routing_summaries and not owns_dense_h3)
             or comfy.model_management.in_training
             or x.ndim != 2
             or not x.is_cuda
@@ -295,7 +297,7 @@ class ChunkedKitchenQKVProjector:
 
 
 class ChunkedKitchenAttentionBackend:
-    name = 'comfy_kitchen_int8_prequantized'
+    name = DENSE_KITCHEN_BACKEND
 
     @property
     def installation_signature(self):
