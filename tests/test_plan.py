@@ -15,6 +15,7 @@ from h3_optimizations.plan import (  # noqa: E402
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MemoryRequest,
     SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_TRITON,
     SparseRequest,
     parse_layer_video_budgets,
@@ -61,6 +62,11 @@ class PlanTests(unittest.TestCase):
             ),
             (2, 0.5, 2, 0.5),
         )
+
+    def test_legacy_kitchen_label_is_normalized(self):
+        request = SparseRequest(backend='Kitchen INT8 (experimental)')
+        self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN)
+        self.assertIn(SPARSE_BACKEND_KITCHEN, request.signature)
 
     def test_explicit_sparse_schedule_is_part_of_request_identity(self):
         request = SparseRequest(
