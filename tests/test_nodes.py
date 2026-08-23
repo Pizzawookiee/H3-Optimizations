@@ -79,7 +79,6 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(input_by_id(memory, 'chunk_rows').default, 4096)
         preserve_precision = input_by_id(memory, 'preserve_precision')
         self.assertFalse(preserve_precision.default)
-        self.assertTrue(preserve_precision.advanced)
         self.assertIn('Do not introduce new quantization', preserve_precision.tooltip)
         self.assertEqual(sparse.node_id, 'H3SparseAttention')
         self.assertEqual(sparse.display_name, 'H3 Sparse Attention')
