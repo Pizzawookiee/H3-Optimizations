@@ -307,5 +307,61 @@ class ProjectorOptionTests(unittest.TestCase):
             ChunkedKitchenQKVProjector(v_mode='streamed')
 
 
+class ProductionDefaultTests(unittest.TestCase):
+    """The measured-free variant has to be what production actually builds."""
+
+    def test_apply_enables_the_measured_defaults_on_the_sparse_route(self):
+        source = (
+            PACK / 'h3_optimizations' / 'apply.py'
+        ).read_text(encoding='utf-8')
+        sparse = source.split('_resolve_kitchen_sparse', 1)[1]
+        self.assertIn('output_layout=OUTPUT_NHD', sparse)
+        self.assertIn('release_carrier_before_out_proj=True', sparse)
+        self.assertIn('strided_qk_input=True', sparse)
+
+    def test_the_dense_route_takes_strided_qk_but_not_the_layout(self):
+        """The layout was measured on the sparse route only."""
+        source = (
+            PACK / 'h3_optimizations' / 'apply.py'
+        ).read_text(encoding='utf-8')
+        dense = source.split('def _resolve_dense', 1)[1].split('def ', 1)[0]
+        self.assertIn('strided_qk_input=True', dense)
+        self.assertNotIn('output_layout=', dense)
+
+    def test_the_dense_backend_never_asks_for_a_release_it_cannot_do(self):
+        """PreparedChunkedKitchenQKV has no release(); asking would raise."""
+        from h3_optimizations.kitchen_qkv import (
+            ChunkedKitchenAttentionBackend,
+            PreparedChunkedKitchenQKV,
+        )
+
+        backend = ChunkedKitchenAttentionBackend()
+        self.assertFalse(
+            getattr(backend, 'release_carrier_before_out_proj', False)
+        )
+        self.assertFalse(hasattr(PreparedChunkedKitchenQKV, 'release'))
+
+    def test_the_sparse_prepared_carrier_can_release(self):
+        self.assertTrue(hasattr(PreparedSparseKitchen, 'release'))
+
+    def test_two_pass_v_is_not_a_production_default(self):
+        """Measured at 0 MiB and +82 ms; it must stay opt-in."""
+        source = (
+            PACK / 'h3_optimizations' / 'apply.py'
+        ).read_text(encoding='utf-8')
+        self.assertNotIn('v_mode=', source)
+        self.assertNotIn('two_pass', source)
+        self.assertEqual(
+            ChunkedKitchenQKVProjector(routing_summaries=True).v_mode,
+            'retain',
+        )
+
+    def test_the_shipped_projector_defaults_stay_opt_in(self):
+        """Constructing without arguments must not pick up the new options."""
+        projector = ChunkedKitchenQKVProjector()
+        self.assertFalse(projector.strided_qk_input)
+        self.assertEqual(projector.v_mode, 'retain')
+
+
 if __name__ == '__main__':
     unittest.main()

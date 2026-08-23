@@ -60,6 +60,16 @@ included on Linux. Sparse Sage remains an optional explicit backend and an
 automatic fallback when a compatible `spas_sage_attn` package is already
 installed; this pack no longer installs or repairs it.
 
+The native Kitchen sparse route holds roughly 900 MiB less at its peak than
+it used to, with bit-identical output. Attention writes its output
+sequence-major and hands back the same logical tensor, so the flatten before
+the output projection is a view rather than a second full-sequence copy; the
+INT8 carriers and the route are released once the kernel is launched instead
+of being held across that projection; and Q/K chunks are quantized where they
+already are rather than being copied contiguous first. Measured on one real
+block at sequence 54006 and 30 percent density: peak allocated 4875 to 3952
+MiB, peak reserved 5536 to 4684 MiB, and slightly faster.
+
 Sparse `auto` uses the shipped native block-sparse Kitchen backend. Compatible
 ConvRot-256 TensorWise INT8 QKV uses the native chunked producer and feeds its
 carrier directly into sparse attention without materializing full BF16 Q/K/V.

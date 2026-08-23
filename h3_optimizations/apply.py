@@ -27,7 +27,7 @@ from .attention.sparse import (
 from .attention.sparse.fused_qkv import (
     TRITON_AVAILABLE as SPARSE_TRITON_AVAILABLE,
 )
-from .attention.sparse.kitchen_sparse import SparseKitchenError
+from .attention.sparse.kitchen_sparse import OUTPUT_NHD, SparseKitchenError
 from .dense_resolver import (
     install_dense_attention,
     preserve_dense_attention,
@@ -211,8 +211,13 @@ def _resolve_dense(plan, model, inventory, environment=None):
         QKV_DENSE_FP8_CHUNKED,
     ):
         backend = ChunkedKitchenAttentionBackend()
+        # The chunk quantizer is handed the same strided Q/K views here as on
+        # the sparse path, and takes them through the same guarded predicate.
+        # The sequence-major output layout is deliberately not enabled on this
+        # path: it was measured on the sparse route only.
         projector = ChunkedKitchenQKVProjector(
-            fp8_projection=qkv.provider_id == QKV_DENSE_FP8_CHUNKED
+            fp8_projection=qkv.provider_id == QKV_DENSE_FP8_CHUNKED,
+            strided_qk_input=True,
         )
     return (
         ResolvedAttention(
@@ -386,14 +391,23 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         **_sparse_config_kwargs(plan),
     )
     projector = (
-        ChunkedKitchenQKVProjector(routing_summaries=True)
+        ChunkedKitchenQKVProjector(
+            routing_summaries=True, strided_qk_input=True
+        )
         if use_projected
         else None
     )
+    # Sequence-major output storage and releasing the carrier before the
+    # output projection are only worth anything together: measured separately
+    # the layout alone moved nothing and the release alone cost 10 ms, while
+    # together they take 923 MiB off peak allocated and 852 MiB off peak
+    # reserved at no cost in time. Block output stays bit-identical.
     backend = SparseKitchenBackend(
         config,
         kitchen=kitchen,
         projector=projector,
+        output_layout=OUTPUT_NHD,
+        release_carrier_before_out_proj=True,
     )
     return (
         ResolvedAttention(
