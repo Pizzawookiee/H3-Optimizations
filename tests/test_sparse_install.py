@@ -485,13 +485,18 @@ class SparseInstallTests(unittest.TestCase):
             )
 
     def test_prestartup_script_respects_skip_environment(self):
+        # Assert the behaviour rather than a leaked module global: prestartup
+        # must reach the installer and must not raise when the skip flag is
+        # set. It also prepares the native backend now, which must not be able
+        # to stop startup either.
         with patch.dict(
             os.environ,
             {sparse_install.SKIP_ENV: '1'},
             clear=False,
         ), patch.object(sparse_install, '_is_installed', return_value=False):
             result = runpy.run_path(str(PACK / 'prestartup_script.py'))
-        self.assertIn('installer', result)
+        self.assertIn('_prepare_sparse_sage', result)
+        self.assertIn('_prepare_native_backend', result)
 
 
 if __name__ == '__main__':

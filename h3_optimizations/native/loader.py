@@ -57,7 +57,9 @@ def _candidate_paths():
     candidates = [pathlib.Path(override)] if override else []
     candidates.extend(
         [
-            # Shipped beside the pack, which is how a release is laid out.
+            # Shipped in the repo, which is how this pack distributes it.
+            _PACK_ROOT / 'native' / 'bin' / name,
+            # Fetched by the bootstrap, if a release is ever used instead.
             _PACK_ROOT / 'native' / 'lib' / name,
             # A local CMake build, single- and multi-config generators.
             _PACK_ROOT / 'native' / 'build' / name,

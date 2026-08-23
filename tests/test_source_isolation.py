@@ -23,9 +23,19 @@ class SourceIsolationTests(unittest.TestCase):
             'torch.cuda.empty_cache',
             'torch.cuda.synchronize',
         )
+        # The ban keeps stalls and allocator churn out of the hot path. The
+        # native self-test is the one place a synchronize is the point: it runs
+        # once at startup to catch asynchronous kernel faults, which surface
+        # only at a sync and would otherwise appear later as an unrelated bug.
+        exempt = {
+            SOURCE / 'native' / 'selftest.py': ('torch.cuda.synchronize',),
+        }
         for path in SOURCE.rglob('*.py'):
             text = path.read_text(encoding='utf-8')
+            allowed = exempt.get(path, ())
             for fragment in banned:
+                if fragment in allowed:
+                    continue
                 self.assertNotIn(fragment, text, '%s contains %s' % (path, fragment))
 
     def test_every_custom_op_uses_the_repo_namespace(self):
