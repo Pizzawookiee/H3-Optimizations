@@ -53,90 +53,60 @@ def block(weight):
 
 
 class PreservePrecisionMemoryTests(unittest.TestCase):
-    def test_bf16_stays_float_chunked_even_when_fp8_is_available(self):
-        inventory = inspect_h3_linears([block(FakeWeight())])
-        resolved = resolve_mlp_provider(
-            inventory,
+    def resolve(self, weight, fp8_available=True):
+        return resolve_mlp_provider(
+            inspect_h3_linears([block(weight)]),
             request=MLP_MEMORY_PRESERVE,
-            fp8_available=True,
+            fp8_available=fp8_available,
         )
+
+    def test_bf16_stays_float_chunked_even_when_fp8_is_available(self):
+        resolved = self.resolve(FakeWeight())
         self.assertEqual(resolved.provider_id, MLP_FLOAT_CHUNKED)
         self.assertEqual(resolved.activation_mode, 'mlp_chunked_native')
         self.assertIn('keeps its checkpoint precision', resolved.reason)
 
     def test_checkpoint_native_fp8_remains_fp8(self):
-        inventory = inspect_h3_linears([
-            block(FakeWeight(
-                layout='TensorCoreFP8E4M3Layout',
-                storage_dtype='float8_e4m3fn',
-            ))
-        ])
-        resolved = resolve_mlp_provider(
-            inventory,
-            request=MLP_MEMORY_PRESERVE,
-            fp8_available=True,
-        )
+        resolved = self.resolve(FakeWeight(
+            layout='TensorCoreFP8E4M3Layout',
+            storage_dtype='float8_e4m3fn',
+        ))
         self.assertEqual(resolved.provider_id, MLP_FP8_CHUNKED)
         self.assertIn('checkpoint-native FP8', resolved.reason)
 
     def test_checkpoint_native_fp8_preserves_upstream_without_fp8_compute(self):
-        inventory = inspect_h3_linears([
-            block(FakeWeight(
+        resolved = self.resolve(
+            FakeWeight(
                 layout='TensorCoreFP8E4M3Layout',
                 storage_dtype='float8_e4m3fn',
-            ))
-        ])
-        resolved = resolve_mlp_provider(
-            inventory,
-            request=MLP_MEMORY_PRESERVE,
+            ),
             fp8_available=False,
         )
         self.assertEqual(resolved.provider_id, MLP_PRESERVE_UPSTREAM)
 
     def test_checkpoint_native_w4a8_remains_native(self):
-        inventory = inspect_h3_linears([
-            block(FakeWeight(
-                layout='AsymW4A8Int8Layout',
-                storage_dtype='int8',
-            ))
-        ])
-        resolved = resolve_mlp_provider(
-            inventory,
-            request=MLP_MEMORY_PRESERVE,
-            fp8_available=True,
-        )
+        resolved = self.resolve(FakeWeight(
+            layout='AsymW4A8Int8Layout',
+            storage_dtype='int8',
+        ))
         self.assertEqual(resolved.provider_id, MLP_W4A8_CHUNKED)
         self.assertIn('without requantization', resolved.reason)
 
     def test_checkpoint_native_convrot_remains_native(self):
-        inventory = inspect_h3_linears([
-            block(FakeWeight(
-                layout='TensorWiseINT8Layout',
-                storage_dtype='int8',
-                convrot=True,
-                convrot_groupsize=256,
-            ))
-        ])
-        resolved = resolve_mlp_provider(
-            inventory,
-            request=MLP_MEMORY_PRESERVE,
-            fp8_available=True,
-        )
+        resolved = self.resolve(FakeWeight(
+            layout='TensorWiseINT8Layout',
+            storage_dtype='int8',
+            convrot=True,
+            convrot_groupsize=256,
+        ))
         self.assertEqual(resolved.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
         self.assertIn('without requantization', resolved.reason)
 
     def test_unsupported_quantized_format_preserves_upstream(self):
-        inventory = inspect_h3_linears([
-            block(FakeWeight(
-                layout='TensorCoreNVFP4Layout',
-                storage_dtype='uint8',
-            ))
-        ])
-        resolved = resolve_mlp_provider(
-            inventory,
-            request=MLP_MEMORY_PRESERVE,
-            fp8_available=True,
-        )
+        resolved = self.resolve(FakeWeight(
+            layout='TensorCoreNVFP4Layout',
+            storage_dtype='uint8',
+        ))
         self.assertEqual(resolved.provider_id, MLP_PRESERVE_UPSTREAM)
         self.assertIn('preserving upstream Comfy execution', resolved.reason)
 
