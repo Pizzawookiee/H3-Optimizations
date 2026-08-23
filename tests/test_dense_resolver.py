@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import torch
+
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
 
 PACK = Path(__file__).resolve().parents[1]
@@ -21,6 +23,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 import h3_optimizations.dense_resolver as dense_resolver  # noqa: E402
+import h3_optimizations.kitchen_qkv as kitchen_qkv  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -38,6 +41,51 @@ class FakePatcher:
         self.model_options['transformer_options'][
             'optimized_attention_override'
         ] = SimpleNamespace()
+
+
+class FakeKitchen:
+    INT8_ATTENTION_PRODUCER_ABI_VERSION = 1
+
+    class Int8AttentionProducerUnavailableError(RuntimeError):
+        pass
+
+    @staticmethod
+    def int8_attention_producer_is_available(_device=None):
+        return True
+
+    @staticmethod
+    def int8_attention_producer_spec(*_args, **_kwargs):
+        return SimpleNamespace(
+            abi_version=1,
+            k_anchor_positions=(),
+            sequence_alignment=256,
+            q_tile=128,
+            k_tile=128,
+        )
+
+    @staticmethod
+    def select_int8_attention_k_anchor(*_args, **_kwargs):
+        return object()
+
+    @staticmethod
+    def create_int8_attention_producer(*_args, **_kwargs):
+        return object()
+
+    @staticmethod
+    def quantize_int8_attention_qk_chunk(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def quantize_int8_attention_v(*_args, **_kwargs):
+        return None
+
+    @staticmethod
+    def finalize_int8_attention_producer(*_args, **_kwargs):
+        return object()
+
+    @staticmethod
+    def int8_attention_from_prequantized(*_args, **_kwargs):
+        return object()
 
 
 class DenseResolverTests(unittest.TestCase):
@@ -131,6 +179,58 @@ class DenseResolverTests(unittest.TestCase):
             resolution.backend_kind,
             dense_resolver.ATTENTION_COMFY_KITCHEN_INT8,
         )
+
+    def test_private_h3_projector_ignores_arbitrary_upstream_override(self):
+        upstream = object()
+        fake = FakeKitchen()
+        expected = object()
+        module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=128)
+        x = SimpleNamespace(
+            ndim=2,
+            is_cuda=True,
+            shape=(256, 256),
+            dtype=torch.bfloat16,
+            device=torch.device('cuda:0'),
+        )
+        projector = kitchen_qkv.ChunkedKitchenQKVProjector(chunk_rows=4096)
+        options = {
+            'optimized_attention_override': upstream,
+            kitchen_qkv.H3_ATTENTION_BACKEND_KEY:
+                kitchen_qkv.DENSE_KITCHEN_BACKEND,
+        }
+
+        with mock.patch.object(
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
+        ), mock.patch.object(
+            kitchen_qkv.comfy.model_management,
+            'in_training',
+            False,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'describe_linear',
+            return_value=SimpleNamespace(
+                fp8=False,
+                plain_float=False,
+                convrot_int8_256=True,
+                w4a8=False,
+            ),
+        ), mock.patch.object(
+            kitchen_qkv,
+            'run_chunked_kitchen_qkv',
+            return_value=expected,
+        ):
+            actual = projector.try_project(
+                module,
+                x,
+                None,
+                layer_index=0,
+                transformer_options=options,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertIs(options['optimized_attention_override'], upstream)
 
 
 if __name__ == '__main__':
