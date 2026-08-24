@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from ..plan import (
     FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_LEGACY_BF16,
@@ -14,6 +15,7 @@ from ..plan import (
 )
 
 QKV_STANDARD = 'standard_h3_qkv'
+QKV_BF16_CHUNKED = 'chunked_bf16_qkv'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_DENSE_FP8_CHUNKED = 'chunked_fp8_kitchen_qkv'
 QKV_DENSE_W4A8_CHUNKED = QKV_DENSE_KITCHEN_CHUNKED
@@ -70,6 +72,45 @@ def _sparse_contract_ok(sparse_spec):
     return sparse_fused_qkv_contract_mismatch(sparse_spec) is None
 
 
+def _qkv_is_native_bf16(inventory):
+    if not inventory.qkv:
+        return False
+    for item in inventory.qkv:
+        dtype = str(item.logical_dtype).lower()
+        if not item.plain_float or not (
+            'bfloat16' in dtype or 'bf16' in dtype
+        ):
+            return False
+    return True
+
+
+def _resolve_preserved_bf16_qkv(inventory, backend_kind):
+    if not _qkv_is_native_bf16(inventory):
+        labels = ', '.join(sorted(set(inventory.labels('qkv'))))
+        return _standard_qkv(
+            'Preserve precision keeps non-BF16 QKV format %s on upstream Comfy execution'
+            % (labels or 'unknown')
+        )
+
+    consumers = {
+        'existing',
+        'comfy_kitchen_int8',
+        'sparse_kitchen_int8',
+        'sparse_sage',
+        'triton_sparse_int8',
+        'flex_attention_fp8',
+    }
+    if backend_kind not in consumers:
+        return _standard_qkv(
+            'the resolved attention backend has no Preserve-precision BF16 QKV consumer'
+        )
+    return QKVProviderResolution(
+        QKV_BF16_CHUNKED,
+        False,
+        'checkpoint-native BF16 QKV uses held 4K projection chunks and preserves BF16 values for the selected attention backend',
+    )
+
+
 def resolve_qkv_provider(
     inventory,
     *,
@@ -91,6 +132,8 @@ def resolve_qkv_provider(
         return _required_or_standard(
             request, 'H3 QKV layers use mixed weight formats'
         )
+    if request == FUSED_QKV_PRESERVE_BF16:
+        return _resolve_preserved_bf16_qkv(inventory, backend_kind)
 
     if inventory.qkv_w4a8:
         if backend_kind == 'comfy_kitchen_int8' and memory_optimize:

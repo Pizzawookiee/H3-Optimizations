@@ -1,5 +1,11 @@
 """Format-neutral QKV inspection, provider selection, and projectors."""
 
+from .bf16 import (
+    BF16QKVBindingError,
+    ChunkedBF16QKVProjector,
+    HeldBF16QKV,
+    PreparedBF16QKV,
+)
 from .formats import (
     H3LinearInventory,
     LinearWeightFormat,
@@ -17,6 +23,10 @@ from .projectors import (
 )
 
 __all__ = [
+    "BF16QKVBindingError",
+    "ChunkedBF16QKVProjector",
+    "HeldBF16QKV",
+    "PreparedBF16QKV",
     "H3LinearInventory",
     "LinearWeightFormat",
     "describe_linear",

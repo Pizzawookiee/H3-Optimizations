@@ -9,6 +9,9 @@ from .attention import AttentionBackendUnavailable
 from .ordering_probe import has_ordering_observer, observe_attention
 
 
+DENSE_KITCHEN_PREQUANTIZED = 'comfy_kitchen_int8_prequantized'
+
+
 def finish_qkv_projection(module, projected, rope_freqs):
     seq = projected.shape[0]
     inner = module.heads * module.head_dim
@@ -144,6 +147,54 @@ def _finish_projected(module, backend, prepared):
         return module.out_proj(out.squeeze(0))
 
 
+def _finish_bf16_projected(
+    module,
+    backend,
+    projected,
+    *,
+    layer_index,
+    transformer_options,
+):
+    """Consume chunked/native BF16 QKV without running QKV projection again."""
+    q, k, v = projected.q, projected.k, projected.v
+    backend_name = getattr(backend, 'name', None)
+
+    # The dense Kitchen backend object exists here only because that is the
+    # package-owned projector slot used by Memory Optimization. Preserve
+    # precision must not force Kitchen attention: feed the already-projected
+    # BF16 tensors to whatever attention Comfy/upstream currently selected.
+    if backend is None or backend_name == DENSE_KITCHEN_PREQUANTIZED:
+        raw = _legacy_attention(
+            module,
+            q,
+            k,
+            v,
+            transformer_options,
+        )
+        source = 'existing_attention_bf16'
+    else:
+        prepared = backend.prepare(
+            q,
+            k,
+            v,
+            layer_index=layer_index,
+            transformer_options=transformer_options,
+        )
+        try:
+            raw = backend.execute(prepared)
+        finally:
+            del prepared
+        source = backend_name or type(backend).__name__
+
+    # The backend launch has consumed the BF16 inputs. Dropping the wrapper
+    # here lets the stream-ordered allocator reclaim them before out_proj.
+    del projected, q, k, v
+    out = flatten_attention_output(module, raw, source)
+    del raw
+    with diagnostics.stage('attention_out'):
+        return module.out_proj(out.squeeze(0))
+
+
 def make_forward(
     module,
     layer_index,
@@ -180,6 +231,16 @@ def make_forward(
                 transformer_options=transformer_options,
             )
             if projected is not None:
+                from .qkv.bf16 import PreparedBF16QKV
+
+                if isinstance(projected, PreparedBF16QKV):
+                    return _finish_bf16_projected(
+                        module,
+                        backend,
+                        projected,
+                        layer_index=layer_index,
+                        transformer_options=transformer_options,
+                    )
                 prepared = backend.prepare_projected(
                     projected,
                     layer_index=layer_index,
