@@ -65,6 +65,7 @@ void launch_quant_qk_per_thread_int8(
 
 void launch_quant_q_per_thread_int8(
     const void *q, void *q_int8, void *q_scale, int B, int H_q, int Lq, int C,
+    int full_Lk,
     int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
     int input_dtype_code, cudaStream_t stream);
 
@@ -127,7 +128,7 @@ void set_error(const char *what) {
 
 extern "C" {
 
-H3_API int h3_int8_abi_version() noexcept { return 2; }
+H3_API int h3_int8_abi_version() noexcept { return 3; }
 
 H3_API const char *h3_int8_last_error() noexcept {
   return g_last_error.empty() ? "" : g_last_error.c_str();
@@ -198,10 +199,11 @@ H3_API int h3_int8_quantize_qk(
 
 H3_API int h3_int8_quantize_q(
     const void *q, void *q_int8, void *q_scale, int B, int H_q, int Lq, int C,
+    int full_Lk,
     int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
     int input_dtype_code, uintptr_t stream) noexcept {
   H3_GUARD(launch_quant_q_per_thread_int8(
-      q, q_int8, q_scale, B, H_q, Lq, C,
+      q, q_int8, q_scale, B, H_q, Lq, C, full_Lk,
       q_stride_b, q_stride_h, q_stride_n, input_dtype_code,
       reinterpret_cast<cudaStream_t>(stream)))
 }

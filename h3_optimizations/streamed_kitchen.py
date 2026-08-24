@@ -644,7 +644,10 @@ def run_streamed_kitchen_qkv(
 
 def _local_query_carrier(projected, q):
     '''Pack one bounded Q chunk using the native Q-only Kitchen transform.'''
-    q_int8, q_scale = quantize_int8_attention_q(q)
+    q_int8, q_scale = quantize_int8_attention_q(
+        q,
+        full_k_length=projected.sequence,
+    )
     return native.PrequantizedInt8Attention(
         q=q_int8,
         k=projected.k,

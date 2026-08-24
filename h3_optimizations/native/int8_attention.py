@@ -256,7 +256,7 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
     )
 
 
-def quantize_int8_attention_q(q):
+def quantize_int8_attention_q(q, *, full_k_length):
     '''Quantize one local H3 query slab without constructing a K carrier.'''
     if q.ndim != 4:
         raise ValueError('q must be [batch, heads, sequence, head_dim]')
@@ -272,6 +272,10 @@ def quantize_int8_attention_q(q):
         )
 
     batch, heads, q_length, head_dim = q.shape
+    full_k_length = int(full_k_length)
+    if full_k_length <= 0:
+        raise ValueError('full_k_length must be positive')
+
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     q_scale = torch.empty(
         batch,
@@ -283,7 +287,7 @@ def quantize_int8_attention_q(q):
     with diagnostics.stage('q_carrier_pack'):
         _check_quantize_q(
             _ptr(q), _ptr(q_int8), _ptr(q_scale),
-            batch, heads, q_length, head_dim,
+            batch, heads, q_length, head_dim, full_k_length,
             q.stride(0), q.stride(1), q.stride(2),
             _DTYPE_TO_CODE[q.dtype], _stream(),
         )

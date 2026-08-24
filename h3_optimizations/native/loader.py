@@ -28,7 +28,7 @@ import threading
 
 import torch
 
-ABI_VERSION = 2
+ABI_VERSION = 3
 
 _LIBRARY_NAMES = {
     'Windows': 'h3_int8_attention.dll',
@@ -122,7 +122,7 @@ def _bind(library):
 
     library.h3_int8_quantize_q.restype = i
     library.h3_int8_quantize_q.argtypes = (
-        [p, p, p] + [i] * 4 + [i64] * 3 + [i, sz]
+        [p, p, p] + [i] * 5 + [i64] * 3 + [i, sz]
     )
 
     library.h3_int8_select_k_anchor.restype = i
