@@ -680,12 +680,18 @@ def apply_plan(model, plan: H3OptimizationPlan):
         plan.memory is not None
         and plan.memory.attention_memory_mode == ATTENTION_MEMORY_STREAMED
     )
-    if streamed_attention:
-        if attention.backend_kind != ATTENTION_KITCHEN_SPARSE:
+    # The memory node is commonly applied before the sparse node. At that
+    # stage the plan legitimately resolves the dense prequantized Kitchen
+    # backend. Defer streamed sparse validation/installation until a sparse
+    # request is actually present; the composed plan is re-resolved when the
+    # sparse node is applied.
+    if streamed_attention and plan.sparse is not None:
+        resolved_backend_name = getattr(attention.backend, 'name', None)
+        if resolved_backend_name != ATTENTION_KITCHEN_SPARSE:
             raise RuntimeError(
                 'Streamed attention memory mode currently requires native '
-                'Kitchen sparse attention; resolved %s'
-                % attention.backend_kind
+                'Kitchen sparse attention; resolved backend=%s kind=%s'
+                % (resolved_backend_name, attention.backend_kind)
             )
         if qkv.provider_id != QKV_DENSE_KITCHEN_CHUNKED:
             raise RuntimeError(
