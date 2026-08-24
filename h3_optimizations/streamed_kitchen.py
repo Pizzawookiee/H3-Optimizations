@@ -680,7 +680,24 @@ def execute_streamed_projected(backend, module, prepared):
     projected = prepared.projected
     sequence = int(projected.sequence)
     query_rows = int(projected.query_chunk_rows)
-    result = None
+    # Reuse the full attention input buffer as the full attention output.
+    # For a given query chunk, projected.x[start:end] has no remaining uses
+    # after Q projection/packing. K/V and routing state are already persistent.
+    # This removes the second full [sequence, hidden] BF16 allocation.
+    result = projected.x
+    if (
+        result.ndim != 2
+        or int(result.shape[0]) != sequence
+    ):
+        raise SparseKitchenError(
+            'streamed in-place attention output requires projected.x shape '
+            '[sequence, hidden]; got %r' % (tuple(result.shape),)
+        )
+    if not result.is_contiguous():
+        raise SparseKitchenError(
+            'streamed in-place attention output requires contiguous projected.x'
+        )
+
     fmt = describe_linear(module.qkv_proj)
     held = None
     q_weight_hold = None
@@ -764,16 +781,41 @@ def execute_streamed_projected(backend, module, prepared):
                 local = module.out_proj(out.squeeze(0))
             del out
 
-            if result is None:
-                result = local.new_empty(sequence, local.shape[-1])
+            if int(local.shape[0]) != int(end - start):
+                raise SparseKitchenError(
+                    'streamed out_proj returned %d rows for query chunk %d:%d'
+                    % (int(local.shape[0]), int(start), int(end))
+                )
+            if int(local.shape[-1]) != int(result.shape[-1]):
+                raise SparseKitchenError(
+                    'streamed out_proj hidden size %d does not match reusable '
+                    'attention buffer hidden size %d'
+                    % (
+                        int(local.shape[-1]),
+                        int(result.shape[-1]),
+                    )
+                )
+            if local.dtype != result.dtype:
+                raise SparseKitchenError(
+                    'streamed out_proj dtype %s does not match reusable '
+                    'attention buffer dtype %s'
+                    % (local.dtype, result.dtype)
+                )
+
+            # Q for this range was projected and quantized above, so the
+            # original input rows are dead. Overwrite them with final out_proj
+            # rows and progressively turn projected.x into attention output.
             result[start:end].copy_(local)
             del local
-
-        if result is None:
-            raise SparseKitchenError(
-                'streamed Kitchen received an empty sequence'
-            )
-        prepared.release()
+        # Drop carriers/summaries/rope while preserving the aliased result
+        # tensor until the caller receives it. Prepared ownership is cleared
+        # manually here because PreparedStreamedKitchenQKV.release() also sets
+        # projected.x = None.
+        projected.release_carriers()
+        projected.release_summaries()
+        projected.rope_freqs = None
+        prepared.projected = None
+        prepared.route = None
         release_stage_prefetch(out_ticket)
         out_ticket = None
         return result
@@ -784,7 +826,8 @@ def execute_streamed_projected(backend, module, prepared):
             q_weight_hold.__exit__(None, None, None)
         if held is not None:
             held.__exit__(None, None, None)
-        prepared.release()
+        if prepared.projected is not None:
+            prepared.release()
 
 
 _ORIGINAL_PROJECT = ChunkedKitchenQKVProjector.try_project
