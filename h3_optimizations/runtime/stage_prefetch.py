@@ -19,6 +19,11 @@ import comfy.ops
 STAGE_PREFETCH_KEY = "h3_optimizations_stage_prefetch"
 ATTENTION_MEMORY_MODE_KEY = "h3_optimizations_attention_memory_mode"
 ATTENTION_MEMORY_STREAMED = "streamed"
+
+_PREFETCH_OVERRIDE_ACTIVE_KEY = "h3_optimizations_prefetch_override_active"
+_PREFETCH_PREVIOUS_PRESENT_KEY = "h3_optimizations_prefetch_previous_present"
+_PREFETCH_PREVIOUS_VALUE_KEY = "h3_optimizations_prefetch_previous_value"
+
 LOG_PREFIX = "[H3 Optimizations]"
 
 
@@ -34,15 +39,52 @@ def configure_stage_prefetch(transformer_options):
     """Replace stock whole-block H3 prefetch only for explicit streamed mode."""
     if transformer_options is None:
         return False
+
     enabled = (
         transformer_options.get(ATTENTION_MEMORY_MODE_KEY)
         == ATTENTION_MEMORY_STREAMED
     )
     transformer_options[STAGE_PREFETCH_KEY] = bool(enabled)
-    if enabled:
-        transformer_options["prefetch_dynamic_vbars"] = False
-    return bool(enabled)
 
+    override_active = bool(
+        transformer_options.get(_PREFETCH_OVERRIDE_ACTIVE_KEY, False)
+    )
+
+    if enabled:
+        # Record the upstream value only when taking ownership of this setting.
+        # configure_stage_prefetch() can be called repeatedly during one
+        # request, so do not overwrite the saved value with our own False.
+        if not override_active:
+            transformer_options[_PREFETCH_PREVIOUS_PRESENT_KEY] = (
+                "prefetch_dynamic_vbars" in transformer_options
+            )
+            transformer_options[_PREFETCH_PREVIOUS_VALUE_KEY] = (
+                transformer_options.get("prefetch_dynamic_vbars")
+            )
+            transformer_options[_PREFETCH_OVERRIDE_ACTIVE_KEY] = True
+
+        transformer_options["prefetch_dynamic_vbars"] = False
+
+    elif override_active:
+        # Restore exactly what existed before streamed mode took ownership.
+        previous_present = bool(
+            transformer_options.pop(
+                _PREFETCH_PREVIOUS_PRESENT_KEY,
+                False,
+            )
+        )
+        previous_value = transformer_options.pop(
+            _PREFETCH_PREVIOUS_VALUE_KEY,
+            None,
+        )
+        transformer_options.pop(_PREFETCH_OVERRIDE_ACTIVE_KEY, None)
+
+        if previous_present:
+            transformer_options["prefetch_dynamic_vbars"] = previous_value
+        else:
+            transformer_options.pop("prefetch_dynamic_vbars", None)
+
+    return bool(enabled)
 
 def stage_prefetch_enabled(transformer_options):
     return bool(
