@@ -2,6 +2,7 @@
 
 from comfy_api.latest import ComfyExtension
 
+from .aimdo_limiter import H3AIMDOResidencyLimiter
 from .nodes import (
     H3MemoryOptimization,
     H3SparseAttention,
@@ -15,6 +16,7 @@ class H3OptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             H3MemoryOptimization,
+            H3AIMDOResidencyLimiter,
             H3SparseAttention,
             H3SparseAttentionAdvanced,
         ]

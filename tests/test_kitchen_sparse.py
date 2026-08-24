@@ -37,6 +37,8 @@ from h3_optimizations.attention.sparse.config import (  # noqa: E402
 from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
     HEAD_DIM,
     KV_TILE,
+    PRODUCTION_KV_TILE,
+    PRODUCTION_Q_TILE,
     Q_TILE,
     SparseKitchenBackend,
     SparseKitchenError,
@@ -129,12 +131,32 @@ def test_rejects_a_foreign_config():
         SparseKitchenBackend(config={"video_budget": 0.3}, kitchen=object())
 
 
+def test_production_geometry_is_64x64():
+    assert (PRODUCTION_Q_TILE, PRODUCTION_KV_TILE) == (64, 64)
+
+
 def test_router_geometry_must_match_the_kernel():
     from h3_optimizations.attention.sparse.router import SparseTileRouter
 
     mismatched = SparseTileRouter(q_tile=Q_TILE, kv_tile=64)
     with pytest.raises(SparseKitchenError, match="router geometry"):
         SparseKitchenBackend(kitchen=object(), router=mismatched)
+
+
+@pytest.mark.parametrize('q_tile,kv_tile', [(128, 64), (64, 64)])
+def test_exact_quality_geometry_reaches_router_executor_and_status(q_tile, kv_tile):
+    backend = SparseKitchenBackend(
+        kitchen=object(),
+        q_tile=q_tile,
+        kv_tile=kv_tile,
+    )
+    assert (backend.router.q_tile, backend.router.kv_tile) == (q_tile, kv_tile)
+    assert (backend.executor.q_tile, backend.executor.kv_tile) == (q_tile, kv_tile)
+    status = backend.as_status()
+    assert (status['sparse_q_tile'], status['sparse_kv_tile']) == (
+        q_tile,
+        kv_tile,
+    )
 
 
 def test_the_backend_imports_nothing_from_sparge():

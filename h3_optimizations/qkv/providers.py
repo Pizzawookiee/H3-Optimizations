@@ -132,6 +132,27 @@ def resolve_qkv_provider(
         return _required_or_standard(
             request, 'H3 QKV layers use mixed weight formats'
         )
+    if (
+        inventory.qkv_convrot_int8_256
+        and backend_kind in (
+            'native_int8_128x64',
+            'native_int8_128x64_sol_residual_64x64',
+            'native_int8_64x64',
+            'native_int8_64x64_sol_residual_64x64',
+            'native_int8_128x128_hard_control',
+            'native_int8_128x128_sol_residual_64x64',
+        )
+    ):
+        if not kitchen_producer_available:
+            return _required_or_standard(
+                request,
+                'the native INT8 sparse architecture needs the Kitchen QKV producer',
+            )
+        return QKVProviderResolution(
+            QKV_DENSE_KITCHEN_CHUNKED,
+            True,
+            'checkpoint-native ConvRot-256 INT8 QKV uses 4K projection chunks into one shared Kitchen INT8 carrier for exact and residual attention',
+        )
     if request == FUSED_QKV_PRESERVE_BF16:
         return _resolve_preserved_bf16_qkv(inventory, backend_kind)
 

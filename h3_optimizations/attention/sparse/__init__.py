@@ -51,6 +51,12 @@ _EXPORT_MODULES = {
     'TritonSparseExecutor': '.triton_sparse',
     'TritonSparseSpec': '.triton_sparse',
     'preflight_triton_sparse': '.triton_sparse',
+    'PreparedSolResidual': '.sol_residual',
+    'SolResidualBackend': '.sol_residual',
+    'SolResidualError': '.sol_residual',
+    'SolResidualSpec': '.sol_residual',
+    'pack_exact_route': '.sol_residual',
+    'preflight_sol_residual': '.sol_residual',
 }
 
 

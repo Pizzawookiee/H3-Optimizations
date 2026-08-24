@@ -5,7 +5,7 @@
 // math is untouched -- INT8 QK -> INT32 scores -> FP32 online softmax ->
 // UINT8 probabilities -> UINT8 P x INT8 V -> FP32 accumulation -> BF16 out.
 // Only the KV loop changes: instead of walking every tile it follows a route
-// of absolute KV tile indices, backend-neutral and carrying its own geometry.
+// of positive deltas between selected KV tile indices.
 #define H3_SPARSE_ROUTE_ENCODING "delta"
 // SPDX-FileCopyrightText: Copyright (c) 2024 by SageAttention team.
 // SPDX-FileContributor: Modified by NVIDIA CORPORATION & AFFILIATES, 2025.
@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
+#include <math_constants.h>
 
 #include "cp_async.cuh"
 #include "math.cuh"
@@ -79,7 +80,9 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     const uint32_t stride_seq_k, const uint32_t stride_h_k,
     const uint32_t stride_bz_v, const uint32_t stride_h_v,
     const uint32_t stride_d_v, const uint32_t stride_bz_o,
-    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale,
+    const uint32_t stride_seq_o, const uint32_t stride_h_o,
+    const uint32_t stride_bz_q_scale, const uint32_t stride_h_q_scale,
+    float sm_scale,
     const int32_t *__restrict__ BlockLut,
     const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride) {
   // compile time check
@@ -106,8 +109,6 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
   static_assert(mask_mode == MaskMode::kNone,
                 "the block-sparse kernel selects tiles through the route "
                 "LUT and takes no attention mask");
-  static_assert(!return_lse, "the block-sparse kernel does not return LSE");
-
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
   constexpr uint32_t num_warps = num_warps_q * num_warps_k;
@@ -117,6 +118,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
                                               ? (head_dim / MMA_QK_K)
                                               : (head_dim / 2 / MMA_QK_K);
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
+  static_assert(num_tiles_q == 1 || num_tiles_q == 2,
+                "the block-sparse LSE epilogue supports one or two Q tiles per warp");
   constexpr bool custom_mask = mask_mode == MaskMode::kCustom ||
                                mask_mode == MaskMode::kCustomKey;
   // For unmasked and causal FP32 kernels, retain raw scores until update_mdo
@@ -159,29 +162,21 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
   bool valid[num_tiles_q][2];
 
   uint32_t q_scale_idx, k_scale_idx;
+  const uint32_t q_scale_base =
+      batch_id * stride_bz_q_scale + head_id * stride_h_q_scale;
 
   if constexpr (Q_GRAN == QuantGranularity::kPerBlock) {
-    const uint32_t num_block_q = gridDim.x;
-    q_scale_idx =
-        batch_id * num_qo_heads * num_block_q + head_id * num_block_q + bx;
+    q_scale_idx = q_scale_base + bx;
   } else if constexpr (Q_GRAN == QuantGranularity::kPerWarp) {
-    const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
-    q_scale_idx = batch_id * num_qo_heads * num_warp_block_q +
-                  head_id * num_warp_block_q + bx * num_warps_q +
+    q_scale_idx = q_scale_base + bx * num_warps_q +
                   get_warp_idx_q<num_warps_q, num_warps_k>();
   } else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
     if constexpr (head_dim == 128 && WARP_Q == 16) {
       constexpr uint32_t quant_warps_q = CTA_Q / 32;
-      const uint32_t num_warp_block_q = gridDim.x * quant_warps_q;
-      q_scale_idx =
-          batch_id * num_qo_heads * (num_warp_block_q * 8) +
-          head_id * (num_warp_block_q * 8) + bx * (quant_warps_q * 8) +
+      q_scale_idx = q_scale_base + bx * (quant_warps_q * 8) +
           (get_warp_idx_q<num_warps_q, num_warps_k>() / 2) * 8 + lane_id / 4;
     } else {
-      const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
-      q_scale_idx =
-          batch_id * num_qo_heads * (num_warp_block_q * 8) +
-          head_id * (num_warp_block_q * 8) + bx * (num_warps_q * 8) +
+      q_scale_idx = q_scale_base + bx * (num_warps_q * 8) +
           get_warp_idx_q<num_warps_q, num_warps_k>() * 8 + lane_id / 4;
     }
   }
@@ -375,14 +370,23 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
             DTypeOut(0.0f);
       }
     }
+    if constexpr (return_lse) {
+      for (uint32_t q_idx = tid; q_idx < CTA_Q; q_idx += cta_threads) {
+        const uint32_t row = bx * CTA_Q + q_idx;
+        if (row < qo_len) {
+          Lse[batch_id * (qo_len * num_qo_heads) + head_id * qo_len + row] =
+              -CUDART_INF_F;
+        }
+      }
+    }
     return;
   }
 
-  // The route holds absolute KV tile indices, strictly ascending. Ascending
-  // order means the ragged final KV tile can only ever be the last entry,
-  // which is why the out-of-bound mask stays peeled into the epilogue exactly
-  // where the dense kernel has it. Absolute rather than delta encoded: the
-  // kernel no longer carries a running sum, and the route stops depending on
+  // The route holds positive deltas between strictly ascending KV tile
+  // indices. Ascending order means the ragged final KV tile can only ever be
+  // the last entry, which is why the out-of-bound mask stays peeled into the
+  // epilogue exactly where the dense kernel has it. The running sum turns each
+  // delta back into the absolute block used by the pointer seeks below.
   // whatever encoding a particular backend happened to want.
   uint32_t load_block = static_cast<uint32_t>(lut_row[0]);
   seek_kv_block(load_block);
@@ -878,16 +882,27 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
   }
 
   if constexpr (return_lse) {
-    // ! this only works for num_tiles_q = 2
-    uint32_t lse_idx = bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) +
-                       WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
-    float *lse_lane_ptr =
-        Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx;
-    uint32_t fq = (lane_id % 4) / 2;
-    uint32_t k = (lane_id % 4) % 2;
-
-    if (lse_idx < qo_len) {
-      lse_lane_ptr[0] = math::ptx_log2(d[fq][k]) + m[fq][k];
+    const uint32_t warp_q =
+        WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
+    if constexpr (num_tiles_q == 1) {
+      if ((lane_id % 4) < 2) {
+        const uint32_t lse_idx =
+            bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 2) + warp_q;
+        if (lse_idx < qo_len) {
+          Lse[batch_id * (qo_len * num_qo_heads) + head_id * qo_len +
+              lse_idx] = math::ptx_log2(d[0][lane_id % 2]) +
+                         m[0][lane_id % 2];
+        }
+      }
+    } else {
+      const uint32_t lse_idx =
+          bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + warp_q;
+      const uint32_t fq = (lane_id % 4) / 2;
+      const uint32_t k = (lane_id % 4) % 2;
+      if (lse_idx < qo_len) {
+        Lse[batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx] =
+            math::ptx_log2(d[fq][k]) + m[fq][k];
+      }
     }
   }
 }

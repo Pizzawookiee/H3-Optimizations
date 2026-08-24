@@ -27,6 +27,7 @@ OUTPUT_LAYOUTS = (OUTPUT_HND, OUTPUT_NHD)
 Q_TILE = 128
 CTA_K = 64
 LARGE_CTA_K = 128
+SPARSE_GEOMETRIES = ((128, 128), (128, 64), (64, 64))
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 # Matches the CUDA backend's conventions; do not renumber.
@@ -151,6 +152,39 @@ def _check_sparse_attention(*arguments):
     loader.check(
         loader.load().h3_int8_sparse_attention(*arguments), 'sparse attention'
     )
+
+
+def _check_sparse_attention_lse(*arguments):
+    loader.check(
+        loader.load().h3_int8_sparse_attention_lse(*arguments),
+        'sparse attention with LSE',
+    )
+
+
+def _validate_sparse_route(quantized, route):
+    if not isinstance(route, BlockSparseRoute):
+        raise TypeError(
+            'route must be a BlockSparseRoute so its encoding and tile '
+            'geometry are explicit, got %s' % type(route).__name__
+        )
+    geometry = (int(route.q_tile), int(route.kv_tile))
+    if geometry not in SPARSE_GEOMETRIES:
+        raise ValueError(
+            'native block-sparse attention does not support %dQ x %dKV'
+            % geometry
+        )
+    if route.kv_tile != quantized.cta_k:
+        raise ValueError(
+            'the route was built for KV tile %d but the carriers are packed '
+            'for %d; walking one at the other width attends to the wrong keys'
+            % (route.kv_tile, quantized.cta_k)
+        )
+    kernel_route = route.for_kernel()
+    if not kernel_route.indices.is_contiguous() or not kernel_route.counts.is_contiguous():
+        raise ValueError('route indices and counts must be contiguous')
+    if kernel_route.indices.dtype != torch.int32 or kernel_route.counts.dtype != torch.int32:
+        raise TypeError('route indices and counts must be int32')
+    return kernel_route
 
 
 def _kernel_head_dim(head_dim):
@@ -346,26 +380,8 @@ def block_sparse_int8_attention_from_prequantized(
     quantized, route, *, output_layout=OUTPUT_HND
 ):
     """INT8 attention over the KV tiles the route selects."""
-    if not isinstance(route, BlockSparseRoute):
-        raise TypeError(
-            'route must be a BlockSparseRoute so its encoding and tile '
-            'geometry are explicit, got %s' % type(route).__name__
-        )
-    if route.kv_tile != quantized.cta_k:
-        raise ValueError(
-            'the route was built for KV tile %d but the carriers are packed '
-            'for %d; walking one at the other width attends to the wrong keys'
-            % (route.kv_tile, quantized.cta_k)
-        )
-    if route.q_tile != Q_TILE:
-        raise ValueError('block-sparse attention is fixed to q tile %d' % Q_TILE)
-
     library = loader.load()
-    kernel_route = route.for_kernel()
-    if not kernel_route.indices.is_contiguous() or not kernel_route.counts.is_contiguous():
-        raise ValueError('route indices and counts must be contiguous')
-    if kernel_route.indices.dtype != torch.int32 or kernel_route.counts.dtype != torch.int32:
-        raise TypeError('route indices and counts must be int32')
+    kernel_route = _validate_sparse_route(quantized, route)
 
     output, output_dtype, geometry, strides = _attention_geometry(
         quantized, output_layout
@@ -376,12 +392,42 @@ def block_sparse_int8_attention_from_prequantized(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
             _ptr(quantized.v_scale), _ptr(kernel_route.indices),
-            _ptr(kernel_route.counts), kv_tiles, quantized.cta_k,
+            _ptr(kernel_route.counts), kv_tiles, route.q_tile,
+            quantized.cta_k,
             *geometry, *strides,
+            quantized.q_scale.stride(0), quantized.q_scale.stride(1),
             quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
             _stream(),
         )
     return _finish(quantized, output)
+
+
+def block_sparse_int8_attention_with_lse_from_prequantized(
+    quantized, route, *, output_layout=OUTPUT_HND
+):
+    """INT8 sparse attention plus the per-row base-2 softmax normalizer."""
+    kernel_route = _validate_sparse_route(quantized, route)
+
+    output, output_dtype, geometry, strides = _attention_geometry(
+        quantized, output_layout
+    )
+    lse = torch.empty(
+        quantized.q.shape[0], quantized.q.shape[1], quantized.q.shape[2],
+        dtype=torch.float32, device=quantized.q.device,
+    )
+    kv_tiles = kernel_route.indices.shape[-1]
+    with diagnostics.stage('sparse_attention_kernel'):
+        _check_sparse_attention_lse(
+            _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
+            _ptr(output), _ptr(lse), _ptr(quantized.q_scale),
+            _ptr(quantized.k_scale), _ptr(quantized.v_scale),
+            _ptr(kernel_route.indices), _ptr(kernel_route.counts),
+            kv_tiles, route.q_tile, quantized.cta_k, *geometry, *strides,
+            quantized.q_scale.stride(0), quantized.q_scale.stride(1),
+            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
+            _stream(),
+        )
+    return _finish(quantized, output), lse
 
 
 def int8_attention_is_available(device=None):

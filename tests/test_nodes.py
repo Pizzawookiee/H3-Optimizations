@@ -145,6 +145,12 @@ class NodeTests(unittest.TestCase):
                 'INT8 Triton',
                 'FP8 FlexAttention',
                 'Kitchen INT8',
+                'Native INT8 128x64',
+                'Native INT8 128x64 + Sol residual 64x64',
+                'Native INT8 64x64',
+                'Native INT8 64x64 + Sol residual 64x64',
+                'Native INT8 128x128 hard control',
+                'Native INT8 128x128 + Sol residual 64x64',
             ],
         )
         self.assertIn('hard requirements', advanced.description)

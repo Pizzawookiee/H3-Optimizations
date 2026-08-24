@@ -17,6 +17,8 @@ Two pieces are needed and neither is in 0.2.31:
   projection quantize each chunk as it is produced rather than materializing
   the whole BF16 sequence;
 - **block-sparse KV traversal**, which walks a routed subset of the KV tiles.
+- **composable sparse softmax state**, which lets the same native traversal
+  return its base-2 row normalizer for a separate rejected-tile residual.
 
 ## Provenance
 
@@ -45,6 +47,13 @@ It is plain C — pointers, ints, a stream handle — loaded through `ctypes`. N
 nanobind, no DLPack, and therefore no Python ABI dimension: one binary per OS
 and architecture set serves every interpreter, rather than separate cp310,
 cp311 and abi3 builds.
+
+ABI 3 adds explicit sparse Q geometry and Q-scale strides. It exposes exact
+128Q x 64KV and 64Q x 64KV traversal without changing Kitchen's Q128
+quantization carrier. ABI 2 added `h3_int8_sparse_attention_lse`; that output
+remains one FP32 base-2 log-sum-exp value per query row. The packaged Windows
+DLL is ABI-versioned so a running Comfy process can keep an older mapped DLL
+until the next normal restart.
 
 ## Building
 

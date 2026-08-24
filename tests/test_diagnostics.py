@@ -100,6 +100,8 @@ class StageCoverageTests(unittest.TestCase):
         'full_carrier_pack': 'attention/sparse/kitchen_sparse.py',
         'sparse_route': 'attention/sparse/kitchen_sparse.py',
         'sparse_carrier_prepare': 'attention/sparse/kitchen_sparse.py',
+        'sol_residual_preprocess': 'attention/sparse/sol_residual.py',
+        'sol_residual_kernel': 'attention/sparse/sol_residual.py',
     }
 
     def test_every_required_stage_is_present_where_it_belongs(self):

@@ -54,12 +54,14 @@ class FakeKitchen:
         self.anchor_samples = None
         self.qk_chunks = []
         self.v = None
+        self.spec_requests = []
 
     @staticmethod
     def int8_attention_producer_is_available(_device=None):
         return True
 
     def int8_attention_producer_spec(self, *_args, **_kwargs):
+        self.spec_requests.append(dict(_kwargs))
         return SimpleNamespace(
             abi_version=1,
             k_anchor_positions=tuple(range(9)),
@@ -334,7 +336,9 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             device=torch.device('cuda:0'),
         )
         projector = kitchen_qkv.ChunkedKitchenQKVProjector(
-            routing_summaries=True
+            routing_summaries=True,
+            q_tile=64,
+            kv_tile=64,
         )
         expected = object()
         with mock.patch.object(
@@ -353,7 +357,7 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             kitchen_qkv,
             'run_chunked_kitchen_qkv',
             return_value=expected,
-        ):
+        ) as run:
             actual = projector.try_project(
                 module,
                 x,
@@ -363,6 +367,9 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             )
 
         self.assertIs(actual, expected)
+        self.assertEqual(fake.spec_requests[-1]['cta_k'], 64)
+        self.assertEqual(run.call_args.kwargs['routing_q_tile'], 64)
+        self.assertEqual(run.call_args.kwargs['routing_kv_tile'], 64)
 
     def test_runtime_capability_decline_returns_to_upstream_forward(self):
         fake = FakeKitchen()

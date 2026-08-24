@@ -167,6 +167,22 @@ def test_producer_availability_uses_validated_attention_gate(monkeypatch):
     assert calls == ["cuda:0"]
 
 
+def test_producer_spec_can_force_the_64kv_carrier(monkeypatch):
+    monkeypatch.setattr(P, 'int8_attention_producer_is_available', lambda _device: True)
+    shape = (1, HEADS, SEQ, HEAD_DIM)
+    spec = P.int8_attention_producer_spec(
+        shape,
+        shape,
+        dtype=torch.bfloat16,
+        device=torch.device('cpu'),
+        cta_k=64,
+    )
+    assert spec.q_tile == 128
+    assert spec.k_tile == 64
+    assert spec.cta_k == 64
+    assert spec.sequence_alignment == 128
+
+
 def test_the_producer_path_is_available_without_a_kitchen_release():
     """The failure this whole exercise exists to fix.
 

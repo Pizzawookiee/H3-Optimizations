@@ -93,5 +93,7 @@ STAGE_NAMES = (
     'sparse_route',
     'sparse_carrier_prepare',
     'sparse_attention_kernel',
+    'sol_residual_preprocess',
+    'sol_residual_kernel',
     'attention_out',
 )

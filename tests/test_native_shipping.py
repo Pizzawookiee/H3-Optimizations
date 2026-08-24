@@ -21,7 +21,6 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations import __version__  # noqa: E402
-from h3_optimizations.attention.sparse.kitchen_sparse import KV_TILE  # noqa: E402
 from h3_optimizations.native import artifacts, int8_attention, selftest  # noqa: E402
 
 
@@ -30,7 +29,7 @@ BIN_DIR = PACK / 'native' / 'bin'
 
 class NativeShippingTests(unittest.TestCase):
     def test_native_binaries_are_packaged(self):
-        windows_binary = BIN_DIR / 'h3_int8_attention.dll'
+        windows_binary = BIN_DIR / 'h3_int8_attention_v3.dll'
         linux_binary = BIN_DIR / 'libh3_int8_attention.so'
 
         self.assertGreater(windows_binary.stat().st_size, 1_000_000)
@@ -66,9 +65,11 @@ class NativeShippingTests(unittest.TestCase):
             self.assertFalse(int8_attention.int8_attention_is_available('cuda'))
             selftest_check.assert_not_called()
 
-    def test_selftest_sparse_parity_uses_production_kv_tile(self):
-        self.assertEqual(selftest._SPARSE_PARITY_CTA_K, KV_TILE)
-        self.assertEqual(selftest._SPARSE_PARITY_CTA_K, 128)
+    def test_selftest_covers_every_shipped_sparse_geometry(self):
+        self.assertEqual(
+            selftest._SPARSE_PARITY_GEOMETRIES,
+            int8_attention.SPARSE_GEOMETRIES,
+        )
 
     def test_selftest_cache_key_includes_revision(self):
         with (
@@ -82,14 +83,14 @@ class NativeShippingTests(unittest.TestCase):
             ),
             mock.patch(
                 'h3_optimizations.native.bootstrap.installed_build_id',
-                return_value='native-v1',
+                return_value='native-v3',
             ),
         ):
             key = selftest._cache_key('cuda')
 
         self.assertEqual(
             key,
-            'sm120|native-v1|%s|NVIDIA GeForce RTX 5070 Ti'
+            'sm120|native-v3|%s|NVIDIA GeForce RTX 5070 Ti'
             % selftest._SELFTEST_REVISION,
         )
 

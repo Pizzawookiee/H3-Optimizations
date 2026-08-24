@@ -166,6 +166,8 @@ def run_two_pass_v_kitchen_qkv(
     spec,
     chunk_rows,
     routing_summaries,
+    routing_q_tile,
+    routing_kv_tile,
     v_backend,
     strided_qk_input,
 ):
@@ -201,8 +203,8 @@ def run_two_pass_v_kitchen_qkv(
         )
         if routing_summaries:
             with diagnostics.stage('routing_summary_generation'):
-                q_summaries.append(_tile_mean(q, int(spec.q_tile)))
-                k_summaries.append(_tile_mean(k, int(spec.k_tile)))
+                q_summaries.append(_tile_mean(q, int(routing_q_tile)))
+                k_summaries.append(_tile_mean(k, int(routing_kv_tile)))
         kitchen.quantize_int8_attention_qk_chunk(
             producer, q, k, q_start=start, k_start=start, **chunk_kwargs
         )
@@ -242,6 +244,8 @@ def run_chunked_kitchen_qkv(
     chunk_rows=CHUNK_ROWS,
     fp8_projection=False,
     routing_summaries=False,
+    routing_q_tile=None,
+    routing_kv_tile=None,
     v_mode=V_MODE_RETAIN,
     v_backend=None,
     strided_qk_input=False,
@@ -249,6 +253,12 @@ def run_chunked_kitchen_qkv(
     del layer_index, transformer_options
     if v_mode not in V_MODES:
         raise FusedQKVError('unknown V mode %r' % v_mode)
+    routing_q_tile = int(
+        spec.q_tile if routing_q_tile is None else routing_q_tile
+    )
+    routing_kv_tile = int(
+        spec.k_tile if routing_kv_tile is None else routing_kv_tile
+    )
     kitchen = resolve_kitchen(x.device)
     if kitchen is None:
         raise FusedQKVError('no INT8 attention producer is available')
@@ -276,6 +286,8 @@ def run_chunked_kitchen_qkv(
                 spec=spec,
                 chunk_rows=chunk_rows,
                 routing_summaries=routing_summaries,
+                routing_q_tile=routing_q_tile,
+                routing_kv_tile=routing_kv_tile,
                 v_backend=v_backend,
                 strided_qk_input=strided_qk_input,
             )
@@ -315,8 +327,8 @@ def run_chunked_kitchen_qkv(
                 )
             if routing_summaries:
                 with diagnostics.stage('routing_summary_generation'):
-                    q_summaries.append(_tile_mean(q, int(spec.q_tile)))
-                    k_summaries.append(_tile_mean(k, int(spec.k_tile)))
+                    q_summaries.append(_tile_mean(q, routing_q_tile))
+                    k_summaries.append(_tile_mean(k, routing_kv_tile))
             kitchen.quantize_int8_attention_qk_chunk(
                 producer,
                 q,
@@ -354,6 +366,8 @@ class ChunkedKitchenQKVProjector:
         chunk_rows=CHUNK_ROWS,
         fp8_projection=False,
         routing_summaries=False,
+        q_tile=None,
+        kv_tile=None,
         v_mode=V_MODE_RETAIN,
         v_backend=None,
         strided_qk_input=False,
@@ -361,6 +375,12 @@ class ChunkedKitchenQKVProjector:
         self.chunk_rows = int(chunk_rows)
         self.fp8_projection = bool(fp8_projection)
         self.routing_summaries = bool(routing_summaries)
+        self.q_tile = None if q_tile is None else int(q_tile)
+        self.kv_tile = None if kv_tile is None else int(kv_tile)
+        if self.q_tile is not None and self.q_tile <= 0:
+            raise ValueError('q_tile must be positive')
+        if self.kv_tile is not None and self.kv_tile <= 0:
+            raise ValueError('kv_tile must be positive')
         if v_mode not in V_MODES:
             raise ValueError('v_mode must be one of %s' % ', '.join(V_MODES))
         self.v_mode = str(v_mode)
@@ -374,6 +394,8 @@ class ChunkedKitchenQKVProjector:
             self.chunk_rows,
             self.fp8_projection,
             self.routing_summaries,
+            self.q_tile,
+            self.kv_tile,
             self.v_mode,
             self.v_backend,
             self.strided_qk_input,
@@ -413,11 +435,15 @@ class ChunkedKitchenQKVProjector:
 
         shape = (1, int(module.heads), int(x.shape[0]), int(module.head_dim))
         try:
+            spec_kwargs = {}
+            if self.kv_tile is not None:
+                spec_kwargs['cta_k'] = self.kv_tile
             spec = kitchen.int8_attention_producer_spec(
                 shape,
                 shape,
                 dtype=x.dtype,
                 device=x.device,
+                **spec_kwargs,
             )
         except kitchen.Int8AttentionProducerUnavailableError:
             return None
@@ -438,6 +464,8 @@ class ChunkedKitchenQKVProjector:
                     chunk_rows=self.chunk_rows,
                     fp8_projection=self.fp8_projection,
                     routing_summaries=self.routing_summaries,
+                    routing_q_tile=self.q_tile,
+                    routing_kv_tile=self.kv_tile,
                     v_mode=self.v_mode,
                     v_backend=self.v_backend,
                     strided_qk_input=self.strided_qk_input,

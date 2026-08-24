@@ -679,14 +679,20 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     options=list(SPARSE_BACKEND_REQUESTS),
                     default=SPARSE_BACKEND_AUTO,
                     tooltip=(
-                        'auto uses native Kitchen INT8, then Sparse Sage, '
+                        'auto uses native Kitchen INT8 at 64x64, then Sparse '
+                        'Sage, '
                         'INT8 Triton, FP8 FlexAttention, and finally the '
                         'resolved dense fallback. '
                         'Explicit backend choices fail if that backend is '
                         'unavailable and do not switch to another backend. '
                         'Kitchen INT8 uses the native block-sparse kernel and '
                         'consumes compatible chunked Kitchen QKV carriers '
-                        'directly. '
+                        'directly. Native INT8 128x128, 128x64, and 64x64 '
+                        'execute those exact sparse geometries over the same '
+                        'Kitchen INT8 carrier. Experimental matched Sol arms '
+                        'keep their native exact geometry and add a 64x64 '
+                        'block-mean K and block-sum V residual for rejected '
+                        'tiles. Auto never selects Sol. '
                         'Bypass this node to force dense attention.'
                     ),
                 ),

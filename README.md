@@ -3,7 +3,8 @@
 Standalone production optimization nodes for MiniMax H3 in ComfyUI.
 
 This pack owns its native Kitchen INT8 attention kernels, chunked QKV producer,
-sparse routing, and bounded MLP execution.
+sparse routing, bounded MLP execution, and an optional DynamicVRAM safety
+control.
 
 ## Nodes
 
@@ -18,6 +19,24 @@ sparse routing, and bounded MLP execution.
   remain native where a compatible bounded MLP provider exists; unsupported
   quantized formats preserve upstream Comfy execution. The toggle defaults off,
   so existing workflows retain the current auto policy.
+- H3 AIMDO Residency Limiter helps prevent avoidable out-of-memory errors on
+  long or high-resolution H3 videos. ComfyUI can underestimate how much working
+  memory H3 will need and keep too much of the model in VRAM. The generation
+  can then run out of memory even when that resolution and length would fit
+  with less of the model kept on the GPU. This node restricts how much of the
+  H3 model ComfyUI keeps in VRAM, leaving more room for the video itself and
+  other temporary work. It changes memory management, not the model math or
+  video quality.
+
+  `2 blocks` is the recommended starting point. Lower settings leave more free
+  VRAM but can be slower because ComfyUI must stream more model weights as they
+  are needed. Higher settings keep more of the model ready on the GPU, which
+  can be faster but leaves less room for the video. `0 blocks` is the most
+  aggressive limit; `stock` turns the limiter off and restores ComfyUI's normal
+  behavior. AIMDO is the model-weight streaming system used by DynamicVRAM; the
+  numeric settings require DynamicVRAM with async weight offloading. The node
+  cannot guarantee that every workflow will fit, because it restrains model
+  memory rather than setting a hard limit on all GPU memory use.
 - H3 Sparse Attention enables fixed-density sparse attention while keeping text,
   reference conditioning, audio, non-video queries, and mixed boundary tiles
   dense. Its default video KV budget is 30 percent. The optional legacy
@@ -28,12 +47,26 @@ sparse routing, and bounded MLP execution.
   steps; Early steps/Early KV and Late steps/Late KV independently control the
   edges. The defaults are two early steps at 50 percent KV and two late steps at
   50 percent KV. If the two windows overlap, the denser of the two requested
-  edge budgets is used. Backend `auto` uses native Kitchen INT8, then an
+  edge budgets is used. Backend `auto` uses native Kitchen INT8 at 64Q x 64KV,
+  then an
   existing compatible Sparse Sage installation, INT8 Triton, FlexAttention,
   and finally the resolved dense H3 path. FlexAttention uses FP8 carriers on
   supported NVIDIA runtimes and native BF16/FP16 Q/K/V through Triton on ROCm.
   Explicit backend selections are hard requirements and error if unavailable;
   bypass the node to force dense attention.
+
+The production native backend and the explicit quality arms execute 64Q x
+64KV, 128Q x 128KV, or 128Q x 64KV routed geometry through the native INT8
+kernel. They reuse the same
+chunked Kitchen Q128 quantization carrier; the 64Q kernel consumes each 64-row
+half directly rather than requantizing Q. Each geometry has a matched Sol arm.
+The hard arm drops rejected tiles. The Sol arm approximates rejected 64Q x 64KV
+tiles with block-mean K and block-sum V and merges that residual into the native
+kernel's softmax state. In the 5 percent FL2VA baker and robot stress cases,
+64Q x 64KV was dramatically more robust than either larger geometry. The
+matched Sol residual did not visibly improve 128Q x 64KV or 64Q x 64KV and
+added sampler time, so `auto` uses hard 64Q x 64KV and never selects Sol. The
+explicit Sol choices remain available for reproducing experiments.
 
 > **Sparse attention changes model computation. It is not free acceleration.**
 > Lower Video KV budgets retain fewer target-video attention connections and can
@@ -60,7 +93,8 @@ The table below is a representative end-to-end sampler sweep comparing dense
 Comfy attention against the optimization pack at two video lengths. Times are
 median sampler-step times from the sweep. The 20-step columns are simple
 projections from the measured step time, so they are useful for scale but are
-not separate wall-clock measurements.
+not separate wall-clock measurements. These measurements predate the 64Q x
+64KV production default and do not measure its current performance.
 
 The 5-second VRAM measurements are deliberately omitted. That workload had
 enough free memory that allocation/offload behavior was demand-driven and
@@ -108,6 +142,65 @@ speed/quality tradeoff, not a claim that 30 percent density is lossless.
 These numbers are measurements from one test setup, not universal performance
 claims. GPU architecture, checkpoint format, sequence length, ComfyUI version,
 and backend availability can all change the result.
+
+## Performance
+
+MiniMax H3 text-to-video at 1376x768 (1.0 MP, 16:9) on an RTX 4070 12 GB,
+`res_multistep`/`simple`, measured end to end through a real sampler. Times are
+the median of three sampler steps after a discarded warmup step; the 20-step
+column extrapolates from that median.
+
+| configuration | 5s step | 5s 20-step | 10s step | 10s 20-step | 10s peak VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Comfy Kitchen INT8 dense (no pack) | 27.4 s | ~9m08s | 85.1 s | ~28m22s | 11800 MiB |
+| SageAttention dense (no pack) | 27.5 s | ~9m09s | out of memory | — | — |
+| H3 Memory Optimization | 25.5 s | ~8m29s | 75.1 s | ~25m02s | 9121 MiB |
+| H3 Memory Optimization + H3 Sparse Attention (KV 100%) | 25.3 s | ~8m26s | 75.9 s | ~25m18s | 8763 MiB |
+| **H3 Memory Optimization + H3 Sparse Attention (KV 30%, default)** | **15.7 s** | **~5m13s** | **39.2 s** | **~13m04s** | **9425 MiB** |
+
+Against Comfy Kitchen INT8 dense, the default configuration is **1.75x faster at
+5s and 2.17x at 10s**. The advantage grows with sequence length, so a single
+speedup number understates it on long clips and overstates it on short ones.
+
+The three pack rows form an observed ladder. The last two steps change one
+thing; the first combines chunked QKV and bounded MLP:
+
+| step | 5s | 10s |
+| --- | ---: | ---: |
+| chunked QKV and bounded MLP | +7.5% | +13.3% |
+| public dense Kitchen to the native Kitchen INT8 kernel | +0.7% | -1.0% |
+| video KV density 100% to 30% | +61.5% | +93.7% |
+
+Chunked QKV is a memory optimization, not a compute-speed optimization. The
+observed QKV timing difference comes from Comfy Kitchen selecting CUTLASS config
+13 for the full large-sequence projection while 4K chunks select the faster
+config 0; forcing config 0 on the full projection accounts for that QKV speed
+change. A future dispatcher fix may therefore remove the timing difference,
+while the lower peak memory from chunking remains. The first row must not be
+read as QKV-only speed attribution.
+
+Sparsity is nearly all of it. The native kernel is not itself faster than
+ComfyUI's public dense `comfy_kitchen_int8` at equal density -- it is what makes
+the density reduction possible, and at 10s it is marginally slower at full
+density. Anyone weighing the pack for its kernel alone should read that row.
+
+VRAM is reported for 10s only, and deliberately. At 5s the card has enough
+headroom that physical VRAM is demand-driven: DynamicVRAM expands into whatever
+is free, so the peaks there measure available memory rather than what a
+configuration needs, and comparing them is misleading. At 10s the card is under
+real pressure and the figures separate: Comfy Kitchen dense reaches 11800 of
+12282 MiB, the pack configurations sit between 8763 and 9425 MiB, and
+SageAttention cannot complete the run at all.
+
+These are physical whole-GPU peaks from `nvidia-smi`, not allocator high-water
+marks, so they answer "does this fit on the card" rather than "how much did the
+allocator hold". The allocator-level figures elsewhere in this README are
+measured separately and are not comparable to these.
+
+Reproduce with `benchmarks/bench_attention_arms.py`, which drives a running
+ComfyUI server over its prompt API. The SageAttention row additionally requires
+a `sageattention` package and ComfyUI-KJNodes for the patch node; it is measured
+here as plain dense SageAttention, not Sparge/`spas_sage_attn`.
 
 ## Install
 
@@ -201,15 +294,16 @@ mismatched QKV format uses standard sparse QKV. An unvalidated Sparse Sage
 architecture uses the next backend only in `auto`; an explicit Sparse Sage
 request errors instead.
 
-Production node IDs are H3MemoryOptimization, H3SparseAttention, and
-H3SparseAttentionAdvanced. H3-Extended is not required.
+Production node IDs are H3MemoryOptimization, H3AIMDOResidencyLimiter,
+H3SparseAttention, and H3SparseAttentionAdvanced. H3-Extended is not required.
 
 ## Validation
 
-CPU tests cover node schemas, plan composition, backend classification, native
-shipping contracts, explicit sparse-backend selection, chunk boundaries and
-RoPE slices, non-H3 no-op behavior, sparse contract and route geometry, runtime
-step/layout publication, explicit early/middle/late density schedules,
+CPU tests cover node schemas, AIMDO limiter arithmetic and load callbacks, plan
+composition, backend classification, native shipping contracts, explicit
+sparse-backend selection, chunk boundaries and RoPE slices, non-H3 no-op
+behavior, sparse contract and route geometry, runtime step/layout publication,
+explicit early/middle/late density schedules,
 deterministic video-only ordering permutations and inverses, fixed-density
 ordering metrics, and source isolation. GPU kernel validation is intentionally
 separate because it requires the matching hardware and compiled backend
@@ -221,6 +315,14 @@ Run the CPU suite from the ComfyUI root:
 
     $env:CUDA_VISIBLE_DEVICES = '-1'
     .\.venv\Scripts\python.exe -m unittest discover -s custom_nodes\H3-Optimizations\tests -p 'test_*.py' -v
+
+The AIMDO residency behavior benchmark uses synthetic 1/2/3/4-page Comfy
+linear weights and runs every limiter level in a fresh process. Unlike a raw
+VBAR fault probe, it completes ComfyUI's temporary-buffer fallback, verifies
+the linear output, checks pin cleanup, and reports persistent VBAR pages,
+temporary cast buffers, AIMDO usage, and whole-device VRAM separately:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\.agents\skills\operate-comfy2-install\scripts\comfy_gpu_preflight.ps1 -- .\custom_nodes\H3-Optimizations\benchmarks\bench_aimdo_residency.py --i-understand-this-uses-gpu --output .\.agent\tmp\aimdo-residency.json
 
 The three-way attention benchmark derives each carrier contract from the
 current checkout and verifies identical sparse routes before timing:

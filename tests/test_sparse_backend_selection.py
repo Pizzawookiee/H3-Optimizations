@@ -216,10 +216,11 @@ class SparseBackendSelectionTests(unittest.TestCase):
         )
         kitchen = SimpleNamespace(__version__='test')
 
-        with mock.patch(
-            'h3_optimizations.attention.sparse.kitchen_sparse.preflight_sparse_kitchen',
+        with mock.patch.object(
+            apply_module,
+            'preflight_sparse_kitchen',
             return_value=kitchen,
-        ), mock.patch.object(
+        ) as preflight, mock.patch.object(
             apply_module,
             'producer_api_available',
             return_value=True,
@@ -234,6 +235,24 @@ class SparseBackendSelectionTests(unittest.TestCase):
         self.assertTrue(qkv.fused)
         self.assertTrue(attention.projector.routing_summaries)
         self.assertIs(attention.backend.projector, attention.projector)
+        self.assertEqual(
+            (attention.projector.q_tile, attention.projector.kv_tile),
+            (64, 64),
+        )
+        self.assertEqual(
+            (
+                attention.backend.executor.q_tile,
+                attention.backend.executor.kv_tile,
+            ),
+            (64, 64),
+        )
+        self.assertEqual(
+            (
+                preflight.call_args.kwargs['q_tile'],
+                preflight.call_args.kwargs['kv_tile'],
+            ),
+            (64, 64),
+        )
 
     def test_auto_prefers_kitchen(self):
         plan = H3OptimizationPlan(sparse=SparseRequest())
@@ -397,14 +416,6 @@ class SparseBackendSelectionTests(unittest.TestCase):
                     apply_module,
                     '_ensure_sparse_runtime',
                     return_value=(object(), True),
-                ), mock.patch.object(
-                    apply_module,
-                    'not_applicable_v_layout',
-                    return_value=SimpleNamespace(
-                        state='not_applicable',
-                        reason='synthetic',
-                        patched_blocks=0,
-                    ),
                 ):
                     apply_module.apply_plan(FakeModel(), plan)
 
@@ -476,15 +487,7 @@ class SparseBackendSelectionTests(unittest.TestCase):
             apply_module,
             '_ensure_sparse_runtime',
             return_value=(object(), True),
-        ) as ensure_runtime, mock.patch.object(
-            apply_module,
-            'not_applicable_v_layout',
-            return_value=SimpleNamespace(
-                state='not_applicable',
-                reason='synthetic',
-                patched_blocks=0,
-            ),
-        ):
+        ) as ensure_runtime:
             apply_module.apply_plan(FakeModel(), plan)
 
         configure.assert_called_once_with(

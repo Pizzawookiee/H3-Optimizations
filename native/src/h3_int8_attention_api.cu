@@ -47,11 +47,21 @@ void launch_sage_attn_kernel(
 void launch_sage_attn_sparse_kernel(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
     const void *k_scale, const void *v_scale, const void *lut,
-    const void *valid_block_num, int lut_stride, int cta_k, int B, int Lq,
-    int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
+    const void *valid_block_num, int lut_stride, int cta_q, int cta_k, int B,
+    int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
     int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
-    int o_st_bz, int o_st_n, int o_st_h, float sm_scale, int output_dtype_code,
-    cudaStream_t stream);
+    int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
+    float sm_scale, int output_dtype_code, cudaStream_t stream);
+
+void launch_sage_attn_sparse_kernel_lse(
+    const void *q, const void *k, const void *v, void *o, void *lse,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz,
+    int q_st_n, int q_st_h, int k_st_bz, int k_st_n, int k_st_h,
+    int v_st_bz, int v_st_h, int v_st_d, int o_st_bz, int o_st_n,
+    int o_st_h, int qs_st_bz, int qs_st_h, float sm_scale,
+    int output_dtype_code, cudaStream_t stream);
 
 const char *sage_attn_sparse_route_encoding();
 
@@ -122,7 +132,7 @@ void set_error(const char *what) {
 
 extern "C" {
 
-H3_API int h3_int8_abi_version() noexcept { return 1; }
+H3_API int h3_int8_abi_version() noexcept { return 3; }
 
 H3_API const char *h3_int8_last_error() noexcept {
   return g_last_error.empty() ? "" : g_last_error.c_str();
@@ -165,16 +175,34 @@ H3_API int h3_int8_dense_attention(
 H3_API int h3_int8_sparse_attention(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
     const void *k_scale, const void *v_scale, const void *lut,
-    const void *valid_block_num, int lut_stride, int cta_k, int B, int Lq,
-    int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
+    const void *valid_block_num, int lut_stride, int cta_q, int cta_k, int B,
+    int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
     int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
-    int o_st_bz, int o_st_n, int o_st_h, float sm_scale, int output_dtype_code,
-    uintptr_t stream) noexcept {
+    int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
+    float sm_scale, int output_dtype_code, uintptr_t stream) noexcept {
   H3_GUARD(launch_sage_attn_sparse_kernel(
       q, k, v, o, q_scale, k_scale, v_scale, lut, valid_block_num, lut_stride,
-      cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n,
-      k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n, o_st_h, sm_scale,
-      output_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+      cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h,
+      k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n,
+      o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_sparse_attention_lse(
+    const void *q, const void *k, const void *v, void *o, void *lse,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz,
+    int q_st_n, int q_st_h, int k_st_bz, int k_st_n, int k_st_h,
+    int v_st_bz, int v_st_h, int v_st_d, int o_st_bz, int o_st_n,
+    int o_st_h, int qs_st_bz, int qs_st_h, float sm_scale,
+    int output_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_sparse_kernel_lse(
+      q, k, v, o, lse, q_scale, k_scale, v_scale, lut, valid_block_num,
+      lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
+      q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
+      o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
 }
 
 H3_API int h3_int8_quantize_qk(

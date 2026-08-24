@@ -19,6 +19,7 @@ import comfy.options  # noqa: E402
 
 comfy.options.enable_args_parsing()
 
+from h3_optimizations.aimdo_limiter import H3AIMDOResidencyLimiter  # noqa: E402
 from h3_optimizations.nodes import (  # noqa: E402
     H3MemoryOptimization,
     H3SparseAttention,
@@ -43,6 +44,7 @@ class PublicNodeTests(unittest.TestCase):
             nodes,
             [
                 H3MemoryOptimization,
+                H3AIMDOResidencyLimiter,
                 H3SparseAttention,
                 H3SparseAttentionAdvanced,
             ],

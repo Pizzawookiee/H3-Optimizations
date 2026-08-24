@@ -346,7 +346,7 @@ class SparseTileRouter:
         context = dense_delta[:context_count].view(1, 1, 1, -1).expand(
             batch,
             heads,
-            geometry.pure_video_q_tiles,
+            indices.shape[-2],
             -1,
         )
         previous = dense[context_count - 1] if context_count else 0

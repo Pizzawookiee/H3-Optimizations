@@ -7,10 +7,9 @@ to be retired in favour of.
 
 Two things differ from the Sparse Sage backend and both are deliberate.
 
-The KV tile is 128, not 64. 128x64 was Sparge's SM89 ABI rather than an H3
-decision, and on the production H3 shape the wider tile measured ~21% faster
-against Sparse Sage at every density from 100% down to 10%, with no loss in
-selection quality. The router already takes its tile size as a parameter.
+The production default is 64Q x 64KV. It preserves substantially more useful
+route geometry at very low attention budgets than the larger tiles without
+changing the carrier format or the router's density policy.
 
 Q/K/V are quantized by Kitchen rather than by the Triton per-tile quantizer.
 Kitchen's carrier is four transforms -- K-anchor detection, anchor subtraction,
@@ -39,11 +38,15 @@ OUTPUT_HND = 'hnd'
 OUTPUT_NHD = 'nhd'
 OUTPUT_LAYOUTS = (OUTPUT_HND, OUTPUT_NHD)
 
+# Keep low-level/research defaults stable. The production resolver passes the
+# selected geometry explicitly through preflight, projection, and execution.
 Q_TILE = 128
-# Measured on SM89: the 128-wide KV tile beats the 64-wide one by 17-19% in
-# the sparse kernel and leaves selection quality unchanged at matched density.
 KV_TILE = 128
+PRODUCTION_Q_TILE = 64
+PRODUCTION_KV_TILE = 64
 HEAD_DIM = 128
+
+_LEGACY_SPARSE_GEOMETRIES = ((128, 64), (128, 128))
 
 
 def _kitchen():
@@ -75,7 +78,9 @@ def _kitchen():
     return comfy_kitchen
 
 
-def preflight_sparse_kitchen(*, cuda_available, capability_getter, kitchen=None):
+def preflight_sparse_kitchen(
+    *, cuda_available, capability_getter, kitchen=None, q_tile=None, kv_tile=None
+):
     '''Resolve the Kitchen sparse kernel, or say exactly why it is unavailable.'''
     if not cuda_available():
         raise SparseKitchenError('Kitchen sparse attention requires CUDA')
@@ -93,6 +98,21 @@ def preflight_sparse_kitchen(*, cuda_available, capability_getter, kitchen=None)
         raise SparseKitchenError(
             'the comfy-kitchen CUDA extension is not available on this device'
         )
+    if q_tile is not None or kv_tile is not None:
+        geometry = (
+            Q_TILE if q_tile is None else int(q_tile),
+            KV_TILE if kv_tile is None else int(kv_tile),
+        )
+        supported = getattr(
+            module,
+            'SPARSE_GEOMETRIES',
+            _LEGACY_SPARSE_GEOMETRIES,
+        )
+        if geometry not in supported:
+            raise SparseKitchenError(
+                'Kitchen sparse attention does not support %dQ x %dKV'
+                % geometry
+            )
     return module
 
 
@@ -164,11 +184,13 @@ class SparseKitchenExecutor:
         self,
         kitchen,
         *,
+        q_tile=Q_TILE,
         kv_tile=KV_TILE,
         allow_cpu_for_tests=False,
         output_layout=OUTPUT_HND,
     ):
         self.kitchen = kitchen
+        self.q_tile = int(q_tile)
         self.kv_tile = int(kv_tile)
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
         if output_layout not in OUTPUT_LAYOUTS:
@@ -235,7 +257,7 @@ class SparseKitchenExecutor:
             route = self.kitchen.BlockSparseRoute(
                 indices=lut,
                 counts=valid_block_num,
-                q_tile=Q_TILE,
+                q_tile=self.q_tile,
                 kv_tile=self.kv_tile,
                 encoding='delta',
             )
@@ -256,6 +278,24 @@ class SparseKitchenExecutor:
             prepared.quantized, prepared.route, output_layout=self.output_layout
         )
 
+    def execute_with_lse(self, prepared):
+        operation = getattr(
+            self.kitchen,
+            'block_sparse_int8_attention_with_lse_from_prequantized',
+            None,
+        )
+        if operation is None:
+            raise SparseKitchenError(
+                'Kitchen sparse attention cannot expose the exact softmax state'
+            )
+        if self.output_layout == OUTPUT_HND:
+            return operation(prepared.quantized, prepared.route)
+        return operation(
+            prepared.quantized,
+            prepared.route,
+            output_layout=self.output_layout,
+        )
+
 
 class SparseKitchenBackend:
     name = 'sparse_kitchen_int8'
@@ -274,6 +314,8 @@ class SparseKitchenBackend:
         output_layout=OUTPUT_HND,
         release_carrier_before_out_proj=False,
         score_chunk_tiles=None,
+        q_tile=Q_TILE,
+        kv_tile=KV_TILE,
     ):
         self.config = config or HybridSparseConfig()
         if not isinstance(self.config, HybridSparseConfig):
@@ -286,6 +328,8 @@ class SparseKitchenBackend:
         module = _kitchen() if kitchen is None else kitchen
         self.executor = executor or SparseKitchenExecutor(
             module,
+            q_tile=q_tile,
+            kv_tile=kv_tile,
             allow_cpu_for_tests=allow_cpu_for_tests,
             output_layout=output_layout,
         )
@@ -294,13 +338,13 @@ class SparseKitchenBackend:
         )
         self.router = router or SparseTileRouter(
             self.config,
-            q_tile=Q_TILE,
+            q_tile=self.executor.q_tile,
             kv_tile=self.executor.kv_tile,
             score_chunk_tiles=score_chunk_tiles,
         )
         self.projector = projector
         if (self.router.q_tile, self.router.kv_tile) != (
-            Q_TILE,
+            self.executor.q_tile,
             self.executor.kv_tile,
         ):
             raise SparseKitchenError(
@@ -308,7 +352,7 @@ class SparseKitchenBackend:
                 % (
                     self.router.q_tile,
                     self.router.kv_tile,
-                    Q_TILE,
+                    self.executor.q_tile,
                     self.executor.kv_tile,
                 )
             )
@@ -319,6 +363,7 @@ class SparseKitchenBackend:
             self.name,
             self.config.signature,
             (type(self.router).__module__, type(self.router).__qualname__),
+            int(self.executor.q_tile),
             int(self.executor.kv_tile),
             str(self.output_layout),
             bool(self.release_carrier_before_out_proj),
@@ -427,6 +472,9 @@ class SparseKitchenBackend:
     def execute(self, prepared):
         return self.executor.execute(prepared)
 
+    def execute_with_lse(self, prepared):
+        return self.executor.execute_with_lse(prepared)
+
     def as_status(self):
         return {
             'mode': self.config.mode,
@@ -434,7 +482,7 @@ class SparseKitchenBackend:
             'denser_early_late_steps': bool(self.config.denser_early_late_steps),
             'density_mode': self.config.density_mode,
             'sparse_architecture': 'comfy_kitchen_int8',
-            'sparse_q_tile': Q_TILE,
+            'sparse_q_tile': int(self.executor.q_tile),
             'sparse_kv_tile': int(self.executor.kv_tile),
             'sparse_v_format': 'int8',
             'route_encoding': 'delta',

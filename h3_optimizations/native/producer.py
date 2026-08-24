@@ -117,7 +117,9 @@ def _shape4(name, shape):
     return normalized
 
 
-def int8_attention_producer_spec(q_shape, k_shape, *, dtype, device, scale=None):
+def int8_attention_producer_spec(
+    q_shape, k_shape, *, dtype, device, scale=None, cta_k=None
+):
     """Fix the carrier geometry before any chunk is produced."""
     if not int8_attention_producer_is_available(device):
         raise Int8AttentionProducerUnavailableError(
@@ -135,7 +137,16 @@ def int8_attention_producer_spec(q_shape, k_shape, *, dtype, device, scale=None)
     original_head_dim = q_input_shape[3]
     kernel_head_dim = _kernel_head_dim(original_head_dim)
     kv_length = k_input_shape[2]
-    cta_k = select_cta_k(kernel_head_dim, kv_length)
+    if cta_k is None:
+        cta_k = select_cta_k(kernel_head_dim, kv_length)
+    else:
+        cta_k = int(cta_k)
+        if cta_k not in (CTA_K, LARGE_CTA_K):
+            raise ValueError(
+                'cta_k must be %d or %d' % (CTA_K, LARGE_CTA_K)
+            )
+        if kernel_head_dim == 64 and cta_k != CTA_K:
+            raise ValueError('head_dim 64 requires cta_k %d' % CTA_K)
     return Int8AttentionProducerSpec(
         abi_version=INT8_ATTENTION_PRODUCER_ABI_VERSION,
         backend='h3_native',

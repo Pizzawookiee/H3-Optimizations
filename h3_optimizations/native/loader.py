@@ -28,9 +28,14 @@ import threading
 
 import torch
 
-ABI_VERSION = 1
+ABI_VERSION = 3
 
 _LIBRARY_NAMES = {
+    'Windows': 'h3_int8_attention_v3.dll',
+    'Linux': 'libh3_int8_attention.so',
+    'Darwin': 'libh3_int8_attention.dylib',
+}
+_LOCAL_LIBRARY_NAMES = {
     'Windows': 'h3_int8_attention.dll',
     'Linux': 'libh3_int8_attention.so',
     'Darwin': 'libh3_int8_attention.dylib',
@@ -55,6 +60,7 @@ def _candidate_paths():
     name = _LIBRARY_NAMES.get(platform.system())
     if name is None:
         return []
+    local_name = _LOCAL_LIBRARY_NAMES[platform.system()]
     override = os.environ.get('H3_INT8_ATTENTION_LIBRARY')
     candidates = [pathlib.Path(override)] if override else []
     candidates.extend(
@@ -62,10 +68,10 @@ def _candidate_paths():
             # Shipped in the repo, which is how this pack distributes it.
             _PACK_ROOT / 'native' / 'bin' / name,
             # Optional local installation path retained for developers.
-            _PACK_ROOT / 'native' / 'lib' / name,
+            _PACK_ROOT / 'native' / 'lib' / local_name,
             # A local CMake build, single- and multi-config generators.
-            _PACK_ROOT / 'native' / 'build' / name,
-            _PACK_ROOT / 'native' / 'build' / 'Release' / name,
+            _PACK_ROOT / 'native' / 'build' / local_name,
+            _PACK_ROOT / 'native' / 'build' / 'Release' / local_name,
         ]
     )
     return candidates
@@ -112,7 +118,13 @@ def _bind(library):
 
     library.h3_int8_sparse_attention.restype = i
     library.h3_int8_sparse_attention.argtypes = (
-        attention_common + [p, p, i, i] + geometry + strides + [f, i, sz]
+        attention_common + [p, p, i, i, i] + geometry + strides
+        + [i, i, f, i, sz]
+    )
+    library.h3_int8_sparse_attention_lse.restype = i
+    library.h3_int8_sparse_attention_lse.argtypes = (
+        [p] * 8 + [p, p, i, i, i] + geometry + strides
+        + [i, i, f, i, sz]
     )
 
     library.h3_int8_quantize_qk.restype = i
@@ -174,14 +186,27 @@ def load(force_reload=False):
             _load_error = 'could not load %s: %s' % (path, error)
             raise NativeUnavailableError(_load_error) from error
 
-        _bind(library)
-        found = library.h3_int8_abi_version()
+        try:
+            library.h3_int8_abi_version.restype = ctypes.c_int
+            library.h3_int8_abi_version.argtypes = []
+            found = library.h3_int8_abi_version()
+        except AttributeError as error:
+            _load_error = 'vendored library at %s has no ABI entry point' % path
+            raise NativeUnavailableError(_load_error) from error
         if found != ABI_VERSION:
             _load_error = (
                 'vendored library at %s reports ABI %d; this build expects %d. '
                 'Rebuild native/.' % (path, found, ABI_VERSION)
             )
             raise NativeUnavailableError(_load_error)
+        try:
+            _bind(library)
+        except AttributeError as error:
+            _load_error = (
+                'vendored library at %s is missing an ABI %d entry point: %s'
+                % (path, ABI_VERSION, error)
+            )
+            raise NativeUnavailableError(_load_error) from error
 
         _library = library
         _load_error = None
