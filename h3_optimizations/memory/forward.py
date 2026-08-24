@@ -24,6 +24,7 @@ from .observer import get_mlp_observer, notify_exact_mlp, notify_mlp_block_end
 from .sharing import get_mlp_sharing
 from ..mlp_sharing.route import get_route_recorder
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
+from ..qkv.formats import describe_linear
 from ..runtime.stage_prefetch import (
     abandon_stage_prefetch,
     begin_stage_prefetch,
@@ -221,10 +222,14 @@ def make_forward(block, layer_index, config, original_forward=None):
         # transfer while norm/modulation work runs, without bringing
         # out_proj/fc1/fc2 into the same residency peak.
         use_stage_prefetch = stage_prefetch_enabled(transformer_options)
+        streamed_convrot_workspace = (
+            use_stage_prefetch
+            and describe_linear(block.attn.qkv_proj).convrot_int8_256
+        )
         qkv_ticket = begin_stage_prefetch(
             block.attn.qkv_proj,
             x.device,
-            enabled=use_stage_prefetch,
+            enabled=use_stage_prefetch and not streamed_convrot_workspace,
         )
 
         # Scalar modulation keeps the original whole-segment fast path. Only
