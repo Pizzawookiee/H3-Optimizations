@@ -11,6 +11,12 @@ import comfy.ops
 import comfy.quant_ops
 from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
+from ..runtime.stage_prefetch import (
+    abandon_stage_prefetch,
+    begin_stage_prefetch,
+    finish_stage_prefetch,
+)
+
 
 _CONVROT_MLPS = weakref.WeakValueDictionary()
 _CONVROT_MLP_IDS = itertools.count(1)
@@ -352,10 +358,18 @@ def _convrot_linear(x, qdata, scale, input_act=None):
 class ConvRotTwoSliceMLP:
     """Prepack two half-width ConvRot feature tiles for one H3 MLP block."""
 
-    def __init__(self, mlp, sample, convrot_linear=None):
+    def __init__(
+        self,
+        mlp,
+        sample,
+        convrot_linear=None,
+        *,
+        stage_prefetch=False,
+    ):
         self.mlp = mlp
         self.sample = sample
         self.convrot_linear = convrot_linear or _convrot_linear
+        self.stage_prefetch = bool(stage_prefetch)
         self.tiles = None
 
     def __enter__(self):
@@ -411,7 +425,19 @@ class ConvRotTwoSliceMLP:
             fc1_qdata = None
             fc1_scale = None
 
-            fc2 = acquire_linear(self.mlp.fc2, self.sample)
+            # Do not overlap the original full fc1 weight with fc2. Once fc1
+            # has been converted to its execution tiles, fault only fc2.
+            fc2_ticket = begin_stage_prefetch(
+                self.mlp.fc2,
+                self.sample.device,
+                enabled=self.stage_prefetch,
+            )
+            try:
+                finish_stage_prefetch(fc2_ticket)
+                fc2_ticket = None
+                fc2 = acquire_linear(self.mlp.fc2, self.sample)
+            finally:
+                abandon_stage_prefetch(fc2_ticket)
             if fc2.bias is not None:
                 raise ValueError("fc2 ConvRot weight must not have a bias")
             fc2_qdata, fc2_scale = _convrot_parts(fc2.weight, "fc2")

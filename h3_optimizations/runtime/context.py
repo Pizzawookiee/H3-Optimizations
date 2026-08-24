@@ -9,6 +9,10 @@ import torch
 import comfy.utils
 
 from .layout import resolve_layout
+from .stage_prefetch import (
+    configure_stage_prefetch,
+    log_stage_prefetch_enabled,
+)
 
 RUNTIME_KEY = 'h3_optimizations_runtime'
 RUNTIME_SESSION_KEY = 'h3_optimizations_runtime_session'
@@ -196,6 +200,8 @@ def make_outer_wrapper(session):
 def make_diffusion_wrapper(session):
     def wrapper(executor, *args, **kwargs):
         options, args, kwargs = _transformer_options(args, kwargs, 3)
+        if configure_stage_prefetch(options):
+            log_stage_prefetch_enabled()
         x = args[0] if args else kwargs.get('x')
         context = args[2] if len(args) > 2 else kwargs.get('context')
         session.observe(
@@ -214,6 +220,11 @@ def make_apply_model_wrapper(session):
 
     def wrapper(executor, *args, **kwargs):
         options, args, kwargs = _transformer_options(args, kwargs, 5)
+        # This marker is preserved into BaseModel's copied transformer options.
+        # Non-compiled H3 additionally clears stock block prefetch in the
+        # diffusion wrapper after BaseModel has enabled dynamic VBAR prefetch.
+        if configure_stage_prefetch(options):
+            log_stage_prefetch_enabled()
         x = args[0] if args else kwargs.get('x')
         latent_shapes = kwargs.get('latent_shapes')
         layout_x = (

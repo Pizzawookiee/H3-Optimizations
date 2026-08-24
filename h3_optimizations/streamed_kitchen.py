@@ -48,6 +48,12 @@ from .mlp_sharing.route import router_kwargs as _route_kwargs
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.w4a8 import HeldW4A8QKV
+from .runtime.stage_prefetch import (
+    abandon_stage_prefetch,
+    begin_stage_prefetch,
+    finish_stage_prefetch,
+    stage_prefetch_enabled,
+)
 
 ATTENTION_MEMORY_MODE_KEY = 'h3_optimizations_attention_memory_mode'
 QUERY_CHUNK_ROWS_KEY = 'h3_optimizations_query_chunk_rows'
@@ -75,6 +81,7 @@ class PreparedStreamedKitchenQKV:
     cta_k: int
     sequence: int
     query_chunk_rows: int
+    stage_prefetch: bool = False
 
     def release_summaries(self):
         self.q_summary = None
@@ -238,6 +245,7 @@ def run_streamed_kitchen_qkv(
     chunk_rows,
     query_chunk_rows,
     strided_qk_input,
+    stage_prefetch=False,
 ):
     '''Prepare full K/V INT8 and route summaries without a full Q carrier.'''
     kitchen = resolve_kitchen(x.device)
@@ -365,6 +373,7 @@ def run_streamed_kitchen_qkv(
             query_chunk_rows=normalize_query_chunk_rows(
                 query_chunk_rows
             ),
+            stage_prefetch=bool(stage_prefetch),
         )
     finally:
         if held is not None:
@@ -420,6 +429,14 @@ def execute_streamed_projected(backend, module, prepared):
             )
     else:
         held = _held_projector(module, projected.x)
+
+    # out_proj is the next stage after the Q-only slice. Fault it while the
+    # first local-Q projection / carrier pack / sparse kernel is running.
+    out_ticket = begin_stage_prefetch(
+        module.out_proj,
+        projected.x.device,
+        enabled=projected.stage_prefetch,
+    )
     try:
         for start in range(0, sequence, query_rows):
             end = min(start + query_rows, sequence)
@@ -478,6 +495,9 @@ def execute_streamed_projected(backend, module, prepared):
                 int(module.heads) * int(module.head_dim),
             )
             del raw
+            if out_ticket is not None:
+                finish_stage_prefetch(out_ticket)
+                out_ticket = None
             with diagnostics.stage('streamed_attention_out'):
                 local = module.out_proj(out.squeeze(0))
             del out
@@ -496,6 +516,7 @@ def execute_streamed_projected(backend, module, prepared):
         prepared.release()
         return result
     finally:
+        abandon_stage_prefetch(out_ticket)
         q_weight = None
         if held is not None:
             held.__exit__(None, None, None)
@@ -558,6 +579,7 @@ def _stream_aware_project(
             transformer_options
         ),
         strided_qk_input=self.strided_qk_input,
+        stage_prefetch=stage_prefetch_enabled(transformer_options),
     )
 
 

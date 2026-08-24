@@ -24,6 +24,11 @@ from .observer import get_mlp_observer, notify_exact_mlp, notify_mlp_block_end
 from .sharing import get_mlp_sharing
 from ..mlp_sharing.route import get_route_recorder
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
+from ..runtime.stage_prefetch import (
+    begin_stage_prefetch,
+    finish_stage_prefetch,
+    stage_prefetch_enabled,
+)
 
 LOG_PREFIX = '[H3 Optimizations]'
 
@@ -83,7 +88,7 @@ def _open_fp8(block, sample, config):
         return None, '%s: %s' % (type(exc).__name__, exc)
 
 
-def _open_mlp(block, sample, config):
+def _open_mlp(block, sample, config, *, stage_prefetch=False):
     if config.fp8:
         held, error = _open_fp8(block, sample, config)
         return held, 'fp8' if held is not None else 'module', error
@@ -92,7 +97,11 @@ def _open_mlp(block, sample, config):
         held, error = _open_generic_held(block, sample, config)
         return held, 'held' if held is not None else 'module', error
 
-    held = ConvRotTwoSliceMLP(block.mlp, sample)
+    held = ConvRotTwoSliceMLP(
+        block.mlp,
+        sample,
+        stage_prefetch=stage_prefetch,
+    )
     try:
         held.__enter__()
         return held, 'convrot', None
@@ -198,6 +207,17 @@ def make_forward(block, layer_index, config, original_forward=None):
             )
         )
 
+        # Stock MiniMax H3 prefetches the entire next transformer block.
+        # Streamed mode replaces that with one-stage lookahead: qkv_proj can
+        # transfer while norm/modulation work runs, without bringing
+        # out_proj/fc1/fc2 into the same residency peak.
+        use_stage_prefetch = stage_prefetch_enabled(transformer_options)
+        qkv_ticket = begin_stage_prefetch(
+            block.attn.qkv_proj,
+            x.device,
+            enabled=use_stage_prefetch,
+        )
+
         # Scalar modulation keeps the original whole-segment fast path. Only
         # ComfyUI's per-token noise-mask selectors are gathered in bounded slabs
         # so long masked sequences do not materialize full [tokens, hidden]
@@ -213,10 +233,19 @@ def make_forward(block, layer_index, config, original_forward=None):
                 scale_msa,
                 selector,
             )
+        finish_stage_prefetch(qkv_ticket)
+        qkv_ticket = None
         attn_out = block.attn(
             h,
             rope_freqs=rope_freqs,
             transformer_options=transformer_options,
+        )
+        # Start fc1 as soon as attention completes. Transfer can overlap the
+        # route bookkeeping and gated residual accumulation below.
+        fc1_ticket = begin_stage_prefetch(
+            block.mlp.fc1,
+            x.device,
+            enabled=use_stage_prefetch,
         )
         if route_recorder is not None:
             route_recorder.record_attention_energy(
@@ -238,7 +267,14 @@ def make_forward(block, layer_index, config, original_forward=None):
             )
         del h, attn_out
 
-        held, mlp_path, held_error = _open_mlp(block, x[:1], config)
+        finish_stage_prefetch(fc1_ticket)
+        fc1_ticket = None
+        held, mlp_path, held_error = _open_mlp(
+            block,
+            x[:1],
+            config,
+            stage_prefetch=use_stage_prefetch,
+        )
         mlp_observer = get_mlp_observer(transformer_options)
         mlp_sharing = get_mlp_sharing(transformer_options)
         if mlp_observer is not None and mlp_sharing is not None:
