@@ -18,21 +18,35 @@ def _unsupported(required, message):
 
 
 class SparseFusedQKVProjector:
-    """Guard chunked Sparse Sage QKV and fall back for auto requests."""
+    """Guard streamed Sparse Sage QKV and fall back for auto requests.
+
+    ConvRot INT8 is the only Sparse Sage provider routed through the streamed
+    execution path.  Other checkpoint formats keep their existing projectors
+    until they have equivalent provider-specific validation.
+    """
 
     name = "chunked_sparse_sage_qkv"
-    qk_format = "sparge_block_int8"
+    qk_format = "streamed_q_sparge_block_int8"
+    streamed_q = True
 
-    def __init__(self, spec, required=False, chunk_rows=4096):
-        from ..attention.sparse.chunked_qkv import (
-            ChunkedSparseQKVProjector as Implementation,
+    def __init__(
+        self,
+        spec,
+        required=False,
+        chunk_rows=4096,
+        query_chunk_rows=4096,
+    ):
+        from ..attention.sparse.sparse_sage_streamed import (
+            StreamedSparseSageQKVProjector as Implementation,
         )
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
+        self.query_chunk_rows = int(query_chunk_rows)
         self._implementation = Implementation(
             spec,
-            chunk_rows=self.chunk_rows,
+            project_chunk_rows=self.chunk_rows,
+            query_chunk_rows=self.query_chunk_rows,
         )
 
     @property

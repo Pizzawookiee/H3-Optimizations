@@ -195,6 +195,24 @@ class HybridSparseBackend:
         layer_index,
         transformer_options,
     ):
+        # The ConvRot Sparse Sage projector uses a separate lifetime contract:
+        # it keeps global K/V, routing summaries, and the original input but no
+        # full Q carrier.  Detect it here without changing provider resolution.
+        from .sparse_sage_streamed import (
+            StreamedSparseSageQKV,
+            prepare_streamed_sparse_sage,
+        )
+
+        if isinstance(projected, StreamedSparseSageQKV):
+            return PreparedHybrid(
+                sparse=prepare_streamed_sparse_sage(
+                    self,
+                    projected,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+            )
+
         snapshot = self._snapshot(
             transformer_options,
             projected.sequence,
@@ -229,7 +247,31 @@ class HybridSparseBackend:
         )
         return PreparedHybrid(sparse=sparse)
 
+    def execute_projected(self, module, prepared):
+        '''Return a final hidden-size tensor when the projected path owns out_proj.'''
+        from .sparse_sage_streamed import (
+            PreparedStreamedSparseSage,
+            execute_streamed_sparse_sage,
+        )
+
+        if (
+            isinstance(prepared, PreparedHybrid)
+            and isinstance(prepared.sparse, PreparedStreamedSparseSage)
+        ):
+            return execute_streamed_sparse_sage(
+                module,
+                self,
+                prepared.sparse,
+            )
+        return None
+
     def execute(self, prepared):
+        from .sparse_sage_streamed import PreparedStreamedSparseSage
+
+        if isinstance(prepared.sparse, PreparedStreamedSparseSage):
+            raise SparseSageError(
+                'streamed Sparse Sage must execute through execute_projected'
+            )
         return self.executor.execute(prepared.sparse)
 
     def as_status(self):
@@ -252,4 +294,6 @@ class HybridSparseBackend:
             'qkv_projector': getattr(self.projector, 'name', None),
             'qkv_chunk_rows': getattr(self.projector, 'chunk_rows', None),
             'smooth_k': False if self.projector is not None else True,
+            'streamed_q': bool(getattr(self.projector, 'streamed_q', False)),
+            'query_chunk_rows': getattr(self.projector, 'query_chunk_rows', None),
         }
