@@ -127,6 +127,23 @@ def flatten_attention_output(module, out, source):
 
 
 def _finish_projected(module, backend, prepared):
+    # A streamed backend may own the full attention -> out_proj lifetime and
+    # return the final hidden-size tensor directly. This is deliberately
+    # opt-in so Kitchen, Triton, BF16 and legacy projected contracts stay put.
+    execute_projected = getattr(backend, 'execute_projected', None)
+    if execute_projected is not None:
+        direct = execute_projected(module, prepared)
+        if direct is not None:
+            if direct.ndim != 2:
+                raise RuntimeError(
+                    '%s returned rank-%d direct projected output; expected rank 2'
+                    % (
+                        getattr(backend, 'name', type(backend).__name__),
+                        direct.ndim,
+                    )
+                )
+            return direct
+
     name = getattr(backend, 'name', type(backend).__name__)
     raw = backend.execute(prepared)
     out = flatten_attention_output(module, raw, name)
