@@ -25,9 +25,10 @@ from .sharing import get_mlp_sharing
 from ..mlp_sharing.route import get_route_recorder
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 from ..runtime.stage_prefetch import (
+    abandon_stage_prefetch,
     begin_stage_prefetch,
-    finish_stage_prefetch,
     stage_prefetch_enabled,
+    wait_stage_prefetch,
 )
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -88,7 +89,14 @@ def _open_fp8(block, sample, config):
         return None, '%s: %s' % (type(exc).__name__, exc)
 
 
-def _open_mlp(block, sample, config, *, stage_prefetch=False):
+def _open_mlp(
+    block,
+    sample,
+    config,
+    *,
+    stage_prefetch=False,
+    fc1_prefetch_ticket=None,
+):
     if config.fp8:
         held, error = _open_fp8(block, sample, config)
         return held, 'fp8' if held is not None else 'module', error
@@ -101,6 +109,7 @@ def _open_mlp(block, sample, config, *, stage_prefetch=False):
         block.mlp,
         sample,
         stage_prefetch=stage_prefetch,
+        fc1_prefetch_ticket=fc1_prefetch_ticket,
     )
     try:
         held.__enter__()
@@ -233,19 +242,30 @@ def make_forward(block, layer_index, config, original_forward=None):
                 scale_msa,
                 selector,
             )
-        finish_stage_prefetch(qkv_ticket)
+        wait_stage_prefetch(qkv_ticket)
+        block.attn._h3_optimizations_qkv_prefetch_ticket = qkv_ticket
         qkv_ticket = None
-        attn_out = block.attn(
-            h,
-            rope_freqs=rope_freqs,
-            transformer_options=transformer_options,
-        )
+        try:
+            attn_out = block.attn(
+                h,
+                rope_freqs=rope_freqs,
+                transformer_options=transformer_options,
+            )
+        finally:
+            leftover = getattr(
+                block.attn,
+                '_h3_optimizations_qkv_prefetch_ticket',
+                None,
+            )
+            if hasattr(block.attn, '_h3_optimizations_qkv_prefetch_ticket'):
+                delattr(block.attn, '_h3_optimizations_qkv_prefetch_ticket')
+            abandon_stage_prefetch(leftover)
         # Start fc1 as soon as attention completes. Transfer can overlap the
         # route bookkeeping and gated residual accumulation below.
         fc1_ticket = begin_stage_prefetch(
             block.mlp.fc1,
             x.device,
-            enabled=use_stage_prefetch,
+            enabled=use_stage_prefetch and config.convrot_2slice,
         )
         if route_recorder is not None:
             route_recorder.record_attention_energy(
@@ -267,14 +287,18 @@ def make_forward(block, layer_index, config, original_forward=None):
             )
         del h, attn_out
 
-        finish_stage_prefetch(fc1_ticket)
-        fc1_ticket = None
-        held, mlp_path, held_error = _open_mlp(
-            block,
-            x[:1],
-            config,
-            stage_prefetch=use_stage_prefetch,
-        )
+        wait_stage_prefetch(fc1_ticket)
+        try:
+            held, mlp_path, held_error = _open_mlp(
+                block,
+                x[:1],
+                config,
+                stage_prefetch=use_stage_prefetch,
+                fc1_prefetch_ticket=fc1_ticket,
+            )
+            fc1_ticket = None
+        finally:
+            abandon_stage_prefetch(fc1_ticket)
         mlp_observer = get_mlp_observer(transformer_options)
         mlp_sharing = get_mlp_sharing(transformer_options)
         if mlp_observer is not None and mlp_sharing is not None:

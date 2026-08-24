@@ -14,7 +14,8 @@ from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 from ..runtime.stage_prefetch import (
     abandon_stage_prefetch,
     begin_stage_prefetch,
-    finish_stage_prefetch,
+    release_stage_prefetch,
+    wait_stage_prefetch,
 )
 
 
@@ -365,17 +366,21 @@ class ConvRotTwoSliceMLP:
         convrot_linear=None,
         *,
         stage_prefetch=False,
+        fc1_prefetch_ticket=None,
     ):
         self.mlp = mlp
         self.sample = sample
         self.convrot_linear = convrot_linear or _convrot_linear
         self.stage_prefetch = bool(stage_prefetch)
+        self.fc1_prefetch_ticket = fc1_prefetch_ticket
         self.tiles = None
 
     def __enter__(self):
         if self.sample.dtype != torch.bfloat16:
             raise TypeError("mlp_chunked_convrot_2slice requires BF16 input")
         if torch.compiler.is_compiling():
+            abandon_stage_prefetch(self.fc1_prefetch_ticket)
+            self.fc1_prefetch_ticket = None
             module_id = getattr(self.mlp, "_h3_optimizations_convrot_mlp_id", None)
             if module_id is None:
                 raise RuntimeError("H3 ConvRot MLP was not registered")
@@ -403,6 +408,7 @@ class ConvRotTwoSliceMLP:
         fc1 = None
         fc2 = None
         try:
+            wait_stage_prefetch(self.fc1_prefetch_ticket)
             fc1 = acquire_linear(self.mlp.fc1, self.sample)
             if fc1.bias is not None:
                 raise ValueError("fc1 ConvRot weight must not have a bias")
@@ -424,6 +430,8 @@ class ConvRotTwoSliceMLP:
             fc1 = None
             fc1_qdata = None
             fc1_scale = None
+            release_stage_prefetch(self.fc1_prefetch_ticket)
+            self.fc1_prefetch_ticket = None
 
             # Do not overlap the original full fc1 weight with fc2. Once fc1
             # has been converted to its execution tiles, fault only fc2.
@@ -433,24 +441,26 @@ class ConvRotTwoSliceMLP:
                 enabled=self.stage_prefetch,
             )
             try:
-                finish_stage_prefetch(fc2_ticket)
-                fc2_ticket = None
+                wait_stage_prefetch(fc2_ticket)
                 fc2 = acquire_linear(self.mlp.fc2, self.sample)
+                if fc2.bias is not None:
+                    raise ValueError("fc2 ConvRot weight must not have a bias")
+                fc2_qdata, fc2_scale = _convrot_parts(fc2.weight, "fc2")
+                if fc2_qdata.shape[0] != hidden_width:
+                    raise ValueError("fc1/fc2 hidden dimensions are incompatible")
+                if fc2_qdata.shape[1] != half_width:
+                    raise ValueError("fc1/fc2 dimensions are not a SwiGLU pair")
+                if half_width % 2 or (half_width // 2) % 256:
+                    raise ValueError("H3 FFN width must split into two group-aligned tiles")
+                fc2_weight_0, fc2_weight_1, fc2_scale = _convrot_fc2_tiles_op(
+                    fc2_qdata, fc2_scale
+                )
+                fc2_tiles = (fc2_weight_0, fc2_weight_1)
             finally:
-                abandon_stage_prefetch(fc2_ticket)
-            if fc2.bias is not None:
-                raise ValueError("fc2 ConvRot weight must not have a bias")
-            fc2_qdata, fc2_scale = _convrot_parts(fc2.weight, "fc2")
-            if fc2_qdata.shape[0] != hidden_width:
-                raise ValueError("fc1/fc2 hidden dimensions are incompatible")
-            if fc2_qdata.shape[1] != half_width:
-                raise ValueError("fc1/fc2 dimensions are not a SwiGLU pair")
-            if half_width % 2 or (half_width // 2) % 256:
-                raise ValueError("H3 FFN width must split into two group-aligned tiles")
-            fc2_weight_0, fc2_weight_1, fc2_scale = _convrot_fc2_tiles_op(
-                fc2_qdata, fc2_scale
-            )
-            fc2_tiles = (fc2_weight_0, fc2_weight_1)
+                if fc2 is not None:
+                    fc2.release()
+                    fc2 = None
+                release_stage_prefetch(fc2_ticket)
             self.tiles = tuple(
                 {
                     "fc1_weight": fc1_tile[0],
@@ -460,14 +470,14 @@ class ConvRotTwoSliceMLP:
                 }
                 for fc1_tile, fc2_tile in zip(fc1_tiles, fc2_tiles)
             )
-            fc2.release()
-            fc2 = None
             return self
         except Exception:
             if fc2 is not None:
                 fc2.release()
             if fc1 is not None:
                 fc1.release()
+            abandon_stage_prefetch(self.fc1_prefetch_ticket)
+            self.fc1_prefetch_ticket = None
             self.release()
             raise
 

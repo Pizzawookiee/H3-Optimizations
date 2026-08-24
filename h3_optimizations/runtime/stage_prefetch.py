@@ -85,15 +85,21 @@ def begin_stage_prefetch(module, device, *, enabled=True):
     )
 
 
-def finish_stage_prefetch(ticket):
-    """Join one stage transfer and clean it exactly like stock prefetch."""
+def wait_stage_prefetch(ticket):
+    """Wait for one staged transfer without discarding module._prefetch."""
+    if ticket is None or not ticket.active:
+        return
+    comfy.model_management.sync_stream(
+        ticket.device,
+        ticket.offload_stream,
+    )
+
+
+def release_stage_prefetch(ticket):
+    """Clean staged VBAR state only after the weight has been consumed."""
     if ticket is None or not ticket.active:
         return
     try:
-        if ticket.offload_stream is not None:
-            ticket.offload_stream.wait_stream(
-                comfy.model_management.current_stream(ticket.device)
-            )
         comfy.model_prefetch.cleanup_prefetched_modules(
             ticket.module,
             [ticket.module],
@@ -104,9 +110,7 @@ def finish_stage_prefetch(ticket):
 
 def abandon_stage_prefetch(ticket):
     """Exception-safe cleanup for a stage that will no longer execute."""
-    if ticket is None or not ticket.active:
-        return
-    finish_stage_prefetch(ticket)
+    release_stage_prefetch(ticket)
 
 
 _logged = False

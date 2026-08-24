@@ -51,7 +51,8 @@ from .qkv.w4a8 import HeldW4A8QKV
 from .runtime.stage_prefetch import (
     abandon_stage_prefetch,
     begin_stage_prefetch,
-    finish_stage_prefetch,
+    release_stage_prefetch,
+    wait_stage_prefetch,
     stage_prefetch_enabled,
 )
 
@@ -496,8 +497,7 @@ def execute_streamed_projected(backend, module, prepared):
             )
             del raw
             if out_ticket is not None:
-                finish_stage_prefetch(out_ticket)
-                out_ticket = None
+                wait_stage_prefetch(out_ticket)
             with diagnostics.stage('streamed_attention_out'):
                 local = module.out_proj(out.squeeze(0))
             del out
@@ -514,6 +514,8 @@ def execute_streamed_projected(backend, module, prepared):
                 'streamed Kitchen received an empty sequence'
             )
         prepared.release()
+        release_stage_prefetch(out_ticket)
+        out_ticket = None
         return result
     finally:
         abandon_stage_prefetch(out_ticket)
@@ -570,17 +572,29 @@ def _stream_aware_project(
         raise FusedQKVError(
             'streamed Kitchen requires rank-2 CUDA activations'
         )
-    return run_streamed_kitchen_qkv(
+
+    qkv_ticket = getattr(
         module,
-        x,
-        rope_freqs,
-        chunk_rows=self.chunk_rows,
-        query_chunk_rows=requested_query_chunk_rows(
-            transformer_options
-        ),
-        strided_qk_input=self.strided_qk_input,
-        stage_prefetch=stage_prefetch_enabled(transformer_options),
+        '_h3_optimizations_qkv_prefetch_ticket',
+        None,
     )
+    if hasattr(module, '_h3_optimizations_qkv_prefetch_ticket'):
+        delattr(module, '_h3_optimizations_qkv_prefetch_ticket')
+    try:
+        wait_stage_prefetch(qkv_ticket)
+        return run_streamed_kitchen_qkv(
+            module,
+            x,
+            rope_freqs,
+            chunk_rows=self.chunk_rows,
+            query_chunk_rows=requested_query_chunk_rows(
+                transformer_options
+            ),
+            strided_qk_input=self.strided_qk_input,
+            stage_prefetch=stage_prefetch_enabled(transformer_options),
+        )
+    finally:
+        release_stage_prefetch(qkv_ticket)
 
 
 def _stream_aware_prepare_projected(
