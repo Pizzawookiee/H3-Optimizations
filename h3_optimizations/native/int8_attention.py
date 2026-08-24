@@ -143,6 +143,10 @@ def _check_quantize_qk(*arguments):
     loader.check(loader.load().h3_int8_quantize_qk(*arguments), 'quantize_qk')
 
 
+def _check_quantize_q(*arguments):
+    loader.check(loader.load().h3_int8_quantize_q(*arguments), 'quantize_q')
+
+
 def _check_quantize_v(*arguments):
     loader.check(loader.load().h3_int8_quantize_v(*arguments), 'quantize_v')
 
@@ -250,6 +254,40 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
         cta_k=cta_k,
         anchor_indices=anchor_indices,
     )
+
+
+def quantize_int8_attention_q(q):
+    '''Quantize one local H3 query slab without constructing a K carrier.'''
+    if q.ndim != 4:
+        raise ValueError('q must be [batch, heads, sequence, head_dim]')
+    if q.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError('q must be float32, float16 or bfloat16')
+    if not q.is_cuda:
+        raise ValueError('q must be a CUDA tensor')
+    if q.stride(-1) != 1:
+        raise ValueError('the Q head dimension must be contiguous')
+    if int(q.shape[-1]) != 128:
+        raise ValueError(
+            'streamed native Q quantization requires H3 head_dim 128'
+        )
+
+    batch, heads, q_length, head_dim = q.shape
+    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
+    q_scale = torch.empty(
+        batch,
+        heads,
+        ((q_length + Q_TILE - 1) // Q_TILE) * 32,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    with diagnostics.stage('q_carrier_pack'):
+        _check_quantize_q(
+            _ptr(q), _ptr(q_int8), _ptr(q_scale),
+            batch, heads, q_length, head_dim,
+            q.stride(0), q.stride(1), q.stride(2),
+            _DTYPE_TO_CODE[q.dtype], _stream(),
+        )
+    return q_int8, q_scale
 
 
 def _attention_geometry(quantized, output_layout=OUTPUT_HND):

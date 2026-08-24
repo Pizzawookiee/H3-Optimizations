@@ -15,11 +15,16 @@ Q-only entry point without changing this backend contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
+import torch.nn.functional as F
+
+import comfy.quant_ops
+from comfy.quant_ops import QuantizedTensor
 
 from . import diagnostics, native
+from .native.int8_attention import quantize_int8_attention_q
 from .attention.sparse.config import resolve_video_budget
 from .attention.sparse.kitchen_sparse import (
     OUTPUT_HND,
@@ -149,6 +154,80 @@ def _held_projector(module, x):
         'streamed Kitchen currently requires ConvRot-256 TensorWise INT8 '
         'or W4A8 QKV; got %s' % fmt.label
     )
+
+
+def _q_only_convrot_weight(module, device):
+    '''Transfer only the first-third Q rows of offloaded ConvRot QKV storage.'''
+    linear = module.qkv_proj
+    if getattr(linear, 'weight_function', None):
+        raise FusedQKVError(
+            'streamed Q-only ConvRot projection does not support patched '
+            'qkv_proj weights'
+        )
+    source = linear.weight
+    if (
+        not isinstance(source, QuantizedTensor)
+        or getattr(source, '_layout_cls', None) != 'TensorWiseINT8Layout'
+    ):
+        raise FusedQKVError(
+            'streamed Q-only projection requires TensorWiseINT8Layout source'
+        )
+    params = source._params
+    if (
+        getattr(params, 'transposed', False)
+        or not getattr(params, 'convrot', False)
+        or int(getattr(params, 'convrot_groupsize', 0)) != 256
+    ):
+        raise FusedQKVError(
+            'streamed Q-only projection requires non-transposed ConvRot-256'
+        )
+
+    inner = int(module.heads) * int(module.head_dim)
+    hidden = int(source.shape[-1])
+    if int(source.shape[0]) != inner * 3:
+        raise FusedQKVError(
+            'fused QKV source has %d rows; expected %d'
+            % (int(source.shape[0]), inner * 3)
+        )
+    qdata = source._qdata[:inner]
+    scale = params.scale
+    if scale.ndim == 0:
+        q_scale = scale
+    elif int(scale.shape[0]) == int(source.shape[0]):
+        q_scale = scale[:inner]
+    else:
+        raise FusedQKVError(
+            'ConvRot QKV scale is not scalar or per-output-row'
+        )
+
+    # Move only Q's raw INT8 rows/scales. This never asks AIMDO/vbar to
+    # materialize the three-way fused qkv_proj weight.
+    qdata = qdata.to(device=device)
+    q_scale = q_scale.to(device=device)
+    q_params = replace(params, scale=q_scale, orig_shape=(inner, hidden))
+    return QuantizedTensor(qdata, source._layout_cls, q_params)
+
+
+def _project_q_only_hnd(module, x, rope_freqs, start, end, q_weight):
+    rows = x[start:end]
+    with diagnostics.stage('streamed_q_only_linear'):
+        q = F.linear(rows, q_weight, None)
+    count = int(end - start)
+    heads = int(module.heads)
+    head_dim = int(module.head_dim)
+    q = module.q_norm(q.view(count, heads, head_dim))
+
+    if rope_freqs is not None:
+        rope = rope_freqs[:, start:end]
+        rot = int(rope.shape[-3]) * 2
+        q4 = q.unsqueeze(0)
+        q_rot = q4[..., :rot].contiguous()
+        comfy.quant_ops.ck.apply_rope_split_half1_(q_rot, rope)
+        q4[..., :rot].copy_(q_rot)
+        del q_rot
+        q = q4[0]
+
+    return q.transpose(0, 1).unsqueeze(0)
 
 
 def run_streamed_kitchen_qkv(
@@ -293,49 +372,13 @@ def run_streamed_kitchen_qkv(
 
 
 def _local_query_carrier(projected, q):
-    '''Pack one bounded Q chunk using the current exact Kitchen transform.'''
-    kitchen = projected.kitchen
-    dummy_k = _query_stub(q)
-    q_shape = tuple(int(value) for value in q.shape)
-    k_shape = tuple(int(value) for value in dummy_k.shape)
-    spec = kitchen.int8_attention_producer_spec(
-        q_shape,
-        k_shape,
-        dtype=q.dtype,
-        device=q.device,
-    )
-    anchor = kitchen.Int8AttentionKAnchor(
-        values=torch.zeros(
-            k_shape[0],
-            k_shape[1],
-            int(spec.kernel_head_dim),
-            dtype=q.dtype,
-            device=q.device,
-        ),
-        indices=torch.full(
-            (k_shape[0], k_shape[1]),
-            -1,
-            dtype=torch.int32,
-            device=q.device,
-        ),
-    )
-    producer = kitchen.create_int8_attention_producer(
-        spec, anchor
-    )
-    kitchen.quantize_int8_attention_qk_chunk(
-        producer,
-        q,
-        dummy_k,
-        q_start=0,
-        k_start=0,
-        allow_strided_input=True,
-    )
-    del dummy_k, anchor
+    '''Pack one bounded Q chunk using the native Q-only Kitchen transform.'''
+    q_int8, q_scale = quantize_int8_attention_q(q)
     return native.PrequantizedInt8Attention(
-        q=producer.q,
+        q=q_int8,
         k=projected.k,
         v=projected.v,
-        q_scale=producer.q_scale,
+        q_scale=q_scale,
         k_scale=projected.k_scale,
         v_scale=projected.v_scale,
         original_head_dim=projected.original_head_dim,
@@ -367,20 +410,39 @@ def execute_streamed_projected(backend, module, prepared):
     sequence = int(projected.sequence)
     query_rows = int(projected.query_chunk_rows)
     result = None
-    held = _held_projector(module, projected.x)
+    fmt = describe_linear(module.qkv_proj)
+    held = None
+    q_weight = None
+    if fmt.convrot_int8_256:
+        with diagnostics.stage('streamed_q_weight_slice'):
+            q_weight = _q_only_convrot_weight(
+                module, projected.x.device
+            )
+    else:
+        held = _held_projector(module, projected.x)
     try:
         for start in range(0, sequence, query_rows):
             end = min(start + query_rows, sequence)
             with diagnostics.stage('streamed_query_projection'):
-                q, k_unused, v_unused = project_chunk_hnd(
-                    module,
-                    projected.x,
-                    projected.rope_freqs,
-                    start,
-                    end,
-                    projector=held,
-                )
-            del k_unused, v_unused
+                if q_weight is not None:
+                    q = _project_q_only_hnd(
+                        module,
+                        projected.x,
+                        projected.rope_freqs,
+                        start,
+                        end,
+                        q_weight,
+                    )
+                else:
+                    q, k_unused, v_unused = project_chunk_hnd(
+                        module,
+                        projected.x,
+                        projected.rope_freqs,
+                        start,
+                        end,
+                        projector=held,
+                    )
+                    del k_unused, v_unused
             with diagnostics.stage(
                 'streamed_query_carrier_pack'
             ):
@@ -434,6 +496,7 @@ def execute_streamed_projected(backend, module, prepared):
         prepared.release()
         return result
     finally:
+        q_weight = None
         if held is not None:
             held.__exit__(None, None, None)
 

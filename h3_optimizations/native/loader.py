@@ -28,7 +28,7 @@ import threading
 
 import torch
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 
 _LIBRARY_NAMES = {
     'Windows': 'h3_int8_attention.dll',
@@ -120,6 +120,11 @@ def _bind(library):
         [p, p, p, p, p, p] + [i] * 10 + [i64] * 6 + [i, p, sz]
     )
 
+    library.h3_int8_quantize_q.restype = i
+    library.h3_int8_quantize_q.argtypes = (
+        [p, p, p] + [i] * 4 + [i64] * 3 + [i, sz]
+    )
+
     library.h3_int8_select_k_anchor.restype = i
     library.h3_int8_select_k_anchor.argtypes = (
         [p, ctypes.POINTER(i), p, p] + [i] * 4 + [i64] * 3 + [i, sz]
@@ -174,7 +179,10 @@ def load(force_reload=False):
             _load_error = 'could not load %s: %s' % (path, error)
             raise NativeUnavailableError(_load_error) from error
 
-        _bind(library)
+        # Check ABI before binding new symbols so an old DLL reports a clean
+        # rebuild message instead of failing with AttributeError.
+        library.h3_int8_abi_version.restype = ctypes.c_int
+        library.h3_int8_abi_version.argtypes = []
         found = library.h3_int8_abi_version()
         if found != ABI_VERSION:
             _load_error = (
@@ -182,6 +190,7 @@ def load(force_reload=False):
                 'Rebuild native/.' % (path, found, ABI_VERSION)
             )
             raise NativeUnavailableError(_load_error)
+        _bind(library)
 
         _library = library
         _load_error = None
