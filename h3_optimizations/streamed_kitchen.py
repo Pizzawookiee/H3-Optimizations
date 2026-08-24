@@ -15,13 +15,18 @@ Q-only entry point without changing this backend contract.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
 
+import comfy.memory_management
+import comfy.model_management
 import comfy.quant_ops
 from comfy.quant_ops import QuantizedTensor
+import comfy_aimdo.model_vbar
+import comfy_aimdo.torch as aimdo_torch
 
 from . import diagnostics, native
 from .native.int8_attention import quantize_int8_attention_q
@@ -165,8 +170,61 @@ def _held_projector(module, x):
     )
 
 
+def _quantized_component_offsets(source):
+    '''Return Comfy gathered-buffer byte offsets for a QuantizedTensor.'''
+    inner_tensors, ctx = source.__tensor_flatten__()
+    offsets = {}
+    offset = 0
+    for attr in inner_tensors:
+        tensor = getattr(source, attr)
+        offsets[attr] = offset
+        offset += comfy.memory_management.vram_aligned_size(tensor)
+    return offsets, ctx
+
+
+def _fault_vbar_tensor_slice(linear, source_tensor, byte_offset, device, label):
+    '''Fault, populate, and expose one tensor slice from a module AIMDO VBAR.'''
+    alloc = getattr(linear, '_v', None)
+    if alloc is None:
+        raise FusedQKVError(
+            'streamed %s-only ConvRot projection requires AIMDO VBAR backing '
+            'for an offloaded qkv_proj' % label
+        )
+    try:
+        vbar, base_ptr, alloc_size = alloc
+    except (TypeError, ValueError) as exc:
+        raise FusedQKVError('qkv_proj AIMDO VBAR allocation is invalid') from exc
+
+    size = int(source_tensor.numel()) * int(source_tensor.element_size())
+    byte_offset = int(byte_offset)
+    if byte_offset < 0 or byte_offset + size > int(alloc_size):
+        raise FusedQKVError(
+            'streamed %s-only ConvRot VBAR slice is outside qkv_proj allocation'
+            % label
+        )
+    suballoc = (vbar, int(base_ptr) + byte_offset, size)
+    signature = comfy_aimdo.model_vbar.vbar_fault(suballoc)
+    if signature is None:
+        raise FusedQKVError(
+            'streamed %s-only ConvRot VBAR fault ran out of VRAM' % label
+        )
+    try:
+        gathered = aimdo_torch.aimdo_to_tensor(suballoc, device)
+        comfy.model_management.cast_to_gathered(
+            [source_tensor],
+            gathered,
+            non_blocking=False,
+        )
+        view = gathered.view(dtype=source_tensor.dtype).view(source_tensor.shape)
+        return suballoc, view
+    except Exception:
+        comfy_aimdo.model_vbar.vbar_unpin(suballoc)
+        raise
+
+
+@contextmanager
 def _convrot_qkv_slice_weight(module, device, index, label):
-    '''Transfer one third of offloaded ConvRot QKV storage without full QKV.'''
+    '''Hold one third of ConvRot QKV using ranged AIMDO VBAR residency.'''
     linear = module.qkv_proj
     if getattr(linear, 'weight_function', None):
         raise FusedQKVError(
@@ -202,6 +260,10 @@ def _convrot_qkv_slice_weight(module, device, index, label):
         )
     start = int(index) * inner
     stop = start + inner
+    if not source._qdata.is_contiguous():
+        raise FusedQKVError(
+            'streamed %s-only ConvRot qdata must be contiguous' % label
+        )
     qdata = source._qdata[start:stop]
     scale = params.scale
     if scale.ndim == 0:
@@ -211,10 +273,65 @@ def _convrot_qkv_slice_weight(module, device, index, label):
     else:
         raise FusedQKVError('ConvRot QKV scale is not scalar or per-output-row')
 
-    qdata = qdata.to(device=device)
-    sliced_scale = sliced_scale.to(device=device)
-    sliced_params = replace(params, scale=sliced_scale, orig_shape=(inner, hidden))
-    return QuantizedTensor(qdata, source._layout_cls, sliced_params)
+    # Already-resident weights need no VBAR fault or copy.
+    if qdata.device == device and sliced_scale.device == device:
+        sliced_params = replace(
+            params,
+            scale=sliced_scale,
+            orig_shape=(inner, hidden),
+        )
+        yield QuantizedTensor(qdata, source._layout_cls, sliced_params)
+        return
+
+    if device.type != 'cuda':
+        raise FusedQKVError(
+            'streamed %s-only ranged ConvRot projection requires CUDA' % label
+        )
+
+    offsets, ctx = _quantized_component_offsets(source)
+    scale_attr = ctx.get('tensor_fields', {}).get('scale')
+    if '_qdata' not in offsets or scale_attr not in offsets:
+        raise FusedQKVError(
+            'streamed %s-only ConvRot source has unsupported flattened storage'
+            % label
+        )
+
+    qdata_row_bytes = int(source._qdata.shape[1]) * int(source._qdata.element_size())
+    qdata_offset = int(offsets['_qdata']) + start * qdata_row_bytes
+
+    if scale.ndim == 0:
+        scale_offset = int(offsets[scale_attr])
+    else:
+        if not scale.is_contiguous():
+            raise FusedQKVError(
+                'streamed %s-only ConvRot scale must be contiguous' % label
+            )
+        scale_row_bytes = int(scale[0].numel()) * int(scale.element_size())
+        scale_offset = int(offsets[scale_attr]) + start * scale_row_bytes
+
+    pinned = []
+    qdata_view = None
+    scale_view = None
+    try:
+        qdata_alloc, qdata_view = _fault_vbar_tensor_slice(
+            linear, qdata, qdata_offset, device, label
+        )
+        pinned.append(qdata_alloc)
+        scale_alloc, scale_view = _fault_vbar_tensor_slice(
+            linear, sliced_scale, scale_offset, device, label
+        )
+        pinned.append(scale_alloc)
+        sliced_params = replace(
+            params,
+            scale=scale_view,
+            orig_shape=(inner, hidden),
+        )
+        yield QuantizedTensor(qdata_view, source._layout_cls, sliced_params)
+    finally:
+        qdata_view = None
+        scale_view = None
+        for alloc in reversed(pinned):
+            comfy_aimdo.model_vbar.vbar_unpin(alloc)
 
 
 def _q_only_convrot_weight(module, device):
@@ -392,18 +509,24 @@ def run_streamed_kitchen_qkv(
             try:
                 with diagnostics.stage('streamed_v_scale_finalize'):
                     v_stager.finalize_scale()
+                v_weight_hold = None
                 with diagnostics.stage('streamed_v_weight_slice'):
-                    v_weight = _v_only_convrot_weight(module, x.device)
+                    v_weight_hold = _v_only_convrot_weight(module, x.device)
+                    v_weight = v_weight_hold.__enter__()
                 try:
                     for start in range(0, sequence, int(chunk_rows)):
                         end = min(start + int(chunk_rows), sequence)
                         with diagnostics.stage('streamed_v_reprojection'):
-                            v = _project_v_only_hnd(module, x, start, end, v_weight)
+                            v = _project_v_only_hnd(
+                                module, x, start, end, v_weight
+                            )
                         with diagnostics.stage('streamed_v_chunk_pack'):
                             v_stager.quantize(v, start)
                         del v
                 finally:
                     v_weight = None
+                    if v_weight_hold is not None:
+                        v_weight_hold.__exit__(None, None, None)
                 v_carrier, v_scale = v_stager.finish()
             except VStagingError as exc:
                 raise FusedQKVError('streamed native V staging failed: %s' % exc) from exc
@@ -484,12 +607,14 @@ def execute_streamed_projected(backend, module, prepared):
     result = None
     fmt = describe_linear(module.qkv_proj)
     held = None
+    q_weight_hold = None
     q_weight = None
     if fmt.convrot_int8_256:
         with diagnostics.stage('streamed_q_weight_slice'):
-            q_weight = _q_only_convrot_weight(
+            q_weight_hold = _q_only_convrot_weight(
                 module, projected.x.device
             )
+            q_weight = q_weight_hold.__enter__()
     else:
         held = _held_projector(module, projected.x)
 
@@ -582,6 +707,8 @@ def execute_streamed_projected(backend, module, prepared):
     finally:
         abandon_stage_prefetch(out_ticket)
         q_weight = None
+        if q_weight_hold is not None:
+            q_weight_hold.__exit__(None, None, None)
         if held is not None:
             held.__exit__(None, None, None)
 
