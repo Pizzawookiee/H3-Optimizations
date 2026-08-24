@@ -43,6 +43,12 @@ MLP_MEMORY_REQUESTS = (
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
 )
 
+ATTENTION_MEMORY_STANDARD = 'standard'
+ATTENTION_MEMORY_STREAMED = 'streamed'
+ATTENTION_MEMORY_REQUESTS = (
+    ATTENTION_MEMORY_STANDARD, ATTENTION_MEMORY_STREAMED,
+)
+
 SPARSE_BACKEND_AUTO = 'auto'
 SPARSE_BACKEND_SAGE = 'Sparse Sage'
 SPARSE_BACKEND_TRITON = 'INT8 Triton'
@@ -60,6 +66,8 @@ SPARSE_BACKEND_REQUESTS = (
 MIN_CHUNK_ROWS = 256
 MAX_CHUNK_ROWS = 65_536
 CHUNK_ALIGNMENT = 256
+MIN_QUERY_CHUNK_ROWS = 128
+QUERY_CHUNK_ALIGNMENT = 128
 DENSITY_FIXED = 'fixed'
 DEFAULT_VIDEO_BUDGET = 0.3
 DEFAULT_EDGE_STEPS = 2
@@ -114,6 +122,8 @@ class MemoryRequest:
     fused_qkv: str = FUSED_QKV_AUTO
     mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 4096
+    attention_memory_mode: str = ATTENTION_MEMORY_STANDARD
+    query_chunk_rows: int = 4096
     prefer_held_weights: bool = True
     mlp_strict: bool = False
 
@@ -140,6 +150,22 @@ class MemoryRequest:
             raise ValueError('unknown fused QKV request %r' % self.fused_qkv)
         if self.mlp_memory not in MLP_MEMORY_REQUESTS:
             raise ValueError('unknown MLP memory request %r' % self.mlp_memory)
+        if self.attention_memory_mode not in ATTENTION_MEMORY_REQUESTS:
+            raise ValueError(
+                'unknown attention memory mode %r'
+                % self.attention_memory_mode
+            )
+        query_chunk_rows = int(self.query_chunk_rows)
+        if not MIN_QUERY_CHUNK_ROWS <= query_chunk_rows <= MAX_CHUNK_ROWS:
+            raise ValueError(
+                'query_chunk_rows must be between %d and %d'
+                % (MIN_QUERY_CHUNK_ROWS, MAX_CHUNK_ROWS)
+            )
+        if query_chunk_rows % QUERY_CHUNK_ALIGNMENT:
+            raise ValueError(
+                'query_chunk_rows must be a multiple of %d'
+                % QUERY_CHUNK_ALIGNMENT
+            )
         chunk_rows = int(self.chunk_rows)
         if not MIN_CHUNK_ROWS <= chunk_rows <= MAX_CHUNK_ROWS:
             raise ValueError(
@@ -158,6 +184,8 @@ class MemoryRequest:
             self.fused_qkv,
             self.mlp_memory,
             int(self.chunk_rows),
+            self.attention_memory_mode,
+            int(self.query_chunk_rows),
             bool(self.prefer_held_weights),
             bool(self.mlp_strict),
         )

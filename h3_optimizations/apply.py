@@ -47,6 +47,7 @@ from .model import get_h3_blocks, is_minimax_h3
 from .patch import configure_backend
 from .plan import (
     ATTENTION_EXISTING,
+    ATTENTION_MEMORY_STREAMED,
     DENSITY_FIXED,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
@@ -675,7 +676,44 @@ def apply_plan(model, plan: H3OptimizationPlan):
     environment = RuntimeEnvironment.detect()
     attention, qkv = _resolve_attention(plan, model, inventory, environment)
 
+    streamed_attention = (
+        plan.memory is not None
+        and plan.memory.attention_memory_mode == ATTENTION_MEMORY_STREAMED
+    )
+    if streamed_attention:
+        if attention.backend_kind != ATTENTION_KITCHEN_SPARSE:
+            raise RuntimeError(
+                'Streamed attention memory mode currently requires native '
+                'Kitchen sparse attention; resolved %s'
+                % attention.backend_kind
+            )
+        if qkv.provider_id != QKV_DENSE_KITCHEN_CHUNKED:
+            raise RuntimeError(
+                'Streamed attention memory mode currently requires the '
+                'chunked Kitchen INT8 QKV provider; resolved %s'
+                % qkv.provider_id
+            )
+        from .streamed_kitchen import install_streaming_support
+
+        install_streaming_support()
+
     patched = model.clone()
+    if plan.memory is not None:
+        from .streamed_kitchen import (
+            ATTENTION_MEMORY_MODE_KEY,
+            QUERY_CHUNK_ROWS_KEY,
+        )
+
+        options = patched.model_options['transformer_options'] = (
+            patched.model_options.get('transformer_options', {}).copy()
+        )
+        options[ATTENTION_MEMORY_MODE_KEY] = (
+            plan.memory.attention_memory_mode
+        )
+        options[QUERY_CHUNK_ROWS_KEY] = int(
+            plan.memory.query_chunk_rows
+        )
+
     attention_blocks = 0
     sparse_execution_selected = attention.backend_kind in (
         ATTENTION_SPARSE,

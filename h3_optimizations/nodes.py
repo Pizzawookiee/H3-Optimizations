@@ -23,6 +23,8 @@ from .ordering_probe import (
 )
 from .plan import (
     ATTENTION_EXISTING,
+    ATTENTION_MEMORY_STANDARD,
+    ATTENTION_MEMORY_STREAMED,
     DEFAULT_EDGE_KV,
     DEFAULT_EDGE_STEPS,
     DEFAULT_VIDEO_BUDGET,
@@ -75,6 +77,8 @@ def _memory_request(
     mlp_memory=MLP_MEMORY_AUTO,
     chunk_rows=DEFAULT_CHUNK_ROWS,
     preserve_precision=False,
+    attention_memory_mode=ATTENTION_MEMORY_STANDARD,
+    query_chunk_rows=DEFAULT_CHUNK_ROWS,
 ):
     '''Resolve the public memory controls into one immutable request.'''
     if not preserve_precision:
@@ -82,6 +86,8 @@ def _memory_request(
             fused_qkv=fused_qkv,
             mlp_memory=mlp_memory,
             chunk_rows=int(chunk_rows),
+            attention_memory_mode=attention_memory_mode,
+            query_chunk_rows=int(query_chunk_rows),
         )
 
     # Preserve precision is a policy over the normal memory node rather than a
@@ -97,6 +103,8 @@ def _memory_request(
             else mlp_memory
         ),
         chunk_rows=int(chunk_rows),
+        attention_memory_mode=attention_memory_mode,
+        query_chunk_rows=int(query_chunk_rows),
     )
 
 
@@ -160,6 +168,39 @@ class H3MemoryOptimization(io.ComfyNode):
                         'Explicit off remains off.'
                     ),
                 ),
+                io.Combo.Input(
+                    'attention_memory_mode',
+                    display_name='Attention memory mode',
+                    options=[
+                        ATTENTION_MEMORY_STANDARD,
+                        ATTENTION_MEMORY_STREAMED,
+                    ],
+                    default=ATTENTION_MEMORY_STANDARD,
+                    tooltip=(
+                        'standard keeps the current full-query Kitchen sparse '
+                        'attention path. streamed explicitly requests low-VRAM '
+                        'query streaming: full K/V INT8 carriers are retained, '
+                        'while Q and the BF16 attention result are processed in '
+                        'bounded chunks. Streamed currently requires native '
+                        'Kitchen sparse attention with a supported quantized QKV '
+                        'provider; unsupported combinations raise instead of '
+                        'silently changing execution.'
+                    ),
+                ),
+                io.Int.Input(
+                    'query_chunk_rows',
+                    display_name='Query chunk rows',
+                    default=DEFAULT_CHUNK_ROWS,
+                    min=128,
+                    max=MAX_CHUNK_ROWS,
+                    step=128,
+                    advanced=True,
+                    tooltip=(
+                        'Maximum query rows processed by streamed Kitchen '
+                        'attention at once. Lower values reduce attention '
+                        'working-set VRAM but increase launch/projection overhead.'
+                    ),
+                ),
                 io.Int.Input(
                     'chunk_rows',
                     display_name='MLP chunk rows',
@@ -198,6 +239,8 @@ class H3MemoryOptimization(io.ComfyNode):
         fused_qkv=FUSED_QKV_AUTO,
         mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
+        attention_memory_mode=ATTENTION_MEMORY_STANDARD,
+        query_chunk_rows=DEFAULT_CHUNK_ROWS,
         preserve_precision=False,
     ):
         plan = read_plan(model).with_memory(
@@ -205,6 +248,8 @@ class H3MemoryOptimization(io.ComfyNode):
                 fused_qkv=fused_qkv,
                 mlp_memory=mlp_memory,
                 chunk_rows=chunk_rows,
+                attention_memory_mode=attention_memory_mode,
+                query_chunk_rows=query_chunk_rows,
                 preserve_precision=bool(preserve_precision),
             )
         )
