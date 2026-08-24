@@ -25,6 +25,7 @@ from comfy.quant_ops import QuantizedTensor
 
 from . import diagnostics, native
 from .native.int8_attention import quantize_int8_attention_q
+from .native.v_staging import BACKEND_NATIVE, TwoPassVCarrier, VStagingError
 from .attention.sparse.config import resolve_video_budget
 from .attention.sparse.kitchen_sparse import (
     OUTPUT_HND,
@@ -164,13 +165,13 @@ def _held_projector(module, x):
     )
 
 
-def _q_only_convrot_weight(module, device):
-    '''Transfer only the first-third Q rows of offloaded ConvRot QKV storage.'''
+def _convrot_qkv_slice_weight(module, device, index, label):
+    '''Transfer one third of offloaded ConvRot QKV storage without full QKV.'''
     linear = module.qkv_proj
     if getattr(linear, 'weight_function', None):
         raise FusedQKVError(
-            'streamed Q-only ConvRot projection does not support patched '
-            'qkv_proj weights'
+            'streamed %s-only ConvRot projection does not support patched '
+            'qkv_proj weights' % label
         )
     source = linear.weight
     if (
@@ -178,7 +179,8 @@ def _q_only_convrot_weight(module, device):
         or getattr(source, '_layout_cls', None) != 'TensorWiseINT8Layout'
     ):
         raise FusedQKVError(
-            'streamed Q-only projection requires TensorWiseINT8Layout source'
+            'streamed %s-only projection requires TensorWiseINT8Layout source'
+            % label
         )
     params = source._params
     if (
@@ -187,7 +189,8 @@ def _q_only_convrot_weight(module, device):
         or int(getattr(params, 'convrot_groupsize', 0)) != 256
     ):
         raise FusedQKVError(
-            'streamed Q-only projection requires non-transposed ConvRot-256'
+            'streamed %s-only projection requires non-transposed ConvRot-256'
+            % label
         )
 
     inner = int(module.heads) * int(module.head_dim)
@@ -197,23 +200,29 @@ def _q_only_convrot_weight(module, device):
             'fused QKV source has %d rows; expected %d'
             % (int(source.shape[0]), inner * 3)
         )
-    qdata = source._qdata[:inner]
+    start = int(index) * inner
+    stop = start + inner
+    qdata = source._qdata[start:stop]
     scale = params.scale
     if scale.ndim == 0:
-        q_scale = scale
+        sliced_scale = scale
     elif int(scale.shape[0]) == int(source.shape[0]):
-        q_scale = scale[:inner]
+        sliced_scale = scale[start:stop]
     else:
-        raise FusedQKVError(
-            'ConvRot QKV scale is not scalar or per-output-row'
-        )
+        raise FusedQKVError('ConvRot QKV scale is not scalar or per-output-row')
 
-    # Move only Q's raw INT8 rows/scales. This never asks AIMDO/vbar to
-    # materialize the three-way fused qkv_proj weight.
     qdata = qdata.to(device=device)
-    q_scale = q_scale.to(device=device)
-    q_params = replace(params, scale=q_scale, orig_shape=(inner, hidden))
-    return QuantizedTensor(qdata, source._layout_cls, q_params)
+    sliced_scale = sliced_scale.to(device=device)
+    sliced_params = replace(params, scale=sliced_scale, orig_shape=(inner, hidden))
+    return QuantizedTensor(qdata, source._layout_cls, sliced_params)
+
+
+def _q_only_convrot_weight(module, device):
+    return _convrot_qkv_slice_weight(module, device, 0, 'Q')
+
+
+def _v_only_convrot_weight(module, device):
+    return _convrot_qkv_slice_weight(module, device, 2, 'V')
 
 
 def _project_q_only_hnd(module, x, rope_freqs, start, end, q_weight):
@@ -238,6 +247,16 @@ def _project_q_only_hnd(module, x, rope_freqs, start, end, q_weight):
     return q.transpose(0, 1).unsqueeze(0)
 
 
+def _project_v_only_hnd(module, x, start, end, v_weight):
+    rows = x[start:end]
+    with diagnostics.stage('streamed_v_only_linear'):
+        v = F.linear(rows, v_weight, None)
+    count = int(end - start)
+    heads = int(module.heads)
+    head_dim = int(module.head_dim)
+    return v.view(count, heads, head_dim).transpose(0, 1).unsqueeze(0)
+
+
 def run_streamed_kitchen_qkv(
     module,
     x,
@@ -247,8 +266,9 @@ def run_streamed_kitchen_qkv(
     query_chunk_rows,
     strided_qk_input,
     stage_prefetch=False,
+    qkv_prefetch_ticket=None,
 ):
-    '''Prepare full K/V INT8 and route summaries without a full Q carrier.'''
+    '''Prepare streamed K/V carriers without full-sequence BF16 Q or V.'''
     kitchen = resolve_kitchen(x.device)
     if kitchen is None:
         raise FusedQKVError('no INT8 attention producer is available')
@@ -281,7 +301,20 @@ def run_streamed_kitchen_qkv(
             % (int(chunk_rows), int(spec.sequence_alignment))
         )
 
+    fmt = describe_linear(module.qkv_proj)
+    staged_v = bool(fmt.convrot_int8_256)
+    v_stager = None
+    if staged_v:
+        try:
+            v_stager = TwoPassVCarrier(spec, backend=BACKEND_NATIVE)
+        except VStagingError as exc:
+            raise FusedQKVError(
+                'streamed ConvRot V staging requires the native V staging '
+                'API; rebuild the H3 native library from this revision'
+            ) from exc
+
     held = _held_projector(module, x)
+    retained_v = None
     try:
         with diagnostics.stage('streamed_anchor_projection'):
             samples = _project_anchor_samples(
@@ -299,7 +332,6 @@ def run_streamed_kitchen_qkv(
         producer = kitchen.create_int8_attention_producer(spec, anchor)
         del anchor
 
-        retained_v = None
         q_summaries = []
         k_summaries = []
         chunk_kwargs = _qk_chunk_kwargs(
@@ -339,31 +371,59 @@ def run_streamed_kitchen_qkv(
                 )
             del q_stub
 
-            if retained_v is None:
-                retained_v = v.new_empty(
-                    (1, heads, sequence, head_dim)
-                )
-            retained_v[:, :, start:end, :].copy_(v)
+            if staged_v:
+                with diagnostics.stage('streamed_v_amax_update'):
+                    v_stager.update(v)
+            else:
+                if retained_v is None:
+                    retained_v = v.new_empty(
+                        (1, heads, sequence, head_dim)
+                    )
+                retained_v[:, :, start:end, :].copy_(v)
             del q, k, v
 
-        with diagnostics.stage('streamed_v_carrier_pack'):
-            kitchen.quantize_int8_attention_v(
-                producer, retained_v
-            )
-        del retained_v
+        if held is not None:
+            held.__exit__(None, None, None)
+            held = None
+        release_stage_prefetch(qkv_prefetch_ticket)
+        qkv_prefetch_ticket = None
 
-        if producer.v is None or producer.v_scale is None:
-            raise FusedQKVError(
-                'streamed Kitchen V carrier was not produced'
-            )
+        if staged_v:
+            try:
+                with diagnostics.stage('streamed_v_scale_finalize'):
+                    v_stager.finalize_scale()
+                with diagnostics.stage('streamed_v_weight_slice'):
+                    v_weight = _v_only_convrot_weight(module, x.device)
+                try:
+                    for start in range(0, sequence, int(chunk_rows)):
+                        end = min(start + int(chunk_rows), sequence)
+                        with diagnostics.stage('streamed_v_reprojection'):
+                            v = _project_v_only_hnd(module, x, start, end, v_weight)
+                        with diagnostics.stage('streamed_v_chunk_pack'):
+                            v_stager.quantize(v, start)
+                        del v
+                finally:
+                    v_weight = None
+                v_carrier, v_scale = v_stager.finish()
+            except VStagingError as exc:
+                raise FusedQKVError('streamed native V staging failed: %s' % exc) from exc
+        else:
+            with diagnostics.stage('streamed_v_carrier_pack'):
+                kitchen.quantize_int8_attention_v(producer, retained_v)
+            del retained_v
+            retained_v = None
+            if producer.v is None or producer.v_scale is None:
+                raise FusedQKVError('streamed Kitchen V carrier was not produced')
+            v_carrier = producer.v
+            v_scale = producer.v_scale
         return PreparedStreamedKitchenQKV(
             x=x,
             rope_freqs=rope_freqs,
             kitchen=kitchen,
             k=producer.k,
-            v=producer.v,
+            v=v_carrier,
             k_scale=producer.k_scale,
-            v_scale=producer.v_scale,
+            v_scale=v_scale,
             q_summary=torch.cat(q_summaries, dim=-2),
             k_summary=torch.cat(k_summaries, dim=-2),
             original_head_dim=int(spec.original_head_dim),
@@ -377,6 +437,8 @@ def run_streamed_kitchen_qkv(
             stage_prefetch=bool(stage_prefetch),
         )
     finally:
+        retained_v = None
+        release_stage_prefetch(qkv_prefetch_ticket)
         if held is not None:
             held.__exit__(None, None, None)
 
@@ -592,6 +654,7 @@ def _stream_aware_project(
             ),
             strided_qk_input=self.strided_qk_input,
             stage_prefetch=stage_prefetch_enabled(transformer_options),
+            qkv_prefetch_ticket=qkv_ticket,
         )
     finally:
         release_stage_prefetch(qkv_ticket)
