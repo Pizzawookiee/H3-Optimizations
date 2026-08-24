@@ -78,7 +78,7 @@ class SourceIsolationTests(unittest.TestCase):
             for fragment in banned:
                 self.assertNotIn(fragment, text, '%s exports %s' % (path, fragment))
 
-    def test_sparse_production_uses_chunked_projector(self):
+    def test_sparse_production_uses_streamed_convrot_projector(self):
         apply_source = (SOURCE / 'apply.py').read_text(encoding='utf-8')
         projector_source = (
             SOURCE / 'qkv' / 'projectors.py'
@@ -89,8 +89,10 @@ class SourceIsolationTests(unittest.TestCase):
 
         self.assertIn('SparseFusedQKVProjector(', apply_source)
         self.assertIn('chunk_rows=4096', apply_source)
-        self.assertIn('ChunkedSparseQKVProjector', projector_source)
+        self.assertIn('StreamedSparseSageQKVProjector', projector_source)
         self.assertNotIn('FusedQKVProjector as Implementation', projector_source)
+        # The backend-level fallback remains the old chunked projector for
+        # callers that construct fused mode without the provider resolver.
         self.assertIn('ChunkedSparseQKVProjector(kernel_spec)', backend_source)
         self.assertNotIn('FusedQKVProjector()', backend_source)
 

@@ -18,7 +18,15 @@ ATTENTION_REQUESTS = (ATTENTION_AUTO, ATTENTION_EXISTING)
 FUSED_QKV_AUTO = 'auto'
 FUSED_QKV_OFF = 'off'
 FUSED_QKV_REQUIRED = 'required'
-FUSED_QKV_REQUESTS = (FUSED_QKV_AUTO, FUSED_QKV_OFF, FUSED_QKV_REQUIRED)
+# Internal request used by the public Preserve precision policy. It keeps an
+# actual BF16 checkpoint in BF16 while still allowing bounded QKV projection.
+FUSED_QKV_PRESERVE_BF16 = 'preserve_bf16'
+FUSED_QKV_REQUESTS = (
+    FUSED_QKV_AUTO,
+    FUSED_QKV_OFF,
+    FUSED_QKV_REQUIRED,
+    FUSED_QKV_PRESERVE_BF16,
+)
 
 MLP_MEMORY_AUTO = 'auto'
 MLP_MEMORY_OFF = 'off'
@@ -112,6 +120,22 @@ class MemoryRequest:
     def __post_init__(self):
         if self.attention not in ATTENTION_REQUESTS:
             raise ValueError('unknown dense attention request %r' % self.attention)
+
+        # The public Preserve precision policy is represented today by keeping
+        # the existing attention backend and disabling QKV requantization. Turn
+        # that specific combination into an internal BF16-preserving request so
+        # a real BF16 checkpoint can still use bounded QKV projection. Explicit
+        # `fused_qkv=off` outside Preserve precision keeps its original meaning.
+        if (
+            self.attention == ATTENTION_EXISTING
+            and self.fused_qkv == FUSED_QKV_OFF
+        ):
+            object.__setattr__(
+                self,
+                'fused_qkv',
+                FUSED_QKV_PRESERVE_BF16,
+            )
+
         if self.fused_qkv not in FUSED_QKV_REQUESTS:
             raise ValueError('unknown fused QKV request %r' % self.fused_qkv)
         if self.mlp_memory not in MLP_MEMORY_REQUESTS:
