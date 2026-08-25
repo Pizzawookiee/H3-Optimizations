@@ -121,3 +121,72 @@ class FinalLayerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FinalLayerExecutionLogTests(unittest.TestCase):
+    '''The patched forward must announce that it actually ran.
+
+    Regression cover for a real diagnostic gap: the install-time message proves
+    only that the patch was attached. Three benchmark runs looked correctly
+    configured while routing sent the forward elsewhere, and nothing in a normal
+    workflow said so.
+    '''
+
+    @staticmethod
+    def _run(chunk_rows, segments, rows=11, calls=1):
+        layer = _Layer()
+        forward = final_layer.make_forward(layer, chunk_rows)
+        x = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+        with mock.patch.object(final_layer.logging, 'info') as info:
+            for _ in range(calls):
+                forward(x, None, *segments)
+        return [call.args for call in info.call_args_list]
+
+    def test_first_execution_logs_once(self):
+        logged = self._run(3, ((0, 7, 0), (7, 11, 1)))
+        self.assertEqual(len(logged), 1)
+        self.assertIn('chunked FinalLayer ran', logged[0][0])
+
+    def test_repeat_executions_stay_quiet(self):
+        # A 20-step sampler must not emit 20 identical lines.
+        logged = self._run(3, ((0, 7, 0), (7, 11, 1)), calls=20)
+        self.assertEqual(len(logged), 1)
+
+    def test_log_reports_rows_and_chunk_counts(self):
+        logged = self._run(3, ((0, 7, 0), (7, 11, 1)))
+        args = logged[0]
+        self.assertEqual(args[1], 11)     # total rows
+        self.assertEqual(args[2], 7)      # video rows
+        self.assertEqual(args[3], 3)      # video chunks: ceil(7/3)
+        self.assertEqual(args[4], 4)      # audio rows
+        self.assertEqual(args[5], 2)      # audio chunks: ceil(4/3)
+        self.assertEqual(args[6], 3)      # chunk_rows
+
+    def test_single_chunk_is_visible_as_such(self):
+        # Bounded in name only: the segment fits in one chunk, so the log must
+        # not imply the activation memory was actually split.
+        logged = self._run(4096, ((0, 7, 0), (7, 11, 1)))
+        args = logged[0]
+        self.assertEqual(args[3], 1)
+        self.assertEqual(args[5], 1)
+
+    def test_empty_audio_segment_reports_zero_chunks(self):
+        logged = self._run(3, ((0, 11, 0), (11, 11, 1)))
+        args = logged[0]
+        self.assertEqual(args[4], 0)
+        self.assertEqual(args[5], 0)
+
+    def test_logging_does_not_change_the_result(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        segments = ((0, 7, 0), (7, 11, 1))
+        expected = layer.forward(x, None, *segments)
+        actual = final_layer.make_forward(layer, 3)(x, None, *segments)
+        self.assertTrue(torch.allclose(expected[0], actual[0], atol=1e-4, rtol=0))
+        self.assertTrue(torch.allclose(expected[1], actual[1], atol=1e-4, rtol=0))
+
+    def test_chunk_count_helper(self):
+        self.assertEqual(final_layer._chunk_count(0, 64), 0)
+        self.assertEqual(final_layer._chunk_count(1, 64), 1)
+        self.assertEqual(final_layer._chunk_count(64, 64), 1)
+        self.assertEqual(final_layer._chunk_count(65, 64), 2)

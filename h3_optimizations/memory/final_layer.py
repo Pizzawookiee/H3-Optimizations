@@ -50,10 +50,38 @@ def chunked_final_layer(layer, x, t_emb, video_seg, audio_seg, chunk_rows):
     return project(video_seg, layer.video_out), project(audio_seg, layer.audio_out)
 
 
+def _chunk_count(rows, chunk_rows):
+    if rows <= 0:
+        return 0
+    return (int(rows) + int(chunk_rows) - 1) // int(chunk_rows)
+
+
 def make_forward(layer, chunk_rows):
     signature = int(chunk_rows)
+    # One line the first time the patched forward actually executes. The
+    # install-time message only proves the patch was attached; it stays silent
+    # when routing sends the forward somewhere else, which is exactly the case
+    # that has to be visible. Reporting the chunk counts also separates real
+    # chunking from a segment that fits in one chunk and is therefore bounded
+    # in name only.
+    announced = []
 
     def forward(x, t_emb, video_seg, audio_seg):
+        if not announced:
+            announced.append(True)
+            video_rows = int(video_seg[1]) - int(video_seg[0])
+            audio_rows = int(audio_seg[1]) - int(audio_seg[0])
+            logging.info(
+                '[H3 Optimizations] chunked FinalLayer ran: %d rows, '
+                'video %d in %d chunk(s), audio %d in %d chunk(s), '
+                'chunk_rows=%d',
+                int(x.shape[0]),
+                video_rows,
+                _chunk_count(video_rows, signature),
+                audio_rows,
+                _chunk_count(audio_rows, signature),
+                signature,
+            )
         return chunked_final_layer(
             layer,
             x,
