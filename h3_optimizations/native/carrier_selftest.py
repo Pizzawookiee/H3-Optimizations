@@ -56,17 +56,19 @@ def run(device=None):
     detail = {}
     try:
         generator = torch.Generator(device=device).manual_seed(20260825)
-        q = torch.randn(
-            _BATCH,
-            _HEADS,
-            _SEQUENCE,
-            _HEAD_DIM,
-            dtype=torch.bfloat16,
-            device=device,
-            generator=generator,
-        )
-        k = torch.randn_like(q, generator=generator)
-        v = torch.randn_like(q, generator=generator)
+
+        def sample():
+            return torch.randn(
+                _BATCH,
+                _HEADS,
+                _SEQUENCE,
+                _HEAD_DIM,
+                dtype=torch.bfloat16,
+                device=device,
+                generator=generator,
+            )
+
+        q, k, v = sample(), sample(), sample()
 
         # Force the carrier geometry used by the parity Triton path.
         carrier = native.prequantize_int8_attention(q, k, v, cta_k=64)
