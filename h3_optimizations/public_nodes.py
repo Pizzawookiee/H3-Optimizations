@@ -3,8 +3,8 @@
 from comfy_api.latest import ComfyExtension
 
 from .aimdo_limiter import H3AIMDOResidencyLimiter
+from .memory_migration_node import H3MemoryOptimization
 from .nodes import (
-    H3MemoryOptimization,
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )

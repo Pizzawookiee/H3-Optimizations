@@ -42,6 +42,18 @@ def is_installed_dense_attention(transformer_options):
     return getattr(override, OVERRIDE_MARKER, None) == ATTENTION_COMFY_KITCHEN_INT8
 
 
+def has_explicit_dense_attention(model_patcher):
+    '''Return true for a user/upstream attention override not installed by us.'''
+    options = (
+        getattr(model_patcher, 'model_options', {})
+        .get('transformer_options', {})
+        or {}
+    )
+    if 'optimized_attention_override' not in options:
+        return False
+    return not is_installed_dense_attention(options)
+
+
 def resolve_dense_attention(model_patcher):
     options = (
         getattr(model_patcher, 'model_options', {})

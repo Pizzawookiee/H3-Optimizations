@@ -25,10 +25,15 @@ import h3_optimizations.apply as apply_module  # noqa: E402
 from h3_optimizations.dense_resolver import (  # noqa: E402
     ATTENTION_COMFY_KITCHEN_INT8,
     ATTENTION_EXISTING,
+    has_explicit_dense_attention,
     install_dense_attention,
     resolve_dense_attention,
 )
-from h3_optimizations.plan import H3OptimizationPlan, MemoryRequest  # noqa: E402
+from h3_optimizations.plan import (  # noqa: E402
+    FUSED_QKV_PRESERVE_BF16,
+    H3OptimizationPlan,
+    MemoryRequest,
+)
 from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_STANDARD,
@@ -82,22 +87,21 @@ class DenseSelectionTests(unittest.TestCase):
             resolution = resolve_dense_attention(model)
 
         lookup.assert_called_once_with('comfy_kitchen_int8', None)
-        self.assertEqual(
-            resolution.selected,
-            ATTENTION_COMFY_KITCHEN_INT8,
-        )
+        self.assertEqual(resolution.selected, ATTENTION_COMFY_KITCHEN_INT8)
         self.assertTrue(install_dense_attention(model, resolution))
-        override = model.model_options[
-            'transformer_options'
-        ]['optimized_attention_override']
+        override = model.model_options['transformer_options']['optimized_attention_override']
         self.assertIs(override.container_function, kitchen_containers)
+        self.assertFalse(has_explicit_dense_attention(model))
+
+    def test_existing_explicit_override_is_detected(self):
+        model = FakePatcher()
+        model.set_model_optimized_attention(pytorch_attention)
+        self.assertTrue(has_explicit_dense_attention(model))
 
     def test_existing_explicit_override_is_preserved(self):
         model = FakePatcher()
         model.set_model_optimized_attention(pytorch_attention)
-        original = model.model_options[
-            'transformer_options'
-        ]['optimized_attention_override']
+        original = model.model_options['transformer_options']['optimized_attention_override']
 
         with patch(
             'h3_optimizations.dense_resolver.get_attention_function',
@@ -108,9 +112,7 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertEqual(resolution.selected, ATTENTION_COMFY_KITCHEN_INT8)
         self.assertFalse(install_dense_attention(model, resolution))
         self.assertIs(
-            model.model_options['transformer_options'][
-                'optimized_attention_override'
-            ],
+            model.model_options['transformer_options']['optimized_attention_override'],
             original,
         )
 
@@ -132,22 +134,15 @@ class DenseSelectionTests(unittest.TestCase):
     def test_official_override_composes_before_and_after_h3_selection(self):
         before = FakePatcher()
         before.set_model_optimized_attention(pytorch_attention)
-        before_override = before.model_options[
-            'transformer_options'
-        ]['optimized_attention_override']
+        before_override = before.model_options['transformer_options']['optimized_attention_override']
         with patch(
             'h3_optimizations.dense_resolver.get_attention_function',
             return_value=kitchen_attention,
         ):
             before_resolution = resolve_dense_attention(before)
-        self.assertEqual(
-            before_resolution.selected,
-            ATTENTION_COMFY_KITCHEN_INT8,
-        )
+        self.assertEqual(before_resolution.selected, ATTENTION_COMFY_KITCHEN_INT8)
         self.assertIs(
-            before.model_options['transformer_options'][
-                'optimized_attention_override'
-            ],
+            before.model_options['transformer_options']['optimized_attention_override'],
             before_override,
         )
 
@@ -159,22 +154,15 @@ class DenseSelectionTests(unittest.TestCase):
             automatic = resolve_dense_attention(after)
         install_dense_attention(after, automatic)
         after.set_model_optimized_attention(pytorch_attention)
-        official_override = after.model_options[
-            'transformer_options'
-        ]['optimized_attention_override']
+        official_override = after.model_options['transformer_options']['optimized_attention_override']
         with patch(
             'h3_optimizations.dense_resolver.get_attention_function',
             return_value=kitchen_attention,
         ):
             after_resolution = resolve_dense_attention(after)
-        self.assertEqual(
-            after_resolution.selected,
-            ATTENTION_COMFY_KITCHEN_INT8,
-        )
+        self.assertEqual(after_resolution.selected, ATTENTION_COMFY_KITCHEN_INT8)
         self.assertIs(
-            after.model_options['transformer_options'][
-                'optimized_attention_override'
-            ],
+            after.model_options['transformer_options']['optimized_attention_override'],
             official_override,
         )
 
@@ -196,10 +184,7 @@ class DenseSelectionTests(unittest.TestCase):
             )
         self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
         self.assertEqual(attention.projector.name, 'chunked_kitchen_qkv')
-        self.assertEqual(
-            attention.backend.name,
-            'comfy_kitchen_int8_prequantized',
-        )
+        self.assertEqual(attention.backend.name, 'comfy_kitchen_int8_prequantized')
 
         model.set_model_optimized_attention(pytorch_attention)
         with patch(
@@ -218,11 +203,30 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
         self.assertEqual(attention.projector.name, 'chunked_kitchen_qkv')
 
-    def test_legacy_existing_request_preserves_incoming_attention(self):
+    def test_preserve_precision_convrot_can_stream_through_dense_kitchen(self):
         model = FakePatcher()
         plan = H3OptimizationPlan().with_memory(
-            MemoryRequest(attention='existing')
+            MemoryRequest(fused_qkv=FUSED_QKV_PRESERVE_BF16)
         )
+        with patch(
+            'h3_optimizations.dense_resolver.get_attention_function',
+            return_value=kitchen_attention,
+        ), patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=True,
+        ):
+            attention, qkv = apply_module._resolve_dense(
+                plan,
+                model,
+                self._convrot_inventory(),
+            )
+        self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
+        self.assertEqual(attention.projector.name, 'chunked_kitchen_qkv')
+
+    def test_legacy_existing_request_preserves_incoming_attention(self):
+        model = FakePatcher()
+        plan = H3OptimizationPlan().with_memory(MemoryRequest(attention='existing'))
         with patch.object(
             apply_module,
             'resolve_dense_attention',
