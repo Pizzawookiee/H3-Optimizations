@@ -1,35 +1,38 @@
-'''Stable public surface for the optimized INT8 Triton sparse backend.'''
+'''Stable public surface for the INT8 Triton sparse backend.
 
-from . import triton_sparse_fast as _impl
-from .triton_compact import (
-    backend_prepare as _backend_prepare,
-    backend_prepare_projected as _backend_prepare_projected,
-    executor_prepare_compact as _executor_prepare_compact,
-    executor_prepare_projected_compact as _executor_prepare_projected_compact,
+The production backend now consumes the exact Kitchen carrier and mirrors the
+Kitchen pure-INT8 probability/value math at 64Q x 64KV. The old Triton carrier
+and executor remain importable for focused legacy tests and benchmarks, but are
+no longer selected by the normal resolver.
+'''
+
+from .triton_sparse_fast import (  # legacy low-level compatibility
+    PreparedTritonSparse,
+    PreparedTritonHybrid,
+    TritonSparseExecutor,
 )
-from .triton_sparse_kernels import launch_int8_sparse as _fast_launch
-
-# Keep the public backend surface stable while replacing the expensive pieces:
-# the attention launcher and Sparge-format route preparation.
-_impl._launch_int8_sparse = _fast_launch
-_impl.TritonSparseExecutor.prepare_compact = _executor_prepare_compact
-_impl.TritonSparseExecutor.prepare_projected_compact = (
-    _executor_prepare_projected_compact
+from .triton_kitchen import (
+    PreparedTritonKitchen,
+    TritonKitchenBackend,
+    TritonKitchenError,
+    TritonKitchenSpec,
+    preflight_triton_kitchen,
 )
-_impl.TritonSparseBackend.prepare = _backend_prepare
-_impl.TritonSparseBackend.prepare_projected = _backend_prepare_projected
 
-_original_as_status = _impl.TritonSparseBackend.as_status
+# Preserve the public names used by apply.py and saved integrations. Only the
+# implementation behind them changes.
+TritonSparseBackend = TritonKitchenBackend
+TritonSparseError = TritonKitchenError
+TritonSparseSpec = TritonKitchenSpec
+preflight_triton_sparse = preflight_triton_kitchen
 
-
-def _optimized_as_status(self):
-    status = _original_as_status(self)
-    status['autotune_block_m'] = [16, 32, 64]
-    status['autotune_warps'] = [4, 8]
-    status['route_format'] = 'absolute_compact_int32_direct'
-    return status
-
-
-_impl.TritonSparseBackend.as_status = _optimized_as_status
-
-from .triton_sparse_fast import *  # noqa: E402,F401,F403
+__all__ = [
+    'PreparedTritonHybrid',
+    'PreparedTritonKitchen',
+    'PreparedTritonSparse',
+    'TritonSparseBackend',
+    'TritonSparseError',
+    'TritonSparseExecutor',
+    'TritonSparseSpec',
+    'preflight_triton_sparse',
+]
