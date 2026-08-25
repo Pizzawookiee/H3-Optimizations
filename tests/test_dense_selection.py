@@ -29,7 +29,11 @@ from h3_optimizations.dense_resolver import (  # noqa: E402
     install_dense_attention,
     resolve_dense_attention,
 )
-from h3_optimizations.plan import H3OptimizationPlan, MemoryRequest  # noqa: E402
+from h3_optimizations.plan import (  # noqa: E402
+    FUSED_QKV_PRESERVE_BF16,
+    H3OptimizationPlan,
+    MemoryRequest,
+)
 from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_STANDARD,
@@ -93,27 +97,6 @@ class DenseSelectionTests(unittest.TestCase):
         model = FakePatcher()
         model.set_model_optimized_attention(pytorch_attention)
         self.assertTrue(has_explicit_dense_attention(model))
-
-    def test_auto_preserve_explicit_override_yields_to_user_choice(self):
-        model = FakePatcher()
-        model.set_model_optimized_attention(pytorch_attention)
-        original = model.model_options['transformer_options']['optimized_attention_override']
-
-        with patch(
-            'h3_optimizations.dense_resolver.get_attention_function',
-            return_value=kitchen_attention,
-        ):
-            resolution = resolve_dense_attention(
-                model,
-                preserve_explicit_override=True,
-            )
-
-        self.assertEqual(resolution.selected, ATTENTION_EXISTING)
-        self.assertFalse(install_dense_attention(model, resolution))
-        self.assertIs(
-            model.model_options['transformer_options']['optimized_attention_override'],
-            original,
-        )
 
     def test_existing_explicit_override_is_preserved(self):
         model = FakePatcher()
@@ -204,6 +187,27 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertEqual(attention.backend.name, 'comfy_kitchen_int8_prequantized')
 
         model.set_model_optimized_attention(pytorch_attention)
+        with patch(
+            'h3_optimizations.dense_resolver.get_attention_function',
+            return_value=kitchen_attention,
+        ), patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=True,
+        ):
+            attention, qkv = apply_module._resolve_dense(
+                plan,
+                model,
+                self._convrot_inventory(),
+            )
+        self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
+        self.assertEqual(attention.projector.name, 'chunked_kitchen_qkv')
+
+    def test_preserve_precision_convrot_can_stream_through_dense_kitchen(self):
+        model = FakePatcher()
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(fused_qkv=FUSED_QKV_PRESERVE_BF16)
+        )
         with patch(
             'h3_optimizations.dense_resolver.get_attention_function',
             return_value=kitchen_attention,
