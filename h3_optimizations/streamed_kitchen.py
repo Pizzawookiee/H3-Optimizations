@@ -213,6 +213,27 @@ def _streamed_weight_workspace(device, required_size):
     return aimdo_torch.aimdo_to_tensor(alloc, device)
 
 
+def _release_streamed_weight_workspace(device):
+    """Release this path's committed AIMDO VRAM between H3 blocks.
+
+    The global cache is useful while one block is executing because Q, K, V and
+    deferred-Q execution can reuse the same virtual buffer. On a 6 GB device,
+    however, retaining the committed pages after the block competes with
+    ComfyUI's next-block model prefetch cast buffer.
+
+    comfy-aimdo VRAMBuffer has grow/create/destroy but no shrink operation.
+    Dropping the final Python reference invokes VRAMBuffer.__del__(), whose
+    native vrambuf_destroy() unmaps and releases committed physical VRAM.
+    """
+    device_index = _workspace_device_index(device)
+    entry = _STREAMED_QKV_WORKSPACES.pop(device_index, None)
+    if entry is not None:
+        # CPython refcounting destroys this immediately once no gathered/view
+        # object still owns it. All gathered QuantizedTensor views are cleared
+        # before callers reach this helper.
+        del entry
+
+
 def _convrot_slice_source(module, index, label):
     linear = module.qkv_proj
     if getattr(linear, 'weight_function', None):
@@ -803,6 +824,12 @@ def execute_streamed_projected(backend, module, prepared):
             held.__exit__(None, None, None)
         if prepared.projected is not None:
             prepared.release()
+
+        # Low-VRAM policy: do not keep our private one-third ConvRot workspace
+        # committed across H3 blocks. The next block may immediately ask
+        # ComfyUI/AIMDO to grow its own model-prefetch cast buffer.
+        if fmt.convrot_int8_256:
+            _release_streamed_weight_workspace(result.device)
 
 
 _ORIGINAL_PROJECT = ChunkedKitchenQKVProjector.try_project
