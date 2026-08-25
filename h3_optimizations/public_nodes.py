@@ -30,6 +30,7 @@ class H3OptimizationsExtension(ComfyExtension):
         ]
         if os.environ.get(BENCHMARK_NODES_ENV) == '1':
             from .benchmark_nodes import (
+                H3BenchmarkAssertRoute,
                 H3BenchmarkForceQKVConfig0,
                 H3FullForwardDigest,
                 H3FullForwardExperiment,
@@ -37,6 +38,7 @@ class H3OptimizationsExtension(ComfyExtension):
 
             nodes.extend((
                 H3BenchmarkForceQKVConfig0,
+                H3BenchmarkAssertRoute,
                 H3FullForwardExperiment,
                 H3FullForwardDigest,
             ))

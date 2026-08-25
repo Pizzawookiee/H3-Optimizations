@@ -38,6 +38,13 @@ STUB_SCHEMAS = {
     'H3BenchmarkForceQKVConfig0': {'input': {'required': {
         'model': ['MODEL', {}],
     }}},
+    'H3BenchmarkAssertRoute': {'input': {'required': {
+        'model': ['MODEL', {}],
+        'attention': ['STRING', {}],
+        'backend': ['STRING', {}],
+        'qkv': ['STRING', {}],
+        'projector': ['STRING', {}],
+    }}},
     'H3AIMDOResidencyLimiter': {'input': {'required': {
         'model': ['MODEL', {}],
         'residency': ['COMBO', {
@@ -232,6 +239,7 @@ class PromptTests(unittest.TestCase):
             [
                 'H3BenchmarkForceQKVConfig0',
                 'H3MemoryOptimization',
+                'H3BenchmarkAssertRoute',
                 'H3AIMDOResidencyLimiter',
             ],
         )
@@ -239,6 +247,13 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(patches[1]['inputs']['qkv_streaming_mode'], 'Off')
         self.assertEqual(patches[1]['inputs']['mlp_memory'], 'auto')
         self.assertEqual(patches[1]['inputs']['chunk_rows'], 4096)
+        self.assertEqual(patches[2]['inputs']['attention'], 'sage')
+        self.assertEqual(patches[2]['inputs']['backend'], 'sage_mem_eff')
+        self.assertEqual(patches[2]['inputs']['qkv'], 'convrot_int8_dense_sage')
+        self.assertEqual(
+            patches[2]['inputs']['projector'],
+            'chunked_kitchen_dense_sage_qkv',
+        )
 
     def test_full_density_streamed_arm_is_100_percent(self):
         graph, _ = build('h3opt_kv100')
@@ -296,16 +311,17 @@ class LadderTests(unittest.TestCase):
     def chain(arm):
         return [(node_type, dict(overrides)) for node_type, overrides in bench.ARMS[arm]]
 
-    def test_sage_memory_adds_only_memory_optimization_to_default_sage(self):
+    def test_sage_memory_adds_memory_and_fail_closed_route_assertion(self):
         sage = self.chain('sage')
         memory = self.chain('sage_memory')
         self.assertEqual(sage, [])
-        self.assertEqual(memory[-1][0], 'H3MemoryOptimization')
-        self.assertEqual(memory[-1][1]['qkv_streaming_mode'], 'Off')
+        self.assertEqual(memory[0][0], 'H3MemoryOptimization')
+        self.assertEqual(memory[0][1]['qkv_streaming_mode'], 'Off')
         self.assertEqual(
-            memory[-1][1]['precision_mode'],
+            memory[0][1]['precision_mode'],
             'Preserve native',
         )
+        self.assertEqual(memory[1][0], 'H3BenchmarkAssertRoute')
 
     def test_streamed_100_and_30_arms_differ_only_in_density(self):
         full = self.chain('h3opt_kv100')

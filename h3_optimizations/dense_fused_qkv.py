@@ -1,9 +1,10 @@
-"""Fused H3 QKV projection for the dense SM89 SageAttention ABI.
+"""Chunked Kitchen H3 QKV production for the dense SM89 SageAttention ABI.
 
 Sparse Sage consumes one scale per 128Q/64KV tile. Dense SageAttention's
-quantization mode 3 consumes its per-thread scale layout instead. This module
-keeps projection, RMSNorm, RoPE, and Q/K quantization in one Triton path while
-emitting the exact dense carrier layout expected by the existing SM89 kernel.
+quantization mode 3 consumes its per-thread scale layout instead. The production
+projector keeps each ConvRot QKV slab on the existing Kitchen linear path, then
+packs Q/K into Sage's carrier. The older all-in-one Triton experiment remains as
+``run_dense_fused_qkv`` for direct benchmarks only.
 """
 
 from __future__ import annotations
@@ -14,6 +15,10 @@ from .dense_fused_qkv_contract import (
     DENSE_QK_FORMAT,
     DenseFusedQKVError,
     HEAD_DIM,
+    K_SCALES_PER_TILE,
+    K_TILE,
+    Q_SCALES_PER_TILE,
+    Q_TILE,
     ROT_DIM,
     PreparedDenseFusedQKV,
     validate_prepared_dense_fused_qkv,
@@ -22,6 +27,11 @@ from .dense_fused_qkv_kernel import (
     TRITON_AVAILABLE,
     dense_fused_qkv_tensor_core,
 )
+from .attention.triton_i64 import per_thread_int8_i64
+from .qkv.chunked import project_chunk_hnd
+
+CHUNK_ROWS = 4096
+
 
 def _plain_qkv_weight(module, x):
     import comfy.ops
@@ -214,32 +224,111 @@ def run_dense_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None)
 
 
 class DenseFusedQKVProjector:
-    """Project H3 directly into the dense SM89 Sage per-thread carrier."""
+    """Chunk Kitchen QKV projection directly into the dense Sage carrier."""
 
-    name = "h3_fused_qkv_dense_sage"
+    name = "chunked_kitchen_dense_sage_qkv"
     qk_format = DENSE_QK_FORMAT
 
-    def __init__(self, tensor_core=None):
-        self.tensor_core = tensor_core
+    def __init__(
+        self,
+        chunk_rows=CHUNK_ROWS,
+        *,
+        quantizer=None,
+        project_chunk=None,
+        allow_cpu_for_tests=False,
+    ):
+        self.chunk_rows = int(chunk_rows)
+        self.quantizer = quantizer or per_thread_int8_i64
+        self.project_chunk = project_chunk or project_chunk_hnd
+        self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
+        if self.chunk_rows <= 0 or self.chunk_rows % Q_TILE:
+            raise ValueError("dense Sage QKV chunk rows must be divisible by 128")
 
     @property
     def installation_signature(self):
-        function = getattr(self.tensor_core, "__func__", self.tensor_core)
-        core = None if function is None else (
-            getattr(function, "__module__", type(function).__module__),
-            getattr(function, "__qualname__", type(function).__qualname__),
-            id(function),
+        def identity(callback):
+            function = getattr(callback, "__func__", callback)
+            return (
+                getattr(function, "__module__", type(function).__module__),
+                getattr(function, "__qualname__", type(function).__qualname__),
+                id(function),
+            )
+
+        return (
+            self.name,
+            self.qk_format,
+            self.chunk_rows,
+            identity(self.quantizer),
+            identity(self.project_chunk),
         )
-        return (self.name, self.qk_format, core)
 
     def bind(self, module):
         return None
 
     def project(self, module, x, rope_freqs, *, layer_index, transformer_options):
-        return run_dense_fused_qkv(
-            module,
-            x,
-            rope_freqs,
-            layer_index=layer_index,
-            tensor_core=self.tensor_core,
+        del transformer_options
+        if x.ndim != 2 or x.dtype != torch.bfloat16 or (
+            not self.allow_cpu_for_tests and not x.is_cuda
+        ):
+            raise DenseFusedQKVError(
+                "chunked dense Sage QKV requires rank-2 CUDA BF16 activations"
+            )
+        if int(module.head_dim) != HEAD_DIM:
+            raise DenseFusedQKVError("chunked dense Sage QKV requires head_dim 128")
+
+        sequence = int(x.shape[0])
+        heads = int(module.heads)
+        shape = (1, heads, sequence, HEAD_DIM)
+        q_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
+        k_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
+        v = torch.empty(shape, dtype=x.dtype, device=x.device)
+        q_scales = ((sequence + Q_TILE - 1) // Q_TILE) * Q_SCALES_PER_TILE
+        k_scales = ((sequence + K_TILE - 1) // K_TILE) * K_SCALES_PER_TILE
+        q_scale = torch.empty((1, heads, q_scales), dtype=torch.float32, device=x.device)
+        k_scale = torch.empty((1, heads, k_scales), dtype=torch.float32, device=x.device)
+        q_scale_start = 0
+        k_scale_start = 0
+
+        for start in range(0, sequence, self.chunk_rows):
+            stop = min(start + self.chunk_rows, sequence)
+            q_chunk, k_chunk, v_chunk = self.project_chunk(
+                module, x, rope_freqs, start, stop
+            )
+            chunk_q, chunk_q_scale, chunk_k, chunk_k_scale = self.quantizer(
+                q_chunk,
+                k_chunk,
+                None,
+                BLKQ=Q_TILE,
+                WARPQ=32,
+                BLKK=K_TILE,
+                WARPK=64,
+                tensor_layout="HND",
+            )
+            q_int8[:, :, start:stop, :].copy_(chunk_q)
+            k_int8[:, :, start:stop, :].copy_(chunk_k)
+            v[:, :, start:stop, :].copy_(v_chunk)
+            q_scale_stop = q_scale_start + int(chunk_q_scale.shape[-1])
+            k_scale_stop = k_scale_start + int(chunk_k_scale.shape[-1])
+            q_scale[:, :, q_scale_start:q_scale_stop].copy_(chunk_q_scale)
+            k_scale[:, :, k_scale_start:k_scale_stop].copy_(chunk_k_scale)
+            q_scale_start = q_scale_stop
+            k_scale_start = k_scale_stop
+            del q_chunk, k_chunk, v_chunk, chunk_q, chunk_k
+            del chunk_q_scale, chunk_k_scale
+
+        if q_scale_start != q_scales or k_scale_start != k_scales:
+            raise DenseFusedQKVError("chunked dense Sage Q/K scale layout is invalid")
+        return validate_prepared_dense_fused_qkv(
+            PreparedDenseFusedQKV(
+                q_int8=q_int8,
+                q_scale=q_scale,
+                k_int8=k_int8,
+                k_scale=k_scale,
+                v=v,
+                output_dtype=x.dtype,
+                sequence=sequence,
+                heads=heads,
+                head_dim=HEAD_DIM,
+                layer_index=int(layer_index),
+            )
         )

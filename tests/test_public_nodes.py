@@ -4,6 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -21,6 +22,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations.aimdo_limiter import H3AIMDOResidencyLimiter  # noqa: E402
+from h3_optimizations.benchmark_nodes import H3BenchmarkAssertRoute  # noqa: E402
 from h3_optimizations.memory_migration_node import (  # noqa: E402
     H3MemoryOptimization,
     PRECISION_MODE_ALLOW_FP8,
@@ -85,9 +87,10 @@ class PublicNodeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {BENCHMARK_NODES_ENV: '1'}):
             nodes = asyncio.run(H3OptimizationsExtension().get_node_list())
         self.assertEqual(
-            [node.__name__ for node in nodes[-3:]],
+            [node.__name__ for node in nodes[-4:]],
             [
                 'H3BenchmarkForceQKVConfig0',
+                'H3BenchmarkAssertRoute',
                 'H3FullForwardExperiment',
                 'H3FullForwardDigest',
             ],
@@ -238,6 +241,33 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.attention, ATTENTION_EXISTING)
         self.assertEqual(request.fused_qkv, FUSED_QKV_AUTO)
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_OFF)
+
+    def test_benchmark_route_assertion_accepts_only_exact_signature(self):
+        signature = {
+            'attention': 'sage',
+            'backend': 'sage_mem_eff',
+            'qkv': 'convrot_int8_dense_sage',
+            'projector': 'chunked_kitchen_dense_sage_qkv',
+        }
+        model = SimpleNamespace(model_options={'transformer_options': {
+            'h3_optimizations_status': {
+                'attention': {
+                    'selected': signature['attention'],
+                    'backend_details': {'backend': signature['backend']},
+                },
+                'fused_qkv': {
+                    'provider': signature['qkv'],
+                    'projector': signature['projector'],
+                },
+            },
+        }})
+
+        H3BenchmarkAssertRoute.execute(model, **signature)
+        with self.assertRaisesRegex(RuntimeError, 'benchmark route mismatch'):
+            H3BenchmarkAssertRoute.execute(
+                model,
+                **{**signature, 'qkv': 'chunked_bf16_qkv'},
+            )
 
     def test_memory_schema_appends_streaming_after_precision_mode(self):
         schema = H3MemoryOptimization.define_schema()

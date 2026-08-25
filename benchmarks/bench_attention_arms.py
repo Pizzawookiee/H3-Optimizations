@@ -114,6 +114,12 @@ ARMS = {
             'precision_mode': 'Preserve native',
             'qkv_streaming_mode': 'Off',
         }),
+        ('H3BenchmarkAssertRoute', {
+            'attention': 'sage',
+            'backend': 'sage_mem_eff',
+            'qkv': 'convrot_int8_dense_sage',
+            'projector': 'chunked_kitchen_dense_sage_qkv',
+        }),
     ],
     'h3opt_kv100': [
         ('H3MemoryOptimization', {'qkv_streaming_mode': 'Auto'}),

@@ -25,7 +25,7 @@ from .apply import (
 )
 from .model import get_h3_blocks, get_minimax_h3_model, is_minimax_h3
 from .patch import configure_backend
-from .plan import read_plan
+from .plan import STATUS_KEY, read_plan
 from .qkv.formats import inspect_h3_linears
 
 
@@ -163,6 +163,61 @@ class H3BenchmarkForceQKVConfig0(io.ComfyNode):
                 _make_forward(linear),
             )
         return io.NodeOutput(patched)
+
+
+class H3BenchmarkAssertRoute(io.ComfyNode):
+    '''Fail before sampling when a benchmark arm resolved the wrong route.'''
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3BenchmarkAssertRoute',
+            display_name='H3 Benchmark Assert Route',
+            category='H3-Optimizations/Benchmarks',
+            description='Benchmark-only fail-closed route assertion.',
+            inputs=[
+                io.Model.Input('model'),
+                io.String.Input('attention'),
+                io.String.Input('backend'),
+                io.String.Input('qkv'),
+                io.String.Input('projector'),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, attention, backend, qkv, projector):
+        options = (
+            getattr(model, 'model_options', {})
+            .get('transformer_options', {})
+            or {}
+        )
+        status = options.get(STATUS_KEY) or {}
+        attention_status = status.get('attention') or {}
+        qkv_status = status.get('fused_qkv') or {}
+        backend_status = attention_status.get('backend_details') or {}
+        actual = {
+            'attention': attention_status.get('selected'),
+            'backend': backend_status.get('backend'),
+            'qkv': qkv_status.get('provider'),
+            'projector': qkv_status.get('projector'),
+        }
+        expected = {
+            'attention': str(attention),
+            'backend': str(backend),
+            'qkv': str(qkv),
+            'projector': str(projector),
+        }
+        if actual != expected:
+            raise RuntimeError(
+                'benchmark route mismatch: expected %s, actual %s'
+                % (json.dumps(expected, sort_keys=True), json.dumps(actual, sort_keys=True))
+            )
+        logging.info(
+            '[H3 Benchmark] validated route: %s',
+            json.dumps(actual, sort_keys=True),
+        )
+        return io.NodeOutput(model)
 
 
 # ---------------------------------------------------------------------------

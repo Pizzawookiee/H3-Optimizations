@@ -312,7 +312,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
         from .dense_fused_qkv import DenseFusedQKVProjector
 
         backend = ProjectedSM89SageBackend(dense.backend)
-        projector = DenseFusedQKVProjector()
+        projector = DenseFusedQKVProjector(chunk_rows=memory.chunk_rows)
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         # Reuse the package-owned attention-forward slot without changing the
         # selected dense attention. attention_forward recognizes the BF16
@@ -1096,10 +1096,11 @@ def apply_plan(model, plan: H3OptimizationPlan):
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
     _warn_about_slow_paths(attention, qkv)
     logging.info(
-        '%s armed: attention=%s qkv=%s mlp=%s memory=%s device=%s',
+        '%s armed: attention=%s qkv=%s qkv_weights=%s mlp=%s memory=%s device=%s',
         LOG_PREFIX,
         attention.selected,
         qkv.provider_id,
+        ','.join(inventory.labels('qkv')) or 'unknown',
         mlp.provider_id,
         describe_memory_options(attention),
         environment.device_name,

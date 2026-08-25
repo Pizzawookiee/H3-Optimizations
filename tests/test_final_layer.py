@@ -13,11 +13,20 @@ ROOT = PACK.parents[1]
 for _root in (str(PACK), str(ROOT)):
     if _root not in sys.path:
         sys.path.insert(0, _root)
+TEST_ARGS = sys.argv[1:]
+sys.argv = [sys.argv[0], '--cpu']
+
+import comfy.options  # noqa: E402
+
+comfy.options.enable_args_parsing()
 
 from h3_optimizations.memory import final_layer
 import h3_optimizations.apply as apply_module
 from h3_optimizations.plan import H3OptimizationPlan, MemoryRequest
 from h3_optimizations.qkv.providers import MLPProviderResolution
+from comfy.model_patcher import ModelPatcher
+
+sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 class _Layer:
@@ -98,6 +107,39 @@ class FinalLayerTests(unittest.TestCase):
             self.assertFalse(final_layer.install(patcher, 4096))
             with self.assertRaises(final_layer.H3FinalLayerPatchError):
                 final_layer.install(patcher, 2048)
+
+    def test_real_model_patcher_attaches_and_dispatches_forward(self):
+        root = torch.nn.Module()
+        root.diffusion_model = torch.nn.Module()
+        layer = torch.nn.Module()
+        implementation = _Layer()
+        layer.norm = implementation.norm
+        layer.video_out = implementation.video_out
+        layer.audio_out = implementation.audio_out
+        layer.adaln_proj = implementation.adaln_proj
+        layer.forward = implementation.forward
+        root.diffusion_model.final_layer = layer
+        patcher = ModelPatcher(root, torch.device('cpu'), torch.device('cpu'))
+
+        with mock.patch.object(
+            final_layer,
+            'get_minimax_h3_model',
+            return_value=root.diffusion_model,
+        ):
+            final_layer.install(patcher, 3)
+        patcher.patch_model(load_weights=False)
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        with mock.patch.object(final_layer.logging, 'info') as info:
+            root.diffusion_model.final_layer(
+                x,
+                None,
+                (0, 7, 0),
+                (7, 11, 1),
+            )
+        patcher.unpatch_model(unpatch_weights=False)
+
+        self.assertEqual(len(info.call_args_list), 1)
+        self.assertIn('chunked FinalLayer ran', info.call_args.args[0])
 
     def test_memory_plan_installs_final_layer_even_when_mlp_is_off(self):
         patcher = _Patcher()

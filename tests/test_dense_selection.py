@@ -283,7 +283,7 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertTrue(qkv.fused)
         self.assertEqual(attention.selected, ATTENTION_SAGE)
         self.assertEqual(attention.backend.name, 'sage_mem_eff')
-        self.assertEqual(attention.projector.name, 'h3_fused_qkv_dense_sage')
+        self.assertEqual(attention.projector.name, 'chunked_kitchen_dense_sage_qkv')
 
     def test_legacy_existing_request_preserves_incoming_attention(self):
         model = FakePatcher()
