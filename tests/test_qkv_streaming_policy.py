@@ -159,29 +159,38 @@ class QKVStreamingPolicyTests(unittest.TestCase):
                 self.assertEqual(resolved.provider_id, QKV_TRITON_SPARSE_CHUNKED)
                 self.assertIn('BF16 Q/K/V chunks', resolved.reason)
 
-    def test_preserve_mode_uses_bounded_bf16_when_consumer_cannot_stream(self):
-        resolved = resolve_qkv_provider(
-            inventory(self.bf16),
-            request=FUSED_QKV_PRESERVE_BF16,
-            backend_kind='existing',
-        )
-        self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
+    def test_generic_attention_uses_bounded_projection_for_all_streamable_formats(self):
+        for weight in (self.bf16, self.convrot, self.w4a8, self.fp8):
+            with self.subTest(layout=weight._layout_cls):
+                resolved = resolve_qkv_provider(
+                    inventory(weight),
+                    request=FUSED_QKV_PRESERVE_BF16,
+                    backend_kind='existing',
+                    memory_optimize=True,
+                    fp8_available=True,
+                )
+                self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
+                self.assertFalse(resolved.fused)
+                self.assertIn('bounded token chunks', resolved.reason)
+                self.assertIn('complete BF16 Q/K/V', resolved.reason)
 
-    def test_allow_fp8_still_uses_bounded_bf16_before_conversion(self):
-        resolved = resolve_qkv_provider(
-            inventory(self.bf16),
-            request=FUSED_QKV_AUTO,
-            backend_kind='existing',
-            memory_optimize=True,
-            fp8_available=True,
-        )
-        self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
-        self.assertNotEqual(resolved.provider_id, QKV_DENSE_FP8_CHUNKED)
+    def test_allow_fp8_still_uses_bounded_native_projection_before_conversion(self):
+        for weight in (self.bf16, self.convrot, self.w4a8, self.fp8):
+            with self.subTest(layout=weight._layout_cls):
+                resolved = resolve_qkv_provider(
+                    inventory(weight),
+                    request=FUSED_QKV_AUTO,
+                    backend_kind='existing',
+                    memory_optimize=True,
+                    fp8_available=True,
+                )
+                self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
+                self.assertNotEqual(resolved.provider_id, QKV_DENSE_FP8_CHUNKED)
 
-    def test_required_does_not_accept_nonfused_bf16_fallback(self):
+    def test_required_does_not_accept_nonfused_bounded_fallback(self):
         with self.assertRaisesRegex(RuntimeError, 'required fused QKV'):
             resolve_qkv_provider(
-                inventory(self.bf16),
+                inventory(self.convrot),
                 request=FUSED_QKV_REQUIRED,
                 backend_kind='existing',
             )

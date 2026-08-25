@@ -11,9 +11,6 @@ both been ruled out.
 from . import providers as base
 from ..plan import FUSED_QKV_OFF, FUSED_QKV_PRESERVE_BF16, FUSED_QKV_REQUIRED
 
-# apply.py already routes this provider id through SparseFusedQKVProjector. The
-# projector is now format-neutral, so retain the established ABI value while
-# the reason/status text describes the actual checkpoint format.
 QKV_STREAMED_SPARSE_SAGE = base.QKV_SPARSE_CONVROT_INT8
 
 _KITCHEN_CARRIER_CONSUMERS = {
@@ -41,9 +38,6 @@ def _native_stream_format(inventory):
 
 
 def is_dense_streamed_provider(provider_id):
-    # Native FP8 is intentionally normalized to the generic Kitchen provider.
-    # QKV_DENSE_FP8_CHUNKED is reserved for actual float->FP8 conversion
-    # fallback, so status/logging can distinguish the two policies.
     return provider_id == base.QKV_DENSE_KITCHEN_CHUNKED
 
 
@@ -70,8 +64,7 @@ def _stream_kitchen(
         (
             'checkpoint-native %s weights project into bounded BF16 Q/K/V '
             'chunks streamed directly into the Kitchen carrier'
-        )
-        % fmt,
+        ) % fmt,
     )
 
 
@@ -92,17 +85,11 @@ def _stream_sparse_sage(
         (
             'checkpoint-native %s weights project into bounded BF16 Q/K/V '
             'chunks for streamed Sparse Sage execution'
-        )
-        % _native_stream_format(inventory),
+        ) % _native_stream_format(inventory),
     )
 
 
-def _stream_triton(
-    inventory,
-    *,
-    backend_kind,
-    triton_available,
-):
+def _stream_triton(inventory, *, backend_kind, triton_available):
     if (
         backend_kind != 'triton_sparse_int8'
         or _native_stream_format(inventory) is None
@@ -115,8 +102,7 @@ def _stream_triton(
         (
             'checkpoint-native %s weights project into bounded BF16 Q/K/V '
             'chunks for the Triton sparse carrier'
-        )
-        % _native_stream_format(inventory),
+        ) % _native_stream_format(inventory),
     )
 
 
@@ -157,27 +143,27 @@ def _native_bounded_fallback(
                 'checkpoint-native W4A8 QKV uses its native Triton provider',
             )
 
-    if inventory.qkv_fp8:
-        if (
-            backend_kind == 'sparse_sage'
-            and fp8_available
-            and triton_available
-            and base._sparse_contract_ok(sparse_spec)
-        ):
-            return base.QKVProviderResolution(
-                base.QKV_SPARSE_FP8_CHUNKED,
-                True,
-                'checkpoint-native FP8 QKV uses held FP8 projection without changing checkpoint precision',
-            )
-        return base._standard_qkv(
-            'checkpoint-native FP8 QKV has no compatible bounded native provider for the selected attention backend'
+    if inventory.qkv_fp8 and (
+        backend_kind == 'sparse_sage'
+        and fp8_available
+        and triton_available
+        and base._sparse_contract_ok(sparse_spec)
+    ):
+        return base.QKVProviderResolution(
+            base.QKV_SPARSE_FP8_CHUNKED,
+            True,
+            'checkpoint-native FP8 QKV uses held FP8 projection without changing checkpoint precision',
         )
 
-    if inventory.qkv_plain_float:
+    fmt = _native_stream_format(inventory)
+    if fmt is not None:
         return base.QKVProviderResolution(
             base.QKV_BF16_CHUNKED,
             False,
-            'floating checkpoint QKV uses bounded BF16 projection without introducing weight quantization',
+            (
+                'checkpoint-native %s QKV projects in bounded token chunks and '
+                'materializes complete BF16 Q/K/V for the selected attention consumer'
+            ) % fmt,
         )
 
     labels = ', '.join(sorted(set(inventory.labels('qkv'))))
@@ -206,8 +192,6 @@ def resolve_qkv_provider(
     if not inventory.homogeneous('qkv'):
         return base._required_or_standard(request, 'H3 QKV layers use mixed weight formats')
 
-    # First priority: remove the sequence-sized BF16 QKV transient. Lower
-    # checkpoint weight precision never changes the BF16 projected-chunk contract.
     streamed = _stream_kitchen(
         inventory,
         request=request,
@@ -232,9 +216,6 @@ def resolve_qkv_provider(
     if streamed is not None:
         return streamed
 
-    # Second priority: retain checkpoint-native/bounded execution. In
-    # particular, a floating checkpoint uses chunked BF16 QKV before we ever
-    # consider converting its QKV weights to FP8.
     native = _native_bounded_fallback(
         inventory,
         backend_kind=backend_kind,
@@ -243,8 +224,6 @@ def resolve_qkv_provider(
         fp8_available=fp8_available,
     )
 
-    # `required` means a consumer-ready projected carrier is mandatory. A
-    # merely bounded non-fused BF16 projection must not silently satisfy it.
     if request == FUSED_QKV_REQUIRED:
         if native.provider_id != base.QKV_STANDARD and native.fused:
             return native
@@ -255,13 +234,9 @@ def resolve_qkv_provider(
 
     if native.provider_id != base.QKV_STANDARD:
         return native
-
-    # Preserve precision stops here. Unsupported formats remain upstream.
     if request == FUSED_QKV_PRESERVE_BF16:
         return native
 
-    # Only now is BF16/FP16 -> FP8 conversion allowed. The older resolver owns
-    # those format-specific last-resort rules.
     return base.resolve_qkv_provider(
         inventory,
         request=request,
