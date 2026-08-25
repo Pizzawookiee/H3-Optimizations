@@ -138,6 +138,29 @@ class MemoryTests(unittest.TestCase):
             'handle',
         )
 
+    def test_forced_bf16_held_mlp_disables_requantization(self):
+        fc1 = object()
+        fc2 = object()
+        mlp = type('MLP', (), {'fc1': fc1, 'fc2': fc2})()
+        sample = torch.empty((1, 8), dtype=torch.bfloat16)
+        weights = iter(
+            (
+                (torch.empty((16, 8), dtype=torch.bfloat16), None, 'fc1'),
+                (torch.empty((8, 8), dtype=torch.bfloat16), None, 'fc2'),
+            )
+        )
+        with patch.object(
+            comfy.ops,
+            'cast_bias_weight',
+            side_effect=lambda *_args, **_kwargs: next(weights),
+        ) as acquire, patch.object(comfy.ops, 'uncast_bias_weight'):
+            with linear_module.HeldMLP(mlp, sample, force_bf16=True):
+                pass
+        self.assertEqual(acquire.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs['want_requant'] is False for call in acquire.call_args_list)
+        )
+
     def test_convrot_two_slice_matches_unsliced_fake_math(self):
         class FakeQuantized:
             def __init__(self, qdata, scale):

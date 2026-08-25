@@ -18,13 +18,16 @@ ATTENTION_REQUESTS = (ATTENTION_AUTO, ATTENTION_EXISTING)
 FUSED_QKV_AUTO = 'auto'
 FUSED_QKV_OFF = 'off'
 FUSED_QKV_REQUIRED = 'required'
-# Internal request used by the public Preserve precision policy. It keeps an
-# actual BF16 checkpoint in BF16 while still allowing bounded QKV projection.
+# Internal requests used by the public precision policy.
+FUSED_QKV_FORCE_BF16 = 'force_bf16'
+FUSED_QKV_FORCE_QUANT = 'force_quant'
 FUSED_QKV_PRESERVE_BF16 = 'preserve_bf16'
 FUSED_QKV_REQUESTS = (
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     FUSED_QKV_REQUIRED,
+    FUSED_QKV_FORCE_BF16,
+    FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_PRESERVE_BF16,
 )
 
@@ -39,6 +42,8 @@ QKV_STREAMING_REQUESTS = (
 
 MLP_MEMORY_AUTO = 'auto'
 MLP_MEMORY_OFF = 'off'
+MLP_MEMORY_BF16 = 'bf16'
+MLP_MEMORY_FORCE_QUANT = 'force_quant'
 MLP_MEMORY_PRESERVE = 'preserve_precision'
 MLP_MEMORY_LEGACY_BF16 = 'legacy_bf16'
 MLP_MEMORY_LEGACY_NATIVE = 'legacy_native'
@@ -46,6 +51,8 @@ MLP_MEMORY_LEGACY_CONVROT_REQUIRED = 'legacy_convrot_2slice_required'
 MLP_MEMORY_REQUESTS = (
     MLP_MEMORY_AUTO,
     MLP_MEMORY_OFF,
+    MLP_MEMORY_BF16,
+    MLP_MEMORY_FORCE_QUANT,
     MLP_MEMORY_PRESERVE,
     MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_NATIVE,

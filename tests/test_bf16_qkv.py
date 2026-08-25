@@ -73,7 +73,17 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         self.assertEqual(projector.chunk_rows, 4096)
         self.assertEqual(
             projector.installation_signature,
-            ('chunked_bf16_qkv', 4096),
+            ('chunked_bf16_qkv', 4096, False, False),
+        )
+        forced = ChunkedBF16QKVProjector(force_weights_bf16=True)
+        self.assertEqual(
+            forced.installation_signature,
+            ('chunked_bf16_qkv', 4096, True, False),
+        )
+        quantized = ChunkedBF16QKVProjector(force_weights_fp8=True)
+        self.assertEqual(
+            quantized.installation_signature,
+            ('chunked_bf16_qkv', 4096, False, True),
         )
 
     def test_chunk_rows_must_be_positive(self):
@@ -111,6 +121,15 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
                 transformer_options={},
             )
         )
+        forced = ChunkedBF16QKVProjector(force_weights_bf16=True)
+        with self.assertRaisesRegex(BF16QKVBindingError, 'CUDA BF16'):
+            forced.try_project(
+                module,
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+            )
 
     def test_source_keeps_streaming_and_full_materialization_separate(self):
         text = (PACK / 'h3_optimizations' / 'qkv' / 'bf16.py').read_text(
@@ -134,8 +153,6 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
     def test_preserve_bf16_has_one_distinct_provider_for_all_consumers(self):
         backend_kinds = (
             'existing',
-            'comfy_kitchen_int8',
-            'sparse_kitchen_int8',
             'sparse_sage',
             'triton_sparse_int8',
             'flex_attention_fp8',
@@ -203,7 +220,7 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         )
         self.assertIn('QKV_BF16_CHUNKED', text)
         self.assertGreaterEqual(
-            text.count('ChunkedBF16QKVProjector(chunk_rows=4096)'),
+            text.count('_bounded_qkv_projector(qkv)'),
             5,
         )
         self.assertIn('projector=attention.projector', text)

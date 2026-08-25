@@ -64,16 +64,37 @@ def acquire_linear(module, sample, want_requant=True):
 class HeldMLP:
     """Hold fc1/fc2 across every token slab when Comfy's buffers permit it."""
 
-    def __init__(self, mlp, sample):
+    def __init__(self, mlp, sample, *, force_bf16=False):
         self.mlp = mlp
         self.sample = sample
+        self.force_bf16 = bool(force_bf16)
         self.fc1_weight = None
         self.fc2_weight = None
 
+    def _validate_bf16(self, acquired, name):
+        if not self.force_bf16:
+            return
+        if isinstance(acquired.weight, QuantizedTensor):
+            raise UnsafeHeldWeights('%s remained quantized in BF16 mode' % name)
+        if getattr(acquired.weight, 'dtype', None) != torch.bfloat16:
+            raise UnsafeHeldWeights('%s was not materialized as BF16' % name)
+        if acquired.bias is not None and getattr(acquired.bias, 'dtype', None) != torch.bfloat16:
+            raise UnsafeHeldWeights('%s bias was not materialized as BF16' % name)
+
     def __enter__(self):
         try:
-            self.fc1_weight = acquire_linear(self.mlp.fc1, self.sample)
-            self.fc2_weight = acquire_linear(self.mlp.fc2, self.sample)
+            self.fc1_weight = acquire_linear(
+                self.mlp.fc1,
+                self.sample,
+                want_requant=not self.force_bf16,
+            )
+            self._validate_bf16(self.fc1_weight, 'fc1')
+            self.fc2_weight = acquire_linear(
+                self.mlp.fc2,
+                self.sample,
+                want_requant=not self.force_bf16,
+            )
+            self._validate_bf16(self.fc2_weight, 'fc2')
             stream1 = _stream_from_handle(self.fc1_weight.handle)
             stream2 = _stream_from_handle(self.fc2_weight.handle)
             if stream1 is not None and stream1 is stream2:

@@ -21,6 +21,7 @@ from comfy.quant_ops import QuantizedTensor
 
 from .. import diagnostics
 from ..attention_forward import finish_qkv_projection, project_qkv, to_hnd
+from .fp8 import HeldFP8QKV
 from .formats import describe_linear
 
 
@@ -53,9 +54,10 @@ class PreparedBF16QKV:
 class HeldBF16QKV:
     """Acquire one floating H3 QKV weight once across all token chunks."""
 
-    def __init__(self, attention, sample):
+    def __init__(self, attention, sample, *, allow_quantized_source=False):
         self.attention = attention
         self.sample = sample
+        self.allow_quantized_source = bool(allow_quantized_source)
         self.weight = None
         self.bias = None
         self.acquired_weight = None
@@ -68,7 +70,7 @@ class HeldBF16QKV:
                 'held BF16 QKV requires a rank-2 BF16 activation sample'
             )
         fmt = describe_linear(self.attention.qkv_proj)
-        if not fmt.plain_float:
+        if not fmt.plain_float and not self.allow_quantized_source:
             raise BF16QKVBindingError(
                 'held BF16 QKV requires floating QKV weights, got %s' % fmt.label
             )
@@ -151,14 +153,29 @@ class ChunkedBF16QKVProjector:
 
     name = 'chunked_bf16_qkv'
 
-    def __init__(self, chunk_rows=CHUNK_ROWS):
+    def __init__(
+        self,
+        chunk_rows=CHUNK_ROWS,
+        *,
+        force_weights_bf16=False,
+        force_weights_fp8=False,
+    ):
         self.chunk_rows = int(chunk_rows)
+        self.force_weights_bf16 = bool(force_weights_bf16)
+        self.force_weights_fp8 = bool(force_weights_fp8)
+        if self.force_weights_bf16 and self.force_weights_fp8:
+            raise ValueError('QKV weights cannot be forced to both BF16 and FP8')
         if self.chunk_rows <= 0:
             raise ValueError('chunk_rows must be positive')
 
     @property
     def installation_signature(self):
-        return (self.name, self.chunk_rows)
+        return (
+            self.name,
+            self.chunk_rows,
+            self.force_weights_bf16,
+            self.force_weights_fp8,
+        )
 
     def _validate(self, module, x, rope_freqs):
         if comfy.model_management.in_training:
@@ -192,7 +209,22 @@ class ChunkedBF16QKVProjector:
             raise TypeError('consume_chunk must be callable')
         sequence = int(x.shape[0])
 
-        held = HeldBF16QKV(module, x[:1]) if fmt.plain_float else None
+        if self.force_weights_fp8:
+            held = HeldFP8QKV(
+                module,
+                x[:1],
+                allow_float_conversion=True,
+            )
+        else:
+            held = (
+                HeldBF16QKV(
+                    module,
+                    x[:1],
+                    allow_quantized_source=self.force_weights_bf16,
+                )
+                if fmt.plain_float or self.force_weights_bf16
+                else None
+            )
         if held is not None:
             held.__enter__()
         try:
@@ -238,4 +270,6 @@ class ChunkedBF16QKVProjector:
         try:
             return self.project(module, x, rope_freqs)
         except BF16QKVBindingError:
+            if self.force_weights_bf16 or self.force_weights_fp8:
+                raise
             return None
