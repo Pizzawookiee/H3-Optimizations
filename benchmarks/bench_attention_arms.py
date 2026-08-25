@@ -1,15 +1,38 @@
-'''End-to-end comparison of H3 attention configurations through the ComfyUI prompt API.
+'''End-to-end comparison of H3 attention and memory configurations.
 
-Unlike the kernel benchmarks in this directory, which time one attention call on
-synthetic already-projected Q/K/V, this drives the *running* ComfyUI server with
-real prompts: real checkpoint, real conditioning, real sampler. What it reports
-is therefore what a user actually experiences, including QKV projection, MLP,
-and every allocator effect the kernel benchmarks deliberately exclude.
+Unlike the kernel benchmarks in this directory, this drives a running ComfyUI
+server with a real H3 checkpoint, conditioning and sampler. It measures the
+user-visible sampler-step cost and whole-GPU VRAM peak.
 
-Only a few steps are executed per arm. A full 20-step H3 run at 1 MP costs
-minutes per arm, and the sampler's per-step cost is essentially flat across the
-trajectory, so a warmup step plus a small measured series buys the same per-step
-number for a fraction of the GPU time. The schedule is still built at its true
+Every arm deliberately shares two benchmark controls:
+
+* H3BenchmarkForceQKVConfig0 forces compatible ConvRot-256 INT8 QKV linears to
+  Comfy Kitchen CUTLASS config 0. This removes the known large-sequence Kitchen
+  dispatcher artifact from the comparison.
+* H3AIMDOResidencyLimiter is fixed to ``0 blocks`` so DynamicVRAM cannot hide or
+  amplify activation-memory differences by retaining a different amount of H3
+  weights between arms.
+
+The benchmark-only config node is not registered in normal ComfyUI sessions.
+Start ComfyUI with ``H3_OPTIMIZATIONS_BENCHMARK_NODES=1`` before running this
+script.
+
+The default ladder is:
+
+1. dense Comfy Kitchen attention;
+2. dense SageAttention;
+3. dense SageAttention plus H3 Memory Optimization. Sage remains the attention
+   consumer while checkpoint-native QKV is projected in bounded Kitchen chunks,
+   MLP activations are bounded, and FinalLayer is chunked. Because ordinary
+   dense Sage still requires complete Q/K/V, those final BF16 tensors remain;
+4. H3 Memory Optimization plus native 64Q x 64KV attention at 100% video KV.
+   This shows the additional VRAM effect of streamed BF16 QKV/carrier execution
+   without attributing any gain to sparsity;
+5. the intended default: the same native 64Q x 64KV streamed path at 30% video
+   KV. Lower densities are quality experiments and are intentionally not part of
+   the README performance default.
+
+Only a few steps are executed per arm. The schedule is still built at its true
 length and then truncated with SplitSigmas, so the executed steps sit on the
 real sigma trajectory rather than on a compressed one.
 
@@ -19,21 +42,14 @@ Two numbers per cell:
   peak MiB  highest driver-level VRAM seen during the run, from nvidia-smi
 
 The VRAM figure is driver-level and whole-GPU, not this process's torch
-allocator. It is the number that decides whether a run fits on the card, which
-is what the comparison is for, but it does include anything else resident on
-the GPU. The idle baseline captured before each arm is reported next to it.
-
-Two things keep that figure meaningful. A discarded priming run loads the
-checkpoint and populates the conditioning cache before the first measured arm,
-and nothing between arms is allowed to reset the server's executor. Resetting it
-evicts the cached conditioning, and the next arm then pulls the 32B text encoder
-back onto the card alongside the resident diffusion model -- a large constant
-added to every arm alike, which drowns out the difference being measured. If
-every arm reports nearly the same peak, suspect that before believing the
-backends are equivalent.
+allocator. A discarded priming run loads the checkpoint and populates the
+conditioning cache before the first measured arm. Nothing between arms resets
+the executor, because doing so evicts conditioning and can pull the 32B text
+encoder back onto the card during the next measurement.
 
 Run from the ComfyUI root against an already-running server, for example:
 
+    H3_OPTIMIZATIONS_BENCHMARK_NODES=1 python main.py
     .\\.venv\\Scripts\\python.exe custom_nodes\\H3-Optimizations\\benchmarks\\bench_attention_arms.py --i-understand-this-uses-gpu
 
 This script never imports torch and never touches CUDA in-process. All GPU work
@@ -60,13 +76,8 @@ DEFAULT_UNET = r'hf_minimax_h3\minimax_h3_fl2va_pruned_int8_convrot.safetensors'
 DEFAULT_CLIP = r'hf_minimax_h3\qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors'
 DEFAULT_VAE = r'hf_minimax_h3\minimax_h3_video_vae_fp16.safetensors'
 
-# 16:9 at 1.0 megapixels, taken from the resolution table shipped in ComfyUI's
-# MiniMax H3 template workflow. Both dimensions are the required multiple of 32.
 ONE_MP = (1376, 768)
 
-# H3 runs at 24 fps and snaps frame counts up to a 17k+5 grid, so neither
-# duration lands exactly on its nominal seconds. The grid value is what the
-# model actually samples, so that is what gets reported.
 FPS = 24
 WORKLOADS = {
     '5s': 124,   # 5.17 s
@@ -78,22 +89,18 @@ DEFAULT_PROMPT = (
     'steam rising from vents, reflections shimmering on wet asphalt.'
 )
 
-# Each arm is the chain of model-patch nodes inserted between the loader and the
-# guider. An empty chain is the unpatched model exactly as the checkpoint loads.
-#
-# The last three form a ladder in which each rung changes exactly one thing, so
-# a speedup can be attributed instead of merely observed:
-#
-#   kitchen      -> h3opt_dense   adds chunked QKV and bounded MLP, attention held
-#                                 at ComfyUI's public dense comfy_kitchen_int8
-#   h3opt_dense  -> h3opt_kv100   swaps that dense backend for the pack's own
-#                                 native Kitchen INT8 kernel, still at full density
-#   h3opt_kv100  -> h3opt         drops video KV density to 0.3, same kernel
-#
-# The 1.0 rung matters because H3SparseAttention at full budget still executes
-# through the sparse backend. Comparing 0.3 against the resolved dense path
-# instead would change the kernel and the density together and attribute both to
-# sparsity.
+# Controls applied identically to every arm. They are outside ARMS on purpose:
+# selecting an unusual diagnostic arm must not accidentally lose benchmark
+# fairness controls.
+COMMON_PREFIX = [
+    ('H3BenchmarkForceQKVConfig0', {}),
+]
+COMMON_SUFFIX = [
+    ('H3AIMDOResidencyLimiter', {'residency': '0 blocks'}),
+]
+
+# Arm-specific patches. The benchmark chain is COMMON_PREFIX + ARMS[arm] +
+# COMMON_SUFFIX.
 ARMS = {
     'stock': [],
     'pytorch': [
@@ -105,32 +112,30 @@ ARMS = {
     'sage': [
         ('PathchSageAttentionKJ', {'sage_attention': 'auto', 'allow_compile': False}),
     ],
-    'h3opt_dense': [
-        ('H3MemoryOptimization', {}),
+    'sage_memory': [
+        ('PathchSageAttentionKJ', {'sage_attention': 'auto', 'allow_compile': False}),
+        ('H3MemoryOptimization', {'qkv_streaming_mode': 'Auto'}),
     ],
     'h3opt_kv100': [
-        ('H3MemoryOptimization', {}),
+        ('H3MemoryOptimization', {'qkv_streaming_mode': 'Auto'}),
         ('H3SparseAttention', {'video_budget': 1.0, 'denser_early_late_steps': False}),
     ],
     'h3opt': [
-        ('H3MemoryOptimization', {}),
+        ('H3MemoryOptimization', {'qkv_streaming_mode': 'Auto'}),
         ('H3SparseAttention', {'video_budget': 0.3, 'denser_early_late_steps': False}),
     ],
 }
 
-DEFAULT_ARMS = 'kitchen,sage,h3opt_dense,h3opt_kv100,h3opt'
+DEFAULT_ARMS = 'kitchen,sage,sage_memory,h3opt_kv100,h3opt'
 
-# What each arm is called in a published table. The internal keys are short
-# enough to type on a command line but say nothing about what was configured;
-# a reader of the results needs the node names they would actually wire up.
 ARM_LABELS = {
-    'stock': 'ComfyUI default attention (no pack)',
-    'pytorch': 'PyTorch attention (no pack)',
-    'kitchen': 'Comfy Kitchen INT8 dense (no pack)',
-    'sage': 'SageAttention dense (no pack)',
-    'h3opt_dense': 'H3 Memory Optimization',
-    'h3opt_kv100': 'H3 Memory Optimization + H3 Sparse Attention (KV 100%)',
-    'h3opt': 'H3 Memory Optimization + H3 Sparse Attention (KV 30%, default)',
+    'stock': 'ComfyUI default attention',
+    'pytorch': 'PyTorch attention',
+    'kitchen': 'Comfy Kitchen INT8 dense',
+    'sage': 'SageAttention dense',
+    'sage_memory': 'SageAttention + chunked QKV/MLP/FinalLayer',
+    'h3opt_kv100': 'H3 streamed native 64x64 attention (KV 100%)',
+    'h3opt': 'H3 streamed native 64x64 attention (KV 30%, default)',
 }
 
 
@@ -139,13 +144,7 @@ ARM_LABELS = {
 # ---------------------------------------------------------------------------
 
 class Schemas:
-    '''Lazily fetched /object_info, used to fill required inputs with defaults.
-
-    Building prompts against the live schema rather than a hardcoded input list
-    means an arm keeps working when a node gains an input. A node that gains a
-    *required* input with no default is the one case that still needs a code
-    change here, and it raises rather than sending a malformed prompt.
-    '''
+    '''Lazily fetched /object_info, used to fill required inputs with defaults.'''
 
     def __init__(self, server, session):
         self.server = server
@@ -157,9 +156,15 @@ class Schemas:
             url = '%s/object_info/%s' % (self.server, node_type)
             async with self.session.get(url) as response:
                 if response.status != 200:
+                    suffix = (
+                        '; restart ComfyUI with '
+                        'H3_OPTIMIZATIONS_BENCHMARK_NODES=1'
+                        if node_type == 'H3BenchmarkForceQKVConfig0'
+                        else ''
+                    )
                     raise BenchError(
-                        'server has no node %r (status %d); is the pack installed '
-                        'and the server restarted?' % (node_type, response.status)
+                        'server has no node %r (status %d)%s'
+                        % (node_type, response.status, suffix)
                     )
                 payload = await response.json()
             if node_type not in payload:
@@ -205,7 +210,7 @@ def default_for(node_type, name, spec):
         return config['default']
     kind = spec[0]
     options = None
-    if isinstance(kind, list):          # inline combo
+    if isinstance(kind, list):
         options = kind
     elif isinstance(config, dict):
         options = config.get('options')
@@ -222,22 +227,7 @@ def default_for(node_type, name, spec):
 # ---------------------------------------------------------------------------
 
 async def build_prompt(schemas, arm, frames, args, seed=None):
-    '''The API-format graph for one arm at one duration.
-
-    The sigma schedule is built from the *unpatched* model and truncated with
-    SplitSigmas, so every arm samples an identical prefix of an identical
-    trajectory and the only difference between arms is how attention executes.
-
-    ``seed`` must differ between the priming run and the measured runs, and
-    between repeats. ComfyUI caches node outputs by input, so a graph it has
-    already executed is served from cache and never touches the GPU: the arm
-    then reports zero step boundaries and no VRAM at all. Arms within one
-    iteration deliberately share a seed, since identical noise is what makes
-    their timings comparable.
-    '''
-    # The server reports a progress boundary at values 1..N, never 0, so N
-    # executed steps yield only N-1 timed intervals. Ask for one extra step so
-    # that --measure-steps survives dropping the warmup.
+    '''The API-format graph for one arm at one duration.'''
     executed = args.warmup_steps + args.measure_steps + 1
     if executed >= args.schedule_steps:
         raise BenchError(
@@ -260,8 +250,6 @@ async def build_prompt(schemas, arm, frames, args, seed=None):
     await node('clip', 'CLIPLoader', {'clip_name': args.clip, 'type': 'minimax'})
     await node('vae', 'VAELoader', {'vae_name': args.vae})
 
-    # No first_frame or last_frame: pure text to video, so the packed layout
-    # carries text, audio and video and no reference items.
     await node(
         'cond', 'MiniMaxH3ImageToVideo',
         {'prompt': args.prompt, 'width': args.width, 'height': args.height,
@@ -270,7 +258,8 @@ async def build_prompt(schemas, arm, frames, args, seed=None):
     )
 
     model_ref = ['loader', 0]
-    for index, (node_type, overrides) in enumerate(ARMS[arm]):
+    patch_chain = tuple(COMMON_PREFIX) + tuple(ARMS[arm]) + tuple(COMMON_SUFFIX)
+    for index, (node_type, overrides) in enumerate(patch_chain):
         patch_id = 'patch%d_%s' % (index, node_type)
         await node(patch_id, node_type, overrides, {'model': model_ref})
         model_ref = [patch_id, 0]
@@ -298,8 +287,6 @@ async def build_prompt(schemas, arm, frames, args, seed=None):
             'latent_image': ['cond', 1],
         },
     )
-    # PreviewAny is an output node that writes nothing, so the graph terminates
-    # without a VAE decode competing for the VRAM being measured.
     await node('sink', 'PreviewAny', {}, {'source': ['sample', 0]})
     return graph, executed
 
@@ -382,12 +369,7 @@ def gpu_now():
 # ---------------------------------------------------------------------------
 
 async def run_prompt(session, server, client_id, graph, expected_steps, timeout):
-    '''Queue one prompt and time each sampler step from the progress stream.
-
-    Returns the timestamp of every step boundary. The interval before the first
-    boundary covers model load, text encode and first-step compilation, which is
-    exactly why the caller discards warmup steps rather than averaging them in.
-    '''
+    '''Queue one prompt and time each sampler step from the progress stream.'''
     import aiohttp
 
     ws_url = server.replace('https://', 'wss://').replace('http://', 'ws://')
@@ -484,19 +466,7 @@ def step_durations(boundaries, warmup):
 
 
 async def reset_between_arms(session, server, unload_models):
-    '''Release model weights between arms without forcing a text re-encode.
-
-    Never send free_memory here. The server treats that flag as "reset the
-    executor", which wipes the cached conditioning and makes the next arm reload
-    the 32B text encoder *on top of* the still-resident diffusion model. That
-    inflates every arm's VRAM peak by the same large constant and buries the
-    difference the benchmark exists to measure.
-
-    unload_models alone unloads the weights but leaves the executor cache
-    intact, so the conditioning survives and only the diffusion model reloads.
-    The default is to do nothing at all, which is both the fastest option and
-    the one that matches how the model sits in a real session.
-    '''
+    '''Release model weights between arms without forcing a text re-encode.'''
     if not unload_models:
         return
     async with session.post(
@@ -506,12 +476,7 @@ async def reset_between_arms(session, server, unload_models):
 
 
 async def prime_server(session, server, client_id, graph, expected_steps, timeout):
-    '''Run one discarded prompt so the first measured arm is not the odd one out.
-
-    Without this the first arm pays the checkpoint load and the text encode
-    inside its own measurement window, and its VRAM peak carries load transients
-    no later arm sees.
-    '''
+    '''Run one discarded prompt so the first measured arm is not the odd one out.'''
     await run_prompt(session, server, client_id, graph, expected_steps, timeout)
 
 
@@ -528,7 +493,6 @@ def render_table(records, args, baseline_arm):
         if record['workload'] not in workloads:
             workloads.append(record['workload'])
 
-    # With --repeat, collapse runs of the same cell to their median.
     grouped = {}
     for record in records:
         if record.get('error'):
@@ -574,9 +538,9 @@ def render_table(records, args, baseline_arm):
 
     note = (
         '\nMedian of %d measured steps after %d warmup step(s), on the first %d '
-        'steps of a %d-step %s/%s trajectory at %dx%d. Peak MiB is whole-GPU '
-        'driver-level VRAM from nvidia-smi, not this process alone. Speedup is '
-        'relative to %s.'
+        'steps of a %d-step %s/%s trajectory at %dx%d. Every arm forces '
+        'ConvRot QKV CUTLASS config 0 and AIMDO residency to 0 blocks. Peak MiB '
+        'is whole-GPU driver-level VRAM from nvidia-smi. Speedup is relative to %s.'
         % (
             args.measure_steps, args.warmup_steps,
             args.warmup_steps + args.measure_steps + 1, args.schedule_steps,
@@ -593,7 +557,7 @@ def render_table(records, args, baseline_arm):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description='Compare H3 attention configurations end to end '
+        description='Compare H3 attention/memory configurations end to end '
                     'via the ComfyUI prompt API.'
     )
     parser.add_argument('--server', default=DEFAULT_SERVER)
@@ -652,7 +616,7 @@ def parse_args(argv=None):
     parser.add_argument('--output', default='',
                         help='write the full JSON record here')
     parser.add_argument('--dry-run', action='store_true',
-                        help='build and print one prompt, contact no GPU')
+                        help='build and print one prompt without sampling')
     parser.add_argument('--i-understand-this-uses-gpu', action='store_true')
     args = parser.parse_args(argv)
 
@@ -698,11 +662,7 @@ def measured_seed(args, iteration, arm_index):
 
 
 def write_output(path_text, args, records):
-    '''Persist after every arm.
-
-    A server-side OOM takes the whole process down with it, and an end-of-run
-    write loses every completed arm when that happens. It already did once.
-    '''
+    '''Persist after every arm so an OOM does not lose completed results.'''
     if not path_text:
         return
     path = Path(path_text)

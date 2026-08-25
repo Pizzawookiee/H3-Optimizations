@@ -42,6 +42,64 @@ def is_installed_dense_attention(transformer_options):
     return getattr(override, OVERRIDE_MARKER, None) == ATTENTION_COMFY_KITCHEN_INT8
 
 
+def _override_wraps_backend(override, backend):
+    '''Recognize Comfy's ModelPatcher wrapper around one registered backend.'''
+    if override is None or backend is None:
+        return False
+    if override is backend:
+        return True
+
+    # ModelPatcher copies the backend's container function onto its wrapper.
+    # This is the cheapest stable signal for current Comfy Kitchen attention.
+    backend_container = getattr(backend, 'container_function', None)
+    if (
+        backend_container is not None
+        and getattr(override, 'container_function', None) is backend_container
+    ):
+        return True
+
+    # Current ModelPatcher.set_model_optimized_attention closes over the exact
+    # registered backend callable. Keep this fallback so detection still works
+    # if Kitchen ever stops exposing a container function.
+    for cell in getattr(override, '__closure__', None) or ():
+        try:
+            wrapped = cell.cell_contents
+        except ValueError:
+            continue
+        if wrapped is backend:
+            return True
+    return False
+
+
+def is_comfy_kitchen_dense_attention(transformer_options):
+    '''Whether the active dense override is our Kitchen path or Comfy's own.'''
+    options = transformer_options or {}
+    override = options.get('optimized_attention_override')
+    if override is None:
+        return False
+    if is_installed_dense_attention(options):
+        return True
+    backend = get_attention_function(ATTENTION_COMFY_KITCHEN_INT8, None)
+    return _override_wraps_backend(override, backend)
+
+
+def has_explicit_dense_attention(model_patcher):
+    '''Return true for an incompatible user/upstream dense attention override.
+
+    Comfy's own Kitchen selector is deliberately compatible: the H3 memory
+    node upgrades that route to the package-owned streamed Kitchen producer and
+    consumer rather than treating it as a conflicting attention choice.
+    '''
+    options = (
+        getattr(model_patcher, 'model_options', {})
+        .get('transformer_options', {})
+        or {}
+    )
+    if 'optimized_attention_override' not in options:
+        return False
+    return not is_comfy_kitchen_dense_attention(options)
+
+
 def resolve_dense_attention(model_patcher):
     options = (
         getattr(model_patcher, 'model_options', {})
@@ -57,12 +115,18 @@ def resolve_dense_attention(model_patcher):
                 'preserved an explicit optimized-attention override; '
                 'Comfy Kitchen INT8 is unavailable for the private H3 path',
             )
+        compatible_kitchen = is_comfy_kitchen_dense_attention(options)
         return DenseResolution(
             ATTENTION_AUTO,
             ATTENTION_COMFY_KITCHEN_INT8,
             None,
-            'preserved an explicit optimized-attention override; '
-            'using Comfy Kitchen INT8 only for the private H3 memory path',
+            (
+                'upgraded an explicit Comfy Kitchen attention choice to the '
+                'streamed private H3 Kitchen path'
+                if compatible_kitchen
+                else 'preserved an explicit optimized-attention override; '
+                'using Comfy Kitchen INT8 only for the private H3 memory path'
+            ),
             ATTENTION_COMFY_KITCHEN_INT8,
         )
 

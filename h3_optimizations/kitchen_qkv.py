@@ -11,6 +11,7 @@ import comfy.quant_ops
 
 from . import diagnostics
 from .attention_forward import project_qkv
+from .qkv.bf16 import HeldBF16QKV
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.fp8 import FP8BindingError, HeldFP8QKV
@@ -79,6 +80,14 @@ def producer_api_available(kitchen=None, device=None):
     if kitchen is not None:
         return _supports_producer(kitchen, device)
     return resolve_kitchen(device) is not None
+
+
+def _native_bf16_format(fmt):
+    dtype = str(getattr(fmt, 'logical_dtype', '')).lower()
+    return bool(
+        getattr(fmt, 'plain_float', False)
+        and ('bfloat16' in dtype or 'bf16' in dtype)
+    )
 
 
 @dataclass(frozen=True)
@@ -334,11 +343,14 @@ def run_chunked_kitchen_qkv(
             held = HeldFP8QKV(
                 module,
                 x[:1],
-                allow_float_conversion=fmt.plain_float,
+                allow_float_conversion=getattr(fmt, 'plain_float', False),
             )
             held.__enter__()
-        elif fmt.w4a8:
+        elif getattr(fmt, 'w4a8', False):
             held = HeldW4A8QKV(module, x[:1])
+            held.__enter__()
+        elif _native_bf16_format(fmt):
+            held = HeldBF16QKV(module, x[:1])
             held.__enter__()
 
         if v_mode == V_MODE_TWO_PASS:
@@ -515,10 +527,15 @@ class ChunkedKitchenQKVProjector:
         if kitchen is None:
             return None
         fmt = describe_linear(module.qkv_proj)
+        native_bf16 = _native_bf16_format(fmt)
         format_ok = (
-            fmt.fp8 or fmt.plain_float
+            getattr(fmt, 'fp8', False) or getattr(fmt, 'plain_float', False)
             if self.fp8_projection
-            else (fmt.convrot_int8_256 or fmt.w4a8)
+            else (
+                getattr(fmt, 'convrot_int8_256', False)
+                or getattr(fmt, 'w4a8', False)
+                or native_bf16
+            )
         )
         owns_dense_h3 = (
             (transformer_options or {}).get(H3_ATTENTION_BACKEND_KEY)
@@ -582,7 +599,10 @@ class ChunkedKitchenQKVProjector:
             TypeError,
             ValueError,
         ):
-            if not self.fp8_projection and not fmt.w4a8:
+            if (
+                not self.fp8_projection
+                and not getattr(fmt, 'w4a8', False)
+            ):
                 raise
             return None
 

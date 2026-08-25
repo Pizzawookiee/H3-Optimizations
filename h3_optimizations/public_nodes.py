@@ -4,16 +4,22 @@ import os
 
 from comfy_api.latest import ComfyExtension
 
+# Import first so every public node, including Sparse Attention used without the
+# Memory node, resolves QKV through the same streamed-BF16 priority policy.
+from . import apply_policy as _apply_policy  # noqa: F401
 from .aimdo_limiter import H3AIMDOResidencyLimiter
+from .memory_migration_node import H3MemoryOptimization
 from .nodes import (
-    H3MemoryOptimization,
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
 
 
+BENCHMARK_NODES_ENV = 'H3_OPTIMIZATIONS_BENCHMARK_NODES'
+
+
 class H3OptimizationsExtension(ComfyExtension):
-    '''Register only production-ready H3 optimization nodes.'''
+    '''Register production nodes, plus explicit opt-in benchmark controls.'''
 
     async def get_node_list(self):
         nodes = [
@@ -22,10 +28,16 @@ class H3OptimizationsExtension(ComfyExtension):
             H3SparseAttention,
             H3SparseAttentionAdvanced,
         ]
-        if os.environ.get('H3_ENABLE_BENCHMARK_NODES') == '1':
+        if os.environ.get(BENCHMARK_NODES_ENV) == '1':
             from .benchmark_nodes import (
+                H3BenchmarkForceQKVConfig0,
                 H3FullForwardDigest,
                 H3FullForwardExperiment,
             )
-            nodes.extend((H3FullForwardExperiment, H3FullForwardDigest))
+
+            nodes.extend((
+                H3BenchmarkForceQKVConfig0,
+                H3FullForwardExperiment,
+                H3FullForwardDigest,
+            ))
         return nodes
