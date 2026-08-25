@@ -111,7 +111,7 @@ class PublicNodeTests(unittest.TestCase):
         legacy = inputs[legacy_index]
         mode = inputs[mode_index]
         self.assertTrue(legacy.extra_dict.get('hidden'))
-        self.assertEqual(mode.default, PRECISION_MODE_ALLOW_FP8)
+        self.assertEqual(mode.default, PRECISION_MODE_PRESERVE)
 
 
 if __name__ == '__main__':
