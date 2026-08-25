@@ -136,26 +136,33 @@ class NodeTests(unittest.TestCase):
             ],
         )
         backend = input_by_id(advanced, 'backend')
-        self.assertEqual(backend.default, 'auto')
+        self.assertEqual(backend.default, 'Kitchen INT8')
         self.assertEqual(
             backend.options,
             [
-                'auto',
+                'Kitchen INT8',
                 'Sparse Sage',
                 'INT8 Triton',
                 'FP8 FlexAttention',
-                'Kitchen INT8',
-                'Native INT8 128x64',
-                'Native INT8 128x64 + Sol residual 64x64',
-                'Native INT8 64x64',
-                'Native INT8 64x64 + Sol residual 64x64',
-                'Native INT8 128x128 hard control',
-                'Native INT8 128x128 + Sol residual 64x64',
             ],
         )
-        self.assertIn('hard requirements', advanced.description)
+        self.assertIn('Kitchen INT8 64x64 is the default', advanced.description)
         self.assertIn('Bypass this node', backend.tooltip)
         self.assertNotIn('experimental', ' '.join(backend.options).lower())
+        self.assertTrue(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Native INT8 128x128 + Sol residual 64x64'
+            )
+        )
+        self.assertTrue(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8 (experimental)'
+            )
+        )
+        self.assertIsInstance(
+            H3SparseAttentionAdvanced.validate_inputs('not a backend'),
+            str,
+        )
         self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.3)
         self.assertEqual(input_by_id(advanced, 'early_steps').default, 2)
         self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)

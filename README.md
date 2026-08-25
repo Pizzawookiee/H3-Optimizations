@@ -53,15 +53,12 @@ control.
   steps; Early steps/Early KV and Late steps/Late KV independently control the
   edges. The defaults are two early steps at 50 percent KV and two late steps at
   50 percent KV. If the two windows overlap, the denser of the two requested
-  edge budgets is used. Backend `auto` uses native Kitchen INT8 at 64Q x 64KV,
-  then an
-  existing compatible Sparse Sage installation, INT8 Triton, FlexAttention,
-  and finally the resolved dense H3 path. FlexAttention uses FP8 carriers on
-  supported NVIDIA runtimes and native BF16/FP16 Q/K/V through Triton on ROCm.
-  Explicit backend selections are hard requirements and error if unavailable;
-  bypass the node to force dense attention.
+  edge budgets is used. The backend choices are Kitchen INT8, Sparse Sage, INT8
+  Triton, and FP8 FlexAttention. Kitchen INT8 is the default and uses the shipped
+  native 64Q x 64KV path. Explicit backend selections are hard requirements and
+  error if unavailable; bypass the node to force dense attention.
 
-The production native backend and the explicit quality arms execute 64Q x
+Benchmark-only native geometry and quality arms execute 64Q x
 64KV, 128Q x 128KV, or 128Q x 64KV routed geometry through the native INT8
 kernel. They reuse the same
 chunked Kitchen Q128 quantization carrier; the 64Q kernel consumes each 64-row
@@ -71,8 +68,9 @@ tiles with block-mean K and block-sum V and merges that residual into the native
 kernel's softmax state. In the 5 percent FL2VA baker and robot stress cases,
 64Q x 64KV was dramatically more robust than either larger geometry. The
 matched Sol residual did not visibly improve 128Q x 64KV or 64Q x 64KV and
-added sampler time, so `auto` uses hard 64Q x 64KV and never selects Sol. The
-explicit Sol choices remain available for reproducing experiments.
+added sampler time. These geometry and Sol controls remain available to
+repository benchmarks and saved workflows but are not shown in the production
+node selector.
 
 > **Sparse attention changes model computation. It is not free acceleration.**
 > Lower Video KV budgets retain fewer target-video attention connections and can
@@ -86,12 +84,11 @@ The production nodes are grouped under H3-Optimizations > Model Patches.
 The production nodes are order-independent. Unsupported model families pass
 through unchanged. Auto modes retain the existing implementation when a
 specialized provider cannot satisfy its complete format and runtime contract.
-A saved workflow containing either H3 Sparse Attention node first uses the
-shipped native Kitchen backend when its per-GPU self-test passes. An existing
-compatible Sparse Sage installation is next, followed by INT8 Triton,
-FlexAttention, and the resolved dense H3 path. The selected fallback and reason
-appear in the node status text. Explicit advanced early/middle/late budgets are
-preserved across all sparse backends.
+The standard H3 Sparse Attention node uses the shipped native Kitchen backend
+when its per-GPU self-test passes, then Sparse Sage, INT8 Triton, FlexAttention,
+and the resolved dense H3 path. The Advanced node instead uses the backend
+selected in its production dropdown, with Kitchen INT8 as its default. Explicit
+advanced early/middle/late budgets are preserved across all sparse backends.
 
 ## Performance
 
