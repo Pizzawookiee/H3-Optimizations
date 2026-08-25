@@ -4,7 +4,8 @@ Streaming is an activation-memory policy, not a request to quantize QKV
 weights. Whenever a compatible consumer exists we keep the checkpoint's weight
 format for the linear, produce post-projection Q/K/V as BF16 chunks, and feed
 those chunks directly into the consumer carrier. BF16/FP16 -> FP8 weight
-conversion is only a fallback after streaming has been ruled out.
+conversion is only a fallback after streaming and native/bounded execution have
+both been ruled out.
 '''
 
 from . import providers as base
@@ -119,7 +120,7 @@ def _stream_triton(
     )
 
 
-def _preserve_native_fallback(
+def _native_bounded_fallback(
     inventory,
     *,
     backend_kind,
@@ -181,7 +182,7 @@ def _preserve_native_fallback(
 
     labels = ', '.join(sorted(set(inventory.labels('qkv'))))
     return base._standard_qkv(
-        'Preserve precision keeps unsupported QKV format %s on upstream Comfy execution'
+        'checkpoint-native QKV format %s has no bounded provider for the selected attention backend'
         % (labels or 'unknown')
     )
 
@@ -231,21 +232,26 @@ def resolve_qkv_provider(
     if streamed is not None:
         return streamed
 
-    # Preserve precision means exactly that: retain whatever format the
-    # checkpoint already supplied. It must not special-case BF16 while throwing
-    # away native FP8/W4A8/ConvRot providers.
+    # Second priority: retain checkpoint-native/bounded execution. In
+    # particular, a floating checkpoint uses chunked BF16 QKV before we ever
+    # consider converting its QKV weights to FP8.
+    native = _native_bounded_fallback(
+        inventory,
+        backend_kind=backend_kind,
+        triton_available=triton_available,
+        sparse_spec=sparse_spec,
+        fp8_available=fp8_available,
+    )
+    if native.provider_id != base.QKV_STANDARD:
+        return native
+
+    # Preserve precision stops here. Unsupported formats remain upstream.
     if request == FUSED_QKV_PRESERVE_BF16:
-        return _preserve_native_fallback(
-            inventory,
-            backend_kind=backend_kind,
-            triton_available=triton_available,
-            sparse_spec=sparse_spec,
-            fp8_available=fp8_available,
-        )
+        return native
 
     # Only now is BF16/FP16 -> FP8 conversion allowed. The older resolver owns
-    # those format-specific fallback rules and required-mode error behavior.
-    return base.resolve_qkv_provider(
+    # those format-specific last-resort rules and required-mode error behavior.
+    converted = base.resolve_qkv_provider(
         inventory,
         request=request,
         backend_kind=backend_kind,
@@ -255,3 +261,4 @@ def resolve_qkv_provider(
         memory_optimize=memory_optimize,
         fp8_available=fp8_available,
     )
+    return converted
