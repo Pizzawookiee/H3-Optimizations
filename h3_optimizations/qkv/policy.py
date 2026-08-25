@@ -10,7 +10,10 @@ conversion is only a fallback after streaming has been ruled out.
 from . import providers as base
 from ..plan import FUSED_QKV_OFF, FUSED_QKV_PRESERVE_BF16, FUSED_QKV_REQUIRED
 
-QKV_STREAMED_SPARSE_SAGE = 'streamed_bf16_sparse_sage'
+# apply.py already routes this provider id through SparseFusedQKVProjector. The
+# projector is now format-neutral, so retain the established ABI value while
+# the reason/status text describes the actual checkpoint format.
+QKV_STREAMED_SPARSE_SAGE = base.QKV_SPARSE_CONVROT_INT8
 
 _KITCHEN_CARRIER_CONSUMERS = {
     'comfy_kitchen_int8',
@@ -31,8 +34,8 @@ def _native_stream_format(inventory):
         return 'W4A8'
     if inventory.qkv_fp8:
         return 'FP8'
-    if inventory.qkv_plain_float:
-        return 'floating'
+    if base._qkv_is_native_bf16(inventory):
+        return 'BF16'
     return None
 
 
