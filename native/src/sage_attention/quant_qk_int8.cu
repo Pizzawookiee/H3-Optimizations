@@ -934,6 +934,76 @@ void launch_quant_qk_per_thread_int8(
 #undef DO
 }
 
+void launch_quant_q_per_thread_int8(
+    const void *q, void *q_int8, void *q_scale, int B, int H_q, int Lq, int C,
+    int full_Lk,
+    int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+    int input_dtype_code, cudaStream_t stream) {
+  if (C != 128) {
+    throw std::runtime_error(
+        "quant_q_per_thread_int8: streamed H3 requires head_dim 128");
+  }
+  if (!q || !q_int8 || !q_scale || B <= 0 || H_q <= 0 || Lq <= 0) {
+    throw std::runtime_error(
+        "quant_q_per_thread_int8: invalid buffer or geometry");
+  }
+  if (full_Lk <= 0) {
+    throw std::runtime_error(
+        "quant_q_per_thread_int8: full K length must be positive");
+  }
+
+  const size_t element_size =
+      input_dtype_code == 0 ? sizeof(float) : sizeof(half);
+  const size_t vector_size = 4 * element_size;
+  const auto stride_ok = [](int64_t stride, int extent) {
+    return extent < 2 || (stride > 0 && stride % 4 == 0);
+  };
+  if (reinterpret_cast<uintptr_t>(q) % vector_size != 0 ||
+      !stride_ok(q_stride_b, B) ||
+      !stride_ok(q_stride_h, H_q) ||
+      !stride_ok(q_stride_n, Lq)) {
+    throw std::runtime_error(
+        "quant_q_per_thread_int8: Q pointer/strides must preserve "
+        "4-element alignment");
+  }
+
+  constexpr int BLKQ = 128;
+  constexpr int WARPQ = 32;
+  constexpr int CHANNEL_TILES = 1;
+  const int q_oblk = (Lq + BLKQ - 1) / BLKQ * (BLKQ / WARPQ);
+  const int q_sc_per_h = q_oblk * 8;
+  dim3 grid(q_oblk, H_q, B);
+
+  // Match the rotation used by the coupled C=128 Q/K quantizer.
+  // Short full-K sequences use rotation 4; otherwise H3 uses rotation 128.
+  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+    if (full_Lk <= 256) {
+      quant_q_kernel<T, 4, BLKQ, WARPQ, CHANNEL_TILES, 4, true>
+          <<<grid, 128, 0, stream>>>(
+              static_cast<const T *>(q),
+              static_cast<int8_t *>(q_int8),
+              static_cast<float *>(q_scale),
+              Lq, C, H_q, q_sc_per_h,
+              q_stride_b, q_stride_h, q_stride_n);
+    } else {
+      quant_q_kernel<T, 4, BLKQ, WARPQ, CHANNEL_TILES, 128, true>
+          <<<grid, 128, 0, stream>>>(
+              static_cast<const T *>(q),
+              static_cast<int8_t *>(q_int8),
+              static_cast<float *>(q_scale),
+              Lq, C, H_q, q_sc_per_h,
+              q_stride_b, q_stride_h, q_stride_n);
+    }
+  });
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("quant_q kernel launch failed: ") +
+        cudaGetErrorString(error));
+  }
+}
+
+
 void launch_select_k_anchor_from_samples(
     const void *samples, const int *sample_positions, void *anchor_values,
     void *anchor_indices, int B, int H_kv, int full_Lk, int C,

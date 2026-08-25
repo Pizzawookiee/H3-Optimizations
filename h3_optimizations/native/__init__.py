@@ -26,6 +26,7 @@ from .int8_attention import (
     int8_attention_from_prequantized,
     int8_attention_is_available,
     prequantize_int8_attention,
+    quantize_int8_attention_q,
 )
 from .producer import (
     INT8_ATTENTION_PRODUCER_ABI_VERSION,
@@ -70,6 +71,7 @@ __all__ = [
     'is_available',
     'load',
     'prequantize_int8_attention',
+    'quantize_int8_attention_q',
     'quantize_int8_attention_qk_chunk',
     'quantize_int8_attention_v',
     'route_encoding',

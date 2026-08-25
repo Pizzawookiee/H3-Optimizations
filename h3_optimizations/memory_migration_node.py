@@ -32,6 +32,14 @@ from .plan import (
     read_plan,
 )
 from .status import format_memory_status
+from .streamed_kitchen import (
+    ATTENTION_MEMORY_MODE_KEY,
+    ATTENTION_MEMORY_STREAMED,
+    QUERY_CHUNK_ROWS_KEY,
+    install_streaming_support,
+)
+
+install_streaming_support()
 
 PRECISION_MODE_AUTO = 'Auto'
 PRECISION_MODE_BF16 = 'BF16'
@@ -254,6 +262,26 @@ class H3MemoryOptimization(io.ComfyNode):
                         'Kitchen. H3 Sparse Attention remains authoritative.'
                     ),
                 ),
+                io.Boolean.Input(
+                    'deferred_q_low_vram',
+                    display_name='Deferred Q low VRAM',
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        'ConvRot INT8 + sparse Kitchen only. Stage one Q/K/V '
+                        'weight third at a time and avoid the full-sequence Q '
+                        'INT8 carrier. Q is reprojected during attention.'
+                    ),
+                ),
+                io.Int.Input(
+                    'deferred_q_rows',
+                    display_name='Deferred Q query rows',
+                    default=4096,
+                    min=128,
+                    max=32768,
+                    step=128,
+                    advanced=True,
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -268,6 +296,8 @@ class H3MemoryOptimization(io.ComfyNode):
         preserve_precision=True,
         precision_mode=PRECISION_MODE_AUTO,
         qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
+        deferred_q_low_vram=False,
+        deferred_q_rows=4096,
     ):
         del preserve_precision
         plan = read_plan(model).with_memory(
@@ -281,6 +311,15 @@ class H3MemoryOptimization(io.ComfyNode):
             )
         )
         patched = apply_plan(model, plan)
+        if bool(deferred_q_low_vram):
+            rows = int(deferred_q_rows)
+            if rows < 128 or rows % 128:
+                raise ValueError('Deferred Q query rows must be a positive multiple of 128')
+            options = patched.model_options['transformer_options'] = (
+                patched.model_options.get('transformer_options', {}).copy()
+            )
+            options[ATTENTION_MEMORY_MODE_KEY] = ATTENTION_MEMORY_STREAMED
+            options[QUERY_CHUNK_ROWS_KEY] = rows
         return io.NodeOutput(
             patched,
             ui=ui.PreviewText(format_memory_status(patched)),
