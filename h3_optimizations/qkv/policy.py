@@ -39,20 +39,11 @@ def _native_stream_format(inventory):
     return None
 
 
-def _kitchen_stream_provider(inventory):
-    # FP8 checkpoint weights need the held FP8 linear binding. Its output is
-    # still the same BF16 Q/K/V streaming contract; the provider id records how
-    # the linear itself is executed, not a lower-precision QKV activation.
-    if inventory.qkv_fp8:
-        return base.QKV_DENSE_FP8_CHUNKED
-    return base.QKV_DENSE_KITCHEN_CHUNKED
-
-
 def is_dense_streamed_provider(provider_id):
-    return provider_id in (
-        base.QKV_DENSE_KITCHEN_CHUNKED,
-        base.QKV_DENSE_FP8_CHUNKED,
-    )
+    # Native FP8 is intentionally normalized to the generic Kitchen provider.
+    # QKV_DENSE_FP8_CHUNKED is reserved for actual float->FP8 conversion
+    # fallback, so status/logging can distinguish the two policies.
+    return provider_id == base.QKV_DENSE_KITCHEN_CHUNKED
 
 
 def _stream_kitchen(
@@ -73,7 +64,7 @@ def _stream_kitchen(
             )
         return None
     return base.QKVProviderResolution(
-        _kitchen_stream_provider(inventory),
+        base.QKV_DENSE_KITCHEN_CHUNKED,
         backend_kind != 'comfy_kitchen_int8',
         (
             'checkpoint-native %s weights project into bounded BF16 Q/K/V '
