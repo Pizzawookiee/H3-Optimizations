@@ -334,3 +334,18 @@ The three-way attention benchmark derives each carrier contract from the
 current checkout and verifies identical sparse routes before timing:
 
     .\.venv\Scripts\python.exe custom_nodes\H3-Optimizations\benchmarks\bench_sparse_backends.py --output sparse-backends.json --i-understand-this-uses-gpu
+
+## Acknowledgements
+
+- Thanks to [Pizzawookiee](https://github.com/Pizzawookiee) for the low-VRAM
+  experiments in [PR #13](https://github.com/Zironic/H3-Optimizations/pull/13)
+  and [PR #26](https://github.com/Zironic/H3-Optimizations/pull/26). Although
+  neither PR was merged as-is, those experiments helped inform the streamed
+  QKV and FinalLayer chunking work that later shipped.
+- The sparse-attention work draws ideas from
+  [MoBA](https://github.com/MoonshotAI/MoBA) and
+  [Sol-Attn](https://nvlabs.github.io/Sana/Sol-Attn/).
+- This project relies heavily on
+  [Comfy Kitchen](https://github.com/Comfy-Org/comfy-kitchen) for quantization,
+  ConvRot execution, and the kernel foundations used by the native attention
+  backend.
