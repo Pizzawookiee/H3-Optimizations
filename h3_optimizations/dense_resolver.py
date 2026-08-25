@@ -42,15 +42,42 @@ def is_installed_dense_attention(transformer_options):
     return getattr(override, OVERRIDE_MARKER, None) == ATTENTION_COMFY_KITCHEN_INT8
 
 
-def resolve_dense_attention(model_patcher):
+def has_explicit_dense_attention(model_patcher):
+    '''Return true for a user/upstream attention override not installed by us.'''
+    options = (
+        getattr(model_patcher, 'model_options', {})
+        .get('transformer_options', {})
+        or {}
+    )
+    if 'optimized_attention_override' not in options:
+        return False
+    return not is_installed_dense_attention(options)
+
+
+def resolve_dense_attention(
+    model_patcher,
+    *,
+    preserve_explicit_override=False,
+    force_kitchen=False,
+):
     options = (
         getattr(model_patcher, 'model_options', {})
         .get('transformer_options', {})
         or {}
     )
     backend = get_attention_function(ATTENTION_COMFY_KITCHEN_INT8, None)
+    explicit_override = (
+        'optimized_attention_override' in options
+        and not is_installed_dense_attention(options)
+    )
 
-    if 'optimized_attention_override' in options:
+    if explicit_override and preserve_explicit_override and not force_kitchen:
+        return _existing_resolution(
+            ATTENTION_AUTO,
+            'preserved an explicit optimized-attention override; Auto QKV streaming did not replace the selected attention backend',
+        )
+
+    if explicit_override:
         if backend is None:
             return _existing_resolution(
                 ATTENTION_AUTO,
@@ -61,8 +88,14 @@ def resolve_dense_attention(model_patcher):
             ATTENTION_AUTO,
             ATTENTION_COMFY_KITCHEN_INT8,
             None,
-            'preserved an explicit optimized-attention override; '
-            'using Comfy Kitchen INT8 only for the private H3 memory path',
+            (
+                'Forced QKV streaming uses Comfy Kitchen INT8 for the private H3 '
+                'memory path while leaving the upstream override installed'
+                if force_kitchen
+                else
+                'preserved an explicit optimized-attention override; using Comfy '
+                'Kitchen INT8 only for the private H3 memory path'
+            ),
             ATTENTION_COMFY_KITCHEN_INT8,
         )
 
@@ -75,7 +108,11 @@ def resolve_dense_attention(model_patcher):
         ATTENTION_AUTO,
         ATTENTION_COMFY_KITCHEN_INT8,
         backend,
-        'selected through ComfyUI public attention registry',
+        (
+            'selected full-density Comfy Kitchen INT8 for Forced QKV streaming'
+            if force_kitchen
+            else 'selected through ComfyUI public attention registry'
+        ),
         ATTENTION_COMFY_KITCHEN_INT8,
     )
 
