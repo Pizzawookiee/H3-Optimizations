@@ -1,30 +1,36 @@
 '''Stable public surface for the INT8 Triton sparse backend.
 
-The production backend now consumes the exact Kitchen carrier and mirrors the
-Kitchen pure-INT8 probability/value math at 64Q x 64KV. The old Triton carrier
-and executor remain importable for focused legacy tests and benchmarks, but are
-no longer selected by the normal resolver.
+The production backend consumes the exact Kitchen carrier and mirrors the
+Kitchen pure-INT8 probability/value math at 64Q x 64KV. The old carrier,
+executor, and spec remain importable so existing tests/benchmarks and saved
+integrations keep their low-level ABI.
 '''
 
+from . import triton_sparse_fast as _legacy
 from .triton_sparse_fast import (  # legacy low-level compatibility
     PreparedTritonSparse,
     PreparedTritonHybrid,
     TritonSparseExecutor,
+    TritonSparseSpec,
 )
 from .triton_kitchen import (
     PreparedTritonKitchen,
     TritonKitchenBackend,
     TritonKitchenError,
-    TritonKitchenSpec,
-    preflight_triton_kitchen,
 )
 
-# Preserve the public names used by apply.py and saved integrations. Only the
-# implementation behind them changes.
+
 TritonSparseBackend = TritonKitchenBackend
 TritonSparseError = TritonKitchenError
-TritonSparseSpec = TritonKitchenSpec
-preflight_triton_sparse = preflight_triton_kitchen
+
+
+def preflight_triton_sparse(**kwargs):
+    '''Keep the historical spec ABI but translate preflight errors uniformly.'''
+    try:
+        return _legacy.preflight_triton_sparse(**kwargs)
+    except _legacy.TritonSparseError as exc:
+        raise TritonKitchenError(str(exc)) from exc
+
 
 __all__ = [
     'PreparedTritonHybrid',
