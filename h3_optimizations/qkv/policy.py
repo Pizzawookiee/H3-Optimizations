@@ -242,6 +242,17 @@ def resolve_qkv_provider(
         sparse_spec=sparse_spec,
         fp8_available=fp8_available,
     )
+
+    # `required` means a consumer-ready projected carrier is mandatory. A
+    # merely bounded non-fused BF16 projection must not silently satisfy it.
+    if request == FUSED_QKV_REQUIRED:
+        if native.provider_id != base.QKV_STANDARD and native.fused:
+            return native
+        raise RuntimeError(
+            'required fused QKV is unavailable: %s'
+            % (native.reason or 'no compatible projected carrier')
+        )
+
     if native.provider_id != base.QKV_STANDARD:
         return native
 
@@ -250,8 +261,8 @@ def resolve_qkv_provider(
         return native
 
     # Only now is BF16/FP16 -> FP8 conversion allowed. The older resolver owns
-    # those format-specific last-resort rules and required-mode error behavior.
-    converted = base.resolve_qkv_provider(
+    # those format-specific last-resort rules.
+    return base.resolve_qkv_provider(
         inventory,
         request=request,
         backend_kind=backend_kind,
@@ -261,4 +272,3 @@ def resolve_qkv_provider(
         memory_optimize=memory_optimize,
         fp8_available=fp8_available,
     )
-    return converted
