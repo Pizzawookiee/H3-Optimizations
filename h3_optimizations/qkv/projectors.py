@@ -17,12 +17,23 @@ def _unsupported(required, message):
     return None
 
 
+def _bf16_streamable(actual):
+    """Whether normal Comfy execution can project this checkpoint to BF16 chunks."""
+    return bool(
+        actual.convrot_int8_256
+        or actual.w4a8
+        or actual.fp8
+        or actual.plain_float
+    )
+
+
 class SparseFusedQKVProjector:
     """Guard streamed Sparse Sage QKV and fall back for auto requests.
 
-    ConvRot INT8 is the only Sparse Sage provider routed through the streamed
-    execution path.  Other checkpoint formats keep their existing projectors
-    until they have equivalent provider-specific validation.
+    Checkpoint weight precision is independent of the streaming contract: every
+    supported source projects one bounded BF16 Q/K/V slab at a time. Sparse
+    Sage then packs the carrier it needs from those BF16 slabs without ever
+    materializing full-sequence BF16 Q.
     """
 
     name = "chunked_sparse_sage_qkv"
@@ -68,7 +79,7 @@ class SparseFusedQKVProjector:
         transformer_options,
     ):
         actual = describe_linear(module.qkv_proj)
-        if not actual.convrot_int8_256:
+        if not _bf16_streamable(actual):
             return _unsupported(
                 self.required,
                 "QKV format is %s" % actual.label,
@@ -139,7 +150,7 @@ class TritonSparseQKVProjector:
         transformer_options,
     ):
         actual = describe_linear(module.qkv_proj)
-        if not (actual.convrot_int8_256 or actual.w4a8):
+        if not _bf16_streamable(actual):
             return _unsupported(
                 self.required,
                 "QKV format is %s" % actual.label,
