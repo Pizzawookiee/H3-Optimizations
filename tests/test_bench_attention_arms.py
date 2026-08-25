@@ -181,22 +181,23 @@ class PromptTests(unittest.TestCase):
             ][0]
             self.assertEqual(patches[index]['inputs']['model'], [prior_id, 0])
 
-    def test_sage_memory_preserves_sage_then_adds_memory_node(self):
+    def test_sage_memory_adds_only_the_memory_node(self):
+        # Sage itself comes from the server's --use-sage-attention, so the arm
+        # adds the memory node and nothing else.
         graph, _ = build('sage_memory')
         patches = patch_nodes(graph)
         self.assertEqual(
             [node['class_type'] for node in patches],
             [
                 'H3BenchmarkForceQKVConfig0',
-                'PathchSageAttentionKJ',
                 'H3MemoryOptimization',
                 'H3AIMDOResidencyLimiter',
             ],
         )
-        self.assertEqual(patches[1]['inputs']['sage_attention'], 'auto')
-        self.assertEqual(patches[2]['inputs']['qkv_streaming_mode'], 'Auto')
-        self.assertEqual(patches[2]['inputs']['mlp_memory'], 'auto')
-        self.assertEqual(patches[2]['inputs']['chunk_rows'], 4096)
+        self.assertEqual(patches[1]['inputs']['precision_mode'], 'Preserve native')
+        self.assertEqual(patches[1]['inputs']['qkv_streaming_mode'], 'Off')
+        self.assertEqual(patches[1]['inputs']['mlp_memory'], 'auto')
+        self.assertEqual(patches[1]['inputs']['chunk_rows'], 4096)
 
     def test_full_density_streamed_arm_is_100_percent(self):
         graph, _ = build('h3opt_kv100')
@@ -254,12 +255,15 @@ class LadderTests(unittest.TestCase):
     def chain(arm):
         return [(node_type, dict(overrides)) for node_type, overrides in bench.ARMS[arm]]
 
-    def test_sage_memory_adds_only_memory_optimization_to_sage(self):
-        sage = self.chain('sage')
+    def test_sage_arms_carry_no_attention_node_of_their_own(self):
+        # Both Sage rows depend on the server's --use-sage-attention flag, which
+        # is why the benchmark verifies it before running them.
+        self.assertEqual(self.chain('sage'), [])
         memory = self.chain('sage_memory')
-        self.assertEqual(memory[:len(sage)], sage)
-        self.assertEqual(memory[-1][0], 'H3MemoryOptimization')
-        self.assertEqual(memory[-1][1]['qkv_streaming_mode'], 'Auto')
+        self.assertEqual([node_type for node_type, _ in memory],
+                         ['H3MemoryOptimization'])
+        self.assertEqual(memory[0][1]['qkv_streaming_mode'], 'Off')
+        self.assertEqual(memory[0][1]['precision_mode'], 'Preserve native')
 
     def test_streamed_100_and_30_arms_differ_only_in_density(self):
         full = self.chain('h3opt_kv100')
@@ -334,3 +338,59 @@ class ResetSemanticsTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SageLaunchFlagTests(unittest.IsolatedAsyncioTestCase):
+    '''The Sage arms come from a launch flag, so the benchmark must verify it.
+
+    Neither Sage row puts an attention node in the graph. On a server started
+    without --use-sage-attention they would silently measure the default
+    backend and still be reported as SageAttention.
+    '''
+
+    class Session:
+        def __init__(self, argv, status=200):
+            self.argv = argv
+            self.status = status
+            self.requested = []
+
+        def get(self, url):
+            self.requested.append(url)
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self):
+            return {'system': {'argv': self.argv}}
+
+    async def test_missing_flag_is_refused(self):
+        session = self.Session(['main.py', '--port', '8189'])
+        with self.assertRaises(bench.BenchError) as caught:
+            await bench.require_command_line_sage(
+                session, 'http://stub', ['kitchen', 'sage']
+            )
+        self.assertIn('--use-sage-attention', str(caught.exception))
+
+    async def test_present_flag_passes(self):
+        session = self.Session(['main.py', '--use-sage-attention'])
+        await bench.require_command_line_sage(
+            session, 'http://stub', ['sage', 'sage_memory']
+        )
+
+    async def test_no_sage_arms_skips_the_check_entirely(self):
+        session = self.Session([])
+        await bench.require_command_line_sage(
+            session, 'http://stub', ['kitchen', 'h3opt']
+        )
+        self.assertEqual(session.requested, [])
+
+    async def test_unreadable_system_stats_is_refused(self):
+        session = self.Session([], status=503)
+        with self.assertRaises(bench.BenchError):
+            await bench.require_command_line_sage(
+                session, 'http://stub', ['sage']
+            )

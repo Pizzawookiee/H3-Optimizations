@@ -20,11 +20,10 @@ script.
 The default ladder is:
 
 1. dense Comfy Kitchen attention;
-2. dense SageAttention;
-3. dense SageAttention plus H3 Memory Optimization. Sage remains the attention
-   consumer while checkpoint-native QKV is projected in bounded Kitchen chunks,
-   MLP activations are bounded, and FinalLayer is chunked. Because ordinary
-   dense Sage still requires complete Q/K/V, those final BF16 tensors remain;
+2. dense SageAttention selected by ComfyUI's ``--use-sage-attention``;
+3. dense SageAttention plus H3 Memory Optimization in Preserve native mode.
+   ConvRot INT8 QKV is projected in chunks directly into the dense Sage carrier,
+   while MLP activations and FinalLayer are chunked;
 4. H3 Memory Optimization plus native 64Q x 64KV attention at 100% video KV.
    This shows the additional VRAM effect of streamed BF16 QKV/carrier execution
    without attributing any gain to sparsity;
@@ -49,7 +48,7 @@ encoder back onto the card during the next measurement.
 
 Run from the ComfyUI root against an already-running server, for example:
 
-    H3_OPTIMIZATIONS_BENCHMARK_NODES=1 python main.py
+    H3_OPTIMIZATIONS_BENCHMARK_NODES=1 python main.py --use-sage-attention
     .\\.venv\\Scripts\\python.exe custom_nodes\\H3-Optimizations\\benchmarks\\bench_attention_arms.py --i-understand-this-uses-gpu
 
 This script never imports torch and never touches CUDA in-process. All GPU work
@@ -109,12 +108,12 @@ ARMS = {
     'kitchen': [
         ('ModelAttentionBackend', {'attention': 'comfy kitchen attention'}),
     ],
-    'sage': [
-        ('PathchSageAttentionKJ', {'sage_attention': 'auto', 'allow_compile': False}),
-    ],
+    'sage': [],
     'sage_memory': [
-        ('PathchSageAttentionKJ', {'sage_attention': 'auto', 'allow_compile': False}),
-        ('H3MemoryOptimization', {'qkv_streaming_mode': 'Auto'}),
+        ('H3MemoryOptimization', {
+            'precision_mode': 'Preserve native',
+            'qkv_streaming_mode': 'Off',
+        }),
     ],
     'h3opt_kv100': [
         ('H3MemoryOptimization', {'qkv_streaming_mode': 'Auto'}),
@@ -465,6 +464,31 @@ def step_durations(boundaries, warmup):
     return deltas[warmup:], deltas
 
 
+async def require_command_line_sage(session, server, arms):
+    '''Refuse to run the Sage arms unless the server actually selected Sage.
+
+    Both Sage rows rely on ComfyUI's --use-sage-attention rather than a node in
+    the graph, so on a server without it they would silently measure whatever
+    the default attention is and still be labelled SageAttention.
+    '''
+    if not any(arm in ('sage', 'sage_memory') for arm in arms):
+        return
+    async with session.get('%s/api/system_stats' % server) as response:
+        if response.status != 200:
+            raise BenchError(
+                'cannot verify --use-sage-attention: /api/system_stats '
+                'returned %d' % response.status
+            )
+        payload = await response.json()
+    argv = (payload.get('system') or {}).get('argv') or []
+    if '--use-sage-attention' not in argv:
+        raise BenchError(
+            'the sage and sage_memory arms require a server started with '
+            '--use-sage-attention; restart ComfyUI with that flag or drop '
+            'those arms'
+        )
+
+
 async def reset_between_arms(session, server, unload_models):
     '''Release model weights between arms without forcing a text re-encode.'''
     if not unload_models:
@@ -698,6 +722,8 @@ async def run_matrix(args):
                 file=sys.stderr,
             )
             return records
+
+        await require_command_line_sage(session, args.server, args.arm_list)
 
         if args.prime:
             prime_arm, prime_label = args.arm_list[0], args.workload_list[0]
