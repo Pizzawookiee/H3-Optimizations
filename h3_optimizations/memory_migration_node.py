@@ -76,11 +76,10 @@ def _memory_request_for_modes(
     preserve_precision = _preserve_precision_for_mode(precision_mode)
     streaming = _qkv_streaming_request(qkv_streaming_mode)
 
-    # Forced explicitly authorizes changing the dense attention choice to
-    # full-density Comfy Kitchen so the QKV producer has a streaming consumer.
-    # Auto never changes attention merely to obtain streaming. Off keeps the
-    # ordinary upstream QKV projection path even if another consumer exists.
-    attention = ATTENTION_AUTO if streaming == QKV_STREAMING_FORCED else ATTENTION_EXISTING
+    # Off preserves the existing attention choice. Auto may claim attention
+    # only when no explicit selector is already present. Forced explicitly
+    # authorizes replacing the dense attention choice with full-density Kitchen.
+    attention = ATTENTION_EXISTING if streaming == QKV_STREAMING_OFF else ATTENTION_AUTO
 
     if preserve_precision:
         qkv_request = (
@@ -118,10 +117,9 @@ class H3MemoryOptimization(io.ComfyNode):
             description=(
                 'Production memory and execution optimizations for MiniMax H3. '
                 'Precision mode controls whether new weight quantization is allowed. '
-                'QKV streaming defaults to Auto: compatible consumers stream bounded '
-                'QKV chunks, while normal attention keeps the chunked/materialized '
-                'compatibility path. Forced may switch dense attention to full-density '
-                'Comfy Kitchen to guarantee a streaming consumer.'
+                'QKV streaming defaults to Auto: when attention is unclaimed it uses '
+                'the full-density Kitchen streaming path; an explicit attention '
+                'selection is preserved. Forced overrides the dense attention choice.'
             ),
             search_aliases=[
                 'H3 VRAM',
@@ -214,12 +212,12 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=QKV_STREAMING_MODE_AUTO,
                     advanced=True,
                     tooltip=(
-                        'Off disables streamed QKV and uses the ordinary QKV path. '
-                        'Auto streams only when the resolved attention consumer is '
-                        'already compatible; otherwise it keeps the bounded chunked '
-                        'compatibility path. Forced explicitly allows this node to '
-                        'switch dense attention to full-density Comfy Kitchen so '
-                        'streamed QKV can be consumed even without H3 Sparse Attention.'
+                        'Off disables streamed QKV and preserves existing attention. '
+                        'Auto uses full-density Kitchen streaming when no explicit '
+                        'attention selector has claimed the model, but preserves an '
+                        'explicit selector. Forced explicitly allows this node to '
+                        'replace dense attention with full-density Comfy Kitchen. '
+                        'An H3 Sparse Attention request is always authoritative.'
                     ),
                 ),
             ],
