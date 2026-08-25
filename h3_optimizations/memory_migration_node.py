@@ -3,21 +3,29 @@
 The legacy preserve_precision boolean must remain in its original serialized
 widget position so old positional ComfyUI workflows continue to deserialize
 correctly. It is hidden from the UI and intentionally ignored by execution.
-The appended precision_mode widget is authoritative; old workflows have no
-saved value for it and therefore adopt its current default on first load.
+New authoritative controls are appended after every legacy widget so old
+workflows adopt their defaults on first load.
 '''
 
 from comfy_api.latest import io, ui
 
 from .apply import apply_plan
-from .nodes import DEFAULT_CHUNK_ROWS, NODE_CATEGORY, _memory_request
+from .nodes import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
 from .plan import (
+    ATTENTION_AUTO,
+    ATTENTION_EXISTING,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
     MAX_CHUNK_ROWS,
     MIN_CHUNK_ROWS,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_OFF,
+    MLP_MEMORY_PRESERVE,
+    QKV_STREAMING_AUTO,
+    QKV_STREAMING_FORCED,
+    QKV_STREAMING_OFF,
+    MemoryRequest,
     read_plan,
 )
 from .status import format_memory_status
@@ -29,6 +37,15 @@ PRECISION_MODE_OPTIONS = (
     PRECISION_MODE_ALLOW_FP8,
 )
 
+QKV_STREAMING_MODE_OFF = 'Off'
+QKV_STREAMING_MODE_AUTO = 'Auto'
+QKV_STREAMING_MODE_FORCED = 'Forced'
+QKV_STREAMING_MODE_OPTIONS = (
+    QKV_STREAMING_MODE_OFF,
+    QKV_STREAMING_MODE_AUTO,
+    QKV_STREAMING_MODE_FORCED,
+)
+
 
 def _preserve_precision_for_mode(precision_mode):
     if precision_mode == PRECISION_MODE_PRESERVE:
@@ -36,6 +53,57 @@ def _preserve_precision_for_mode(precision_mode):
     if precision_mode == PRECISION_MODE_ALLOW_FP8:
         return False
     raise ValueError('unknown precision mode %r' % precision_mode)
+
+
+def _qkv_streaming_request(mode):
+    if mode == QKV_STREAMING_MODE_OFF:
+        return QKV_STREAMING_OFF
+    if mode == QKV_STREAMING_MODE_AUTO:
+        return QKV_STREAMING_AUTO
+    if mode == QKV_STREAMING_MODE_FORCED:
+        return QKV_STREAMING_FORCED
+    raise ValueError('unknown QKV streaming mode %r' % mode)
+
+
+def _memory_request_for_modes(
+    *,
+    fused_qkv,
+    mlp_memory,
+    chunk_rows,
+    precision_mode,
+    qkv_streaming_mode,
+):
+    preserve_precision = _preserve_precision_for_mode(precision_mode)
+    streaming = _qkv_streaming_request(qkv_streaming_mode)
+
+    # Forced explicitly authorizes changing the dense attention choice to
+    # full-density Comfy Kitchen so the QKV producer has a streaming consumer.
+    # Auto never changes attention merely to obtain streaming. Off keeps the
+    # ordinary upstream QKV projection path even if another consumer exists.
+    attention = ATTENTION_AUTO if streaming == QKV_STREAMING_FORCED else ATTENTION_EXISTING
+
+    if preserve_precision:
+        qkv_request = (
+            FUSED_QKV_OFF
+            if streaming == QKV_STREAMING_OFF
+            else FUSED_QKV_PRESERVE_BF16
+        )
+        mlp_request = (
+            MLP_MEMORY_PRESERVE
+            if mlp_memory == MLP_MEMORY_AUTO
+            else mlp_memory
+        )
+    else:
+        qkv_request = FUSED_QKV_OFF if streaming == QKV_STREAMING_OFF else fused_qkv
+        mlp_request = mlp_memory
+
+    return MemoryRequest(
+        attention=attention,
+        fused_qkv=qkv_request,
+        mlp_memory=mlp_request,
+        chunk_rows=int(chunk_rows),
+        qkv_streaming=streaming,
+    )
 
 
 class H3MemoryOptimization(io.ComfyNode):
@@ -49,17 +117,17 @@ class H3MemoryOptimization(io.ComfyNode):
             category=NODE_CATEGORY,
             description=(
                 'Production memory and execution optimizations for MiniMax H3. '
-                'Compatible quantized checkpoints keep their checkpoint weight '
-                'precision while using specialized or chunked execution paths. '
-                'Precision mode defaults to Preserve precision, which forbids new '
-                'weight quantization. Allow FP8 conversion permits supported '
-                'ordinary BF16/FP16 QKV and MLP weights to be converted to FP8 '
-                'E4M3 when accelerated FP8 is available.'
+                'Precision mode controls whether new weight quantization is allowed. '
+                'QKV streaming defaults to Auto: compatible consumers stream bounded '
+                'QKV chunks, while normal attention keeps the chunked/materialized '
+                'compatibility path. Forced may switch dense attention to full-density '
+                'Comfy Kitchen to guarantee a streaming consumer.'
             ),
             search_aliases=[
                 'H3 VRAM',
                 'H3 memory',
                 'H3 fused QKV',
+                'H3 streamed QKV',
                 'H3 chunked MLP',
                 'H3 preserve precision',
                 'H3 non quantized memory',
@@ -139,6 +207,21 @@ class H3MemoryOptimization(io.ComfyNode):
                         'memory/performance savings.'
                     ),
                 ),
+                io.Combo.Input(
+                    'qkv_streaming_mode',
+                    display_name='QKV streaming',
+                    options=list(QKV_STREAMING_MODE_OPTIONS),
+                    default=QKV_STREAMING_MODE_AUTO,
+                    advanced=True,
+                    tooltip=(
+                        'Off disables streamed QKV and uses the ordinary QKV path. '
+                        'Auto streams only when the resolved attention consumer is '
+                        'already compatible; otherwise it keeps the bounded chunked '
+                        'compatibility path. Forced explicitly allows this node to '
+                        'switch dense attention to full-density Comfy Kitchen so '
+                        'streamed QKV can be consumed even without H3 Sparse Attention.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -152,16 +235,18 @@ class H3MemoryOptimization(io.ComfyNode):
         chunk_rows=DEFAULT_CHUNK_ROWS,
         preserve_precision=True,
         precision_mode=PRECISION_MODE_PRESERVE,
+        qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
     ):
         # preserve_precision is intentionally ignored. It only absorbs the old
-        # positional workflow value so precision_mode can migrate defaults.
+        # positional workflow value so the appended enums can migrate defaults.
         del preserve_precision
         plan = read_plan(model).with_memory(
-            _memory_request(
+            _memory_request_for_modes(
                 fused_qkv=fused_qkv,
                 mlp_memory=mlp_memory,
                 chunk_rows=chunk_rows,
-                preserve_precision=_preserve_precision_for_mode(precision_mode),
+                precision_mode=precision_mode,
+                qkv_streaming_mode=qkv_streaming_mode,
             )
         )
         patched = apply_plan(model, plan)
