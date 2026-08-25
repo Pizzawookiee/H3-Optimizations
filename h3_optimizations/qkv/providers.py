@@ -33,6 +33,20 @@ MLP_FP8_CHUNKED = 'fp8_chunked'
 MLP_W4A8_CHUNKED = 'w4a8_chunked'
 MLP_CONVROT_INT8_TWO_SLICE = 'convrot_int8_two_slice'
 
+# These backends already consume the package's Kitchen INT8 carrier. A native
+# BF16 checkpoint can therefore stream projection/norm/RoPE slabs straight
+# into that existing carrier instead of materializing complete BF16 Q/K/V.
+_BF16_KITCHEN_CARRIER_CONSUMERS = {
+    'comfy_kitchen_int8',
+    'sparse_kitchen_int8',
+    'native_int8_128x64',
+    'native_int8_128x64_sol_residual_64x64',
+    'native_int8_64x64',
+    'native_int8_64x64_sol_residual_64x64',
+    'native_int8_128x128_hard_control',
+    'native_int8_128x128_sol_residual_64x64',
+}
+
 
 @dataclass(frozen=True)
 class QKVProviderResolution:
@@ -108,10 +122,23 @@ def _resolve_preserve_precision_qkv(
             % (labels or 'unknown')
         )
 
+    if backend_kind in _BF16_KITCHEN_CARRIER_CONSUMERS:
+        if not kitchen_producer_available:
+            return _standard_qkv(
+                'the Kitchen QKV producer is unavailable; Preserve precision keeps native BF16 QKV on upstream Comfy execution'
+            )
+        return QKVProviderResolution(
+            QKV_DENSE_KITCHEN_CHUNKED,
+            backend_kind != 'comfy_kitchen_int8',
+            (
+                'checkpoint-native BF16 QKV streams held 4K BF16 projection, '
+                'norm, and RoPE chunks directly into the Kitchen INT8 carrier '
+                'without weight requantization'
+            ),
+        )
+
     consumers = {
         'existing',
-        'comfy_kitchen_int8',
-        'sparse_kitchen_int8',
         'sparse_sage',
         'triton_sparse_int8',
         'flex_attention_fp8',
