@@ -1,4 +1,4 @@
-name: Build Windows native DLL
+name: Build Windows native DLL test
 
 on:
   workflow_dispatch:
