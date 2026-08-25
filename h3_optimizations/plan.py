@@ -28,6 +28,15 @@ FUSED_QKV_REQUESTS = (
     FUSED_QKV_PRESERVE_BF16,
 )
 
+QKV_STREAMING_OFF = 'off'
+QKV_STREAMING_AUTO = 'auto'
+QKV_STREAMING_FORCED = 'forced'
+QKV_STREAMING_REQUESTS = (
+    QKV_STREAMING_OFF,
+    QKV_STREAMING_AUTO,
+    QKV_STREAMING_FORCED,
+)
+
 MLP_MEMORY_AUTO = 'auto'
 MLP_MEMORY_OFF = 'off'
 MLP_MEMORY_PRESERVE = 'preserve_precision'
@@ -126,20 +135,24 @@ class MemoryRequest:
     fused_qkv: str = FUSED_QKV_AUTO
     mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 4096
+    qkv_streaming: str = QKV_STREAMING_AUTO
     prefer_held_weights: bool = True
     mlp_strict: bool = False
 
     def __post_init__(self):
         if self.attention not in ATTENTION_REQUESTS:
             raise ValueError('unknown dense attention request %r' % self.attention)
+        if self.qkv_streaming not in QKV_STREAMING_REQUESTS:
+            raise ValueError('unknown QKV streaming request %r' % self.qkv_streaming)
 
         # The public Preserve precision policy is represented today by keeping
         # the existing attention backend and disabling QKV requantization. Turn
         # that specific combination into an internal BF16-preserving request so
         # a real BF16 checkpoint can still use bounded QKV projection. Explicit
-        # `fused_qkv=off` outside Preserve precision keeps its original meaning.
+        # QKV streaming Off keeps the ordinary upstream QKV path instead.
         if (
-            self.attention == ATTENTION_EXISTING
+            self.qkv_streaming != QKV_STREAMING_OFF
+            and self.attention == ATTENTION_EXISTING
             and self.fused_qkv == FUSED_QKV_OFF
         ):
             object.__setattr__(
@@ -170,6 +183,7 @@ class MemoryRequest:
             self.fused_qkv,
             self.mlp_memory,
             int(self.chunk_rows),
+            self.qkv_streaming,
             bool(self.prefer_held_weights),
             bool(self.mlp_strict),
         )
