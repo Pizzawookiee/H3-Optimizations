@@ -314,7 +314,7 @@ def _launch_and_run(launcher, benchmark_argv):
         '--disable-metadata',
     ]
     environment = os.environ.copy()
-    environment['H3_ENABLE_BENCHMARK_NODES'] = '1'
+    environment['H3_OPTIMIZATIONS_BENCHMARK_NODES'] = '1'
     environment['PYTHONUNBUFFERED'] = '1'
     environment.setdefault('PYTORCH_CUDA_ALLOC_CONF', PRODUCTION_ALLOC_CONF)
 
