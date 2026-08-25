@@ -163,8 +163,11 @@ def run(device=None, *, verbose=False):
                     kv_tile=kv_tile,
                     encoding='absolute',
                 )
+                # The self-test is the authority that populates the geometry
+                # verdict, so bypass the runtime geometry gate here. Calling
+                # the normal gated path would recurse back into this test.
                 routed = native.block_sparse_int8_attention_from_prequantized(
-                    carrier, route
+                    carrier, route, validate_geometry=False
                 )
                 torch.cuda.synchronize(device)
                 parity[key] = torch.equal(routed, dense_by_kv[kv_tile])
@@ -189,6 +192,7 @@ def run(device=None, *, verbose=False):
                 native.block_sparse_int8_attention_with_lse_from_prequantized(
                     parity_carrier,
                     route,
+                    validate_geometry=False,
                 )
             )
             lse_reference = _carrier_lse_reference(parity_carrier)
