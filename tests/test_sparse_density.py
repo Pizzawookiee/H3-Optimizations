@@ -210,14 +210,13 @@ def test_advanced_node_schema_and_request():
     )
     backend = input_by_id(schema, 'backend')
     check(
-        backend.default == 'auto'
+        backend.default == 'Kitchen INT8'
         and backend.options
         == [
-            'auto',
+            'Kitchen INT8',
             'Sparse Sage',
             'INT8 Triton',
             'FP8 FlexAttention',
-            'Kitchen INT8 (experimental)',
         ],
         'advanced backend selector exposes the supported sparse backends',
     )

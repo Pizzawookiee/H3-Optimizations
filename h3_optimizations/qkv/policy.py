@@ -19,6 +19,7 @@ from ..plan import (
 )
 
 QKV_STREAMED_SPARSE_SAGE = base.QKV_SPARSE_CONVROT_INT8
+DENSE_SAGE_SM89 = 'dense_sage_sm89'
 
 _KITCHEN_CARRIER_CONSUMERS = {
     'comfy_kitchen_int8',
@@ -201,6 +202,15 @@ def resolve_qkv_provider(
         return base._required_or_standard(request, 'the H3 model has no QKV projection inventory')
     if not inventory.homogeneous('qkv'):
         return base._required_or_standard(request, 'H3 QKV layers use mixed weight formats')
+    if backend_kind == DENSE_SAGE_SM89:
+        return base.resolve_qkv_provider(
+            inventory,
+            request=request,
+            backend_kind=backend_kind,
+            triton_available=triton_available,
+            memory_optimize=memory_optimize,
+            fp8_available=fp8_available,
+        )
     if request == FUSED_QKV_FORCE_BF16:
         if not (
             inventory.qkv_plain_float

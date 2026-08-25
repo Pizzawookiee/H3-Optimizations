@@ -13,10 +13,10 @@ except ImportError:  # pragma: no cover
 
 from . import triton_qkv_fast as _qkv
 from .fused_qkv import HEAD_DIM
-from .router import KV_TILE
 
 TritonSparseQKVError = _qkv.TritonSparseQKVError
 normalize_v_scale_group_size = _qkv.normalize_v_scale_group_size
+KV_TILE = _qkv.KV_TILE
 
 
 if TRITON_AVAILABLE:

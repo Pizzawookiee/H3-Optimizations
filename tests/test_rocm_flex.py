@@ -39,7 +39,7 @@ class FakeMetadata:
 
 
 class FakeRouter:
-    q_tile = 128
+    q_tile = 64
     kv_tile = 64
 
     def build_lut(self, q, _k, _layout, _video_budget, *, sink=None):
@@ -141,7 +141,7 @@ class RocmFlexTests(unittest.TestCase):
         self.assertIs(call_v, v)
         self.assertIsNone(kwargs['score_mod'])
         self.assertEqual(kwargs['kernel_options']['BACKEND'], FLEX_BACKEND_TRITON)
-        self.assertEqual(kwargs['kernel_options']['BLOCK_M'], 128)
+        self.assertEqual(kwargs['kernel_options']['BLOCK_M'], 64)
         self.assertEqual(kwargs['kernel_options']['BLOCK_N'], 64)
 
         status = backend.as_status()

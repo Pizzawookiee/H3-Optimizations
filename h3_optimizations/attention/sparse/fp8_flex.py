@@ -17,11 +17,13 @@ import comfy.model_management
 from .. import AttentionBackendUnavailable
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
-from .router import KV_TILE, Q_TILE, SparseRouterError, SparseTileRouter
+from .router import SparseRouterError, SparseTileRouter
 from ...mlp_sharing.route import router_kwargs as _route_kwargs
 
 
 CHUNK_ROWS = 4096
+FLEX_Q_TILE = 64
+FLEX_KV_TILE = 64
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 FLEX_BACKEND_FLASH = 'FLASH'
@@ -39,8 +41,8 @@ class FP8FlexSpec:
     block_mask_type: object
     kernel_backend: str = FLEX_BACKEND_TRITON
     fp8_dtype: torch.dtype = FP8_DTYPE
-    q_tile: int = Q_TILE
-    kv_tile: int = KV_TILE
+    q_tile: int = FLEX_Q_TILE
+    kv_tile: int = FLEX_KV_TILE
     quantize_fp8: bool = True
 
     @property

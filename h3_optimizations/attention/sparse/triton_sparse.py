@@ -24,7 +24,7 @@ _original_as_status = _impl.TritonSparseBackend.as_status
 
 def _optimized_as_status(self):
     status = _original_as_status(self)
-    status['autotune_block_m'] = [16, 32, 64, 128]
+    status['autotune_block_m'] = [16, 32, 64]
     status['autotune_warps'] = [4, 8]
     status['route_format'] = 'absolute_compact_int32_direct'
     return status

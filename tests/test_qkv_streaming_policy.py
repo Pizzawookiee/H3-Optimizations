@@ -20,6 +20,7 @@ from h3_optimizations.qkv.formats import inspect_h3_linears  # noqa: E402
 from h3_optimizations.qkv.policy import resolve_qkv_provider  # noqa: E402
 from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_BF16_CHUNKED,
+    QKV_DENSE_CONVROT_INT8,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_FORCE_BF16_CHUNKED,
@@ -223,6 +224,17 @@ class QKVStreamingPolicyTests(unittest.TestCase):
                 kitchen_producer_available=True,
                 fp8_available=False,
             )
+
+    def test_preserve_native_uses_dense_fused_convrot_provider(self):
+        resolved = resolve_qkv_provider(
+            inventory(self.convrot),
+            request=FUSED_QKV_PRESERVE_BF16,
+            backend_kind='dense_sage_sm89',
+            triton_available=True,
+            memory_optimize=True,
+        )
+        self.assertEqual(resolved.provider_id, QKV_DENSE_CONVROT_INT8)
+        self.assertTrue(resolved.fused)
 
     def test_required_does_not_accept_nonfused_bounded_fallback(self):
         with self.assertRaisesRegex(RuntimeError, 'required fused QKV'):

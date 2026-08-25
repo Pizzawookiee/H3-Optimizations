@@ -20,6 +20,7 @@ QKV_STANDARD = 'standard_h3_qkv'
 QKV_BF16_CHUNKED = 'chunked_bf16_qkv'
 QKV_FORCE_BF16_CHUNKED = 'force_bf16_qkv'
 QKV_FORCE_QUANT_CHUNKED = 'force_quant_qkv'
+QKV_DENSE_CONVROT_INT8 = 'convrot_int8_dense_sage'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_STREAMED_BF16_KITCHEN = 'streamed_bf16_kitchen_qkv'
 QKV_DENSE_FP8_CHUNKED = 'chunked_fp8_kitchen_qkv'
@@ -182,6 +183,21 @@ def resolve_qkv_provider(
     if not inventory.homogeneous('qkv'):
         return _required_or_standard(
             request, 'H3 QKV layers use mixed weight formats'
+        )
+    if backend_kind == 'dense_sage_sm89':
+        if not inventory.qkv_convrot_int8_256:
+            return _required_or_standard(
+                request,
+                'native dense fused Sage requires ConvRot-256 INT8 QKV',
+            )
+        if not triton_available:
+            return _required_or_standard(
+                request, 'native dense fused Sage requires Triton'
+            )
+        return QKVProviderResolution(
+            QKV_DENSE_CONVROT_INT8,
+            True,
+            'native ConvRot-256 INT8 QKV projects directly into dense Sage carriers',
         )
     if (
         inventory.qkv_convrot_int8_256

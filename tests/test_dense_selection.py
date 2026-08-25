@@ -25,18 +25,27 @@ import h3_optimizations.apply as apply_module  # noqa: E402
 from h3_optimizations.dense_resolver import (  # noqa: E402
     ATTENTION_COMFY_KITCHEN_INT8,
     ATTENTION_EXISTING,
+    ATTENTION_SAGE,
+    ATTENTION_SAGE_SM89,
+    DenseResolution,
     has_explicit_dense_attention,
     install_dense_attention,
     resolve_dense_attention,
 )
 from h3_optimizations.plan import (  # noqa: E402
+    FUSED_QKV_AUTO,
     FUSED_QKV_PRESERVE_BF16,
     H3OptimizationPlan,
     MemoryRequest,
+    QKV_STREAMING_OFF,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
+    QKV_DENSE_CONVROT_INT8,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_STANDARD,
+)
+from h3_optimizations.qkv.policy import (  # noqa: E402
+    resolve_qkv_provider as resolve_qkv_policy,
 )
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -223,6 +232,58 @@ class DenseSelectionTests(unittest.TestCase):
             )
         self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
         self.assertEqual(attention.projector.name, 'chunked_kitchen_qkv')
+
+    def test_streaming_off_preserve_native_uses_fused_dense_sage(self):
+        model = FakePatcher()
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_PRESERVE_BF16,
+                qkv_streaming=QKV_STREAMING_OFF,
+            )
+        )
+        delegate = SimpleNamespace(
+            name='sage_mem_eff',
+            api=SimpleNamespace(version='2.2.test', kernel_name='fake'),
+            allow_cpu_for_tests=True,
+            runtime_listeners=(),
+        )
+        resolution = DenseResolution(
+            ATTENTION_SAGE,
+            ATTENTION_SAGE,
+            delegate,
+            'test command-line Sage route',
+            ATTENTION_SAGE_SM89,
+        )
+        environment = SimpleNamespace(
+            capability=(8, 9),
+            device_index=None,
+            cuda_available=False,
+        )
+        with patch.object(
+            apply_module,
+            'resolve_command_line_sage_fused_attention',
+            return_value=resolution,
+        ), patch(
+            'h3_optimizations.dense_fused_qkv.TRITON_AVAILABLE',
+            True,
+        ), patch.object(
+            apply_module,
+            'resolve_qkv_provider',
+            resolve_qkv_policy,
+        ):
+            attention, qkv = apply_module._resolve_dense(
+                plan,
+                model,
+                self._convrot_inventory(),
+                environment,
+            )
+
+        self.assertEqual(qkv.provider_id, QKV_DENSE_CONVROT_INT8)
+        self.assertTrue(qkv.fused)
+        self.assertEqual(attention.selected, ATTENTION_SAGE)
+        self.assertEqual(attention.backend.name, 'sage_mem_eff')
+        self.assertEqual(attention.projector.name, 'h3_fused_qkv_dense_sage')
 
     def test_legacy_existing_request_preserves_incoming_attention(self):
         model = FakePatcher()

@@ -57,13 +57,13 @@ control.
   steps; Early steps/Early KV and Late steps/Late KV independently control the
   edges. The defaults are two early steps at 50 percent KV and two late steps at
   50 percent KV. If the two windows overlap, the denser of the two requested
-  edge budgets is used. Backend `auto` uses native Kitchen INT8 at 64Q x 64KV,
-  then an
-  existing compatible Sparse Sage installation, INT8 Triton, FlexAttention,
-  and finally the resolved dense H3 path. FlexAttention uses FP8 carriers on
+  edge budgets is used. The backend selector exposes Kitchen INT8, Sparse Sage,
+  INT8 Triton, and FP8 FlexAttention. Kitchen INT8 at 64Q x 64KV is the default.
+  FlexAttention uses FP8 carriers on
   supported NVIDIA runtimes and native BF16/FP16 Q/K/V through Triton on ROCm.
   Explicit backend selections are hard requirements and error if unavailable;
-  bypass the node to force dense attention.
+  bypass the node to force dense attention. Legacy saved backend values remain
+  accepted for workflow compatibility but are not shown in the dropdown.
 
 The production native backend and the explicit quality arms execute 64Q x
 64KV, 128Q x 128KV, or 128Q x 64KV routed geometry through the native INT8
@@ -212,8 +212,8 @@ measured separately and are not comparable to these.
 
 Reproduce with `benchmarks/bench_attention_arms.py`, which drives a running
 ComfyUI server over its prompt API. The SageAttention row additionally requires
-a `sageattention` package and ComfyUI-KJNodes for the patch node; it is measured
-here as plain dense SageAttention, not Sparge/`spas_sage_attn`.
+a `sageattention` package and a server started with `--use-sage-attention`; it
+is measured here as plain dense SageAttention, not Sparge/`spas_sage_attn`.
 
 ## Install
 
@@ -265,8 +265,10 @@ attention. If native Kitchen is unavailable, `auto` tries an existing
 compatible Sparse Sage package and then the package INT8 Triton sparse backend
 on NVIDIA compute capability 8.0 or newer. Triton consumes the same route and,
 for compatible ConvRot-256 TensorWise INT8 checkpoints, uses 4K QKV chunks to
-produce its INT8 carriers directly. If that backend is unavailable,
-FlexAttention is next. On supported NVIDIA runtimes, Flex stores Q/K/V as
+produce its INT8 carriers directly. The package-owned INT8 Triton and
+FlexAttention fallbacks both use 64Q x 64KV routing, matching the native Kitchen
+default. If Triton is unavailable, FlexAttention is next. On supported NVIDIA
+runtimes, Flex stores Q/K/V as
 per-head-scaled E4M3, restores Q/K scale before softmax, converts the FP8 output
 back to the original floating dtype, and consumes the same route. Hopper and
 Blackwell request the FA4 backend when its CuTe package is installed; other

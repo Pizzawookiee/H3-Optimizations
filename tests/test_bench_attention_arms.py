@@ -151,6 +151,49 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(args.warmup_steps, 1)
 
 
+class ServerPreflightTests(unittest.IsolatedAsyncioTestCase):
+    class Response:
+        def __init__(self, argv):
+            self.status = 200
+            self.argv = argv
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def json(self):
+            return {'system': {'argv': self.argv}}
+
+    class Session:
+        def __init__(self, argv):
+            self.argv = argv
+
+        def get(self, _url):
+            return ServerPreflightTests.Response(self.argv)
+
+    async def test_sage_arms_require_command_line_sage(self):
+        await bench.require_command_line_sage(
+            self.Session(['main.py', '--use-sage-attention']),
+            'http://stub',
+            ['sage_memory'],
+        )
+        with self.assertRaisesRegex(bench.BenchError, '--use-sage-attention'):
+            await bench.require_command_line_sage(
+                self.Session(['main.py']),
+                'http://stub',
+                ['sage'],
+            )
+
+    async def test_non_sage_arms_do_not_require_command_line_sage(self):
+        await bench.require_command_line_sage(
+            self.Session(['main.py']),
+            'http://stub',
+            ['kitchen', 'h3opt'],
+        )
+
+
 class PromptTests(unittest.TestCase):
     def test_every_arm_forces_config0_and_zero_aimdo(self):
         for arm in bench.ARMS:
@@ -181,22 +224,21 @@ class PromptTests(unittest.TestCase):
             ][0]
             self.assertEqual(patches[index]['inputs']['model'], [prior_id, 0])
 
-    def test_sage_memory_preserves_sage_then_adds_memory_node(self):
+    def test_sage_memory_preserves_default_sage_then_adds_memory_node(self):
         graph, _ = build('sage_memory')
         patches = patch_nodes(graph)
         self.assertEqual(
             [node['class_type'] for node in patches],
             [
                 'H3BenchmarkForceQKVConfig0',
-                'PathchSageAttentionKJ',
                 'H3MemoryOptimization',
                 'H3AIMDOResidencyLimiter',
             ],
         )
-        self.assertEqual(patches[1]['inputs']['sage_attention'], 'auto')
-        self.assertEqual(patches[2]['inputs']['qkv_streaming_mode'], 'Auto')
-        self.assertEqual(patches[2]['inputs']['mlp_memory'], 'auto')
-        self.assertEqual(patches[2]['inputs']['chunk_rows'], 4096)
+        self.assertEqual(patches[1]['inputs']['precision_mode'], 'Preserve native')
+        self.assertEqual(patches[1]['inputs']['qkv_streaming_mode'], 'Off')
+        self.assertEqual(patches[1]['inputs']['mlp_memory'], 'auto')
+        self.assertEqual(patches[1]['inputs']['chunk_rows'], 4096)
 
     def test_full_density_streamed_arm_is_100_percent(self):
         graph, _ = build('h3opt_kv100')
@@ -254,12 +296,16 @@ class LadderTests(unittest.TestCase):
     def chain(arm):
         return [(node_type, dict(overrides)) for node_type, overrides in bench.ARMS[arm]]
 
-    def test_sage_memory_adds_only_memory_optimization_to_sage(self):
+    def test_sage_memory_adds_only_memory_optimization_to_default_sage(self):
         sage = self.chain('sage')
         memory = self.chain('sage_memory')
-        self.assertEqual(memory[:len(sage)], sage)
+        self.assertEqual(sage, [])
         self.assertEqual(memory[-1][0], 'H3MemoryOptimization')
-        self.assertEqual(memory[-1][1]['qkv_streaming_mode'], 'Auto')
+        self.assertEqual(memory[-1][1]['qkv_streaming_mode'], 'Off')
+        self.assertEqual(
+            memory[-1][1]['precision_mode'],
+            'Preserve native',
+        )
 
     def test_streamed_100_and_30_arms_differ_only_in_density(self):
         full = self.chain('h3opt_kv100')

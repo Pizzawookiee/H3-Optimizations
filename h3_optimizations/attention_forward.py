@@ -79,6 +79,7 @@ def _legacy_attention(module, q, k, v, transformer_options, attention=None):
         module.heads,
         mask=None,
         skip_reshape=True,
+        skip_output_reshape=True,
         transformer_options=transformer_options,
     )
 
