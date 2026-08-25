@@ -54,30 +54,15 @@ def has_explicit_dense_attention(model_patcher):
     return not is_installed_dense_attention(options)
 
 
-def resolve_dense_attention(
-    model_patcher,
-    *,
-    preserve_explicit_override=False,
-    force_kitchen=False,
-):
+def resolve_dense_attention(model_patcher):
     options = (
         getattr(model_patcher, 'model_options', {})
         .get('transformer_options', {})
         or {}
     )
     backend = get_attention_function(ATTENTION_COMFY_KITCHEN_INT8, None)
-    explicit_override = (
-        'optimized_attention_override' in options
-        and not is_installed_dense_attention(options)
-    )
 
-    if explicit_override and preserve_explicit_override and not force_kitchen:
-        return _existing_resolution(
-            ATTENTION_AUTO,
-            'preserved an explicit optimized-attention override; Auto QKV streaming did not replace the selected attention backend',
-        )
-
-    if explicit_override:
+    if 'optimized_attention_override' in options:
         if backend is None:
             return _existing_resolution(
                 ATTENTION_AUTO,
@@ -88,14 +73,8 @@ def resolve_dense_attention(
             ATTENTION_AUTO,
             ATTENTION_COMFY_KITCHEN_INT8,
             None,
-            (
-                'Forced QKV streaming uses Comfy Kitchen INT8 for the private H3 '
-                'memory path while leaving the upstream override installed'
-                if force_kitchen
-                else
-                'preserved an explicit optimized-attention override; using Comfy '
-                'Kitchen INT8 only for the private H3 memory path'
-            ),
+            'preserved an explicit optimized-attention override; '
+            'using Comfy Kitchen INT8 only for the private H3 memory path',
             ATTENTION_COMFY_KITCHEN_INT8,
         )
 
@@ -108,11 +87,7 @@ def resolve_dense_attention(
         ATTENTION_AUTO,
         ATTENTION_COMFY_KITCHEN_INT8,
         backend,
-        (
-            'selected full-density Comfy Kitchen INT8 for Forced QKV streaming'
-            if force_kitchen
-            else 'selected through ComfyUI public attention registry'
-        ),
+        'selected through ComfyUI public attention registry',
         ATTENTION_COMFY_KITCHEN_INT8,
     )
 
