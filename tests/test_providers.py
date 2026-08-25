@@ -18,6 +18,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     MLP_FP8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
     MLP_W4A8_CHUNKED,
+    QKV_BF16_CHUNKED,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_DENSE_W4A8_CHUNKED,
@@ -28,6 +29,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     resolve_qkv_provider,
 )
 from h3_optimizations.plan import (  # noqa: E402
+    FUSED_QKV_PRESERVE_BF16,
     MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
 )
@@ -196,6 +198,53 @@ class ProviderTests(unittest.TestCase):
                 fp8_available=True,
             )
             self.assertEqual(mlp.provider_id, MLP_FP8_CHUNKED)
+
+    def test_preserve_bf16_streams_into_existing_kitchen_carrier_consumers(self):
+        inventory = inspect_h3_linears([block(self.plain)])
+        consumers = (
+            'comfy_kitchen_int8',
+            'sparse_kitchen_int8',
+            'native_int8_128x64',
+            'native_int8_128x64_sol_residual_64x64',
+            'native_int8_64x64',
+            'native_int8_64x64_sol_residual_64x64',
+            'native_int8_128x128_hard_control',
+            'native_int8_128x128_sol_residual_64x64',
+        )
+        for backend_kind in consumers:
+            with self.subTest(backend_kind=backend_kind):
+                qkv = resolve_qkv_provider(
+                    inventory,
+                    request=FUSED_QKV_PRESERVE_BF16,
+                    backend_kind=backend_kind,
+                    kitchen_producer_available=True,
+                )
+                self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
+                self.assertIn('streams held 4K BF16', qkv.reason)
+                self.assertIn('without weight requantization', qkv.reason)
+
+    def test_preserve_bf16_keeps_full_bf16_for_noncarrier_consumers(self):
+        inventory = inspect_h3_linears([block(self.plain)])
+        for backend_kind in ('existing', 'sparse_sage', 'triton_sparse_int8'):
+            with self.subTest(backend_kind=backend_kind):
+                qkv = resolve_qkv_provider(
+                    inventory,
+                    request=FUSED_QKV_PRESERVE_BF16,
+                    backend_kind=backend_kind,
+                    kitchen_producer_available=True,
+                )
+                self.assertEqual(qkv.provider_id, QKV_BF16_CHUNKED)
+
+    def test_preserve_bf16_does_not_require_a_missing_kitchen_producer(self):
+        inventory = inspect_h3_linears([block(self.plain)])
+        qkv = resolve_qkv_provider(
+            inventory,
+            request=FUSED_QKV_PRESERVE_BF16,
+            backend_kind='sparse_kitchen_int8',
+            kitchen_producer_available=False,
+        )
+        self.assertEqual(qkv.provider_id, QKV_STANDARD)
+        self.assertIn('producer is unavailable', qkv.reason)
 
     def test_bf16_uses_float_chunking_without_fp8_hardware(self):
         inventory = inspect_h3_linears([block(self.plain)])
