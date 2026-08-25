@@ -12,6 +12,7 @@ from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
+    FUSED_QKV_REQUIRED,
 )
 from h3_optimizations.qkv.formats import inspect_h3_linears  # noqa: E402
 from h3_optimizations.qkv.policy import resolve_qkv_provider  # noqa: E402
@@ -165,6 +166,25 @@ class QKVStreamingPolicyTests(unittest.TestCase):
             backend_kind='existing',
         )
         self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
+
+    def test_allow_fp8_still_uses_bounded_bf16_before_conversion(self):
+        resolved = resolve_qkv_provider(
+            inventory(self.bf16),
+            request=FUSED_QKV_AUTO,
+            backend_kind='existing',
+            memory_optimize=True,
+            fp8_available=True,
+        )
+        self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
+        self.assertNotEqual(resolved.provider_id, QKV_DENSE_FP8_CHUNKED)
+
+    def test_required_does_not_accept_nonfused_bf16_fallback(self):
+        with self.assertRaisesRegex(RuntimeError, 'required fused QKV'):
+            resolve_qkv_provider(
+                inventory(self.bf16),
+                request=FUSED_QKV_REQUIRED,
+                backend_kind='existing',
+            )
 
     def test_streaming_off_is_absolute(self):
         resolved = resolve_qkv_provider(
