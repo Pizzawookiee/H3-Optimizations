@@ -5,11 +5,18 @@ weights. Whenever a compatible consumer exists we keep the checkpoint's weight
 format for the linear, produce post-projection Q/K/V as BF16 chunks, and feed
 those chunks directly into the consumer carrier. BF16/FP16 -> FP8 weight
 conversion is only a fallback after streaming and native/bounded execution have
-both been ruled out.
+both been ruled out. Explicit BF16 and Force quant requests bypass that Auto
+priority and require their requested weight representation.
 '''
 
 from . import providers as base
-from ..plan import FUSED_QKV_OFF, FUSED_QKV_PRESERVE_BF16, FUSED_QKV_REQUIRED
+from ..plan import (
+    FUSED_QKV_FORCE_BF16,
+    FUSED_QKV_FORCE_QUANT,
+    FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
+    FUSED_QKV_REQUIRED,
+)
 
 QKV_STREAMED_SPARSE_SAGE = base.QKV_SPARSE_CONVROT_INT8
 
@@ -38,7 +45,10 @@ def _native_stream_format(inventory):
 
 
 def is_dense_streamed_provider(provider_id):
-    return provider_id == base.QKV_DENSE_KITCHEN_CHUNKED
+    return provider_id in (
+        base.QKV_DENSE_KITCHEN_CHUNKED,
+        base.QKV_DENSE_FP8_CHUNKED,
+    )
 
 
 def _stream_kitchen(
@@ -191,6 +201,31 @@ def resolve_qkv_provider(
         return base._required_or_standard(request, 'the H3 model has no QKV projection inventory')
     if not inventory.homogeneous('qkv'):
         return base._required_or_standard(request, 'H3 QKV layers use mixed weight formats')
+    if request == FUSED_QKV_FORCE_BF16:
+        if not (
+            inventory.qkv_plain_float
+            or inventory.qkv_convrot_int8_256
+            or inventory.qkv_w4a8
+            or inventory.qkv_fp8
+        ):
+            raise RuntimeError(
+                'BF16 mode cannot materialize the checkpoint QKV format as BF16'
+            )
+        return base.QKVProviderResolution(
+            base.QKV_FORCE_BF16_CHUNKED,
+            False,
+            'QKV weights are materialized as BF16 for bounded BF16 projection',
+        )
+    if request == FUSED_QKV_FORCE_QUANT and inventory.qkv_plain_float:
+        if not fp8_available:
+            raise RuntimeError(
+                'Force quant requires accelerated FP8 execution for floating QKV weights'
+            )
+        return base.QKVProviderResolution(
+            base.QKV_FORCE_QUANT_CHUNKED,
+            False,
+            'floating QKV weights are forced to FP8 E4M3 for bounded projection',
+        )
 
     streamed = _stream_kitchen(
         inventory,

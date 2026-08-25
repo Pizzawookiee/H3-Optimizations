@@ -30,6 +30,8 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
 )
 from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_PRESERVE_BF16,
+    MLP_MEMORY_BF16,
+    MLP_MEMORY_FORCE_QUANT,
     MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
 )
@@ -254,6 +256,27 @@ class ProviderTests(unittest.TestCase):
             fp8_available=False,
         )
         self.assertEqual(mlp.provider_id, MLP_FLOAT_CHUNKED)
+
+    def test_bf16_mode_selects_forced_bf16_mlp_execution(self):
+        inventory = inspect_h3_linears([block(self.convrot)])
+        mlp = resolve_mlp_provider(inventory, request=MLP_MEMORY_BF16)
+        self.assertEqual(mlp.provider_id, MLP_FLOAT_CHUNKED)
+        self.assertEqual(mlp.activation_mode, 'mlp_chunked_bf16')
+
+    def test_force_quant_converts_plain_mlp_and_requires_fp8(self):
+        inventory = inspect_h3_linears([block(self.plain)])
+        mlp = resolve_mlp_provider(
+            inventory,
+            request=MLP_MEMORY_FORCE_QUANT,
+            fp8_available=True,
+        )
+        self.assertEqual(mlp.provider_id, MLP_FP8_CHUNKED)
+        with self.assertRaisesRegex(RuntimeError, 'accelerated FP8'):
+            resolve_mlp_provider(
+                inventory,
+                request=MLP_MEMORY_FORCE_QUANT,
+                fp8_available=False,
+            )
 
     def test_nvfp4_memory_preserves_upstream(self):
         inventory = inspect_h3_linears([block(self.nvfp4)])

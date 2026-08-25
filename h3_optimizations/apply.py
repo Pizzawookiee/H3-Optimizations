@@ -82,6 +82,8 @@ from .qkv.providers import (
     MLP_OFF,
     MLP_PRESERVE_UPSTREAM,
     QKV_BF16_CHUNKED,
+    QKV_FORCE_BF16_CHUNKED,
+    QKV_FORCE_QUANT_CHUNKED,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
@@ -122,6 +124,20 @@ SPARSE_EXECUTION_BACKENDS = (
     ATTENTION_SOL_128X64,
     ATTENTION_SOL_64X64,
 )
+
+_BOUNDED_QKV_PROVIDERS = (
+    QKV_BF16_CHUNKED,
+    QKV_FORCE_BF16_CHUNKED,
+    QKV_FORCE_QUANT_CHUNKED,
+)
+
+
+def _bounded_qkv_projector(qkv):
+    return ChunkedBF16QKVProjector(
+        chunk_rows=4096,
+        force_weights_bf16=qkv.provider_id == QKV_FORCE_BF16_CHUNKED,
+        force_weights_fp8=qkv.provider_id == QKV_FORCE_QUANT_CHUNKED,
+    )
 
 
 @dataclass(frozen=True)
@@ -270,12 +286,12 @@ def _resolve_dense(plan, model, inventory, environment=None):
     )
     backend = None
     projector = None
-    if qkv.provider_id == QKV_BF16_CHUNKED:
+    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         # Reuse the package-owned attention-forward slot without changing the
         # selected dense attention. attention_forward recognizes the BF16
         # payload and delegates it to the existing Comfy/upstream backend.
         backend = ChunkedKitchenAttentionBackend()
-        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+        projector = _bounded_qkv_projector(qkv)
     elif qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
         QKV_DENSE_FP8_CHUNKED,
@@ -326,8 +342,8 @@ def _resolve_sparse(plan, environment, inventory):
         **_sparse_config_kwargs(plan),
     )
     projector = None
-    if qkv.provider_id == QKV_BF16_CHUNKED:
-        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+        projector = _bounded_qkv_projector(qkv)
     elif qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
         from .qkv.projectors import SparseFusedQKVProjector
 
@@ -370,6 +386,8 @@ def _resolve_fp8_flex(
         inventory,
         request=_qkv_request(plan),
         backend_kind=ATTENTION_FP8_FLEX,
+        memory_optimize=plan.memory is not None,
+        fp8_available=_fp8_execution_available(environment),
     )
     config = HybridSparseConfig(
         mode=MODE_SAGE128,
@@ -377,8 +395,8 @@ def _resolve_fp8_flex(
     )
     backend = FP8FlexBackend(config, spec=spec)
     projector = (
-        ChunkedBF16QKVProjector(chunk_rows=4096)
-        if qkv.provider_id == QKV_BF16_CHUNKED
+        _bounded_qkv_projector(qkv)
+        if qkv.provider_id in _BOUNDED_QKV_PROVIDERS
         else None
     )
     if fallback_reason is None:
@@ -411,14 +429,16 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
         request=_qkv_request(plan),
         backend_kind=ATTENTION_TRITON_SPARSE,
         triton_available=True,
+        memory_optimize=plan.memory is not None,
+        fp8_available=_fp8_execution_available(environment),
     )
     config = HybridSparseConfig(
         mode=MODE_SAGE128,
         **_sparse_config_kwargs(plan),
     )
     projector = None
-    if qkv.provider_id == QKV_BF16_CHUNKED:
-        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+        projector = _bounded_qkv_projector(qkv)
     elif qkv.provider_id == QKV_TRITON_SPARSE_CHUNKED:
         from .qkv.projectors import TritonSparseQKVProjector
 
@@ -461,6 +481,8 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         kitchen_producer_available=producer_api_available(
             device=getattr(environment, 'device_index', None),
         ),
+        memory_optimize=plan.memory is not None,
+        fp8_available=_fp8_execution_available(environment),
     )
     use_projected = qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
@@ -470,8 +492,8 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
         **_sparse_config_kwargs(plan),
     )
-    if qkv.provider_id == QKV_BF16_CHUNKED:
-        projector = ChunkedBF16QKVProjector(chunk_rows=4096)
+    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+        projector = _bounded_qkv_projector(qkv)
     elif use_projected:
         projector = ChunkedKitchenQKVProjector(
             routing_summaries=True,
@@ -991,6 +1013,8 @@ def apply_plan(model, plan: H3OptimizationPlan):
     elif plan.memory is not None:
         if qkv.provider_id in (
             QKV_BF16_CHUNKED,
+            QKV_FORCE_BF16_CHUNKED,
+            QKV_FORCE_QUANT_CHUNKED,
             QKV_DENSE_KITCHEN_CHUNKED,
             QKV_DENSE_FP8_CHUNKED,
         ):

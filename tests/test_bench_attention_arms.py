@@ -63,8 +63,8 @@ STUB_SCHEMAS = {
         'chunk_rows': ['INT', {'default': 4096}],
         'preserve_precision': ['BOOLEAN', {'default': True}],
         'precision_mode': ['COMBO', {
-            'default': 'Preserve precision',
-            'options': ['Preserve precision', 'Allow FP8 conversion'],
+            'default': 'Auto',
+            'options': ['Auto', 'BF16', 'Preserve native', 'Force quant'],
         }],
         'qkv_streaming_mode': ['COMBO', {
             'default': 'Auto',

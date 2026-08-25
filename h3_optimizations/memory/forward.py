@@ -54,11 +54,13 @@ def _gate_add(x, other, gate, selector):
 def _open_generic_held(block, sample, config):
     if not config.prefer_held_weights:
         return None, None
-    held = HeldMLP(block.mlp, sample)
+    held = HeldMLP(block.mlp, sample, force_bf16=config.bf16_swiglu)
     try:
         held.__enter__()
         return held, None
     except UnsafeHeldWeights as exc:
+        if config.bf16_swiglu:
+            raise
         return None, str(exc)
     except (RuntimeError, TypeError, ValueError) as exc:
         if config.strict:

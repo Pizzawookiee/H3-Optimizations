@@ -10,6 +10,8 @@ sys.path.insert(0, str(PACK))
 
 from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_AUTO,
+    FUSED_QKV_FORCE_BF16,
+    FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
@@ -20,6 +22,8 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_BF16_CHUNKED,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
+    QKV_FORCE_BF16_CHUNKED,
+    QKV_FORCE_QUANT_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     QKV_STANDARD,
     QKV_TRITON_SPARSE_CHUNKED,
@@ -186,6 +190,39 @@ class QKVStreamingPolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
                 self.assertNotEqual(resolved.provider_id, QKV_DENSE_FP8_CHUNKED)
+
+    def test_bf16_mode_forces_bf16_projection_for_supported_formats(self):
+        for weight in (self.bf16, self.convrot, self.w4a8, self.fp8):
+            with self.subTest(layout=weight._layout_cls):
+                resolved = resolve_qkv_provider(
+                    inventory(weight),
+                    request=FUSED_QKV_FORCE_BF16,
+                    backend_kind='comfy_kitchen_int8',
+                    kitchen_producer_available=True,
+                    fp8_available=True,
+                )
+                self.assertEqual(resolved.provider_id, QKV_FORCE_BF16_CHUNKED)
+
+    def test_force_quant_converts_plain_qkv_before_native_streaming(self):
+        resolved = resolve_qkv_provider(
+            inventory(self.bf16),
+            request=FUSED_QKV_FORCE_QUANT,
+            backend_kind='comfy_kitchen_int8',
+            kitchen_producer_available=True,
+            memory_optimize=True,
+            fp8_available=True,
+        )
+        self.assertEqual(resolved.provider_id, QKV_FORCE_QUANT_CHUNKED)
+
+    def test_force_quant_fails_when_plain_qkv_cannot_run_fp8(self):
+        with self.assertRaisesRegex(RuntimeError, 'accelerated FP8'):
+            resolve_qkv_provider(
+                inventory(self.bf16),
+                request=FUSED_QKV_FORCE_QUANT,
+                backend_kind='comfy_kitchen_int8',
+                kitchen_producer_available=True,
+                fp8_available=False,
+            )
 
     def test_required_does_not_accept_nonfused_bounded_fallback(self):
         with self.assertRaisesRegex(RuntimeError, 'required fused QKV'):

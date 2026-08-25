@@ -14,11 +14,15 @@ from .plan import (
     ATTENTION_AUTO,
     ATTENTION_EXISTING,
     FUSED_QKV_AUTO,
+    FUSED_QKV_FORCE_BF16,
+    FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     MAX_CHUNK_ROWS,
     MIN_CHUNK_ROWS,
     MLP_MEMORY_AUTO,
+    MLP_MEMORY_BF16,
+    MLP_MEMORY_FORCE_QUANT,
     MLP_MEMORY_OFF,
     MLP_MEMORY_PRESERVE,
     QKV_STREAMING_AUTO,
@@ -29,12 +33,22 @@ from .plan import (
 )
 from .status import format_memory_status
 
+PRECISION_MODE_AUTO = 'Auto'
+PRECISION_MODE_BF16 = 'BF16'
+PRECISION_MODE_PRESERVE_NATIVE = 'Preserve native'
+PRECISION_MODE_FORCE_QUANT = 'Force quant'
+PRECISION_MODE_OPTIONS = (
+    PRECISION_MODE_AUTO,
+    PRECISION_MODE_BF16,
+    PRECISION_MODE_PRESERVE_NATIVE,
+    PRECISION_MODE_FORCE_QUANT,
+)
 PRECISION_MODE_PRESERVE = 'Preserve precision'
 PRECISION_MODE_ALLOW_FP8 = 'Allow FP8 conversion'
-PRECISION_MODE_OPTIONS = (
-    PRECISION_MODE_PRESERVE,
-    PRECISION_MODE_ALLOW_FP8,
-)
+_PRECISION_MODE_COMPATIBILITY = {
+    PRECISION_MODE_PRESERVE: PRECISION_MODE_PRESERVE_NATIVE,
+    PRECISION_MODE_ALLOW_FP8: PRECISION_MODE_AUTO,
+}
 
 QKV_STREAMING_MODE_OFF = 'Off'
 QKV_STREAMING_MODE_AUTO = 'Auto'
@@ -46,12 +60,11 @@ QKV_STREAMING_MODE_OPTIONS = (
 )
 
 
-def _preserve_precision_for_mode(precision_mode):
-    if precision_mode == PRECISION_MODE_PRESERVE:
-        return True
-    if precision_mode == PRECISION_MODE_ALLOW_FP8:
-        return False
-    raise ValueError('unknown precision mode %r' % precision_mode)
+def _normalize_precision_mode(precision_mode):
+    mode = _PRECISION_MODE_COMPATIBILITY.get(precision_mode, precision_mode)
+    if mode not in PRECISION_MODE_OPTIONS:
+        raise ValueError('unknown precision mode %r' % precision_mode)
+    return mode
 
 
 def _qkv_streaming_request(mode):
@@ -77,7 +90,7 @@ def _memory_request_for_modes(
     # authoritative public policy now; keeping the argument preserves old
     # positional workflows without preserving its old conflicting semantics.
     del fused_qkv
-    preserve_precision = _preserve_precision_for_mode(precision_mode)
+    precision_mode = _normalize_precision_mode(precision_mode)
     streaming = _qkv_streaming_request(qkv_streaming_mode)
 
     # Off preserves the current attention backend. Auto claims unselected dense
@@ -92,20 +105,27 @@ def _memory_request_for_modes(
         else ATTENTION_AUTO
     )
 
-    if streaming == QKV_STREAMING_OFF:
-        qkv_request = FUSED_QKV_OFF
-    elif preserve_precision:
-        # Historical internal name: semantically this now means preserve the
-        # checkpoint's native weight precision while preferring BF16 streaming.
-        qkv_request = FUSED_QKV_PRESERVE_BF16
-    else:
-        # Streaming still wins. AUTO merely permits BF16/FP16 -> FP8 conversion
-        # later if no compatible BF16-streamed/native provider exists.
-        qkv_request = FUSED_QKV_AUTO
+    qkv_requests = {
+        PRECISION_MODE_AUTO: FUSED_QKV_AUTO,
+        PRECISION_MODE_BF16: FUSED_QKV_FORCE_BF16,
+        PRECISION_MODE_PRESERVE_NATIVE: FUSED_QKV_PRESERVE_BF16,
+        PRECISION_MODE_FORCE_QUANT: FUSED_QKV_FORCE_QUANT,
+    }
+    qkv_request = (
+        FUSED_QKV_OFF
+        if streaming == QKV_STREAMING_OFF
+        else qkv_requests[precision_mode]
+    )
 
+    mlp_requests = {
+        PRECISION_MODE_AUTO: MLP_MEMORY_AUTO,
+        PRECISION_MODE_BF16: MLP_MEMORY_BF16,
+        PRECISION_MODE_PRESERVE_NATIVE: MLP_MEMORY_PRESERVE,
+        PRECISION_MODE_FORCE_QUANT: MLP_MEMORY_FORCE_QUANT,
+    }
     mlp_request = (
-        MLP_MEMORY_PRESERVE
-        if preserve_precision and mlp_memory == MLP_MEMORY_AUTO
+        mlp_requests[precision_mode]
+        if mlp_memory == MLP_MEMORY_AUTO
         else mlp_memory
     )
 
@@ -115,6 +135,10 @@ def _memory_request_for_modes(
         mlp_memory=mlp_request,
         chunk_rows=int(chunk_rows),
         qkv_streaming=streaming,
+        mlp_strict=precision_mode in (
+            PRECISION_MODE_BF16,
+            PRECISION_MODE_FORCE_QUANT,
+        ),
     )
 
 
@@ -129,10 +153,10 @@ class H3MemoryOptimization(io.ComfyNode):
             category=NODE_CATEGORY,
             description=(
                 'Production memory and execution optimizations for MiniMax H3. '
-                'QKV streaming defaults to Auto and prefers bounded BF16 Q/K/V '
-                'chunks whenever a compatible attention consumer exists, regardless '
-                'of checkpoint weight quantization. Precision mode controls whether '
-                'new FP8 weight conversion is allowed only as a fallback.'
+                'QKV streaming defaults to Auto and prefers bounded Q/K/V chunks '
+                'whenever a compatible attention consumer exists. Precision mode '
+                'selects automatic, BF16, checkpoint-native, or forced quantized '
+                'weight execution.'
             ),
             search_aliases=[
                 'H3 VRAM',
@@ -169,10 +193,8 @@ class H3MemoryOptimization(io.ComfyNode):
                     options=[MLP_MEMORY_AUTO, MLP_MEMORY_OFF],
                     default=MLP_MEMORY_AUTO,
                     tooltip=(
-                        'auto uses the checkpoint-native optimized MLP path when '
-                        'available. Allow FP8 conversion may convert ordinary '
-                        'BF16/FP16 MLP weights to FP8 E4M3. Preserve precision keeps '
-                        'floating weights floating while retaining bounded chunking. '
+                        'auto applies the selected precision policy while retaining '
+                        'bounded MLP chunking. '
                         'Explicit off remains off.'
                     ),
                 ),
@@ -207,13 +229,14 @@ class H3MemoryOptimization(io.ComfyNode):
                     'precision_mode',
                     display_name='Precision mode',
                     options=list(PRECISION_MODE_OPTIONS),
-                    default=PRECISION_MODE_PRESERVE,
+                    default=PRECISION_MODE_AUTO,
                     advanced=True,
                     tooltip=(
-                        'Preserve precision never introduces new weight quantization. '
-                        'Allow FP8 conversion permits supported BF16/FP16 weight '
-                        'conversion only when a checkpoint-native or BF16-streamed '
-                        'QKV path is unavailable; MLP may also use FP8 conversion.'
+                        'Auto selects the best compatible native path and may use FP8 '
+                        'conversion as a fallback. BF16 materializes supported weights '
+                        'as BF16. Preserve native never introduces a new conversion. '
+                        'Force quant keeps supported quantized checkpoints native and '
+                        'requires floating weights to use FP8 E4M3.'
                     ),
                 ),
                 io.Combo.Input(
@@ -243,7 +266,7 @@ class H3MemoryOptimization(io.ComfyNode):
         mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         preserve_precision=True,
-        precision_mode=PRECISION_MODE_PRESERVE,
+        precision_mode=PRECISION_MODE_AUTO,
         qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
     ):
         del preserve_precision
@@ -262,3 +285,11 @@ class H3MemoryOptimization(io.ComfyNode):
             patched,
             ui=ui.PreviewText(format_memory_status(patched)),
         )
+
+    @classmethod
+    def validate_inputs(cls, precision_mode):
+        try:
+            _normalize_precision_mode(precision_mode)
+        except ValueError as exc:
+            return str(exc)
+        return True

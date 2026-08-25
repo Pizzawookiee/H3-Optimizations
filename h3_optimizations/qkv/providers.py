@@ -7,6 +7,8 @@ from ..plan import (
     FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
     MLP_MEMORY_AUTO,
+    MLP_MEMORY_BF16,
+    MLP_MEMORY_FORCE_QUANT,
     MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MLP_MEMORY_LEGACY_NATIVE,
@@ -16,6 +18,8 @@ from ..plan import (
 
 QKV_STANDARD = 'standard_h3_qkv'
 QKV_BF16_CHUNKED = 'chunked_bf16_qkv'
+QKV_FORCE_BF16_CHUNKED = 'force_bf16_qkv'
+QKV_FORCE_QUANT_CHUNKED = 'force_quant_qkv'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_STREAMED_BF16_KITCHEN = 'streamed_bf16_kitchen_qkv'
 QKV_DENSE_FP8_CHUNKED = 'chunked_fp8_kitchen_qkv'
@@ -432,6 +436,29 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
         )
     if request == MLP_MEMORY_PRESERVE:
         return _resolve_preserve_precision_mlp(inventory, fp8_available)
+    if request == MLP_MEMORY_BF16:
+        return MLPProviderResolution(
+            MLP_FLOAT_CHUNKED,
+            'mlp_chunked_bf16',
+            'MLP weights are materialized as BF16 for bounded BF16 execution',
+        )
+    if request == MLP_MEMORY_FORCE_QUANT:
+        if inventory.mlp_plain_float:
+            if not fp8_available:
+                raise RuntimeError(
+                    'Force quant requires accelerated FP8 execution for floating MLP weights'
+                )
+            return MLPProviderResolution(
+                MLP_FP8_CHUNKED,
+                'mlp_chunked_fp8',
+                'floating H3 MLP weights are forced to FP8 E4M3',
+            )
+        resolved = _resolve_preserve_precision_mlp(inventory, fp8_available)
+        if resolved.provider_id == MLP_PRESERVE_UPSTREAM:
+            raise RuntimeError(
+                'Force quant has no executable provider for the checkpoint MLP format'
+            )
+        return resolved
     if _convrot_compatible(inventory):
         if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
             return MLPProviderResolution(

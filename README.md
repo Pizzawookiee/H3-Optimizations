@@ -14,17 +14,21 @@ control.
   chunked FP8 execution, and ordinary BF16/FP16 QKV/MLP weights may be converted
   to FP8 E4M3 when accelerated FP8 is available. FinalLayer norm, modulation,
   and FP32 output projection also run in bounded token chunks using the same
-  activation chunk-row setting. The advanced `Preserve
-  precision` toggle forbids new weight quantization. With sparse Kitchen,
+  activation chunk-row setting. The advanced precision selector offers four
+  policies: `Auto` chooses the best compatible path and may use FP8 conversion
+  as a fallback; `BF16` materializes supported weights for BF16 execution;
+  `Preserve native` never introduces a new weight conversion; and `Force quant`
+  requires floating weights to use FP8 E4M3 while retaining supported native
+  quantized checkpoint formats. With sparse Kitchen,
   checkpoint-native ConvRot INT8 QKV streams BF16 projection, norm, and RoPE
   chunks into the routed INT8 carrier instead of materializing full-sequence
   BF16 Q/K/V. Other dense QKV stays on the upstream Comfy path, while MLP auto
   keeps BF16/FP16 weights floating and still uses bounded token chunking.
   Checkpoint-native ConvRot, FP8, and W4A8
   remain native where a compatible bounded MLP provider exists; unsupported
-  quantized formats preserve upstream Comfy execution. Preserve precision
-  defaults on for newly added nodes and omitted API inputs. Workflows that
-  explicitly store `false` retain the quantizing auto policy.
+  quantized formats preserve upstream Comfy execution. `Auto` is the default.
+  Saved `Preserve precision` and `Allow FP8 conversion` values remain accepted
+  as compatibility aliases for `Preserve native` and `Auto` respectively.
 - H3 AIMDO Residency Limiter helps prevent avoidable out-of-memory errors on
   long or high-resolution H3 videos. ComfyUI can underestimate how much working
   memory H3 will need and keep too much of the model in VRAM. The generation
