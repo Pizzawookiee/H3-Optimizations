@@ -99,10 +99,16 @@ class SparseFusedQKVProjector:
 
 
 class TritonSparseQKVProjector:
-    """Guard chunked Triton sparse QKV and fall back for auto requests."""
+    """Produce the exact Kitchen carrier consumed by the Triton fallback.
+
+    The old fallback had its own coarse block-INT8 carrier. 64x64 numerical
+    parity requires that projection/quantization stop being backend-specific,
+    so this compatibility wrapper keeps the existing provider ID and public
+    projector name while delegating to the Kitchen producer.
+    """
 
     name = "chunked_triton_sparse_qkv"
-    qk_format = "block_int8"
+    qk_format = "kitchen_per_thread_int8"
 
     def __init__(
         self,
@@ -110,24 +116,29 @@ class TritonSparseQKVProjector:
         chunk_rows=4096,
         v_scale_group_size=None,
     ):
-        from ..attention.sparse.triton_qkv import (
-            ChunkedTritonSparseQKVProjector as Implementation,
-            normalize_v_scale_group_size,
-        )
+        from ..attention.sparse.triton_qkv import normalize_v_scale_group_size
+        from ..kitchen_qkv import ChunkedKitchenQKVProjector
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
-        self.v_scale_group_size = normalize_v_scale_group_size(
-            v_scale_group_size
-        )
-        self._implementation = Implementation(
+        requested_group = normalize_v_scale_group_size(v_scale_group_size)
+        if requested_group != 1:
+            raise ValueError(
+                'Kitchen-parity Triton uses Kitchen per-channel V scaling; '
+                'H3_TRITON_V_SCALE_GROUP must be 1'
+            )
+        self.v_scale_group_size = 1
+        self._implementation = ChunkedKitchenQKVProjector(
             chunk_rows=self.chunk_rows,
-            v_scale_group_size=self.v_scale_group_size,
+            routing_summaries=True,
+            q_tile=64,
+            kv_tile=64,
+            strided_qk_input=True,
         )
 
     @property
     def v_format(self):
-        return self._implementation.v_format
+        return "kitchen_per_channel_permuted_int8"
 
     @property
     def installation_signature(self):
@@ -156,13 +167,19 @@ class TritonSparseQKVProjector:
                 "QKV format is %s" % actual.label,
             )
         try:
-            return self._implementation.project(
+            projected = self._implementation.try_project(
                 module,
                 x,
                 rope_freqs,
                 layer_index=layer_index,
                 transformer_options=transformer_options,
             )
+            if projected is None:
+                return _unsupported(
+                    self.required,
+                    "Kitchen INT8 producer is unavailable at runtime",
+                )
+            return projected
         except Exception as exc:
             if is_fused_weight_format_error(exc):
                 return _unsupported(self.required, str(exc))
