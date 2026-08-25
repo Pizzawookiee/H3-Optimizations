@@ -27,6 +27,7 @@ from .int8_attention import (
     int8_attention_is_available,
     prequantize_int8_attention,
 )
+from . import producer as _producer
 from .producer import (
     INT8_ATTENTION_PRODUCER_ABI_VERSION,
     SUPPORTS_STRIDED_QK_CHUNK,
@@ -37,12 +38,31 @@ from .producer import (
     create_int8_attention_producer,
     finalize_int8_attention_producer,
     int8_attention_k_anchor_positions,
-    int8_attention_producer_is_available,
     int8_attention_producer_spec,
     quantize_int8_attention_qk_chunk,
     quantize_int8_attention_v,
     select_int8_attention_k_anchor,
 )
+
+
+def int8_attention_producer_is_available(device=None):
+    """Whether the Kitchen-compatible carrier machinery is healthy here.
+
+    Carrier production is independent of native sparse traversal.  The full
+    native self-test intentionally rejects the native attention surface when
+    any sparse geometry is wrong; Triton only needs the quantizers, so gate
+    those on the carrier+dense leg instead.
+    """
+    from . import carrier_selftest
+
+    return carrier_selftest.check(device)
+
+
+# producer.py calls this name from its own module globals when it creates a
+# spec. Replace that gate too, otherwise the public wrapper above would report
+# healthy while int8_attention_producer_spec still rejected the same device.
+_producer.int8_attention_producer_is_available = int8_attention_producer_is_available
+
 
 __all__ = [
     'SUPPORTS_STRIDED_QK_CHUNK',
