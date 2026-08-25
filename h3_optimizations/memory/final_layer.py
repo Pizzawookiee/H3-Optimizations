@@ -1,0 +1,110 @@
+'''Bounded MiniMax H3 FinalLayer execution.'''
+
+import logging
+
+import torch
+
+from ..model import get_minimax_h3_model
+
+
+FINAL_LAYER_KEY = 'diffusion_model.final_layer.forward'
+OWNER_MARKER = '_h3_optimizations_final_layer'
+SIGNATURE_MARKER = '_h3_optimizations_final_layer_signature'
+
+
+class H3FinalLayerPatchError(RuntimeError):
+    pass
+
+
+def _selector(value, start, stop):
+    return value if value.ndim == 1 else value[start:stop]
+
+
+def chunked_final_layer(layer, x, t_emb, video_seg, audio_seg, chunk_rows):
+    shift, scale = layer.adaln_proj(t_emb)
+
+    def project(segment, output):
+        first, last, row = segment
+        selected_shift = shift[row]
+        selected_scale = scale[row]
+        pieces = []
+        for start in range(first, last, int(chunk_rows)):
+            stop = min(start + int(chunk_rows), last)
+            local_start = start - first
+            local_stop = stop - first
+            value = (
+                layer.norm(x[start:stop])
+                * (1.0 + _selector(selected_scale, local_start, local_stop))
+                + _selector(selected_shift, local_start, local_stop)
+            ).to(torch.float32)
+            pieces.append(output(value))
+        if not pieces:
+            value = (
+                layer.norm(x[first:last])
+                * (1.0 + _selector(selected_scale, 0, 0))
+                + _selector(selected_shift, 0, 0)
+            ).to(torch.float32)
+            return output(value)
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+    return project(video_seg, layer.video_out), project(audio_seg, layer.audio_out)
+
+
+def make_forward(layer, chunk_rows):
+    signature = int(chunk_rows)
+
+    def forward(x, t_emb, video_seg, audio_seg):
+        return chunked_final_layer(
+            layer,
+            x,
+            t_emb,
+            video_seg,
+            audio_seg,
+            signature,
+        )
+
+    setattr(forward, OWNER_MARKER, True)
+    setattr(forward, SIGNATURE_MARKER, signature)
+    return forward
+
+
+def install(model_patcher, chunk_rows):
+    '''Patch FinalLayer once; identical installation is idempotent.'''
+
+    chunk_rows = int(chunk_rows)
+    if chunk_rows <= 0:
+        raise ValueError('chunk_rows must be positive')
+    model = get_minimax_h3_model(model_patcher)
+    if model is None:
+        raise H3FinalLayerPatchError(
+            'H3 Memory Optimization can only patch MiniMaxH3Model'
+        )
+    layer = getattr(model, 'final_layer', None)
+    if layer is None:
+        raise H3FinalLayerPatchError('MiniMax H3 has no final layer')
+
+    existing = getattr(model_patcher, 'object_patches', {}).get(FINAL_LAYER_KEY)
+    if existing is not None:
+        if not getattr(existing, OWNER_MARKER, False):
+            raise H3FinalLayerPatchError(
+                'another patch already owns %s; remove one H3 memory patch'
+                % FINAL_LAYER_KEY
+            )
+        installed = getattr(existing, SIGNATURE_MARKER, None)
+        if installed == chunk_rows:
+            return False
+        raise H3FinalLayerPatchError(
+            'H3 FinalLayer is already configured for %s rows; requested %s. '
+            'Remove the earlier node instead of relying on node order.'
+            % (installed, chunk_rows)
+        )
+
+    model_patcher.add_object_patch(
+        FINAL_LAYER_KEY,
+        make_forward(layer, chunk_rows),
+    )
+    logging.info(
+        '[H3 Optimizations] patched FinalLayer: chunk_rows=%d',
+        chunk_rows,
+    )
+    return True

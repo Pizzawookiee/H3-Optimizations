@@ -42,14 +42,21 @@ def format_memory_status(model):
     attention = status.get('attention', {})
     qkv = status.get('fused_qkv', {})
     mlp = status.get('mlp', {})
+    final_layer = status.get('final_layer') or {}
     lines = [
         'Attention: %s' % (attention.get('selected') or 'preserve incoming'),
         'QKV: %s' % _provider_text(qkv, 'standard_h3_qkv'),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
+    if final_layer.get('chunked'):
+        lines.append(
+            'FinalLayer: chunked (%d-row chunks)'
+            % int(final_layer.get('chunk_rows') or 4096)
+        )
     if qkv.get('provider') in (
         'chunked_kitchen_qkv',
         'chunked_fp8_kitchen_qkv',
+        'streamed_bf16_kitchen_qkv',
     ):
         lines[1] += ' (%d-row chunks, Kitchen %s)' % (
             int(qkv.get('chunk_rows') or 4096),
@@ -62,7 +69,7 @@ def format_memory_status(model):
         'off',
         'preserve_upstream_mlp',
     ):
-        lines[-1] += ' (%d-row chunks)' % int(chunk_rows)
+        lines[2] += ' (%d-row chunks)' % int(chunk_rows)
     return '\n'.join(lines)
 
 

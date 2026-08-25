@@ -17,6 +17,7 @@ from ..plan import (
 QKV_STANDARD = 'standard_h3_qkv'
 QKV_BF16_CHUNKED = 'chunked_bf16_qkv'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
+QKV_STREAMED_BF16_KITCHEN = 'streamed_bf16_kitchen_qkv'
 QKV_DENSE_FP8_CHUNKED = 'chunked_fp8_kitchen_qkv'
 QKV_DENSE_W4A8_CHUNKED = QKV_DENSE_KITCHEN_CHUNKED
 QKV_SPARSE_CONVROT_INT8 = 'convrot_int8_sparse_sage'
@@ -84,7 +85,22 @@ def _qkv_is_native_bf16(inventory):
     return True
 
 
-def _resolve_preserved_bf16_qkv(inventory, backend_kind):
+def _resolve_preserve_precision_qkv(
+    inventory, backend_kind, kitchen_producer_available
+):
+    if (
+        inventory.qkv_convrot_int8_256
+        and backend_kind == 'sparse_kitchen_int8'
+    ):
+        if not kitchen_producer_available:
+            return _standard_qkv(
+                'the Kitchen QKV producer is unavailable; Preserve precision keeps ConvRot-256 INT8 QKV on upstream Comfy execution'
+            )
+        return QKVProviderResolution(
+            QKV_STREAMED_BF16_KITCHEN,
+            True,
+            'checkpoint-native ConvRot-256 INT8 QKV streams BF16 projection chunks into the routed Kitchen INT8 carrier',
+        )
     if not _qkv_is_native_bf16(inventory):
         labels = ', '.join(sorted(set(inventory.labels('qkv'))))
         return _standard_qkv(
@@ -154,7 +170,9 @@ def resolve_qkv_provider(
             'checkpoint-native ConvRot-256 INT8 QKV uses 4K projection chunks into one shared Kitchen INT8 carrier for exact and residual attention',
         )
     if request == FUSED_QKV_PRESERVE_BF16:
-        return _resolve_preserved_bf16_qkv(inventory, backend_kind)
+        return _resolve_preserve_precision_qkv(
+            inventory, backend_kind, kitchen_producer_available
+        )
 
     if inventory.qkv_w4a8:
         if backend_kind == 'comfy_kitchen_int8' and memory_optimize:

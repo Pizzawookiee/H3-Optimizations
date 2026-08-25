@@ -26,7 +26,10 @@ from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
     SparseKitchenError,
 )
 from h3_optimizations.plan import (  # noqa: E402
+    ATTENTION_EXISTING,
+    FUSED_QKV_OFF,
     H3OptimizationPlan,
+    MemoryRequest,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
@@ -39,6 +42,7 @@ from h3_optimizations.plan import (  # noqa: E402
 from h3_optimizations.qkv.providers import (  # noqa: E402
     MLPProviderResolution,
     QKVProviderResolution,
+    QKV_STREAMED_BF16_KITCHEN,
 )
 from h3_optimizations.status import format_sparse_status  # noqa: E402
 
@@ -234,6 +238,8 @@ class SparseBackendSelectionTests(unittest.TestCase):
         self.assertEqual(qkv.provider_id, 'chunked_kitchen_qkv')
         self.assertTrue(qkv.fused)
         self.assertTrue(attention.projector.routing_summaries)
+        self.assertTrue(attention.projector.stream_output)
+        self.assertTrue(attention.backend.stream_output)
         self.assertIs(attention.backend.projector, attention.projector)
         self.assertEqual(
             (attention.projector.q_tile, attention.projector.kv_tile),
@@ -253,6 +259,54 @@ class SparseBackendSelectionTests(unittest.TestCase):
             ),
             (64, 64),
         )
+
+    def test_preserve_precision_defaults_to_streamed_sparse_kitchen(self):
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_OFF,
+            ),
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN),
+        )
+        inventory = SimpleNamespace(
+            qkv=(object(),),
+            qkv_convrot_int8_256=True,
+            qkv_w4a8=False,
+            qkv_fp8=False,
+            qkv_plain_float=False,
+            homogeneous=lambda name: name == 'qkv',
+            labels=lambda _name: ('TensorWiseINT8Layout+convrot256',),
+        )
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(8, 9),
+            device_index=0,
+        )
+
+        with mock.patch.object(
+            apply_module,
+            'preflight_sparse_kitchen',
+            return_value=SimpleNamespace(__version__='test'),
+        ), mock.patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=True,
+        ):
+            attention, qkv = apply_module._resolve_kitchen_sparse(
+                plan,
+                environment,
+                inventory,
+            )
+
+        self.assertEqual(qkv.provider_id, QKV_STREAMED_BF16_KITCHEN)
+        self.assertTrue(qkv.fused)
+        self.assertEqual(
+            (attention.projector.q_tile, attention.projector.kv_tile),
+            (64, 64),
+        )
+        self.assertTrue(attention.projector.strided_qk_input)
+        self.assertTrue(attention.projector.stream_output)
+        self.assertTrue(attention.backend.stream_output)
 
     def test_auto_prefers_kitchen(self):
         plan = H3OptimizationPlan(sparse=SparseRequest())

@@ -63,6 +63,13 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.mlp_memory, 'auto')
         self.assertEqual(request.chunk_rows, 2048)
 
+    def test_preserve_precision_defaults_on(self):
+        request = _memory_request(chunk_rows=2048)
+        self.assertEqual(request.attention, ATTENTION_EXISTING)
+        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
+        self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
+        self.assertEqual(request.chunk_rows, 2048)
+
     def test_preserve_precision_keeps_bf16_qkv_chunking_without_requantization(self):
         request = _memory_request(
             fused_qkv='auto',

@@ -51,6 +51,7 @@ from .kitchen_qkv import (
     producer_api_available,
 )
 from .memory.config import ActivationMemoryConfig
+from .memory.final_layer import install as install_final_layer
 from .memory.patch import install as install_memory_patch
 from .mlp_sharing.execution import install_sharing
 from .model import get_h3_blocks, is_minimax_h3
@@ -86,6 +87,7 @@ from .qkv.providers import (
     QKV_SPARSE_CONVROT_INT8,
     QKV_SPARSE_FP8_CHUNKED,
     QKV_STANDARD,
+    QKV_STREAMED_BF16_KITCHEN,
     QKV_TRITON_SPARSE_CHUNKED,
     resolve_mlp_provider,
     resolve_qkv_provider,
@@ -230,6 +232,8 @@ def describe_memory_options(attention):
         installed.append('seq_major_out')
     if getattr(backend, 'release_carrier_before_out_proj', False):
         installed.append('early_carrier_release')
+    if getattr(backend, 'stream_output', False):
+        installed.append('streamed_out')
     if getattr(projector, 'strided_qk_input', False):
         installed.append('strided_qk')
     v_mode = getattr(projector, 'v_mode', None)
@@ -458,7 +462,10 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             device=getattr(environment, 'device_index', None),
         ),
     )
-    use_projected = qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED
+    use_projected = qkv.provider_id in (
+        QKV_DENSE_KITCHEN_CHUNKED,
+        QKV_STREAMED_BF16_KITCHEN,
+    )
     config = HybridSparseConfig(
         mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
         **_sparse_config_kwargs(plan),
@@ -471,14 +478,13 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             q_tile=KITCHEN_Q_TILE,
             kv_tile=KITCHEN_KV_TILE,
             strided_qk_input=True,
+            stream_output=True,
         )
     else:
         projector = None
-    # Sequence-major output storage and releasing the carrier before the
-    # output projection are only worth anything together: measured separately
-    # the layout alone moved nothing and the release alone cost 10 ms, while
-    # together they take 923 MiB off peak allocated and 852 MiB off peak
-    # reserved at no cost in time. Block output stays bit-identical.
+    # Reuse the disposable normalized input as the output buffer and project
+    # query slices immediately. The non-projected fallback still uses the
+    # sequence-major output and early carrier release below.
     backend = SparseKitchenBackend(
         config,
         kitchen=kitchen,
@@ -487,6 +493,7 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         kv_tile=KITCHEN_KV_TILE,
         output_layout=OUTPUT_NHD,
         release_carrier_before_out_proj=True,
+        stream_output=use_projected,
     )
     return (
         ResolvedAttention(
@@ -619,6 +626,7 @@ def _resolve_native_geometry(
             q_tile=q_tile,
             kv_tile=kv_tile,
             strided_qk_input=True,
+            stream_output=True,
         )
         if use_projected else None
     )
@@ -630,6 +638,7 @@ def _resolve_native_geometry(
         kv_tile=kv_tile,
         output_layout=OUTPUT_NHD,
         release_carrier_before_out_proj=True,
+        stream_output=use_projected,
     )
     return (
         ResolvedAttention(
@@ -782,6 +791,7 @@ def _install_mlp(model_patcher, plan, inventory, environment):
     memory = plan.memory
     if memory is None:
         return resolve_mlp_provider(inventory, request='off'), 0
+    install_final_layer(model_patcher, int(memory.chunk_rows))
     resolution = resolve_mlp_provider(
         inventory,
         request=memory.mlp_memory,
@@ -887,6 +897,7 @@ def _status(
                 if qkv.provider_id in (
                     QKV_DENSE_KITCHEN_CHUNKED,
                     QKV_DENSE_FP8_CHUNKED,
+                    QKV_STREAMED_BF16_KITCHEN,
                 )
                 else None
             ),
@@ -901,6 +912,14 @@ def _status(
             ),
             'patched_blocks': int(mlp_blocks),
         },
+        'final_layer': (
+            None
+            if plan.memory is None
+            else {
+                'chunked': True,
+                'chunk_rows': int(plan.memory.chunk_rows),
+            }
+        ),
         'mlp_sharing': (
             None
             if plan.mlp_sharing is None

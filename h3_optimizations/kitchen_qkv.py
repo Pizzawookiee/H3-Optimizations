@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -85,6 +85,7 @@ class PreparedChunkedKitchenQKV:
     carrier: object
     q_summary: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
+    output_buffer: torch.Tensor | None = None
 
 
 def _rope_rows(rope_freqs, rows):
@@ -371,6 +372,7 @@ class ChunkedKitchenQKVProjector:
         v_mode=V_MODE_RETAIN,
         v_backend=None,
         strided_qk_input=False,
+        stream_output=False,
     ):
         self.chunk_rows = int(chunk_rows)
         self.fp8_projection = bool(fp8_projection)
@@ -386,6 +388,7 @@ class ChunkedKitchenQKVProjector:
         self.v_mode = str(v_mode)
         self.v_backend = v_backend
         self.strided_qk_input = bool(strided_qk_input)
+        self.stream_output = bool(stream_output)
 
     @property
     def installation_signature(self):
@@ -399,6 +402,7 @@ class ChunkedKitchenQKVProjector:
             self.v_mode,
             self.v_backend,
             self.strided_qk_input,
+            self.stream_output,
         )
 
     def try_project(
@@ -454,7 +458,7 @@ class ChunkedKitchenQKVProjector:
             return None
         try:
             with diagnostics.stage('qkv_producer_total'):
-                return run_chunked_kitchen_qkv(
+                projected = run_chunked_kitchen_qkv(
                     module,
                     x,
                     rope_freqs,
@@ -470,6 +474,9 @@ class ChunkedKitchenQKVProjector:
                     v_backend=self.v_backend,
                     strided_qk_input=self.strided_qk_input,
                 )
+                if self.stream_output:
+                    projected = replace(projected, output_buffer=x)
+                return projected
         except (
             FP8BindingError,
             W4A8BindingError,

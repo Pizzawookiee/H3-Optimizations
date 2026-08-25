@@ -20,7 +20,7 @@ tile-mean Q/K summaries for routing. The Sparge fused projector remains
 incompatible because it emits a different per-tile carrier.
 '''
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ... import diagnostics
 from ...runtime.context import get_runtime_snapshot
@@ -162,6 +162,7 @@ class PreparedSparseKitchen:
     original_head_dim: int
     layer_index: int
     metadata: dict
+    output_buffer: object = None
 
     def release(self):
         """Drop the carriers and route once the kernel no longer needs them.
@@ -175,6 +176,7 @@ class PreparedSparseKitchen:
         """
         self.quantized = None
         self.route = None
+        self.output_buffer = None
 
 
 class SparseKitchenExecutor:
@@ -313,6 +315,8 @@ class SparseKitchenBackend:
         allow_cpu_for_tests=False,
         output_layout=OUTPUT_HND,
         release_carrier_before_out_proj=False,
+        stream_output=False,
+        query_chunk_rows=4096,
         score_chunk_tiles=None,
         q_tile=Q_TILE,
         kv_tile=KV_TILE,
@@ -336,6 +340,18 @@ class SparseKitchenBackend:
         self.release_carrier_before_out_proj = bool(
             release_carrier_before_out_proj
         )
+        self.stream_output = bool(stream_output)
+        self.query_chunk_rows = int(query_chunk_rows)
+        if self.stream_output and (
+            self.query_chunk_rows <= 0 or self.query_chunk_rows % 128
+        ):
+            raise ValueError(
+                'query_chunk_rows must be a positive 128-row multiple'
+            )
+        if self.stream_output and not getattr(projector, 'stream_output', False):
+            raise SparseKitchenError(
+                'streamed Kitchen output requires an output-capturing projector'
+            )
         self.router = router or SparseTileRouter(
             self.config,
             q_tile=self.executor.q_tile,
@@ -367,6 +383,8 @@ class SparseKitchenBackend:
             int(self.executor.kv_tile),
             str(self.output_layout),
             bool(self.release_carrier_before_out_proj),
+            bool(self.stream_output),
+            int(self.query_chunk_rows),
             getattr(self.router, 'score_chunk_tiles', None),
             str(getattr(self.executor.kitchen, '__version__', 'unknown')),
             (
@@ -453,7 +471,7 @@ class SparseKitchenBackend:
                 )
         except SparseRouterError as exc:
             raise SparseKitchenError('sparse routing failed: %s' % exc) from exc
-        return self.executor.prepare_projected(
+        prepared = self.executor.prepare_projected(
             projected.carrier,
             lut,
             valid_block_num,
@@ -464,6 +482,8 @@ class SparseKitchenBackend:
                 projected.q_summary.shape[1],
             ),
         )
+        prepared.output_buffer = projected.output_buffer
+        return prepared
 
     @property
     def output_layout(self):
@@ -471,6 +491,63 @@ class SparseKitchenBackend:
 
     def execute(self, prepared):
         return self.executor.execute(prepared)
+
+    def execute_projected(self, module, prepared):
+        if not self.stream_output or prepared.output_buffer is None:
+            return None
+
+        quantized = prepared.quantized
+        route = prepared.route
+        output = prepared.output_buffer
+        route_q_tile = int(route.q_tile)
+        sequence = int(quantized.q.shape[-2])
+        packed_q_tiles = (sequence + 127) // 128
+        if quantized.q_scale.shape[-1] % packed_q_tiles:
+            raise SparseKitchenError(
+                'streamed Kitchen output received invalid Q scales'
+            )
+        scales_per_packed_q_tile = (
+            quantized.q_scale.shape[-1] // packed_q_tiles
+        )
+
+        for start in range(0, sequence, self.query_chunk_rows):
+            stop = min(start + self.query_chunk_rows, sequence)
+            first_route_tile = start // route_q_tile
+            stop_route_tile = (stop + route_q_tile - 1) // route_q_tile
+            first_scale_tile = start // 128
+            stop_scale_tile = (stop + 127) // 128
+            q = quantized.q[..., start:stop, :].contiguous()
+            q_scale = quantized.q_scale[
+                ...,
+                first_scale_tile * scales_per_packed_q_tile:
+                stop_scale_tile * scales_per_packed_q_tile,
+            ].contiguous()
+            chunk_carrier = replace(quantized, q=q, q_scale=q_scale)
+            chunk_route = replace(
+                route,
+                indices=route.indices[
+                    ..., first_route_tile:stop_route_tile, :
+                ].contiguous(),
+                counts=route.counts[
+                    ..., first_route_tile:stop_route_tile
+                ].contiguous(),
+            )
+            raw = self.executor.kitchen.block_sparse_int8_attention_from_prequantized(
+                chunk_carrier,
+                chunk_route,
+                output_layout=OUTPUT_NHD,
+            )
+            flat = raw.transpose(1, 2).reshape(
+                raw.shape[0],
+                raw.shape[2],
+                module.heads * module.head_dim,
+            )
+            with diagnostics.stage('attention_out'):
+                output[start:stop].copy_(module.out_proj(flat.squeeze(0)))
+            del raw, flat, chunk_carrier, chunk_route, q, q_scale
+
+        prepared.release()
+        return output
 
     def execute_with_lse(self, prepared):
         return self.executor.execute_with_lse(prepared)
@@ -493,6 +570,8 @@ class SparseKitchenBackend:
             'release_carrier_before_out_proj': bool(
                 self.release_carrier_before_out_proj
             ),
+            'streamed_attention_output': bool(self.stream_output),
+            'query_chunk_rows': int(self.query_chunk_rows),
             'approximate': True,
             'fused_qkv': self.projector is not None,
             'qkv_projector': (

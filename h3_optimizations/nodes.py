@@ -74,7 +74,7 @@ def _memory_request(
     fused_qkv=FUSED_QKV_AUTO,
     mlp_memory=MLP_MEMORY_AUTO,
     chunk_rows=DEFAULT_CHUNK_ROWS,
-    preserve_precision=False,
+    preserve_precision=True,
 ):
     '''Resolve the public memory controls into one immutable request.'''
     if not preserve_precision:
@@ -85,9 +85,10 @@ def _memory_request(
         )
 
     # Preserve precision is a policy over the normal memory node rather than a
-    # separate optimization stack. The current optimized dense QKV route feeds
-    # quantized Kitchen carriers, so keep dense attention/QKV upstream. MLP auto
-    # still uses bounded execution, but never converts floating weights to FP8.
+    # separate optimization stack. Dense attention stays upstream, while an
+    # explicitly selected sparse backend may consume checkpoint-native bounded
+    # QKV projection without introducing weight conversion. MLP auto still uses
+    # bounded execution, but never converts floating weights to FP8.
     return MemoryRequest(
         attention=ATTENTION_EXISTING,
         fused_qkv=FUSED_QKV_OFF,
@@ -115,9 +116,10 @@ class H3MemoryOptimization(io.ComfyNode):
                 'precision while using specialized or chunked execution paths. '
                 'For ordinary BF16/FP16 checkpoints, Auto may convert supported '
                 'QKV and MLP weights to FP8 E4M3 when accelerated FP8 is '
-                'available. Enable Preserve precision to forbid new quantization: '
-                'dense attention and QKV stay upstream while bounded MLP and '
-                'modulation chunking remain enabled.'
+                'available. Preserve precision defaults on to forbid new weight '
+                'quantization: compatible ConvRot INT8 QKV streams BF16 chunks '
+                'to sparse Kitchen, while other dense QKV stays upstream and '
+                'bounded MLP and modulation chunking remain enabled.'
             ),
             search_aliases=[
                 'H3 VRAM',
@@ -143,7 +145,9 @@ class H3MemoryOptimization(io.ComfyNode):
                         'to FP8 E4M3; this conversion is lossy and may change '
                         'generated output. Unsupported quantized formats use '
                         'standard Comfy QKV. off always uses standard H3 QKV. '
-                        'Preserve precision overrides auto to the standard QKV path.'
+                        'With sparse Kitchen, Preserve precision streams compatible '
+                        'ConvRot INT8 projection through BF16 chunks into its INT8 '
+                        'carrier; other formats use their precision-preserving path.'
                     ),
                 ),
                 io.Combo.Input(
@@ -162,29 +166,32 @@ class H3MemoryOptimization(io.ComfyNode):
                 ),
                 io.Int.Input(
                     'chunk_rows',
-                    display_name='MLP chunk rows',
+                    display_name='Activation chunk rows',
                     default=DEFAULT_CHUNK_ROWS,
                     min=MIN_CHUNK_ROWS,
                     max=MAX_CHUNK_ROWS,
                     step=256,
                     advanced=True,
                     tooltip=(
-                        'Maximum token rows processed by one MLP chunk. Larger '
-                        'chunks may be faster but use more activation memory.'
+                        'Maximum token rows processed by one MLP or FinalLayer '
+                        'chunk. Larger chunks may be faster but use more '
+                        'activation memory.'
                     ),
                 ),
                 io.Boolean.Input(
                     'preserve_precision',
                     display_name='Preserve precision',
-                    default=False,
+                    default=True,
                     advanced=True,
                     tooltip=(
                         'Do not introduce new quantization. BF16/FP16 MLP weights '
                         'stay floating and are still processed in bounded chunks; '
                         'checkpoint-native quantization stays native where supported. '
-                        'Dense attention and QKV projection remain on the upstream '
-                        'Comfy path. This overrides QKV auto and MLP auto only; an '
-                        'explicit MLP off request remains off.'
+                        'Compatible ConvRot INT8 QKV streams BF16 projection, norm, '
+                        'and RoPE chunks into a selected sparse Kitchen carrier. '
+                        'Other dense QKV remains on the upstream Comfy path. This '
+                        'overrides QKV auto and MLP auto only; an explicit MLP off '
+                        'request remains off.'
                     ),
                 ),
             ],
@@ -198,7 +205,7 @@ class H3MemoryOptimization(io.ComfyNode):
         fused_qkv=FUSED_QKV_AUTO,
         mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
-        preserve_precision=False,
+        preserve_precision=True,
     ):
         plan = read_plan(model).with_memory(
             _memory_request(

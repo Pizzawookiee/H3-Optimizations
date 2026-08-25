@@ -12,13 +12,19 @@ control.
   applies compatible memory/execution providers. ConvRot INT8 QKV can project
   in 4K token chunks directly into Comfy Kitchen carriers. Native FP8 uses held
   chunked FP8 execution, and ordinary BF16/FP16 QKV/MLP weights may be converted
-  to FP8 E4M3 when accelerated FP8 is available. The advanced `Preserve
-  precision` toggle forbids new quantization: dense attention and QKV stay on
-  the upstream Comfy path, while MLP auto keeps BF16/FP16 weights floating and
-  still uses bounded token chunking. Checkpoint-native ConvRot, FP8, and W4A8
+  to FP8 E4M3 when accelerated FP8 is available. FinalLayer norm, modulation,
+  and FP32 output projection also run in bounded token chunks using the same
+  activation chunk-row setting. The advanced `Preserve
+  precision` toggle forbids new weight quantization. With sparse Kitchen,
+  checkpoint-native ConvRot INT8 QKV streams BF16 projection, norm, and RoPE
+  chunks into the routed INT8 carrier instead of materializing full-sequence
+  BF16 Q/K/V. Other dense QKV stays on the upstream Comfy path, while MLP auto
+  keeps BF16/FP16 weights floating and still uses bounded token chunking.
+  Checkpoint-native ConvRot, FP8, and W4A8
   remain native where a compatible bounded MLP provider exists; unsupported
-  quantized formats preserve upstream Comfy execution. The toggle defaults off,
-  so existing workflows retain the current auto policy.
+  quantized formats preserve upstream Comfy execution. Preserve precision
+  defaults on for newly added nodes and omitted API inputs. Workflows that
+  explicitly store `false` retain the quantizing auto policy.
 - H3 AIMDO Residency Limiter helps prevent avoidable out-of-memory errors on
   long or high-resolution H3 videos. ComfyUI can underestimate how much working
   memory H3 will need and keep too much of the model in VRAM. The generation
@@ -226,15 +232,15 @@ included on Linux. Sparse Sage remains an optional explicit backend and an
 automatic fallback when a compatible `spas_sage_attn` package is already
 installed; this pack no longer installs or repairs it.
 
-The native Kitchen sparse route holds roughly 900 MiB less at its peak than it
-used to, with bit-identical output. Attention writes its output sequence-major
-and hands back the same logical tensor, so the flatten before the output
-projection is a view rather than a second full-sequence copy; the INT8 carriers
-and the route are released once the kernel is launched instead of being held
-across that projection; and Q/K chunks are quantized where they already are
-rather than being copied contiguous first. Measured on one real block at
-sequence 54006 and 30 percent density: peak allocated 4875 to 3952 MiB, peak
-reserved 5536 to 4684 MiB, and slightly faster.
+The projected native Kitchen sparse route consumes attention in 4K query
+slices and writes each output projection directly into the disposable
+normalized block input. Its full-forward output is bit-identical to the prior
+route. Non-projected fallback execution retains sequence-major output storage
+and early carrier release. Q/K chunks are quantized where they already are
+rather than being copied contiguous first. At the 124-frame production shape
+with AIMDO restrained to zero blocks, streamed output reduced incremental peak
+VRAM by 382 MiB at 0.93 percent sampler cost. FinalLayer chunking reduced it by
+1549 MiB at 0.04 percent cost; its sampled output relative RMSE was 0.000154.
 
 Sparse `auto` uses the shipped native block-sparse Kitchen backend. Compatible
 ConvRot-256 TensorWise INT8 QKV uses the native chunked producer and feeds its

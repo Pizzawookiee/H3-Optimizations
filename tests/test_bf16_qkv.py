@@ -39,6 +39,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_BF16_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_STANDARD,
+    QKV_STREAMED_BF16_KITCHEN,
     resolve_qkv_provider,
 )
 
@@ -160,6 +161,32 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
             memory_optimize=True,
         )
         self.assertEqual(resolved.provider_id, QKV_STANDARD)
+
+    def test_preserve_precision_streams_convrot_bf16_into_sparse_kitchen(self):
+        inventory = FakeInventory()
+        inventory.qkv[0].plain_float = False
+        inventory.qkv_plain_float = False
+        inventory.qkv_convrot_int8_256 = True
+
+        resolved = resolve_qkv_provider(
+            inventory,
+            request=FUSED_QKV_PRESERVE_BF16,
+            backend_kind='sparse_kitchen_int8',
+            kitchen_producer_available=True,
+        )
+
+        self.assertEqual(resolved.provider_id, QKV_STREAMED_BF16_KITCHEN)
+        self.assertTrue(resolved.fused)
+        self.assertIn('streams BF16 projection chunks', resolved.reason)
+
+        unavailable = resolve_qkv_provider(
+            inventory,
+            request=FUSED_QKV_PRESERVE_BF16,
+            backend_kind='sparse_kitchen_int8',
+            kitchen_producer_available=False,
+        )
+        self.assertEqual(unavailable.provider_id, QKV_STANDARD)
+        self.assertFalse(unavailable.fused)
 
     def test_attention_forward_consumes_bf16_without_reprojection(self):
         text = (
