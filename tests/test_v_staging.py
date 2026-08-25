@@ -11,6 +11,7 @@ import sys
 import unittest
 
 import torch
+from unittest import mock
 
 PACK = Path(__file__).resolve().parents[1]
 ROOT = PACK.parents[1]
@@ -209,6 +210,22 @@ class OrderingTests(unittest.TestCase):
             self.skipTest('the native staging kernels are present')
         with self.assertRaises(VStagingError):
             TwoPassVCarrier(spec_for(256), backend=v_staging.BACKEND_NATIVE)
+
+    def test_shipped_library_gets_the_same_ctypes_binding_as_the_sidecar(self):
+        class Function:
+            pass
+
+        library = type('Library', (), {
+            'h3_int8_v_amax_chunk': Function(),
+            'h3_int8_quantize_v_chunk_into': Function(),
+        })()
+        with mock.patch.object(v_staging.loader, 'load', return_value=library):
+            self.assertIs(v_staging._library_with_v_staging(), library)
+        self.assertEqual(library.h3_int8_v_amax_chunk.argtypes[0], v_staging.ctypes.c_void_p)
+        self.assertEqual(
+            library.h3_int8_quantize_v_chunk_into.argtypes[0],
+            v_staging.ctypes.c_void_p,
+        )
 
 
 class RoundingTests(unittest.TestCase):

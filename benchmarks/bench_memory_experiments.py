@@ -11,6 +11,9 @@ current peak moves:
   nhd_release   both output-side fixes
   strided_qk    stop materializing every Q/K chunk before the pack kernel
   two_pass_v    produce the V carrier without a full-sequence BF16 V
+  stream_output query-slice attention output/out_proj into disposable input
+  stream_output_two_pass_v
+                combine streamed output with two-pass V to expose interactions
   all           every variant above at once
 
 Two things every variant must survive before its numbers mean anything: the
@@ -73,6 +76,13 @@ VARIANTS = {
         {'output_layout': 'nhd', 'release_carrier_before_out_proj': True},
         {'strided_qk_input': True, 'v_mode': 'two_pass'},
     ),
+    'stream_output': (
+        {'output_layout': 'nhd'}, {'strided_qk_input': True}
+    ),
+    'stream_output_two_pass_v': (
+        {'output_layout': 'nhd'},
+        {'strided_qk_input': True, 'v_mode': 'two_pass'},
+    ),
 }
 
 
@@ -92,6 +102,10 @@ def parse_args(argv=None):
     parser.add_argument('--video-budget', type=float, default=0.3)
     parser.add_argument(
         '--qkv-chunk-rows', type=int, default=DEFAULT_QKV_CHUNK_ROWS
+    )
+    parser.add_argument(
+        '--query-chunk-rows', type=int, default=DEFAULT_QKV_CHUNK_ROWS,
+        help='query rows per streamed attention/out_proj step',
     )
     parser.add_argument('--score-chunk-tiles', type=int, default=None)
     parser.add_argument(
@@ -134,6 +148,8 @@ def parse_args(argv=None):
         parser.error('--video-budget must be in [0.01, 1]')
     if args.qkv_chunk_rows <= 0 or args.qkv_chunk_rows % 128:
         parser.error('--qkv-chunk-rows must be a positive multiple of 128')
+    if args.query_chunk_rows <= 0 or args.query_chunk_rows % 128:
+        parser.error('--query-chunk-rows must be a positive multiple of 128')
     if args.warmup < 0 or args.forwards <= 0:
         parser.error('iteration arguments are invalid')
     if not args.i_understand_this_uses_gpu:
@@ -229,6 +245,7 @@ def main(argv=None):
     from h3_optimizations.native import v_staging
     from h3_optimizations.qkv.formats import describe_linear
     from h3_optimizations.runtime.context import RUNTIME_KEY, RuntimeSnapshot
+    from streamed_kitchen_output import CapturingProjector, StreamedOutputBackend
 
     if not torch.cuda.is_available():
         raise SystemExit('CUDA is required')
@@ -285,7 +302,7 @@ def main(argv=None):
 
     def build(name):
         backend_options, projector_options = VARIANTS[name]
-        projector = ChunkedKitchenQKVProjector(
+        base_projector = ChunkedKitchenQKVProjector(
             chunk_rows=args.qkv_chunk_rows,
             routing_summaries=True,
             v_backend=(
@@ -295,15 +312,21 @@ def main(argv=None):
             ),
             **projector_options,
         )
-        backend = SparseKitchenBackend(
+        base_backend = SparseKitchenBackend(
             HybridSparseConfig(
                 mode=MODE_SAGE128_FUSED_QKV, video_budget=args.video_budget
             ),
             kitchen=kitchen,
-            projector=projector,
+            projector=base_projector,
             score_chunk_tiles=args.score_chunk_tiles,
             **backend_options,
         )
+        if name.startswith('stream_output'):
+            projector = CapturingProjector(base_projector)
+            backend = StreamedOutputBackend(base_backend, args.query_chunk_rows)
+        else:
+            projector = base_projector
+            backend = base_backend
         status = backend.as_status()
         if status['sparse_architecture'] != 'comfy_kitchen_int8':
             raise SystemExit('%s is not on native Kitchen sparse' % name)
@@ -451,6 +474,7 @@ def main(argv=None):
         'video_start': int(args.video_start),
         'video_budget': float(args.video_budget),
         'qkv_chunk_rows': int(args.qkv_chunk_rows),
+        'query_chunk_rows': int(args.query_chunk_rows),
         'score_chunk_tiles': args.score_chunk_tiles,
         'mlp_chunk_rows': int(MLP_CHUNK_ROWS),
         'seed': int(args.seed),

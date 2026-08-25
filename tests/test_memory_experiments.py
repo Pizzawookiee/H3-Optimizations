@@ -294,6 +294,7 @@ class ProjectorOptionTests(unittest.TestCase):
         variants = (
             {'v_mode': 'two_pass'},
             {'strided_qk_input': True},
+            {'stream_output': True},
             {'chunk_rows': 1024},
         )
         for options in variants:
@@ -318,6 +319,7 @@ class ProductionDefaultTests(unittest.TestCase):
         self.assertIn('output_layout=OUTPUT_NHD', sparse)
         self.assertIn('release_carrier_before_out_proj=True', sparse)
         self.assertIn('strided_qk_input=True', sparse)
+        self.assertIn('stream_output=True', sparse)
 
     def test_the_dense_route_takes_strided_qk_but_not_the_layout(self):
         """The layout was measured on the sparse route only."""
@@ -360,6 +362,7 @@ class ProductionDefaultTests(unittest.TestCase):
         """Constructing without arguments must not pick up the new options."""
         projector = ChunkedKitchenQKVProjector()
         self.assertFalse(projector.strided_qk_input)
+        self.assertFalse(projector.stream_output)
         self.assertEqual(projector.v_mode, 'retain')
 
 

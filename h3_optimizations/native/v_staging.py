@@ -150,7 +150,7 @@ def _library_with_v_staging():
     except loader.NativeUnavailableError:
         library = None
     if library is not None and _exports(library):
-        return library
+        return _bind_v_staging(library)
     return _load_sidecar()
 
 

@@ -31,6 +31,7 @@ from h3_optimizations.attention.sparse.sol_residual import (  # noqa: E402
     SolResidualBackend,
     SolResidualError,
     SolResidualSpec,
+    _gather_k_anchor,
     _summarize_kv_cpu,
     pack_exact_route,
     preflight_sol_residual,
@@ -93,6 +94,7 @@ def make_carrier(sequence=256, *, cta_k=EXACT_KV_TILE):
         input_dtype=torch.bfloat16,
         attention_scale=head_dim ** -0.5,
         cta_k=cta_k,
+        anchor_indices=torch.zeros(batch, heads, dtype=torch.int32),
     )
 
 
@@ -120,6 +122,11 @@ class FakeExactBackend:
     def prepare_projected(self, projected, **_kwargs):
         self.calls.append('prepare_projected')
         return FakePreparedExact(projected.carrier, self.route)
+
+    def prepare(self, q, _k, _v, **_kwargs):
+        self.calls.append('prepare')
+        carrier = make_carrier(q.shape[-2], cta_k=self.route.kv_tile)
+        return FakePreparedExact(carrier, self.route)
 
     def execute(self, prepared):
         self.calls.append('execute')
@@ -171,21 +178,36 @@ class CarrierSummaryTests(unittest.TestCase):
         k_mean, _v_sum = _summarize_kv_cpu(carrier)
         self.assertEqual(k_mean[0, 0, :, 0].float().tolist(), [1.0, 2.0, 3.0])
 
+    def test_negative_anchor_index_means_no_k_centering(self):
+        k = torch.arange(12, dtype=torch.bfloat16).reshape(1, 1, 3, 4)
+        anchor = _gather_k_anchor(k, torch.tensor([[-1]], dtype=torch.int32))
+        self.assertTrue(torch.equal(anchor, torch.zeros_like(anchor)))
+
 
 class SolResidualBackendTests(unittest.TestCase):
     def test_both_arms_share_native_exact_and_only_sol_launches_residual(self):
         carrier = make_carrier()
+        residual_q = torch.full(carrier.q.shape, 3.0, dtype=torch.bfloat16)
+        residual_k_mean = torch.full(
+            (1, 1, 4, 128), 5.0, dtype=torch.bfloat16
+        )
+        residual_v_sum = torch.full_like(residual_k_mean, 7.0)
         projected = PreparedChunkedKitchenQKV(
             carrier,
             q_summary=torch.zeros(1, 1, 2, 128, dtype=torch.bfloat16),
             k_summary=torch.zeros(1, 1, 2, 128, dtype=torch.bfloat16),
+            residual_q=residual_q,
+            residual_k_mean=residual_k_mean,
+            residual_v_sum=residual_v_sum,
         )
         route = make_route(256, selected=(0,))
         residual_routes = []
 
         def launcher(prepared, exact_output, exact_lse):
-            self.assertEqual(prepared.q.dtype, torch.int8)
-            self.assertEqual(prepared.q_scale.dtype, torch.float32)
+            self.assertIs(prepared.q, residual_q)
+            self.assertIsNone(prepared.q_scale)
+            self.assertIs(prepared.k_mean, residual_k_mean)
+            self.assertIs(prepared.v_sum, residual_v_sum)
             self.assertEqual(exact_lse.dtype, torch.float32)
             residual_routes.append(prepared.exact_route.clone())
             return exact_output
@@ -225,9 +247,85 @@ class SolResidualBackendTests(unittest.TestCase):
         self.assertEqual(hard_exact.calls, ['prepare_projected', 'execute'])
         self.assertEqual(sol_exact.calls, ['prepare_projected', 'execute_with_lse'])
         self.assertEqual(len(residual_routes), 1)
-        self.assertTrue(torch.equal(residual_routes[0], pack_exact_route(route, q_tiles=2, kv_tiles=2)))
+        self.assertTrue(
+            torch.equal(
+                residual_routes[0],
+                pack_exact_route(route, q_tiles=2, kv_tiles=2),
+            )
+        )
         self.assertEqual(hard_prepared.metadata['rejected_blocks'], 'dropped')
-        self.assertEqual(sol_prepared.metadata['rejected_blocks'], 'sol_int8_k_mean_v_sum_64x64')
+        self.assertEqual(
+            sol_prepared.metadata['rejected_blocks'],
+            'sol_bf16_q_k_mean_v_sum_64x64',
+        )
+
+    def test_projected_carrier_without_bf16_payload_keeps_int8_fallback(self):
+        carrier = make_carrier()
+        route = make_route(256, selected=(0,))
+
+        def launcher(prepared, exact_output, _exact_lse):
+            self.assertIs(prepared.q, carrier.q)
+            self.assertIs(prepared.q_scale, carrier.q_scale)
+            return exact_output
+
+        backend = SolResidualBackend(
+            HybridSparseConfig(video_budget=0.5),
+            approximate_rejected=True,
+            exact_backend=FakeExactBackend(route),
+            allow_cpu_for_tests=True,
+            launcher=launcher,
+        )
+        prepared = backend.prepare_projected(
+            PreparedChunkedKitchenQKV(carrier),
+            layer_index=3,
+            transformer_options={},
+        )
+        backend.execute(prepared)
+
+        self.assertEqual(
+            prepared.metadata['rejected_blocks'],
+            'sol_int8_k_mean_v_sum_64x64',
+        )
+
+    def test_standard_qkv_uses_bf16_query_and_anchor_centered_summaries(self):
+        sequence = 130
+        rows = torch.arange(sequence, dtype=torch.bfloat16).view(1, 1, -1, 1)
+        q = rows.expand(1, 1, sequence, 128).clone()
+        k = q + 100
+        v = q + 200
+        route = make_route(sequence, selected=(0,))
+
+        def launcher(prepared, exact_output, _exact_lse):
+            self.assertIs(prepared.q, q)
+            self.assertIsNone(prepared.q_scale)
+            self.assertEqual(
+                prepared.k_mean[0, 0, :, 0].float().tolist(),
+                [31.5, 95.5, 128.0],
+            )
+            return exact_output
+
+        exact = FakeExactBackend(route)
+        backend = SolResidualBackend(
+            HybridSparseConfig(video_budget=0.5),
+            approximate_rejected=True,
+            exact_backend=exact,
+            allow_cpu_for_tests=True,
+            launcher=launcher,
+        )
+        prepared = backend.prepare(
+            q,
+            k,
+            v,
+            layer_index=3,
+            transformer_options={},
+        )
+        backend.execute(prepared)
+
+        self.assertEqual(exact.calls, ['prepare', 'execute_with_lse'])
+        self.assertEqual(
+            prepared.metadata['rejected_blocks'],
+            'sol_bf16_q_k_mean_v_sum_64x64',
+        )
 
     def test_sol_residual_matches_128x64_and_64x64_exact_geometry(self):
         for q_tile, kv_tile in ((128, 64), (64, 64)):
@@ -531,6 +629,10 @@ class SolResidualSelectionTests(unittest.TestCase):
             self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
             self.assertIsInstance(attention.projector, ChunkedKitchenQKVProjector)
             self.assertTrue(attention.projector.routing_summaries)
+            self.assertEqual(
+                attention.projector.high_precision_residual,
+                request == SPARSE_BACKEND_SOL,
+            )
             if request == SPARSE_BACKEND_NATIVE_HARD:
                 residual_preflight.assert_not_called()
             else:

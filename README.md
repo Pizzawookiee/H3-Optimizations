@@ -68,11 +68,14 @@ chunked Kitchen Q128 quantization carrier; the 64Q kernel consumes each 64-row
 half directly rather than requantizing Q. Each geometry has a matched Sol arm.
 The hard arm drops rejected tiles. The Sol arm approximates rejected 64Q x 64KV
 tiles with block-mean K and block-sum V and merges that residual into the native
-kernel's softmax state. In the 5 percent FL2VA baker and robot stress cases,
-64Q x 64KV was dramatically more robust than either larger geometry. The
-matched Sol residual did not visibly improve 128Q x 64KV or 64Q x 64KV and
-added sampler time, so `auto` uses hard 64Q x 64KV and never selects Sol. The
-explicit Sol choices remain available for reproducing experiments.
+kernel's softmax state. The explicit Sol arms retain BF16 Q and form their
+anchor-centred K means and V sums from BF16 values before the Kitchen carrier
+is quantized; routed exact attention and its LSE remain native INT8. In the 5
+percent FL2VA baker and robot stress cases, 64Q x 64KV was dramatically more
+robust than either larger geometry. The earlier INT8-derived Sol residual did
+not visibly improve 128Q x 64KV or 64Q x 64KV and added sampler time, so `auto`
+uses hard 64Q x 64KV and never selects Sol. The explicit Sol choices run the
+new BF16 residual for quality evaluation.
 
 > **Sparse attention changes model computation. It is not free acceleration.**
 > Lower Video KV budgets retain fewer target-video attention connections and can

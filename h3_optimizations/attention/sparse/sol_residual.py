@@ -3,7 +3,7 @@
 # Saganaki22/ComfyUI-sol-attn at SOURCE_COMMIT. The Apache-2.0 license text is
 # included at native/LICENSE.
 
-'''Native sparse attention with an optional 64x64 Sol residual.'''
+'''Native sparse attention with an optional BF16 64x64 Sol residual.'''
 
 from __future__ import annotations
 
@@ -13,7 +13,10 @@ import logging
 import torch
 
 from ... import diagnostics
-from ...kitchen_qkv import PreparedChunkedKitchenQKV
+from ...kitchen_qkv import (
+    PreparedChunkedKitchenQKV,
+    summarize_high_precision_sol_kv,
+)
 from .config import HybridSparseConfig
 from .kitchen_sparse import (
     HEAD_DIM,
@@ -67,7 +70,7 @@ class SolResidualSpec:
 
     @property
     def implementation(self):
-        return 'native_int8_%dx%d_plus_sol_residual_%dx%d' % (
+        return 'native_int8_%dx%d_plus_sol_bf16_residual_%dx%d' % (
             self.exact_q_tile,
             self.exact_kv_tile,
             self.residual_q_tile,
@@ -233,6 +236,7 @@ if TRITON_AVAILABLE:
         block_size: tl.constexpr,
         group_size: tl.constexpr,
         route_group: tl.constexpr,
+        q_is_int8: tl.constexpr,
     ):
         q_block = tl.program_id(0)
         batch_head = tl.program_id(1)
@@ -251,16 +255,19 @@ if TRITON_AVAILABLE:
             + dims[None, :],
             mask=q_valid[:, None],
             other=0,
-        ).to(tl.float32)
-        q_scale = tl.load(
-            q_scale_ptr
-            + batch_head * q_scales_per_head
-            + (q_rows // 32) * 8
-            + q_rows % 8,
-            mask=q_valid,
-            other=0.0,
         )
-        q = (q * q_scale[:, None]).to(tl.bfloat16)
+        if q_is_int8:
+            q_scale = tl.load(
+                q_scale_ptr
+                + batch_head * q_scales_per_head
+                + (q_rows // 32) * 8
+                + q_rows % 8,
+                mask=q_valid,
+                other=0.0,
+            )
+            q = (q.to(tl.float32) * q_scale[:, None]).to(tl.bfloat16)
+        else:
+            q = q.to(tl.bfloat16)
         exact_output = tl.load(
             exact_output_ptr
             + batch * so_b
@@ -403,6 +410,17 @@ def _summarize_kv_cpu(carrier):
     )
 
 
+def _gather_k_anchor(k, anchor_indices):
+    if anchor_indices is None or tuple(anchor_indices.shape) != tuple(k.shape[:2]):
+        raise SolResidualError('high-precision Sol needs native K anchor indices')
+    live = anchor_indices >= 0
+    rows = anchor_indices.clamp_min(0).long().unsqueeze(-1).unsqueeze(-1).expand(
+        *k.shape[:2], 1, k.shape[-1]
+    )
+    anchor = k.gather(-2, rows).squeeze(-2)
+    return torch.where(live.unsqueeze(-1), anchor, torch.zeros_like(anchor))
+
+
 @dataclass
 class PreparedSolResidual:
     exact: object
@@ -460,12 +478,14 @@ def launch_sol_residual(prepared, exact_output, exact_lse):
         dtype=torch.bfloat16,
         device=prepared.q.device,
     )
+    q_is_int8 = prepared.q_scale is not None
+    q_scale = prepared.q_scale if q_is_int8 else prepared.q
     with diagnostics.stage('sol_residual_kernel'):
         _sol_residual_kernel[
             (prepared.residual_q_tiles, prepared.q.shape[0] * prepared.heads)
         ](
             prepared.q,
-            prepared.q_scale,
+            q_scale,
             prepared.k_mean,
             prepared.v_sum,
             exact_output,
@@ -487,11 +507,12 @@ def launch_sol_residual(prepared, exact_output, exact_lse):
             exact_q_tiles=prepared.exact_q_tiles,
             exact_kv_tiles=prepared.exact_kv_tiles,
             residual_kv_tiles=prepared.residual_kv_tiles,
-            q_scales_per_head=prepared.q_scale.shape[-1],
+            q_scales_per_head=(prepared.q_scale.shape[-1] if q_is_int8 else 0),
             route_words=prepared.exact_route.shape[-1],
             block_size=prepared.residual_q_tile,
             group_size=ROUTE_GROUP,
             route_group=ROUTE_GROUP,
+            q_is_int8=q_is_int8,
             num_warps=8,
             num_stages=1,
         )
@@ -521,7 +542,7 @@ class SolResidualBackend:
         self.approximate = self.approximate_rejected
         self.spec = spec or SolResidualSpec()
         self.name = (
-            'native_int8_%dx%d_sol_residual_%dx%d' % (
+            'native_int8_%dx%d_sol_bf16_residual_%dx%d' % (
                 self.spec.exact_q_tile,
                 self.spec.exact_kv_tile,
                 self.spec.residual_q_tile,
@@ -603,7 +624,16 @@ class SolResidualBackend:
         if carrier.v_scale.numel() != batch * heads * head_dim:
             raise SolResidualError('Sol residual V scale layout is incompatible')
 
-    def _finish_prepare(self, exact, carrier, *, layer_index):
+    def _finish_prepare(
+        self,
+        exact,
+        carrier,
+        *,
+        layer_index,
+        residual_q=None,
+        residual_k_mean=None,
+        residual_v_sum=None,
+    ):
         self._validate_carrier(carrier)
         if (
             int(exact.route.q_tile) != self.spec.exact_q_tile
@@ -625,6 +655,38 @@ class SolResidualBackend:
         residual_kv_tiles = (
             sequence + self.spec.residual_kv_tile - 1
         ) // self.spec.residual_kv_tile
+        residual_values = (residual_q, residual_k_mean, residual_v_sum)
+        high_precision_residual = all(value is not None for value in residual_values)
+        if any(value is not None for value in residual_values) and not high_precision_residual:
+            raise SolResidualError('high-precision Sol residual payload is incomplete')
+        if high_precision_residual:
+            if (
+                tuple(residual_q.shape) != tuple(carrier.q.shape)
+                or residual_q.dtype != torch.bfloat16
+                or residual_q.device != carrier.q.device
+                or residual_q.stride(-1) != 1
+            ):
+                raise SolResidualError('high-precision Sol Q has an invalid carrier')
+            summary_shape = (batch, heads, residual_kv_tiles, self.spec.head_dim)
+            for name, value in (
+                ('K mean', residual_k_mean),
+                ('V sum', residual_v_sum),
+            ):
+                if (
+                    tuple(value.shape) != summary_shape
+                    or value.dtype != torch.bfloat16
+                    or value.device != carrier.q.device
+                    or not value.is_contiguous()
+                ):
+                    raise SolResidualError(
+                        'high-precision Sol %s has an invalid carrier' % name
+                    )
+        if not self.approximate_rejected:
+            rejected_blocks = 'dropped'
+        elif high_precision_residual:
+            rejected_blocks = 'sol_bf16_q_k_mean_v_sum_64x64'
+        else:
+            rejected_blocks = 'sol_int8_k_mean_v_sum_64x64'
         metadata = dict(exact.metadata)
         metadata.update(
             {
@@ -634,11 +696,7 @@ class SolResidualBackend:
                     self.spec.exact_q_tile,
                     self.spec.exact_kv_tile,
                 ),
-                'rejected_blocks': (
-                    'sol_int8_k_mean_v_sum_64x64'
-                    if self.approximate_rejected
-                    else 'dropped'
-                ),
+                'rejected_blocks': rejected_blocks,
                 'source_commit': SOURCE_COMMIT,
                 'source_repository': SOURCE_REPOSITORY,
             }
@@ -673,16 +731,24 @@ class SolResidualBackend:
             q_tiles=exact_q_tiles,
             kv_tiles=exact_kv_tiles,
         )
-        if carrier.q.device.type == 'cuda':
-            k_mean, v_sum = _summarize_kv(carrier)
-        elif self.allow_cpu_for_tests:
-            k_mean, v_sum = _summarize_kv_cpu(carrier)
-        else:  # pragma: no cover - guarded by the exact backend
-            raise SolResidualError('Sol residual attention requires CUDA tensors')
+        if high_precision_residual:
+            q = residual_q
+            q_scale = None
+            k_mean = residual_k_mean
+            v_sum = residual_v_sum
+        else:
+            q = carrier.q
+            q_scale = carrier.q_scale
+            if carrier.q.device.type == 'cuda':
+                k_mean, v_sum = _summarize_kv(carrier)
+            elif self.allow_cpu_for_tests:
+                k_mean, v_sum = _summarize_kv_cpu(carrier)
+            else:  # pragma: no cover - guarded by the exact backend
+                raise SolResidualError('Sol residual attention requires CUDA tensors')
         return PreparedSolResidual(
             exact=exact,
-            q=carrier.q,
-            q_scale=carrier.q_scale,
+            q=q,
+            q_scale=q_scale,
             k_mean=k_mean,
             v_sum=v_sum,
             exact_route=exact_route,
@@ -724,10 +790,20 @@ class SolResidualBackend:
             )
         except SparseKitchenError as exc:
             raise SolResidualError('native exact attention preparation failed: %s' % exc) from exc
+        residual_q = residual_k_mean = residual_v_sum = None
+        if self.approximate_rejected:
+            anchor = _gather_k_anchor(k, exact.quantized.anchor_indices)
+            residual_k_mean, residual_v_sum = summarize_high_precision_sol_kv(
+                k, v, anchor
+            )
+            residual_q = q
         return self._finish_prepare(
             exact,
             exact.quantized,
             layer_index=layer_index,
+            residual_q=residual_q,
+            residual_k_mean=residual_k_mean,
+            residual_v_sum=residual_v_sum,
         )
 
     def prepare_projected(
@@ -751,6 +827,9 @@ class SolResidualBackend:
             exact,
             projected.carrier,
             layer_index=layer_index,
+            residual_q=projected.residual_q,
+            residual_k_mean=projected.residual_k_mean,
+            residual_v_sum=projected.residual_v_sum,
         )
 
     def execute(self, prepared):
@@ -820,7 +899,7 @@ class SolResidualBackend:
                 if self.approximate_rejected else None
             ),
             'rejected_blocks': (
-                'sol_int8_k_mean_v_sum_64x64'
+                'sol_bf16_q_k_mean_v_sum_64x64'
                 if self.approximate_rejected else 'dropped'
             ),
             'fused_qkv': self.projector is not None,

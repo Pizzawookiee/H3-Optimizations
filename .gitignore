@@ -10,3 +10,7 @@ native/selftest.json
 # library is committed; this local one is not.
 native/bin/h3_v_staging.*
 native/bin/libh3_v_staging.*
+
+# Benchmark-only Q quantizer side-car (native/build_q_only.ps1).
+native/bin/h3_q_only.*
+native/bin/libh3_q_only.*

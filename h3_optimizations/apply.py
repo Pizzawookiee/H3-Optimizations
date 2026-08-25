@@ -564,6 +564,7 @@ def _resolve_sol_experiment(
             q_tile=q_tile,
             kv_tile=kv_tile,
             strided_qk_input=True,
+            high_precision_residual=approximate_rejected,
         )
         if use_projected else None
     )

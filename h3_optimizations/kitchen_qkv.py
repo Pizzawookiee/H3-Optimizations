@@ -18,6 +18,7 @@ from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 
 
 CHUNK_ROWS = 4096
+SOL_RESIDUAL_TILE = 64
 STRIDED_QK_CAPABILITY = 'SUPPORTS_STRIDED_QK_CHUNK'
 V_MODE_RETAIN = 'retain'
 V_MODE_TWO_PASS = 'two_pass'
@@ -85,6 +86,9 @@ class PreparedChunkedKitchenQKV:
     carrier: object
     q_summary: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
+    residual_q: torch.Tensor | None = None
+    residual_k_mean: torch.Tensor | None = None
+    residual_v_sum: torch.Tensor | None = None
     output_buffer: torch.Tensor | None = None
 
 
@@ -139,6 +143,35 @@ def _tile_mean(x, tile):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
 
 
+def _tile_reduce_fp32(x, tile, reduction):
+    full = x.shape[-2] // tile
+    remainder = x.shape[-2] % tile
+    pieces = []
+    if full:
+        grouped = x[..., :full * tile, :].reshape(
+            *x.shape[:-2], full, tile, x.shape[-1]
+        )
+        pieces.append(reduction(grouped, dim=-2, dtype=torch.float32))
+    if remainder:
+        pieces.append(
+            reduction(x[..., full * tile:, :], dim=-2, keepdim=True, dtype=torch.float32)
+        )
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
+
+
+def summarize_high_precision_sol_kv(k, v, anchor_values):
+    if k.shape != v.shape or k.ndim != 4:
+        raise FusedQKVError('high-precision Sol summaries require equal HND K/V')
+    if tuple(anchor_values.shape) != tuple(k.shape[:2] + k.shape[-1:]):
+        raise FusedQKVError('high-precision Sol K anchor has an invalid shape')
+    if anchor_values.dtype != k.dtype or anchor_values.device != k.device:
+        raise FusedQKVError('high-precision Sol K anchor must match K')
+    k_mean = _tile_reduce_fp32(k, SOL_RESIDUAL_TILE, torch.mean)
+    k_mean.sub_(anchor_values.float().unsqueeze(-2))
+    v_sum = _tile_reduce_fp32(v, SOL_RESIDUAL_TILE, torch.sum)
+    return k_mean.to(k.dtype), v_sum.to(v.dtype)
+
+
 def _project_v_chunk(module, x, rope_freqs, start, end, projector):
     """One chunk's V, with Q and K discarded.
 
@@ -171,6 +204,7 @@ def run_two_pass_v_kitchen_qkv(
     routing_kv_tile,
     v_backend,
     strided_qk_input,
+    high_precision_residual,
 ):
     """Produce the carrier without ever holding a full-sequence BF16 V.
 
@@ -190,6 +224,7 @@ def run_two_pass_v_kitchen_qkv(
     del samples
     with diagnostics.stage('producer_create'):
         producer = kitchen.create_int8_attention_producer(spec, anchor)
+    residual_anchor = anchor.values if high_precision_residual else None
     del anchor
 
     sequence = int(x.shape[0])
@@ -197,6 +232,9 @@ def run_two_pass_v_kitchen_qkv(
     staging = TwoPassVCarrier(spec, backend=v_backend)
     q_summaries = []
     k_summaries = []
+    residual_q = None
+    residual_k_means = []
+    residual_v_sums = []
     for start in range(0, sequence, int(chunk_rows)):
         end = min(start + int(chunk_rows), sequence)
         q, k, v = project_chunk_hnd(
@@ -206,6 +244,17 @@ def run_two_pass_v_kitchen_qkv(
             with diagnostics.stage('routing_summary_generation'):
                 q_summaries.append(_tile_mean(q, int(routing_q_tile)))
                 k_summaries.append(_tile_mean(k, int(routing_kv_tile)))
+        if high_precision_residual:
+            if residual_q is None:
+                residual_q = q.new_empty(
+                    (1, int(module.heads), sequence, int(module.head_dim))
+                )
+            residual_q[:, :, start:end, :].copy_(q)
+            k_mean, v_sum = summarize_high_precision_sol_kv(
+                k, v, residual_anchor
+            )
+            residual_k_means.append(k_mean)
+            residual_v_sums.append(v_sum)
         kitchen.quantize_int8_attention_qk_chunk(
             producer, q, k, q_start=start, k_start=start, **chunk_kwargs
         )
@@ -231,6 +280,15 @@ def run_two_pass_v_kitchen_qkv(
             kitchen.finalize_int8_attention_producer(producer),
             q_summary=torch.cat(q_summaries, dim=-2) if q_summaries else None,
             k_summary=torch.cat(k_summaries, dim=-2) if k_summaries else None,
+            residual_q=residual_q,
+            residual_k_mean=(
+                torch.cat(residual_k_means, dim=-2)
+                if residual_k_means else None
+            ),
+            residual_v_sum=(
+                torch.cat(residual_v_sums, dim=-2)
+                if residual_v_sums else None
+            ),
         )
 
 
@@ -250,10 +308,16 @@ def run_chunked_kitchen_qkv(
     v_mode=V_MODE_RETAIN,
     v_backend=None,
     strided_qk_input=False,
+    high_precision_residual=False,
 ):
     del layer_index, transformer_options
     if v_mode not in V_MODES:
         raise FusedQKVError('unknown V mode %r' % v_mode)
+    if high_precision_residual and int(chunk_rows) % SOL_RESIDUAL_TILE:
+        raise FusedQKVError(
+            'high-precision Sol requires chunk rows divisible by %d'
+            % SOL_RESIDUAL_TILE
+        )
     routing_q_tile = int(
         spec.q_tile if routing_q_tile is None else routing_q_tile
     )
@@ -291,6 +355,7 @@ def run_chunked_kitchen_qkv(
                 routing_kv_tile=routing_kv_tile,
                 v_backend=v_backend,
                 strided_qk_input=strided_qk_input,
+                high_precision_residual=high_precision_residual,
             )
 
         with diagnostics.stage('anchor_projection'):
@@ -305,6 +370,7 @@ def run_chunked_kitchen_qkv(
         del samples
         with diagnostics.stage('producer_create'):
             producer = kitchen.create_int8_attention_producer(spec, anchor)
+        residual_anchor = anchor.values if high_precision_residual else None
         del anchor
 
         sequence = int(x.shape[0])
@@ -312,6 +378,9 @@ def run_chunked_kitchen_qkv(
         retained_v = None
         q_summaries = []
         k_summaries = []
+        residual_q = None
+        residual_k_means = []
+        residual_v_sums = []
         for start in range(0, sequence, int(chunk_rows)):
             end = min(start + int(chunk_rows), sequence)
             q, k, v = project_chunk_hnd(
@@ -330,6 +399,17 @@ def run_chunked_kitchen_qkv(
                 with diagnostics.stage('routing_summary_generation'):
                     q_summaries.append(_tile_mean(q, routing_q_tile))
                     k_summaries.append(_tile_mean(k, routing_kv_tile))
+            if high_precision_residual:
+                if residual_q is None:
+                    residual_q = q.new_empty(
+                        (1, int(module.heads), sequence, int(module.head_dim))
+                    )
+                residual_q[:, :, start:end, :].copy_(q)
+                k_mean, v_sum = summarize_high_precision_sol_kv(
+                    k, v, residual_anchor
+                )
+                residual_k_means.append(k_mean)
+                residual_v_sums.append(v_sum)
             kitchen.quantize_int8_attention_qk_chunk(
                 producer,
                 q,
@@ -353,6 +433,15 @@ def run_chunked_kitchen_qkv(
                 k_summary=(
                     torch.cat(k_summaries, dim=-2) if k_summaries else None
                 ),
+                residual_q=residual_q,
+                residual_k_mean=(
+                    torch.cat(residual_k_means, dim=-2)
+                    if residual_k_means else None
+                ),
+                residual_v_sum=(
+                    torch.cat(residual_v_sums, dim=-2)
+                    if residual_v_sums else None
+                ),
             )
     finally:
         if held is not None:
@@ -372,6 +461,7 @@ class ChunkedKitchenQKVProjector:
         v_mode=V_MODE_RETAIN,
         v_backend=None,
         strided_qk_input=False,
+        high_precision_residual=False,
         stream_output=False,
     ):
         self.chunk_rows = int(chunk_rows)
@@ -388,7 +478,13 @@ class ChunkedKitchenQKVProjector:
         self.v_mode = str(v_mode)
         self.v_backend = v_backend
         self.strided_qk_input = bool(strided_qk_input)
+        self.high_precision_residual = bool(high_precision_residual)
         self.stream_output = bool(stream_output)
+        if self.high_precision_residual and self.chunk_rows % SOL_RESIDUAL_TILE:
+            raise ValueError(
+                'high-precision Sol requires chunk rows divisible by %d'
+                % SOL_RESIDUAL_TILE
+            )
 
     @property
     def installation_signature(self):
@@ -402,6 +498,7 @@ class ChunkedKitchenQKVProjector:
             self.v_mode,
             self.v_backend,
             self.strided_qk_input,
+            self.high_precision_residual,
             self.stream_output,
         )
 
@@ -473,6 +570,7 @@ class ChunkedKitchenQKVProjector:
                     v_mode=self.v_mode,
                     v_backend=self.v_backend,
                     strided_qk_input=self.strided_qk_input,
+                    high_precision_residual=self.high_precision_residual,
                 )
                 if self.stream_output:
                     projected = replace(projected, output_buffer=x)

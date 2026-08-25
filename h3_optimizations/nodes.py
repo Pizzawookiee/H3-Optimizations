@@ -698,8 +698,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'execute those exact sparse geometries over the same '
                         'Kitchen INT8 carrier. Experimental matched Sol arms '
                         'keep their native exact geometry and add a 64x64 '
-                        'block-mean K and block-sum V residual for rejected '
-                        'tiles. Auto never selects Sol. '
+                        'residual from BF16 Q/K/V before carrier quantization. '
+                        'Auto never selects Sol. '
                         'Bypass this node to force dense attention.'
                     ),
                 ),
