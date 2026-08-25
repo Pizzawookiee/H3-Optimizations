@@ -689,8 +689,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     default=SPARSE_BACKEND_KITCHEN,
                     tooltip=(
                         'Kitchen INT8 uses the shipped native 64Q x 64KV path. '
-                        'Sparse Sage, INT8 Triton, and FP8 FlexAttention select '
-                        'those implementations explicitly. '
+                        'INT8 Triton and FP8 FlexAttention use the same 64Q x '
+                        '64KV routing geometry. Sparse Sage uses its installed '
+                        'kernel geometry. Each alternative is selected explicitly. '
                         'Explicit backend choices fail if that backend is '
                         'unavailable and do not switch to another backend. '
                         'Bypass this node to force dense attention.'

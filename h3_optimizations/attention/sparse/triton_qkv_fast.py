@@ -20,11 +20,12 @@ except ImportError:  # pragma: no cover
 from ...qkv.chunked import project_chunk_hnd
 from .chunked_qkv import pack_sparse_qk_chunk_into
 from .fused_qkv import HEAD_DIM
-from .router import KV_TILE, Q_TILE
 
 
 CHUNK_ROWS = 4096
-CARRIER_VERSION = 2
+Q_TILE = 64
+KV_TILE = 64
+CARRIER_VERSION = 3
 V_SCALE_GROUPS = (1, 8, 16, 32, 128)
 V_SCALE_GROUP_ENV = 'H3_TRITON_V_SCALE_GROUP'
 

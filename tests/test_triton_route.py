@@ -24,7 +24,7 @@ def layout(sequence=512, video_start=192):
 class TritonRouteTests(unittest.TestCase):
     def test_compact_absolute_route_matches_delta_router_selection(self):
         torch.manual_seed(17)
-        router = SparseTileRouter(q_tile=128, kv_tile=64)
+        router = SparseTileRouter(q_tile=64, kv_tile=64)
         packed = layout()
         geometry = router.geometry(packed)
         q = torch.randn(1, 2, geometry.q_tiles, 128, dtype=torch.float32)
@@ -51,7 +51,7 @@ class TritonRouteTests(unittest.TestCase):
         )
 
     def test_full_density_returns_no_sparse_route(self):
-        router = SparseTileRouter(q_tile=128, kv_tile=64)
+        router = SparseTileRouter(q_tile=64, kv_tile=64)
         packed = layout()
         geometry = router.geometry(packed)
         q = torch.zeros(1, 1, geometry.q_tiles, 128)

@@ -59,7 +59,9 @@ control.
   50 percent KV. If the two windows overlap, the denser of the two requested
   edge budgets is used. The backend choices are Kitchen INT8, Sparse Sage, INT8
   Triton, and FP8 FlexAttention. Kitchen INT8 is the default and uses the shipped
-  native 64Q x 64KV path. Explicit backend selections are hard requirements and
+  native 64Q x 64KV path. The package-owned INT8 Triton and FP8 FlexAttention
+  fallbacks use the same 64Q x 64KV routing geometry; Sparse Sage follows its
+  installed kernel ABI. Explicit backend selections are hard requirements and
   error if unavailable; bypass the node to force dense attention.
 
 Benchmark-only native geometry and quality arms execute 64Q x
@@ -206,8 +208,8 @@ measured separately and are not comparable to these.
 
 Reproduce with `benchmarks/bench_attention_arms.py`, which drives a running
 ComfyUI server over its prompt API. The SageAttention row additionally requires
-a `sageattention` package and ComfyUI-KJNodes for the patch node; it is measured
-here as plain dense SageAttention, not Sparge/`spas_sage_attn`.
+a `sageattention` package and a server started with `--use-sage-attention`; it
+is measured here as plain dense SageAttention, not Sparge/`spas_sage_attn`.
 
 ## Install
 
@@ -259,8 +261,10 @@ attention. If native Kitchen is unavailable, `auto` tries an existing
 compatible Sparse Sage package and then the package INT8 Triton sparse backend
 on NVIDIA compute capability 8.0 or newer. Triton consumes the same route and,
 for compatible ConvRot-256 TensorWise INT8 checkpoints, uses 4K QKV chunks to
-produce its INT8 carriers directly. If that backend is unavailable,
-FlexAttention is next. On supported NVIDIA runtimes, Flex stores Q/K/V as
+produce its INT8 carriers directly. The package-owned INT8 Triton and
+FlexAttention fallbacks both use 64Q x 64KV routing, matching the native Kitchen
+default. If Triton is unavailable, FlexAttention is next. On supported NVIDIA
+runtimes, Flex stores Q/K/V as
 per-head-scaled E4M3, restores Q/K scale before softmax, converts the FP8 output
 back to the original floating dtype, and consumes the same route. Hopper and
 Blackwell request the FA4 backend when its CuTe package is installed; other

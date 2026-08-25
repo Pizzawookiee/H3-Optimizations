@@ -170,7 +170,7 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.attention, ATTENTION_AUTO)
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_FORCED)
 
-    def test_streaming_off_preserves_attention_and_disables_qkv_projector(self):
+    def test_streaming_off_preserves_attention_and_native_qkv_policy(self):
         request = _memory_request_for_modes(
             fused_qkv='auto',
             mlp_memory='auto',
@@ -179,7 +179,19 @@ class PublicNodeTests(unittest.TestCase):
             qkv_streaming_mode=QKV_STREAMING_MODE_OFF,
         )
         self.assertEqual(request.attention, ATTENTION_EXISTING)
-        self.assertEqual(request.fused_qkv, FUSED_QKV_OFF)
+        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
+        self.assertEqual(request.qkv_streaming, QKV_STREAMING_OFF)
+
+    def test_streaming_off_allows_bounded_qkv_when_precision_is_not_preserved(self):
+        request = _memory_request_for_modes(
+            fused_qkv='auto',
+            mlp_memory='auto',
+            chunk_rows=2048,
+            precision_mode=PRECISION_MODE_AUTO,
+            qkv_streaming_mode=QKV_STREAMING_MODE_OFF,
+        )
+        self.assertEqual(request.attention, ATTENTION_EXISTING)
+        self.assertEqual(request.fused_qkv, FUSED_QKV_AUTO)
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_OFF)
 
     def test_precision_modes_map_to_distinct_execution_policies(self):

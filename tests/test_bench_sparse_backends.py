@@ -40,8 +40,8 @@ class SparseBackendBenchmarkTests(unittest.TestCase):
 
     def test_backend_geometry_must_match(self):
         contracts = {
-            'int8_triton': SimpleNamespace(q_tile=128, kv_tile=64),
-            'fp8_flex': SimpleNamespace(q_tile=128, kv_tile=64),
+            'int8_triton': SimpleNamespace(q_tile=64, kv_tile=64),
+            'fp8_flex': SimpleNamespace(q_tile=64, kv_tile=64),
             'sparse_sage': SimpleNamespace(q_tile=64, kv_tile=128),
         }
         with self.assertRaisesRegex(ValueError, 'geometries differ'):

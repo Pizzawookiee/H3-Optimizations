@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import comfy.model_management
 from comfy.ldm.modules.attention import get_attention_function
 
 
 ATTENTION_AUTO = 'auto'
 ATTENTION_COMFY_KITCHEN_INT8 = 'comfy_kitchen_int8'
 ATTENTION_EXISTING = 'existing'
+ATTENTION_SAGE = 'sage'
+ATTENTION_SAGE_SM89 = 'dense_sage_sm89'
 OVERRIDE_MARKER = '_h3_optimizations_dense_backend'
 
 
@@ -34,6 +37,50 @@ def _existing_resolution(requested, reason):
 
 def preserve_dense_attention(reason):
     return _existing_resolution(ATTENTION_EXISTING, reason)
+
+
+def command_line_sage_selected(model_patcher):
+    options = (
+        getattr(model_patcher, 'model_options', {})
+        .get('transformer_options', {})
+        or {}
+    )
+    if 'optimized_attention_override' in options:
+        return False
+    return bool(comfy.model_management.sage_attention_enabled())
+
+
+def resolve_command_line_sage_fused_attention(model_patcher, environment):
+    if not command_line_sage_selected(model_patcher):
+        return None
+    if tuple(getattr(environment, 'capability', ()) or ()) != (8, 9):
+        return DenseResolution(
+            ATTENTION_SAGE,
+            ATTENTION_SAGE,
+            None,
+            'native dense fused QKV requires SM89',
+            ATTENTION_SAGE,
+        )
+    try:
+        from .attention.sage_mem_eff import SM89SageMemoryEfficientBackend
+
+        backend = SM89SageMemoryEfficientBackend()
+    except Exception as exc:
+        return DenseResolution(
+            ATTENTION_SAGE,
+            ATTENTION_SAGE,
+            None,
+            'native dense fused Sage preflight failed: %s: %s'
+            % (type(exc).__name__, exc),
+            ATTENTION_SAGE,
+        )
+    return DenseResolution(
+        ATTENTION_SAGE,
+        ATTENTION_SAGE,
+        backend,
+        'command-line Sage with native ConvRot fused-QKV support',
+        ATTENTION_SAGE_SM89,
+    )
 
 
 def is_installed_dense_attention(transformer_options):
@@ -145,7 +192,10 @@ def resolve_dense_attention(model_patcher):
 
 
 def install_dense_attention(model_patcher, resolution):
-    if resolution.backend is None:
+    if (
+        resolution.backend is None
+        or resolution.backend_kind != ATTENTION_COMFY_KITCHEN_INT8
+    ):
         return False
     model_patcher.set_model_optimized_attention(resolution.backend)
     override = model_patcher.model_options[

@@ -34,7 +34,7 @@ sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 def dense_delta_lut(sequence, heads):
-    q_tiles = (sequence + 127) // 128
+    q_tiles = (sequence + 63) // 64
     kv_tiles = (sequence + 63) // 64
     lut = torch.zeros((1, heads, q_tiles, kv_tiles), dtype=torch.int32)
     if kv_tiles > 1:
@@ -55,6 +55,7 @@ class TritonSparseBackendTests(unittest.TestCase):
             triton_available=True,
         )
         self.assertEqual(spec.signature[0], 'triton_int8_qk_u8p_int8v')
+        self.assertEqual((spec.q_tile, spec.kv_tile), (64, 64))
         self.assertEqual(spec.v_scale_group_size, 1)
         with self.assertRaisesRegex(TritonSparseError, 'requires Triton'):
             preflight_triton_sparse(
@@ -158,14 +159,14 @@ class TritonSparseBackendTests(unittest.TestCase):
         q = torch.zeros(1, 1, sequence, 128, dtype=torch.float16)
         projected = pack_float_qkv(q, q, q, layer_index=0)
         lut, valid = dense_delta_lut(sequence, 1)
-        # Dense first Q tile. Sparse second Q tile attends context block 0 and
-        # selected video block 2: absolute [0, 2] -> delta [0, 2].
-        lut[0, 0, 1].zero_()
-        lut[0, 0, 1, 1] = 2
-        valid[0, 0, 1] = 2
+        # Dense first Q tile. Every remaining Q tile attends context block 0
+        # and selected video block 2: absolute [0, 2] -> delta [0, 2].
+        lut[0, 0, 1:].zero_()
+        lut[0, 0, 1:, 1] = 2
+        valid[0, 0, 1:] = 2
         metadata = {
             'dense_q_tiles': 1,
-            'sparse_q_tiles': 1,
+            'sparse_q_tiles': 3,
             'pure_video_kv_tiles': 3,
             'retained_video_kv_tiles': 1,
         }
@@ -182,9 +183,9 @@ class TritonSparseBackendTests(unittest.TestCase):
             metadata=metadata,
         )
         self.assertEqual(prepared.dense_q_tiles, 1)
-        self.assertEqual(prepared.sparse_q_tiles, 1)
+        self.assertEqual(prepared.sparse_q_tiles, 3)
         self.assertEqual(prepared.sparse_selected, 2)
-        self.assertEqual(tuple(prepared.kv_indices.shape), (1, 1, 1, 2))
+        self.assertEqual(tuple(prepared.kv_indices.shape), (1, 1, 3, 2))
         self.assertEqual(prepared.kv_indices[0, 0, 0].tolist(), [0, 2])
         self.assertEqual(
             prepared.metadata['route_format'],

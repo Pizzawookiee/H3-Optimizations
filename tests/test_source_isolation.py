@@ -60,12 +60,11 @@ class SourceIsolationTests(unittest.TestCase):
         self.assertNotIn('._C', source)
         self.assertNotIn('PrequantizedInt8Attention(', source)
 
-    def test_legacy_dense_stack_is_not_exported_to_production(self):
+    def test_dense_sage_stack_stays_at_the_h3_apply_boundary(self):
         production_boundaries = (
             SOURCE / 'attention' / '__init__.py',
             SOURCE / 'qkv' / '__init__.py',
             SOURCE / 'qkv' / 'projectors.py',
-            SOURCE / 'apply.py',
         )
         banned = (
             'SM89SageMemoryEfficientBackend',
@@ -77,6 +76,9 @@ class SourceIsolationTests(unittest.TestCase):
             text = path.read_text(encoding='utf-8')
             for fragment in banned:
                 self.assertNotIn(fragment, text, '%s exports %s' % (path, fragment))
+        apply_source = (SOURCE / 'apply.py').read_text(encoding='utf-8')
+        self.assertIn('ProjectedSM89SageBackend', apply_source)
+        self.assertIn('DenseFusedQKVProjector', apply_source)
 
     def test_sparse_production_uses_streamed_convrot_projector(self):
         apply_source = (SOURCE / 'apply.py').read_text(encoding='utf-8')

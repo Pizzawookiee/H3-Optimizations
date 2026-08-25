@@ -1,15 +1,25 @@
 '''CPU fake-kernel tests for prepared dense Sage backends.'''
 
 from pathlib import Path
+import os
 import sys
 import unittest
+from unittest import mock
 
 import torch
+
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
 
 PACK = Path(__file__).resolve().parents[1]
 ROOT = PACK.parents[1]
 sys.path.insert(0, str(PACK))
 sys.path.insert(0, str(ROOT))
+TEST_ARGS = sys.argv[1:]
+sys.argv = [sys.argv[0], '--cpu']
+
+import comfy.options  # noqa: E402
+
+comfy.options.enable_args_parsing()
 
 from h3_optimizations.attention.sage_arch import (  # noqa: E402
     KernelBinding,
@@ -26,7 +36,12 @@ from h3_optimizations.attention.sage_mem_eff import (  # noqa: E402
     PreparedSM89,
     SageSM89API,
     SM89SageMemoryEfficientBackend,
+    _load_api,
+    _resolve_sm89_kernel,
 )
+from h3_optimizations.dense_fused_qkv import DenseFusedQKVProjector  # noqa: E402
+
+sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 def fused_hnd(sequence=65, heads=2):
@@ -111,6 +126,103 @@ class FakeFP8:
 
 
 class DenseBackendTests(unittest.TestCase):
+    def test_dense_sage_projector_assembles_chunked_kitchen_projection(self):
+        projected_ranges = []
+        quantized_lengths = []
+
+        def project_chunk(_module, _x, _rope, start, stop):
+            projected_ranges.append((start, stop))
+            shape = (1, 2, stop - start, 128)
+            value = len(projected_ranges)
+            return (
+                torch.full(shape, value, dtype=torch.bfloat16),
+                torch.full(shape, value + 10, dtype=torch.bfloat16),
+                torch.full(shape, value + 20, dtype=torch.bfloat16),
+            )
+
+        def quantizer(q, k, _km, **kwargs):
+            self.assertEqual(kwargs['tensor_layout'], 'HND')
+            length = int(q.shape[2])
+            quantized_lengths.append(length)
+            q_scales = ((length + 127) // 128) * 32
+            k_scales = ((length + 63) // 64) * 4
+            return (
+                torch.full(q.shape, len(quantized_lengths), dtype=torch.int8),
+                torch.full((1, 2, q_scales), len(quantized_lengths), dtype=torch.float32),
+                torch.full(k.shape, len(quantized_lengths) + 10, dtype=torch.int8),
+                torch.full((1, 2, k_scales), len(quantized_lengths) + 10, dtype=torch.float32),
+            )
+
+        projector = DenseFusedQKVProjector(
+            chunk_rows=128,
+            quantizer=quantizer,
+            project_chunk=project_chunk,
+            allow_cpu_for_tests=True,
+        )
+        prepared = projector.project(
+            type('Attention', (), {'heads': 2, 'head_dim': 128})(),
+            torch.empty((257, 4), dtype=torch.bfloat16),
+            None,
+            layer_index=7,
+            transformer_options={},
+        )
+
+        self.assertEqual(projected_ranges, [(0, 128), (128, 256), (256, 257)])
+        self.assertEqual(quantized_lengths, [128, 128, 1])
+        self.assertEqual(tuple(prepared.q_int8.shape), (1, 2, 257, 128))
+        self.assertEqual(tuple(prepared.q_scale.shape), (1, 2, 96))
+        self.assertEqual(tuple(prepared.k_scale.shape), (1, 2, 20))
+        self.assertTrue(torch.all(prepared.v[:, :, :128] == 21))
+        self.assertTrue(torch.all(prepared.v[:, :, 128:256] == 22))
+        self.assertTrue(torch.all(prepared.v[:, :, 256:] == 23))
+        self.assertEqual(prepared.layer_index, 7)
+
+    def test_sm89_resolves_extension_alias_used_by_public_dispatcher(self):
+        kernel = FakeKernel(expected_granularity=3)
+        extension = type('WheelExtension', (), {
+            'qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf': kernel,
+        })()
+        namespace = {'wheel_chosen_alias': extension}
+        exec('def dispatch():\n    return wheel_chosen_alias', namespace)
+        core = type('SageCore', (), {
+            'sageattn_qk_int8_pv_fp8_cuda': staticmethod(namespace['dispatch']),
+        })()
+
+        resolved, name, source, scale_max, accumulation = _resolve_sm89_kernel(core)
+
+        self.assertIs(resolved, kernel)
+        self.assertEqual(name, 'qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf')
+        self.assertEqual(source, 'WheelExtension')
+        self.assertEqual(scale_max, 2.25)
+        self.assertEqual(accumulation, 'fp32+fp16')
+
+    def test_sm89_accepts_any_version_with_compatible_capabilities(self):
+        kernel = FakeKernel(expected_granularity=3)
+        extension = type('WheelExtension', (), {
+            'qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf': kernel,
+        })()
+        namespace = {'wheel_chosen_alias': extension}
+        exec('def dispatch():\n    return wheel_chosen_alias', namespace)
+        core = type(sys)('sageattention.core')
+        core.SM89_ENABLED = True
+        core.per_channel_fp8 = lambda *_args, **_kwargs: None
+        core.sageattn_qk_int8_pv_fp8_cuda = namespace['dispatch']
+        package = type(sys)('sageattention')
+        package.__path__ = []
+        package.core = core
+
+        with mock.patch.dict(
+            sys.modules,
+            {'sageattention': package, 'sageattention.core': core},
+        ), mock.patch(
+            'h3_optimizations.attention.sage_mem_eff.importlib.metadata.version',
+            return_value='9.7.test',
+        ):
+            api = _load_api()
+
+        self.assertEqual(api.version, '9.7.test')
+        self.assertIs(api.kernel, kernel)
+
     def test_sm89_execute_does_not_requantize_prepared_v(self):
         kernel = FakeKernel(expected_granularity=3)
 

@@ -29,6 +29,7 @@ from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_PRESERVE_BF16,
     MemoryRequest,
 )
+from h3_optimizations.attention_forward import _legacy_attention  # noqa: E402
 from h3_optimizations.qkv.bf16 import (  # noqa: E402
     BF16QKVBindingError,
     CHUNK_ROWS,
@@ -67,6 +68,28 @@ class FakeInventory:
 
 
 class ChunkedBF16QKVContracts(unittest.TestCase):
+    def test_existing_attention_is_requested_to_return_hnd(self):
+        calls = []
+
+        def attention(*args, **kwargs):
+            calls.append((args, kwargs))
+            return args[0]
+
+        q = torch.empty((1, 2, 3, 4), dtype=torch.bfloat16)
+        self.assertIs(
+            _legacy_attention(
+                SimpleNamespace(heads=2),
+                q,
+                q,
+                q,
+                {},
+                attention=attention,
+            ),
+            q,
+        )
+        self.assertTrue(calls[0][1]['skip_reshape'])
+        self.assertTrue(calls[0][1]['skip_output_reshape'])
+
     def test_default_chunk_rows_is_4096(self):
         projector = ChunkedBF16QKVProjector()
         self.assertEqual(CHUNK_ROWS, 4096)

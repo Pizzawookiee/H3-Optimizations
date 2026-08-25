@@ -26,12 +26,12 @@ class TritonSparseQKVTests(unittest.TestCase):
         self.assertEqual(prepared.q_int8.dtype, torch.int8)
         self.assertEqual(prepared.k_int8.dtype, torch.int8)
         self.assertEqual(prepared.v_int8.dtype, torch.int8)
-        self.assertEqual(tuple(prepared.q_scale.shape), (1, heads, 2))
+        self.assertEqual(tuple(prepared.q_scale.shape), (1, heads, 3))
         self.assertEqual(tuple(prepared.k_scale.shape), (1, heads, 3))
         self.assertEqual(tuple(prepared.v_scale.shape), (1, heads, 3, 128))
         self.assertEqual(tuple(prepared.v_sum.shape), (1, heads, 3, 128))
         self.assertEqual(prepared.v_sum.dtype, torch.int32)
-        self.assertEqual(tuple(prepared.q_summary.shape), (1, heads, 2, 128))
+        self.assertEqual(tuple(prepared.q_summary.shape), (1, heads, 3, 128))
         self.assertEqual(tuple(prepared.k_summary.shape), (1, heads, 3, 128))
         self.assertEqual(prepared.output_dtype, q.dtype)
         self.assertEqual(prepared.layer_index, 7)
@@ -106,6 +106,7 @@ class TritonSparseQKVTests(unittest.TestCase):
 
         self.assertTrue(torch.all(prepared.q_summary[0, 0, 0] == 1))
         self.assertTrue(torch.all(prepared.q_summary[0, 0, 1] == 1))
+        self.assertTrue(torch.all(prepared.q_summary[0, 0, 2] == 1))
         self.assertTrue(torch.all(prepared.k_summary[0, 0, 2] == 1))
 
     def test_validation_rejects_wrong_v_scale_geometry(self):

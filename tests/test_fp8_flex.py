@@ -76,7 +76,7 @@ class FakeMetadata:
 
 
 class FakeRouter:
-    q_tile = 128
+    q_tile = 64
     kv_tile = 64
 
     def build_lut(self, q, _k, _layout, _video_budget, *, sink=None):
@@ -190,10 +190,10 @@ class FP8FlexTests(unittest.TestCase):
 
     def test_delta_lut_becomes_compact_flex_block_indices(self):
         lut = torch.tensor(
-            [[[[0, 2, 1], [0, 1, 1]]]],
+            [[[[0, 2, 1], [0, 1, 1], [0, 1, 1]]]],
             dtype=torch.int32,
         )
-        valid = torch.tensor([[[2, 3]]], dtype=torch.int32)
+        valid = torch.tensor([[[2, 3, 3]]], dtype=torch.int32)
 
         block_mask = block_mask_from_delta_lut(
             self._spec(),
@@ -202,12 +202,12 @@ class FP8FlexTests(unittest.TestCase):
             192,
         )
 
-        self.assertEqual(block_mask.BLOCK_SIZE, (128, 64))
+        self.assertEqual(block_mask.BLOCK_SIZE, (64, 64))
         self.assertEqual(block_mask.seq_lengths, (192, 192))
         self.assertTrue(torch.equal(block_mask.kv_num_blocks, valid))
         self.assertEqual(
             block_mask.kv_indices.tolist(),
-            [[[[0, 2, 3], [0, 1, 2]]]],
+            [[[[0, 2, 3], [0, 1, 2], [0, 1, 2]]]],
         )
         self.assertIsNone(block_mask.q_indices)
 
@@ -287,7 +287,7 @@ class FP8FlexTests(unittest.TestCase):
             kwargs['kernel_options']['BACKEND'],
             FLEX_BACKEND_TRITON,
         )
-        self.assertEqual(kwargs['kernel_options']['BLOCK_M'], 128)
+        self.assertEqual(kwargs['kernel_options']['BLOCK_M'], 64)
         self.assertEqual(kwargs['kernel_options']['BLOCK_N'], 64)
         self.assertTrue(
             kwargs['kernel_options']['ROWS_GUARANTEED_SAFE']

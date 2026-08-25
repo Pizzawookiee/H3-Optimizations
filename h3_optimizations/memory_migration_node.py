@@ -93,9 +93,11 @@ def _memory_request_for_modes(
     precision_mode = _normalize_precision_mode(precision_mode)
     streaming = _qkv_streaming_request(qkv_streaming_mode)
 
-    # Off preserves the current attention backend. Auto claims unselected dense
-    # attention only to obtain a real streamed producer and yields to an
-    # explicit selector. Forced explicitly authorizes the Kitchen dense path.
+    # Off preserves the current attention backend. With conversion allowed it
+    # may still use bounded QKV projection; it only forbids a streamed carrier
+    # from claiming attention. Auto claims unselected dense attention to obtain
+    # a streamed producer and yields to an explicit selector. Forced explicitly
+    # authorizes the Kitchen dense path.
     # An H3 Sparse request remains separately authoritative through the shared
     # order-independent optimization plan.
     attention = (
@@ -111,11 +113,7 @@ def _memory_request_for_modes(
         PRECISION_MODE_PRESERVE_NATIVE: FUSED_QKV_PRESERVE_BF16,
         PRECISION_MODE_FORCE_QUANT: FUSED_QKV_FORCE_QUANT,
     }
-    qkv_request = (
-        FUSED_QKV_OFF
-        if streaming == QKV_STREAMING_OFF
-        else qkv_requests[precision_mode]
-    )
+    qkv_request = qkv_requests[precision_mode]
 
     mlp_requests = {
         PRECISION_MODE_AUTO: MLP_MEMORY_AUTO,
@@ -246,7 +244,9 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=QKV_STREAMING_MODE_AUTO,
                     advanced=True,
                     tooltip=(
-                        'Off disables streamed QKV and preserves existing attention. '
+                        'Off disables streamed carriers and preserves existing '
+                        'attention. The selected precision policy still controls '
+                        'bounded or native fused QKV projection. '
                         'Auto prefers BF16 Q/K/V chunk streaming and only claims dense '
                         'Kitchen when a compatible streamed producer is available; it '
                         'preserves explicit attention selectors. Forced explicitly '

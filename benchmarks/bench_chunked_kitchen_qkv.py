@@ -356,7 +356,6 @@ def current_fused_preparation(module, x, rope, block_index):
 
 
 def build_legacy_fused_backend():
-    import h3_optimizations.attention.sm89_compat  # noqa: F401
     import h3_optimizations.attention.v_snapshot_compat  # noqa: F401
     from h3_optimizations.attention.sage_mem_eff import (
         SM89SageMemoryEfficientBackend,

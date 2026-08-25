@@ -41,6 +41,7 @@ from .attention.sparse.kitchen_sparse import (
 from .dense_resolver import (
     install_dense_attention,
     preserve_dense_attention,
+    resolve_command_line_sage_fused_attention,
     resolve_dense_attention,
 )
 from .environment import RuntimeEnvironment
@@ -61,6 +62,7 @@ from .plan import (
     DENSITY_FIXED,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
     H3OptimizationPlan,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
@@ -75,6 +77,7 @@ from .plan import (
     SPARSE_BACKEND_SOL_64X64,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
+    QKV_STREAMING_OFF,
 )
 from .qkv.bf16 import ChunkedBF16QKVProjector
 from .qkv.formats import inspect_h3_linears
@@ -82,6 +85,7 @@ from .qkv.providers import (
     MLP_OFF,
     MLP_PRESERVE_UPSTREAM,
     QKV_BF16_CHUNKED,
+    QKV_DENSE_CONVROT_INT8,
     QKV_FORCE_BF16_CHUNKED,
     QKV_FORCE_QUANT_CHUNKED,
     QKV_DENSE_FP8_CHUNKED,
@@ -265,7 +269,20 @@ def describe_memory_options(attention):
 
 def _resolve_dense(plan, model, inventory, environment=None):
     memory = plan.memory
-    dense = (
+    native_fused_sage = (
+        resolve_command_line_sage_fused_attention(model, environment)
+        if (
+            memory is not None
+            and memory.qkv_streaming == QKV_STREAMING_OFF
+            and memory.fused_qkv in (
+                FUSED_QKV_AUTO,
+                FUSED_QKV_PRESERVE_BF16,
+            )
+            and inventory.qkv_convrot_int8_256
+        )
+        else None
+    )
+    dense = native_fused_sage or (
         preserve_dense_attention('no memory optimization requested')
         if memory is None
         else (
@@ -274,6 +291,9 @@ def _resolve_dense(plan, model, inventory, environment=None):
             else resolve_dense_attention(model)
         )
     )
+    dense_triton_available = False
+    if dense.backend_kind == 'dense_sage_sm89':
+        from .dense_fused_qkv import TRITON_AVAILABLE as dense_triton_available
     qkv = resolve_qkv_provider(
         inventory,
         request=_qkv_request(plan),
@@ -281,12 +301,19 @@ def _resolve_dense(plan, model, inventory, environment=None):
         kitchen_producer_available=producer_api_available(
             device=getattr(environment, 'device_index', None)
         ),
+        triton_available=bool(dense_triton_available),
         memory_optimize=memory is not None,
         fp8_available=_fp8_execution_available(environment),
     )
     backend = None
     projector = None
-    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+    if qkv.provider_id == QKV_DENSE_CONVROT_INT8:
+        from .dense_backend import ProjectedSM89SageBackend
+        from .dense_fused_qkv import DenseFusedQKVProjector
+
+        backend = ProjectedSM89SageBackend(dense.backend)
+        projector = DenseFusedQKVProjector(chunk_rows=memory.chunk_rows)
+    elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         # Reuse the package-owned attention-forward slot without changing the
         # selected dense attention. attention_forward recognizes the BF16
         # payload and delegates it to the existing Comfy/upstream backend.
@@ -400,10 +427,10 @@ def _resolve_fp8_flex(
         else None
     )
     if fallback_reason is None:
-        reason = 'explicit FP8 FlexAttention selection'
+        reason = 'explicit FP8 FlexAttention 64Q x 64KV selection'
         dense_resolution = None
     else:
-        reason = '%s; using FP8 FlexAttention' % fallback_reason
+        reason = '%s; using FP8 FlexAttention 64Q x 64KV' % fallback_reason
         dense_resolution = dense_attention.dense_resolution
     return (
         ResolvedAttention(
@@ -449,9 +476,10 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
         projector=projector,
     )
     reason = (
-        'explicit INT8 Triton sparse attention selection'
+        'explicit INT8 Triton 64Q x 64KV sparse attention selection'
         if fallback_reason is None
-        else '%s; using INT8 Triton sparse attention' % fallback_reason
+        else '%s; using INT8 Triton 64Q x 64KV sparse attention'
+        % fallback_reason
     )
     return (
         ResolvedAttention(
@@ -1011,6 +1039,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
             install_dense_attention(patched, attention.dense_resolution)
     elif plan.memory is not None:
         if qkv.provider_id in (
+            QKV_DENSE_CONVROT_INT8,
             QKV_BF16_CHUNKED,
             QKV_FORCE_BF16_CHUNKED,
             QKV_FORCE_QUANT_CHUNKED,
@@ -1066,10 +1095,11 @@ def apply_plan(model, plan: H3OptimizationPlan):
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
     _warn_about_slow_paths(attention, qkv)
     logging.info(
-        '%s armed: attention=%s qkv=%s mlp=%s memory=%s device=%s',
+        '%s armed: attention=%s qkv=%s qkv_weights=%s mlp=%s memory=%s device=%s',
         LOG_PREFIX,
         attention.selected,
         qkv.provider_id,
+        ','.join(inventory.labels('qkv')) or 'unknown',
         mlp.provider_id,
         describe_memory_options(attention),
         environment.device_name,

@@ -5,11 +5,9 @@ FP8 V, no K smoothing) while separating preparation from execution so the
 caller can release the fused BF16 QKV projection before the attention kernel
 starts.
 
-SageAttention 2.2 wheels are not uniform across platforms. In particular, some
-Windows builds expose the SM89 kernels only through the compiled extension or
-``torch.ops`` rather than as attributes on ``sageattention.sm89_compile``. The
-resolver below searches every supported export surface and selects the best
-available official kernel.
+SageAttention wheels are not uniform across platforms. The resolver follows
+the installed public dispatcher and PyTorch's registered operators instead of
+depending on a wheel-specific extension namespace.
 """
 
 from dataclasses import dataclass
@@ -22,7 +20,6 @@ import torch
 from . import stats
 from .triton_i64 import per_thread_int8_i64
 
-SUPPORTED_SAGE_PREFIXES = ("2.2.",)
 V_OFFSET_LIMIT = (1 << 32) - 1
 
 # Preferred order matches SageAttention's public SM89 dispatch. Every candidate
@@ -90,28 +87,20 @@ def _append_unique(modules, module):
 def _sm89_export_surfaces(core):
     """Return every place a SageAttention wheel may expose SM89 kernels.
 
-    Official source binds ``sm89_compile`` in ``sageattention.core``. Windows
-    wheels and locally compiled builds have also been observed exposing only the
-    direct extension or registered ``torch.ops`` namespace. All use the same
-    low-level function signature consumed by this backend.
+    The Python dispatcher is the stable authority: inspect the globals it
+    actually references instead of depending on the wheel's extension alias.
+    The core module scan covers compiled dispatchers that have no Python code.
     """
     modules = []
-    _append_unique(modules, getattr(core, "sm89_compile", None))
 
     public_fn = getattr(core, "sageattn_qk_int8_pv_fp8_cuda", None)
     fn_globals = getattr(public_fn, "__globals__", {}) if public_fn is not None else {}
-    _append_unique(modules, fn_globals.get("sm89_compile"))
+    code = getattr(public_fn, "__code__", None)
+    for name in getattr(code, "co_names", ()):
+        _append_unique(modules, fn_globals.get(name))
 
-    for module_name in ("sageattention.sm89_compile", "sageattention._qattn_sm89"):
-        try:
-            _append_unique(modules, importlib.import_module(module_name))
-        except Exception:
-            pass
-
-    try:
-        _append_unique(modules, torch.ops.sageattention_sm89)
-    except Exception:
-        pass
+    for value in vars(core).values():
+        _append_unique(modules, value)
     return modules
 
 
@@ -119,8 +108,31 @@ def _surface_name(surface):
     return getattr(surface, "__name__", type(surface).__name__)
 
 
+def _registered_sm89_kernels():
+    found = {}
+    wanted = {name for name, _, _ in KERNEL_CANDIDATES}
+    try:
+        names = torch._C._dispatch_get_all_op_names()
+    except Exception:
+        return found
+    for full_name in names:
+        if "::" not in full_name:
+            continue
+        namespace, basename = full_name.split("::", 1)
+        if basename not in wanted:
+            continue
+        try:
+            kernel = getattr(getattr(torch.ops, namespace), basename)
+        except Exception:
+            continue
+        if callable(kernel):
+            found.setdefault(basename, (kernel, "torch.ops.%s" % namespace))
+    return found
+
+
 def _resolve_sm89_kernel(core):
     surfaces = _sm89_export_surfaces(core)
+    registered = _registered_sm89_kernels()
     for kernel_name, v_scale_max, accumulation in KERNEL_CANDIDATES:
         for surface in surfaces:
             try:
@@ -135,6 +147,9 @@ def _resolve_sm89_kernel(core):
                     v_scale_max,
                     accumulation,
                 )
+        if kernel_name in registered:
+            kernel, source = registered[kernel_name]
+            return kernel, kernel_name, source, v_scale_max, accumulation
 
     available = set()
     for surface in surfaces:
@@ -143,10 +158,11 @@ def _resolve_sm89_kernel(core):
         except Exception:
             continue
         available.update(name for name in names if name.startswith("qk_int8_sv_f8"))
+    available.update(registered)
     expected = ", ".join(name for name, _, _ in KERNEL_CANDIDATES)
     found = ", ".join(sorted(available)) or "none discoverable"
     raise EfficientSageError(
-        "SageAttention 2.2.x has no supported SM89 kernel export. "
+        "SageAttention has no supported SM89 kernel export. "
         "Expected one of: %s. Found: %s" % (expected, found)
     )
 
@@ -158,24 +174,18 @@ def _load_api():
     except Exception as exc:
         stats.increment("compatibility_errors")
         raise EfficientSageError(
-            "sage_mem_eff requires SageAttention 2.2.x with the SM89 extension"
+            "sage_mem_eff requires SageAttention with the SM89 extension"
         ) from exc
 
-    if not version.startswith(SUPPORTED_SAGE_PREFIXES):
-        stats.increment("compatibility_errors")
-        raise EfficientSageError(
-            "sage_mem_eff was validated against SageAttention 2.2.x; installed version is %s"
-            % version
-        )
     if not getattr(core, "SM89_ENABLED", False):
         stats.increment("compatibility_errors")
         raise EfficientSageError("SageAttention's SM89 extension is unavailable")
 
     per_channel_fp8 = getattr(core, "per_channel_fp8", None)
-    if per_channel_fp8 is None:
+    if not callable(per_channel_fp8):
         stats.increment("compatibility_errors")
         raise EfficientSageError(
-            "SageAttention 2.2.x internal API changed: missing per_channel_fp8"
+            "SageAttention has no compatible per_channel_fp8 helper"
         )
 
     try:

@@ -8,8 +8,10 @@ import torch
 
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
-from .router import KV_TILE, Q_TILE, SparseRouterError, SparseTileRouter
+from .router import SparseRouterError, SparseTileRouter
 from .triton_qkv import (
+    KV_TILE,
+    Q_TILE,
     TritonSparseQKVError,
     normalize_v_scale_group_size,
     pack_float_qkv,
