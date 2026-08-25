@@ -10,6 +10,7 @@ workflows adopt their defaults on first load.
 from comfy_api.latest import io, ui
 
 from .apply import apply_plan
+from .dense_resolver import has_explicit_dense_attention
 from .nodes import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
 from .plan import (
     ATTENTION_AUTO,
@@ -72,14 +73,22 @@ def _memory_request_for_modes(
     chunk_rows,
     precision_mode,
     qkv_streaming_mode,
+    explicit_attention_selected=False,
 ):
     preserve_precision = _preserve_precision_for_mode(precision_mode)
     streaming = _qkv_streaming_request(qkv_streaming_mode)
 
-    # Off preserves the existing attention choice. Auto may claim attention
-    # only when no explicit selector is already present. Forced explicitly
-    # authorizes replacing the dense attention choice with full-density Kitchen.
-    attention = ATTENTION_EXISTING if streaming == QKV_STREAMING_OFF else ATTENTION_AUTO
+    # Off always preserves the existing attention choice. Auto claims the
+    # unselected/default attention path, but yields to an explicit upstream
+    # selector. Forced explicitly authorizes replacing the dense attention
+    # choice with full-density Kitchen. An H3 Sparse request remains separately
+    # authoritative through the shared order-independent plan.
+    attention = (
+        ATTENTION_EXISTING
+        if streaming == QKV_STREAMING_OFF
+        or (streaming == QKV_STREAMING_AUTO and explicit_attention_selected)
+        else ATTENTION_AUTO
+    )
 
     if preserve_precision:
         qkv_request = (
@@ -214,8 +223,8 @@ class H3MemoryOptimization(io.ComfyNode):
                     tooltip=(
                         'Off disables streamed QKV and preserves existing attention. '
                         'Auto uses full-density Kitchen streaming when no explicit '
-                        'attention selector has claimed the model, but preserves an '
-                        'explicit selector. Forced explicitly allows this node to '
+                        'attention selector has claimed the input model, but preserves '
+                        'an explicit selector. Forced explicitly allows this node to '
                         'replace dense attention with full-density Comfy Kitchen. '
                         'An H3 Sparse Attention request is always authoritative.'
                     ),
@@ -245,6 +254,7 @@ class H3MemoryOptimization(io.ComfyNode):
                 chunk_rows=chunk_rows,
                 precision_mode=precision_mode,
                 qkv_streaming_mode=qkv_streaming_mode,
+                explicit_attention_selected=has_explicit_dense_attention(model),
             )
         )
         patched = apply_plan(model, plan)
