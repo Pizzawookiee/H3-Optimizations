@@ -25,8 +25,8 @@ from .status import format_memory_status
 PRECISION_MODE_PRESERVE = 'Preserve precision'
 PRECISION_MODE_ALLOW_FP8 = 'Allow FP8 conversion'
 PRECISION_MODE_OPTIONS = (
-    PRECISION_MODE_ALLOW_FP8,
     PRECISION_MODE_PRESERVE,
+    PRECISION_MODE_ALLOW_FP8,
 )
 
 
@@ -51,9 +51,10 @@ class H3MemoryOptimization(io.ComfyNode):
                 'Production memory and execution optimizations for MiniMax H3. '
                 'Compatible quantized checkpoints keep their checkpoint weight '
                 'precision while using specialized or chunked execution paths. '
-                'Precision mode defaults to Allow FP8 conversion for supported '
-                'ordinary BF16/FP16 QKV and MLP weights when accelerated FP8 is '
-                'available. Preserve precision forbids new weight quantization.'
+                'Precision mode defaults to Preserve precision, which forbids new '
+                'weight quantization. Allow FP8 conversion permits supported '
+                'ordinary BF16/FP16 QKV and MLP weights to be converted to FP8 '
+                'E4M3 when accelerated FP8 is available.'
             ),
             search_aliases=[
                 'H3 VRAM',
@@ -129,13 +130,13 @@ class H3MemoryOptimization(io.ComfyNode):
                     'precision_mode',
                     display_name='Precision mode',
                     options=list(PRECISION_MODE_OPTIONS),
-                    default=PRECISION_MODE_ALLOW_FP8,
+                    default=PRECISION_MODE_PRESERVE,
                     advanced=True,
                     tooltip=(
+                        'Preserve precision introduces no new weight quantization. '
                         'Allow FP8 conversion permits supported BF16/FP16 QKV and '
                         'MLP weights to be converted to FP8 E4M3 for additional '
-                        'memory/performance savings. Preserve precision introduces '
-                        'no new weight quantization.'
+                        'memory/performance savings.'
                     ),
                 ),
             ],
@@ -150,7 +151,7 @@ class H3MemoryOptimization(io.ComfyNode):
         mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         preserve_precision=True,
-        precision_mode=PRECISION_MODE_ALLOW_FP8,
+        precision_mode=PRECISION_MODE_PRESERVE,
     ):
         # preserve_precision is intentionally ignored. It only absorbs the old
         # positional workflow value so precision_mode can migrate defaults.
