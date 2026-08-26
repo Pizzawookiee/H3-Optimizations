@@ -113,31 +113,65 @@ class SageSM86MemoryEfficientBackend(ArchitectureBackend):
         )
 
     def execute(self, prepared):
-        v_source = prepared.v_source
+        v_carrier, v_scale = self.prepare_streamed_v(prepared.v_source)
+        prepared.v_source = None
+        return self.execute_rectangular(
+            prepared.q_int8,
+            prepared.q_scale,
+            prepared.k_int8,
+            prepared.k_scale,
+            v_carrier,
+            v_scale,
+            output_dtype=prepared.output_dtype,
+            softmax_scale=prepared.softmax_scale,
+            layer_index=prepared.layer_index,
+            prepared=prepared,
+        )
+
+    def prepare_streamed_v(self, v_source):
         v_fp16 = (
             v_source
             if v_source.dtype == torch.float16
             else v_source.to(torch.float16)
         )
-        prepared.v_source = None
-        del v_source
+        return v_fp16, None
+
+    def execute_rectangular(
+        self,
+        q_int8,
+        q_scale,
+        k_int8,
+        k_scale,
+        v_carrier,
+        v_scale,
+        *,
+        output_dtype,
+        softmax_scale,
+        layer_index,
+        prepared=None,
+    ):
+        del v_scale, softmax_scale
         try:
             output, _ = self.api.attention(
-                prepared.q_int8,
-                prepared.k_int8,
-                v_fp16,
-                prepared.q_scale,
-                prepared.k_scale,
+                q_int8,
+                k_int8,
+                v_carrier,
+                q_scale,
+                k_scale,
                 tensor_layout="HND",
                 attn_mask=None,
-                output_dtype=prepared.output_dtype,
+                output_dtype=output_dtype,
                 return_lse=False,
             )
         except Exception as exc:
-            self.kernel_error(
-                prepared,
-                "triton_attn_qk_int8_per_block",
-                exc,
-            )
+            if prepared is not None:
+                self.kernel_error(
+                    prepared,
+                    "triton_attn_qk_int8_per_block",
+                    exc,
+                )
+            raise EfficientSageError(
+                "%s rectangular kernel failed at layer %d" % (self.name, layer_index)
+            ) from exc
         stats.increment("executed")
         return output

@@ -357,20 +357,16 @@ def _resolve_dense(plan, model, inventory, environment=None):
         dense_sage
         and qkv.provider_id != QKV_STANDARD
     ):
-        from .dense_fused_qkv import DenseFusedQKVProjector
+        from .dense_streamed_sage import (
+            StreamedDenseSageBackend,
+            StreamedDenseSageQKVProjector,
+        )
 
-        if dense.backend_kind == ATTENTION_SAGE_SM89:
-            from .dense_backend import ProjectedSM89SageBackend
-
-            backend = ProjectedSM89SageBackend(dense.backend)
-            carrier_backend = None
-        else:
-            backend = dense.backend
-            carrier_backend = dense.backend
-        projector = DenseFusedQKVProjector(
+        backend = StreamedDenseSageBackend(dense.backend)
+        projector = StreamedDenseSageQKVProjector(
+            dense.backend,
             chunk_rows=memory.chunk_rows,
             projection_mode=_streamed_projection_mode(qkv, inventory),
-            carrier_backend=carrier_backend,
         )
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         backend = ChunkedKitchenAttentionBackend()
@@ -393,12 +389,14 @@ def _resolve_dense(plan, model, inventory, environment=None):
         QKV_FORCE_CONVROT_INT8_KITCHEN,
         QKV_FORCE_BF16_STREAMED_KITCHEN,
     ):
-        backend = ChunkedKitchenAttentionBackend()
+        backend = ChunkedKitchenAttentionBackend(
+            stream_output=True,
+            query_chunk_rows=memory.chunk_rows,
+        )
         # The chunk quantizer is handed the same strided Q/K views here as on
         # the sparse path, and takes them through the same guarded predicate.
-        # The sequence-major output layout is deliberately not enabled on this
-        # path: it was measured on the sparse route only.
         projector = ChunkedKitchenQKVProjector(
+            chunk_rows=memory.chunk_rows,
             force_weights_bf16=(
                 qkv.provider_id == QKV_FORCE_BF16_STREAMED_KITCHEN
             ),
@@ -407,6 +405,8 @@ def _resolve_dense(plan, model, inventory, environment=None):
                 qkv.provider_id == QKV_FORCE_CONVROT_INT8_KITCHEN
             ),
             strided_qk_input=True,
+            stream_output=True,
+            streamed_q=True,
         )
     return (
         ResolvedAttention(

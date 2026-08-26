@@ -117,7 +117,7 @@ ARMS = {
             'attention': 'sage',
             'backend': 'sage_mem_eff',
             'qkv': 'convrot_int8_dense_sage',
-            'projector': 'chunked_kitchen_dense_sage_qkv',
+            'projector': 'streamed_dense_sage_qkv',
         }),
     ],
     'h3opt_kv100': [

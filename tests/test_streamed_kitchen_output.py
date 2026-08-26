@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 import torch
 
@@ -26,7 +27,11 @@ from h3_optimizations.attention.sparse.kitchen_sparse import (
     PreparedSparseKitchen,
     SparseKitchenBackend,
 )
-from h3_optimizations.kitchen_qkv import ChunkedKitchenQKVProjector
+from h3_optimizations.kitchen_qkv import (
+    ChunkedKitchenAttentionBackend,
+    ChunkedKitchenQKVProjector,
+    PreparedChunkedKitchenQKV,
+)
 from h3_optimizations.native.int8_attention import (
     BlockSparseRoute,
     PrequantizedInt8Attention,
@@ -47,6 +52,15 @@ class _Kitchen:
         self.calls.append(
             (carrier.q.shape[-2], route.indices.shape[-2], output_layout)
         )
+        return carrier.q.to(torch.float32)
+
+
+class _DenseKitchen:
+    def __init__(self):
+        self.calls = []
+
+    def int8_attention_from_prequantized(self, carrier, output_layout):
+        self.calls.append((carrier.q.shape[-2], output_layout))
         return carrier.q.to(torch.float32)
 
 
@@ -144,6 +158,43 @@ class StreamedKitchenOutputTests(unittest.TestCase):
             router=_Router(),
         )
         self.assertFalse(backend.stream_output)
+
+    def test_dense_kitchen_streams_query_and_output_slabs(self):
+        q = torch.arange(2 * 257 * 128).to(torch.int8).reshape(1, 2, 257, 128)
+        carrier = PrequantizedInt8Attention(
+            q=q,
+            k=torch.empty_like(q),
+            v=torch.empty(2 * 128, 257, dtype=torch.int8),
+            q_scale=torch.empty(1, 2, 96),
+            k_scale=torch.empty(1),
+            v_scale=torch.empty(1),
+            original_head_dim=128,
+            input_dtype=torch.float32,
+            attention_scale=1.0,
+            cta_k=64,
+        )
+        output = torch.empty(257, 256)
+        prepared = PreparedChunkedKitchenQKV(
+            carrier,
+            output_buffer=output,
+        )
+        kitchen = _DenseKitchen()
+        backend = ChunkedKitchenAttentionBackend(
+            stream_output=True,
+            query_chunk_rows=128,
+        )
+
+        with mock.patch(
+            'h3_optimizations.kitchen_qkv.resolve_kitchen',
+            return_value=kitchen,
+        ):
+            actual = backend.execute_projected(_Module(), prepared)
+
+        expected = q.transpose(1, 2).reshape(1, 257, 256).squeeze(0).float()
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(kitchen.calls, [(128, 'nhd'), (128, 'nhd'), (1, 'nhd')])
+        self.assertIsNone(prepared.carrier)
+        self.assertIsNone(prepared.output_buffer)
 
 
 if __name__ == '__main__':

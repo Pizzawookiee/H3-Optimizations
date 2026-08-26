@@ -77,8 +77,10 @@ class SourceIsolationTests(unittest.TestCase):
             for fragment in banned:
                 self.assertNotIn(fragment, text, '%s exports %s' % (path, fragment))
         apply_source = (SOURCE / 'apply.py').read_text(encoding='utf-8')
-        self.assertIn('ProjectedSM89SageBackend', apply_source)
-        self.assertIn('DenseFusedQKVProjector', apply_source)
+        self.assertIn('StreamedDenseSageBackend', apply_source)
+        self.assertIn('StreamedDenseSageQKVProjector', apply_source)
+        self.assertNotIn('ProjectedSM89SageBackend', apply_source)
+        self.assertNotIn('DenseFusedQKVProjector', apply_source)
 
     def test_sparse_production_uses_streamed_convrot_projector(self):
         apply_source = (SOURCE / 'apply.py').read_text(encoding='utf-8')

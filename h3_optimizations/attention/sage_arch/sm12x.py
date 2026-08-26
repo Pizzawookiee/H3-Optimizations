@@ -135,41 +135,69 @@ class SageSM12xMemoryEfficientBackend(ArchitectureBackend):
         )
 
     def execute(self, prepared):
-        v_source = prepared.v_source
+        v_carrier, v_scale = self.prepare_streamed_v(prepared.v_source)
+        prepared.v_source = None
+        return self.execute_rectangular(
+            prepared.q_int8,
+            prepared.q_scale,
+            prepared.k_int8,
+            prepared.k_scale,
+            v_carrier,
+            v_scale,
+            output_dtype=prepared.output_dtype,
+            softmax_scale=prepared.softmax_scale,
+            layer_index=prepared.layer_index,
+            prepared=prepared,
+        )
+
+    def prepare_streamed_v(self, v_source):
         v_fp8, v_scale, _ = self.api.per_channel_fp8(
             v_source,
             tensor_layout="HND",
             scale_max=2.25,
             smooth_v=False,
         )
-        prepared.v_source = None
-        del v_source
+        return v_fp8, v_scale
 
+    def execute_rectangular(
+        self,
+        q_int8,
+        q_scale,
+        k_int8,
+        k_scale,
+        v_carrier,
+        v_scale,
+        *,
+        output_dtype,
+        softmax_scale,
+        layer_index,
+        prepared=None,
+    ):
         output = torch.empty(
-            prepared.q_int8.shape,
-            dtype=prepared.output_dtype,
-            device=prepared.q_int8.device,
+            q_int8.shape,
+            dtype=output_dtype,
+            device=q_int8.device,
         )
         try:
             self.api.kernel.fn(
-                prepared.q_int8,
-                prepared.k_int8,
-                v_fp8,
+                q_int8,
+                k_int8,
+                v_carrier,
                 output,
-                prepared.q_scale,
-                prepared.k_scale,
+                q_scale,
+                k_scale,
                 v_scale,
                 1,
                 0,
                 2,
-                prepared.softmax_scale,
+                softmax_scale,
                 0,
             )
         except Exception as exc:
-            self.kernel_error(
-                prepared,
-                self.api.kernel.name,
-                exc,
-            )
+            if prepared is not None:
+                self.kernel_error(prepared, self.api.kernel.name, exc)
+            raise EfficientSageError(
+                "%s rectangular kernel failed at layer %d" % (self.name, layer_index)
+            ) from exc
         stats.increment("executed")
         return output

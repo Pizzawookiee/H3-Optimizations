@@ -16,6 +16,15 @@ from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.fp8 import FP8BindingError, HeldFP8QKV
 from .qkv.int8 import ConvRotINT8BindingError, HeldConvRotINT8QKV
+from .qkv.streamed import (
+    PROJECTION_FORCE_BF16,
+    PROJECTION_FORCE_FP8,
+    PROJECTION_FORCE_INT8,
+    PROJECTION_NATIVE,
+    create_held_qkv,
+    project_kv_hnd,
+    project_q_hnd,
+)
 from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 
 
@@ -34,6 +43,10 @@ PRODUCER_API = (
     'quantize_int8_attention_v',
     'finalize_int8_attention_producer',
     'int8_attention_from_prequantized',
+)
+STREAMED_PRODUCER_API = (
+    'quantize_int8_attention_k_chunk',
+    'quantize_int8_attention_q_chunk',
 )
 H3_ATTENTION_BACKEND_KEY = 'h3_optimizations_attention_backend'
 DENSE_KITCHEN_BACKEND = 'comfy_kitchen_int8_prequantized'
@@ -73,6 +86,13 @@ def _supports_producer(module, device):
         return False
 
 
+def _supports_streamed_producer(module, device):
+    return bool(
+        _supports_producer(module, device)
+        and all(hasattr(module, name) for name in STREAMED_PRODUCER_API)
+    )
+
+
 def producer_api_available(kitchen=None, device=None):
     if kitchen is not None:
         return _supports_producer(kitchen, device)
@@ -87,12 +107,35 @@ def _native_bf16_format(fmt):
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class PreparedChunkedKitchenQKV:
     carrier: object
     q_summary: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     output_buffer: torch.Tensor | None = None
+
+    def release(self):
+        self.carrier = None
+        self.q_summary = None
+        self.k_summary = None
+        self.output_buffer = None
+
+
+@dataclass
+class PreparedStreamedKitchenQKV:
+    module: object
+    x: torch.Tensor
+    rope_freqs: torch.Tensor | None
+    carrier: object
+    projection_mode: str
+    output_buffer: torch.Tensor | None
+
+    def release(self):
+        self.module = None
+        self.x = None
+        self.rope_freqs = None
+        self.carrier = None
+        self.output_buffer = None
 
 
 def _rope_rows(rope_freqs, rows):
@@ -270,6 +313,72 @@ def run_chunked_kitchen_qkv(
             held.__exit__(None, None, None)
 
 
+def run_streamed_kitchen_qkv(
+    module,
+    x,
+    rope_freqs,
+    *,
+    layer_index,
+    transformer_options,
+    spec,
+    chunk_rows,
+    projection_mode,
+    strided_qk_input=False,
+):
+    del layer_index, transformer_options
+    kitchen = resolve_kitchen(x.device)
+    if kitchen is None:
+        raise FusedQKVError('no streamed INT8 attention producer is available')
+
+    held = create_held_qkv(module, x[:1], projection_mode)
+    held.__enter__()
+    try:
+        with diagnostics.stage('anchor_projection'):
+            samples = _project_anchor_samples(
+                module,
+                x,
+                rope_freqs,
+                spec.k_anchor_positions,
+                projector=held,
+            )
+        anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
+        del samples
+        producer = kitchen.create_int8_attention_producer(spec, anchor)
+        sequence = int(x.shape[0])
+        retained_v = None
+        chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
+        for start in range(0, sequence, int(chunk_rows)):
+            end = min(start + int(chunk_rows), sequence)
+            k, v = project_kv_hnd(held, x, rope_freqs, start, end)
+            if retained_v is None:
+                retained_v = v.new_empty(
+                    (1, int(module.heads), sequence, int(module.head_dim))
+                )
+            kitchen.quantize_int8_attention_k_chunk(
+                producer,
+                k,
+                k_start=start,
+                **chunk_kwargs,
+            )
+            with diagnostics.stage('v_retention_copy'):
+                retained_v[..., start:end, :].copy_(v)
+            del k, v
+        kitchen.quantize_int8_attention_v(producer, retained_v)
+        del retained_v
+        carrier = kitchen.finalize_int8_attention_producer(producer)
+    finally:
+        held.__exit__(None, None, None)
+
+    return PreparedStreamedKitchenQKV(
+        module=module,
+        x=x,
+        rope_freqs=rope_freqs,
+        carrier=carrier,
+        projection_mode=projection_mode,
+        output_buffer=x,
+    )
+
+
 class ChunkedKitchenQKVProjector:
     name = 'chunked_kitchen_qkv'
 
@@ -284,6 +393,7 @@ class ChunkedKitchenQKVProjector:
         kv_tile=None,
         strided_qk_input=False,
         stream_output=False,
+        streamed_q=False,
     ):
         self.chunk_rows = int(chunk_rows)
         self.force_weights_bf16 = bool(force_weights_bf16)
@@ -308,6 +418,9 @@ class ChunkedKitchenQKVProjector:
             raise ValueError('kv_tile must be positive')
         self.strided_qk_input = bool(strided_qk_input)
         self.stream_output = bool(stream_output)
+        self.streamed_q = bool(streamed_q)
+        if self.streamed_q and not self.stream_output:
+            raise ValueError('streamed Kitchen Q requires streamed output')
 
     @property
     def installation_signature(self):
@@ -322,6 +435,7 @@ class ChunkedKitchenQKVProjector:
             self.kv_tile,
             self.strided_qk_input,
             self.stream_output,
+            self.streamed_q,
         )
 
     def try_project(
@@ -375,13 +489,22 @@ class ChunkedKitchenQKVProjector:
         ):
             return None
 
+        use_streamed_q = bool(
+            self.streamed_q
+            and _supports_streamed_producer(kitchen, x.device)
+        )
         shape = (1, int(module.heads), int(x.shape[0]), int(module.head_dim))
+        q_shape = (
+            (1, int(module.heads), 1, int(module.head_dim))
+            if use_streamed_q
+            else shape
+        )
         try:
             spec_kwargs = {}
             if self.kv_tile is not None:
                 spec_kwargs['cta_k'] = self.kv_tile
             spec = kitchen.int8_attention_producer_spec(
-                shape,
+                q_shape,
                 shape,
                 dtype=x.dtype,
                 device=x.device,
@@ -396,22 +519,42 @@ class ChunkedKitchenQKVProjector:
             return None
         try:
             with diagnostics.stage('qkv_producer_total'):
-                projected = run_chunked_kitchen_qkv(
-                    module,
-                    x,
-                    rope_freqs,
-                    layer_index=layer_index,
-                    transformer_options=transformer_options,
-                    spec=spec,
-                    chunk_rows=self.chunk_rows,
-                    force_weights_bf16=self.force_weights_bf16,
-                    fp8_projection=self.fp8_projection,
-                    convrot_int8_projection=self.convrot_int8_projection,
-                    routing_summaries=self.routing_summaries,
-                    routing_q_tile=self.q_tile,
-                    routing_kv_tile=self.kv_tile,
-                    strided_qk_input=self.strided_qk_input,
-                )
+                if use_streamed_q:
+                    projection_mode = PROJECTION_NATIVE
+                    if self.force_weights_bf16:
+                        projection_mode = PROJECTION_FORCE_BF16
+                    elif self.fp8_projection:
+                        projection_mode = PROJECTION_FORCE_FP8
+                    elif self.convrot_int8_projection:
+                        projection_mode = PROJECTION_FORCE_INT8
+                    projected = run_streamed_kitchen_qkv(
+                        module,
+                        x,
+                        rope_freqs,
+                        layer_index=layer_index,
+                        transformer_options=transformer_options,
+                        spec=spec,
+                        chunk_rows=self.chunk_rows,
+                        projection_mode=projection_mode,
+                        strided_qk_input=self.strided_qk_input,
+                    )
+                else:
+                    projected = run_chunked_kitchen_qkv(
+                        module,
+                        x,
+                        rope_freqs,
+                        layer_index=layer_index,
+                        transformer_options=transformer_options,
+                        spec=spec,
+                        chunk_rows=self.chunk_rows,
+                        force_weights_bf16=self.force_weights_bf16,
+                        fp8_projection=self.fp8_projection,
+                        convrot_int8_projection=self.convrot_int8_projection,
+                        routing_summaries=self.routing_summaries,
+                        routing_q_tile=self.q_tile,
+                        routing_kv_tile=self.kv_tile,
+                        strided_qk_input=self.strided_qk_input,
+                    )
                 if self.stream_output:
                     projected = replace(projected, output_buffer=x)
                 return projected
@@ -436,9 +579,19 @@ class ChunkedKitchenQKVProjector:
 class ChunkedKitchenAttentionBackend:
     name = DENSE_KITCHEN_BACKEND
 
+    def __init__(self, *, stream_output=False, query_chunk_rows=CHUNK_ROWS):
+        self.stream_output = bool(stream_output)
+        self.query_chunk_rows = int(query_chunk_rows)
+        if self.stream_output and (
+            self.query_chunk_rows <= 0 or self.query_chunk_rows % 128
+        ):
+            raise ValueError(
+                'query_chunk_rows must be a positive 128-row multiple'
+            )
+
     @property
     def installation_signature(self):
-        return (self.name,)
+        return (self.name, self.stream_output, self.query_chunk_rows)
 
     def prepare(self, *_args, **_kwargs):
         raise RuntimeError('chunked Kitchen attention requires its QKV producer')
@@ -451,7 +604,10 @@ class ChunkedKitchenAttentionBackend:
         transformer_options,
     ):
         del layer_index, transformer_options
-        if not isinstance(projected, PreparedChunkedKitchenQKV):
+        if not isinstance(
+            projected,
+            (PreparedChunkedKitchenQKV, PreparedStreamedKitchenQKV),
+        ):
             raise TypeError('chunked Kitchen attention received an invalid carrier')
         return projected
 
@@ -465,3 +621,121 @@ class ChunkedKitchenAttentionBackend:
         if kitchen is None:
             raise FusedQKVError('no INT8 attention producer is available')
         return kitchen.int8_attention_from_prequantized(prepared.carrier)
+
+    def execute_projected(self, module, prepared):
+        if not self.stream_output or prepared.output_buffer is None:
+            return None
+        if not isinstance(
+            prepared,
+            (PreparedChunkedKitchenQKV, PreparedStreamedKitchenQKV),
+        ):
+            raise TypeError('chunked Kitchen attention received an invalid carrier')
+
+        kitchen = resolve_kitchen()
+        if kitchen is None:
+            raise FusedQKVError('no INT8 attention producer is available')
+        from .native.int8_attention import OUTPUT_NHD
+
+        quantized = prepared.carrier
+        output = prepared.output_buffer
+        streamed_q = isinstance(prepared, PreparedStreamedKitchenQKV)
+        sequence = int(prepared.x.shape[0]) if streamed_q else int(quantized.q.shape[-2])
+        if not streamed_q:
+            packed_q_tiles = (sequence + 127) // 128
+            if quantized.q_scale.shape[-1] % packed_q_tiles:
+                raise FusedQKVError(
+                    'streamed dense Kitchen output received invalid Q scales'
+                )
+            scales_per_packed_q_tile = (
+                quantized.q_scale.shape[-1] // packed_q_tiles
+            )
+
+        try:
+            for start in range(0, sequence, self.query_chunk_rows):
+                stop = min(start + self.query_chunk_rows, sequence)
+                if streamed_q:
+                    held = create_held_qkv(
+                        prepared.module,
+                        prepared.x[start:start + 1],
+                        prepared.projection_mode,
+                    )
+                    held.__enter__()
+                    try:
+                        q = project_q_hnd(
+                            held,
+                            prepared.x,
+                            prepared.rope_freqs,
+                            start,
+                            stop,
+                        )
+                    finally:
+                        held.__exit__(None, None, None)
+                    q_shape = tuple(q.shape)
+                    k_shape = (
+                        q_shape[0],
+                        quantized.k.shape[1],
+                        1,
+                        q_shape[3],
+                    )
+                    spec = kitchen.int8_attention_producer_spec(
+                        q_shape,
+                        k_shape,
+                        dtype=q.dtype,
+                        device=q.device,
+                        cta_k=quantized.cta_k,
+                    )
+                    samples = q.new_zeros(
+                        k_shape[0],
+                        k_shape[1],
+                        len(spec.k_anchor_positions),
+                        k_shape[3],
+                    )
+                    anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
+                    del samples
+                    producer = kitchen.create_int8_attention_producer(spec, anchor)
+                    kitchen.quantize_int8_attention_q_chunk(
+                        producer,
+                        q,
+                        q_start=0,
+                        allow_strided_input=True,
+                    )
+                    kitchen.quantize_int8_attention_v(producer, q[..., :1, :])
+                    q_carrier = kitchen.finalize_int8_attention_producer(producer)
+                    chunk_carrier = replace(
+                        q_carrier,
+                        k=quantized.k,
+                        v=quantized.v,
+                        k_scale=quantized.k_scale,
+                        v_scale=quantized.v_scale,
+                        input_dtype=quantized.input_dtype,
+                        attention_scale=quantized.attention_scale,
+                        cta_k=quantized.cta_k,
+                        anchor_indices=quantized.anchor_indices,
+                    )
+                    q_scale = q_carrier.q_scale
+                    del q_carrier
+                else:
+                    first_scale_tile = start // 128
+                    stop_scale_tile = (stop + 127) // 128
+                    q = quantized.q[..., start:stop, :].contiguous()
+                    q_scale = quantized.q_scale[
+                        ...,
+                        first_scale_tile * scales_per_packed_q_tile:
+                        stop_scale_tile * scales_per_packed_q_tile,
+                    ].contiguous()
+                    chunk_carrier = replace(quantized, q=q, q_scale=q_scale)
+                raw = kitchen.int8_attention_from_prequantized(
+                    chunk_carrier,
+                    output_layout=OUTPUT_NHD,
+                )
+                flat = raw.transpose(1, 2).reshape(
+                    raw.shape[0],
+                    raw.shape[2],
+                    module.heads * module.head_dim,
+                )
+                with diagnostics.stage('attention_out'):
+                    output[start:stop].copy_(module.out_proj(flat.squeeze(0)))
+                del raw, flat, chunk_carrier, q, q_scale
+            return output
+        finally:
+            prepared.release()

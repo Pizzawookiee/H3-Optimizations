@@ -110,6 +110,12 @@ def format_qkv_execution(status):
                 prefix,
                 chunk_rows,
             )
+        if projector == 'streamed_dense_sage_qkv':
+            return '%s -> %s; retained native Sage K/V + %d-row Q/output slabs' % (
+                weights,
+                prefix,
+                chunk_rows,
+            )
         if projector == 'chunked_kitchen_dense_sage_qkv':
             return '%s -> %s in %d-row chunks -> dense Sage Q/K carrier; V retained in BF16' % (
                 weights,
@@ -145,6 +151,11 @@ def format_qkv_execution(status):
             chunk_rows,
         )
     if provider == 'force_convrot_int8_qkv':
+        if projector == 'streamed_dense_sage_qkv':
+            return '%s -> runtime ConvRot-256 INT8 projection; retained native Sage K/V + %d-row Q/output slabs' % (
+                weights,
+                chunk_rows,
+            )
         if projector == 'chunked_kitchen_dense_sage_qkv':
             return '%s -> runtime ConvRot-256 INT8 projection in %d-row chunks -> dense Sage Q/K carrier; V retained in BF16' % (
                 weights,

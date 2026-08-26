@@ -175,6 +175,8 @@ class DenseSelectionTests(unittest.TestCase):
             api=SimpleNamespace(version='2.2.test', kernel_name='fake'),
             allow_cpu_for_tests=True,
             runtime_listeners=(),
+            projected_q_tile=128,
+            projected_k_tile=64,
         )
         environment = SimpleNamespace(capability=(8, 9))
 
@@ -443,6 +445,8 @@ class DenseSelectionTests(unittest.TestCase):
             api=SimpleNamespace(version='2.2.test', kernel_name='fake'),
             allow_cpu_for_tests=True,
             runtime_listeners=(),
+            projected_q_tile=128,
+            projected_k_tile=64,
         )
         dense = DenseResolution(
             ATTENTION_SAGE,
@@ -467,7 +471,7 @@ class DenseSelectionTests(unittest.TestCase):
             'resolve_current_dense_attention',
             return_value=dense,
         ), patch(
-            'h3_optimizations.dense_fused_qkv.TRITON_AVAILABLE',
+            'h3_optimizations.attention.triton_i64.TRITON_AVAILABLE',
             True,
         ), patch.object(
             apply_module,
@@ -501,6 +505,8 @@ class DenseSelectionTests(unittest.TestCase):
                         self.assertTrue(
                             attention.projector.consumer_native_carrier
                         )
+                        self.assertTrue(attention.projector.streamed_q)
+                        self.assertIs(attention.backend.delegate, backend)
 
     def test_non_sm89_dense_sage_installs_architecture_carrier(self):
         backend = SimpleNamespace(
@@ -542,12 +548,10 @@ class DenseSelectionTests(unittest.TestCase):
             )
 
         self.assertTrue(qkv.fused)
-        self.assertIs(attention.backend, backend)
-        self.assertIs(attention.projector.carrier_backend, backend)
-        self.assertEqual(
-            attention.projector.qk_format,
-            'sage_per_thread_64_128',
-        )
+        self.assertIs(attention.backend.delegate, backend)
+        self.assertIs(attention.projector.backend, backend)
+        self.assertEqual(attention.projector.name, 'streamed_dense_sage_qkv')
+        self.assertTrue(attention.projector.streamed_q)
 
     def test_streaming_off_preserves_upstream_qkv_and_attention(self):
         model = FakePatcher()

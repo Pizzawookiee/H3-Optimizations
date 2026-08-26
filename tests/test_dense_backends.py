@@ -41,6 +41,7 @@ from h3_optimizations.attention.sage_mem_eff import (  # noqa: E402
     _resolve_sm89_kernel,
 )
 from h3_optimizations.dense_fused_qkv import DenseFusedQKVProjector  # noqa: E402
+import h3_optimizations.qkv.streamed as streamed_qkv  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -83,11 +84,12 @@ class FakeKernel:
     def __init__(self, expected_granularity):
         self.expected_granularity = expected_granularity
         self.v_dtype = None
+        self.shapes = []
 
     def __call__(
         self,
-        _q,
-        _k,
+        q,
+        k,
         v,
         out,
         _q_scale,
@@ -95,6 +97,7 @@ class FakeKernel:
         *args,
     ):
         self.v_dtype = v.dtype
+        self.shapes.append((q.shape[-2], k.shape[-2], v.shape[-2], out.shape[-2]))
         layout, causal, granularity, _scale, return_lse = args[-5:]
         if (
             layout != 1
@@ -127,6 +130,80 @@ class FakeFP8:
 
 
 class DenseBackendTests(unittest.TestCase):
+    def test_every_sage_architecture_executes_rectangular_q_against_global_kv(self):
+        kernel3 = FakeKernel(expected_granularity=3)
+        kernel2 = FakeKernel(expected_granularity=2)
+        fp8 = FakeFP8()
+
+        def per_block(q, k, **_kwargs):
+            return fake_thread_quantizer(q, k)
+
+        def attention(q, k, v, _q_scale, _k_scale, **kwargs):
+            return torch.zeros(q.shape, dtype=kwargs['output_dtype']), torch.empty(0)
+
+        def per_warp(q, k, km=None, **_kwargs):
+            return fake_thread_quantizer(q, k, km)
+
+        backends = (
+            SageSM75MemoryEfficientBackend(
+                api=SM86API('2.2.test', per_block, attention),
+                allow_cpu_for_tests=True,
+            ),
+            SageSM80MemoryEfficientBackend(
+                api=SM80API('2.2.test', KernelBinding(kernel3, 'sm80', 'test')),
+                quantizer=fake_thread_quantizer,
+                allow_cpu_for_tests=True,
+            ),
+            SageSM86MemoryEfficientBackend(
+                api=SM86API('2.2.test', per_block, attention),
+                allow_cpu_for_tests=True,
+            ),
+            SM89SageMemoryEfficientBackend(
+                api=SageSM89API(
+                    '2.2.test',
+                    fp8,
+                    kernel3,
+                    'sm89',
+                ),
+                quantizer=fake_thread_quantizer,
+                allow_cpu_for_tests=True,
+            ),
+            SageSM90MemoryEfficientBackend(
+                api=SM90API('2.2.test', fp8, KernelBinding(kernel3, 'sm90', 'test')),
+                quantizer=fake_thread_quantizer,
+                allow_cpu_for_tests=True,
+            ),
+            SageSM12xMemoryEfficientBackend(
+                api=SM12xAPI(
+                    '2.2.test',
+                    per_warp,
+                    fp8,
+                    KernelBinding(kernel2, 'sm12x', 'test'),
+                ),
+                allow_cpu_for_tests=True,
+            ),
+        )
+        q = torch.zeros((1, 2, 33, 128), dtype=torch.bfloat16)
+        k = torch.zeros((1, 2, 65, 128), dtype=torch.bfloat16)
+        v = torch.zeros_like(k)
+
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                q_int8, q_scale = backend.quantize_projected_q(q)
+                k_int8, k_scale = backend.quantize_projected_k(k)
+                v_carrier, v_scale = backend.prepare_streamed_v(v)
+                output = backend.execute_rectangular(
+                    q_int8,
+                    q_scale,
+                    k_int8,
+                    k_scale,
+                    v_carrier,
+                    v_scale,
+                    output_dtype=torch.bfloat16,
+                    softmax_scale=128**-0.5,
+                    layer_index=4,
+                )
+                self.assertEqual(tuple(output.shape), (1, 2, 33, 128))
     def test_dense_sage_projector_assembles_chunked_kitchen_projection(self):
         projected_ranges = []
         quantized_lengths = []
@@ -215,8 +292,9 @@ class DenseBackendTests(unittest.TestCase):
         )
         module = type('Attention', (), {'heads': 2, 'head_dim': 128})()
         source = torch.empty((257, 4), dtype=torch.bfloat16)
-        with mock.patch(
-            'h3_optimizations.qkv.streamed.create_held_qkv',
+        with mock.patch.object(
+            streamed_qkv,
+            'create_held_qkv',
             return_value=held,
         ) as factory:
             prepared = projector.project(

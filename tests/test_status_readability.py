@@ -150,6 +150,24 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             ),
         )
 
+    def test_dense_sage_reports_bounded_q_and_output(self):
+        status = {
+            'fused_qkv': {
+                'provider': 'force_bf16_qkv',
+                'projector': 'streamed_dense_sage_qkv',
+                'chunk_rows': 4096,
+                'streamed_q': True,
+            },
+            'weight_formats': {'qkv': ['Parameter:torch.bfloat16']},
+        }
+        self.assertEqual(
+            format_qkv_execution(status),
+            (
+                'BF16 weights -> forced BF16 projection; retained native '
+                'Sage K/V + 4096-row Q/output slabs'
+            ),
+        )
+
     def test_projector_name_does_not_claim_streaming_without_capability(self):
         status = {
             'fused_qkv': {

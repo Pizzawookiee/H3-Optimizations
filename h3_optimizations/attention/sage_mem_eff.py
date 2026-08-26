@@ -227,6 +227,8 @@ def first_unsafe_v_length(heads=56, head_dim=128, sequence_stride=None):
 
 class SM89SageMemoryEfficientBackend:
     name = "sage_mem_eff"
+    projected_q_tile = 128
+    projected_k_tile = 64
 
     def __init__(self, api=None, quantizer=None, allow_cpu_for_tests=False):
         self.api = api if api is not None else _load_api()
@@ -234,6 +236,32 @@ class SM89SageMemoryEfficientBackend:
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
         stats.increment("configured")
         self._logged = False
+
+    def quantize_projected_qk(self, q, k):
+        return self.quantizer(
+            q,
+            k,
+            None,
+            BLKQ=128,
+            WARPQ=32,
+            BLKK=64,
+            WARPK=64,
+            tensor_layout="HND",
+        )
+
+    def quantize_projected_q(self, q):
+        q_int8, q_scale, _k_int8, _k_scale = self.quantize_projected_qk(
+            q,
+            q[..., :1, :].contiguous(),
+        )
+        return q_int8, q_scale
+
+    def quantize_projected_k(self, k):
+        _q_int8, _q_scale, k_int8, k_scale = self.quantize_projected_qk(
+            k[..., :1, :].contiguous(),
+            k,
+        )
+        return k_int8, k_scale
 
     def _validate(self, q, k, v):
         if q.shape != k.shape or q.shape != v.shape:
@@ -268,16 +296,7 @@ class SM89SageMemoryEfficientBackend:
 
     def prepare(self, q, k, v, *, layer_index, transformer_options):
         batch, heads, sequence, head_dim = self._validate(q, k, v)
-        q_int8, q_scale, k_int8, k_scale = self.quantizer(
-            q,
-            k,
-            None,
-            BLKQ=128,
-            WARPQ=32,
-            BLKK=64,
-            WARPK=64,
-            tensor_layout="HND",
-        )
+        q_int8, q_scale, k_int8, k_scale = self.quantize_projected_qk(q, k)
 
         guarded_v = guard_v_stride(v)
         v_fp8, v_scale, _ = self.api.per_channel_fp8(
@@ -319,41 +338,83 @@ class SM89SageMemoryEfficientBackend:
         )
 
     def execute(self, prepared):
+        return self.execute_rectangular(
+            prepared.q_int8,
+            prepared.q_scale,
+            prepared.k_int8,
+            prepared.k_scale,
+            prepared.v_fp8,
+            prepared.v_scale,
+            output_dtype=prepared.output_dtype,
+            softmax_scale=prepared.softmax_scale,
+            layer_index=prepared.layer_index,
+            kernel=prepared.kernel,
+            kernel_name=prepared.kernel_name,
+        )
+
+    def prepare_streamed_v(self, v):
+        guarded_v = guard_v_stride(v)
+        v_fp8, v_scale, _ = self.api.per_channel_fp8(
+            guarded_v,
+            tensor_layout="HND",
+            scale_max=self.api.v_scale_max,
+            smooth_v=False,
+        )
+        del guarded_v
+        return v_fp8, v_scale
+
+    def execute_rectangular(
+        self,
+        q_int8,
+        q_scale,
+        k_int8,
+        k_scale,
+        v_carrier,
+        v_scale,
+        *,
+        output_dtype,
+        softmax_scale,
+        layer_index,
+        kernel=None,
+        kernel_name=None,
+    ):
+        kernel = self.api.kernel if kernel is None else kernel
+        kernel_name = self.api.kernel_name if kernel_name is None else kernel_name
         output = torch.empty(
-            prepared.q_int8.shape,
-            dtype=prepared.output_dtype,
-            device=prepared.q_int8.device,
+            q_int8.shape,
+            dtype=output_dtype,
+            device=q_int8.device,
         )
         try:
-            prepared.kernel(
-                prepared.q_int8,
-                prepared.k_int8,
-                prepared.v_fp8,
+            kernel(
+                q_int8,
+                k_int8,
+                v_carrier,
                 output,
-                prepared.q_scale,
-                prepared.k_scale,
-                prepared.v_scale,
+                q_scale,
+                k_scale,
+                v_scale,
                 1,  # HND
                 0,  # non-causal
                 3,  # per-thread Q/K quantization
-                prepared.softmax_scale,
+                softmax_scale,
                 0,  # no LSE return
             )
         except Exception as exc:
             stats.increment("kernel_errors")
-            device = prepared.q_int8.device
+            device = q_int8.device
             gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else str(device)
             raise EfficientSageError(
                 "sage_mem_eff kernel failed: layer=%d sequence=%d heads=%d head_dim=%d "
                 "dtype=%s device=%s kernel=%s SageAttention=%s"
                 % (
-                    prepared.layer_index,
-                    prepared.sequence,
-                    prepared.heads,
-                    prepared.head_dim,
-                    prepared.output_dtype,
+                    layer_index,
+                    k_int8.shape[-2],
+                    q_int8.shape[1],
+                    q_int8.shape[-1],
+                    output_dtype,
                     gpu,
-                    prepared.kernel_name,
+                    kernel_name,
                     self.api.version,
                 )
             ) from exc

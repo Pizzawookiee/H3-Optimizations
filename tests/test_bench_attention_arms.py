@@ -252,7 +252,7 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(patches[2]['inputs']['qkv'], 'convrot_int8_dense_sage')
         self.assertEqual(
             patches[2]['inputs']['projector'],
-            'chunked_kitchen_dense_sage_qkv',
+            'streamed_dense_sage_qkv',
         )
 
     def test_full_density_streamed_arm_is_100_percent(self):

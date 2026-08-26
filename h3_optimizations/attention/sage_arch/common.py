@@ -309,6 +309,22 @@ class ArchitectureBackend:
                 )
         return batch, heads, sequence, head_dim
 
+    def quantize_projected_q(self, q):
+        dummy_k = q[..., :1, :].contiguous()
+        q_int8, q_scale, _k_int8, _k_scale = self.quantize_projected_qk(
+            q,
+            dummy_k,
+        )
+        return q_int8, q_scale
+
+    def quantize_projected_k(self, k):
+        dummy_q = k[..., :1, :].contiguous()
+        _q_int8, _q_scale, k_int8, k_scale = self.quantize_projected_qk(
+            dummy_q,
+            k,
+        )
+        return k_int8, k_scale
+
     def prepared(
         self,
         q,

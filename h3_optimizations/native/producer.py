@@ -325,6 +325,71 @@ def quantize_int8_attention_qk_chunk(
     producer._k_ranges.append((k_start, k_start + k.shape[2]))
 
 
+def _dummy_chunk(spec, heads):
+    return torch.zeros(
+        spec.q_input_shape[0],
+        int(heads),
+        1,
+        spec.original_head_dim,
+        dtype=spec.input_dtype,
+        device=spec.device,
+    )
+
+
+def quantize_int8_attention_q_chunk(
+    producer, q, *, q_start, allow_strided_input=False
+):
+    """Pack Q while doing only one row of companion K work."""
+    if producer._finalized:
+        raise RuntimeError('the producer has already been finalized')
+    spec = producer.spec
+    _check_chunk(
+        'q', q_start, q.shape[2], spec.q_input_shape[2], spec.sequence_alignment
+    )
+    if spec.k_input_shape[2] != 1:
+        raise ValueError('Q-only packing requires a one-row K companion')
+    if q.dtype != spec.input_dtype:
+        raise TypeError('chunks must have dtype %r' % spec.input_dtype)
+
+    k = _dummy_chunk(spec, spec.k_input_shape[1])
+    library = loader.load()
+    with diagnostics.stage('qk_pack_input_contiguous'):
+        q = _prepare_chunk_input(q, spec.kernel_head_dim, allow_strided_input)
+        k = _prepare_chunk_input(k, spec.kernel_head_dim, False)
+    with diagnostics.stage('qk_carrier_pack'):
+        _quantize_qk_chunk(library, producer, spec, q, k, q_start, 0)
+    producer._q_ranges.append((q_start, q_start + q.shape[2]))
+    if not producer._k_ranges:
+        producer._k_ranges.append((0, 1))
+
+
+def quantize_int8_attention_k_chunk(
+    producer, k, *, k_start, allow_strided_input=False
+):
+    """Pack K while retaining only a one-row companion Q carrier."""
+    if producer._finalized:
+        raise RuntimeError('the producer has already been finalized')
+    spec = producer.spec
+    _check_chunk(
+        'k', k_start, k.shape[2], spec.k_input_shape[2], spec.sequence_alignment
+    )
+    if spec.q_input_shape[2] != 1:
+        raise ValueError('K-only packing requires a one-row Q companion')
+    if k.dtype != spec.input_dtype:
+        raise TypeError('chunks must have dtype %r' % spec.input_dtype)
+
+    q = _dummy_chunk(spec, spec.q_input_shape[1])
+    library = loader.load()
+    with diagnostics.stage('qk_pack_input_contiguous'):
+        q = _prepare_chunk_input(q, spec.kernel_head_dim, False)
+        k = _prepare_chunk_input(k, spec.kernel_head_dim, allow_strided_input)
+    with diagnostics.stage('qk_carrier_pack'):
+        _quantize_qk_chunk(library, producer, spec, q, k, 0, k_start)
+    if not producer._q_ranges:
+        producer._q_ranges.append((0, 1))
+    producer._k_ranges.append((k_start, k_start + k.shape[2]))
+
+
 def _quantize_qk_chunk(library, producer, spec, q, k, q_start, k_start):
     loader.check(
         library.h3_int8_quantize_qk_chunk(

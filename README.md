@@ -27,18 +27,20 @@ control.
   checkpoint-native ConvRot INT8 QKV streams BF16 projection, norm, and RoPE
   chunks into the routed INT8 carrier instead of materializing full-sequence
   BF16 Q/K/V. Official SageAttention2 selections use a capability-specific
-  native Q/K carrier on SM75, SM80, SM86, SM87, SM89, SM90, SM100, SM120, and
+  native K/V carrier on SM75, SM80, SM86, SM87, SM89, SM90, SM100, SM120, and
   SM121 for BF16, ConvRot-256 INT8, W4A8, and FP8 checkpoints when the installed
   Sage and source projector expose the required contract. The carrier follows
   each architecture's per-block, per-thread, or per-warp quantization and V
-  format. Comfy's known built-in attention consumers retain full BF16 K/V,
+  format, while Q and attention output stay bounded to the configured chunk
+  size. Comfy's known built-in attention consumers retain full BF16 K/V,
   stream bounded BF16 Q, and write each output-projection chunk into the
   disposable block input. Unknown explicit attention overrides preserve a
   single full-Q invocation in Auto because their callable contract is opaque.
   Overrides that explicitly implement the streamed-H3 consumer contract below
   receive bounded Q against global K/V instead.
-  An external Comfy Kitchen selection uses its streamed INT8 carrier for all
-  four formats. `Off` leaves QKV projection and attention entirely upstream;
+  An external Comfy Kitchen selection retains global INT8 K/V while streaming
+  bounded Q and output-projection slabs for all four formats. `Off` leaves QKV
+  projection and attention entirely upstream;
   `Forced` may replace dense attention with the private full-density Kitchen
   path. Native ConvRot, W4A8, and FP8 expose separate K/V-only and Q-only
   projections, so bounded-query consumers do not repeat the complete QKV
