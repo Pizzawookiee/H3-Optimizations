@@ -6,6 +6,8 @@ executor, and spec remain importable so existing tests/benchmarks and saved
 integrations keep their low-level ABI.
 '''
 
+import torch
+
 from . import triton_sparse_fast as _legacy
 from .triton_sparse_fast import (  # legacy low-level compatibility
     PreparedTritonSparse,
@@ -18,14 +20,25 @@ from .triton_kitchen import (
     TritonKitchenBackend,
     TritonKitchenError,
 )
+from .triton_kitchen_sm120 import SM120TritonKitchenBackend
 
 
-TritonSparseBackend = TritonKitchenBackend
 TritonSparseError = TritonKitchenError
 
 
+def TritonSparseBackend(config=None, **kwargs):
+    '''Construct the Kitchen-parity backend appropriate for this CUDA target.'''
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability())
+    backend = (
+        SM120TritonKitchenBackend
+        if capability == (12, 0)
+        else TritonKitchenBackend
+    )
+    return backend(config, **kwargs)
+
+
 def preflight_triton_sparse(**kwargs):
-    '''Keep the historical spec ABI but translate preflight errors uniformly.'''
+    '''Keep the historical spec ABI while translating preflight errors uniformly.'''
     try:
         return _legacy.preflight_triton_sparse(**kwargs)
     except _legacy.TritonSparseError as exc:

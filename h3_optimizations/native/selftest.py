@@ -4,9 +4,11 @@ The library is compiled for several architectures and validated directly on
 one. A prebuilt binary makes "it was built for this card" an assumption rather
 than something anyone checked, so check it here once and cache the verdict.
 
-The dense kernel, baseline 128x128 sparse kernel, and sparse LSE path form the
-backend-wide gate. Each shipped sparse geometry is then validated independently
-so a bad optional geometry does not disable working native fallbacks.
+The dense CTA_K=64 carrier path is the common producer gate. Sparse geometries
+are validated independently: production Kitchen is usable when either 64x64 or
+its carrier-compatible 128x64 fallback passes. The legacy 128x128/LSE path is
+validated only when an LSE-dependent experimental backend explicitly asks for
+it, so it cannot disable normal Kitchen.
 
 Blackwell deliberately uses different probability math for short CTA_K=64
 dense rows. Sparse kernels use the fused path. Geometry parity therefore runs
@@ -31,10 +33,12 @@ _CACHE = pathlib.Path(__file__).resolve().parent.parent.parent / 'native' / 'sel
 _lock = threading.Lock()
 _result = None
 _detail_result = None
+_lse_lock = threading.Lock()
+_lse_results = {}
 
 # Bump whenever the meaning of a cached pass/fail changes without changing the
 # native binary build ID. Otherwise an old failure can survive a Python-only fix.
-_SELFTEST_REVISION = 'v5'
+_SELFTEST_REVISION = 'v6'
 
 # K > 512 is intentional. Blackwell's dense CTA_K=64 launcher chooses a
 # lower-pressure probability path at K <= 512 while sparse always uses fused
@@ -44,7 +48,7 @@ _BATCH, _HEADS, _Q_LEN, _KV_LEN, _HEAD_DIM = 1, 4, 640, 640, 128
 # Keep this local to the native startup layer: importing the high-level sparse
 # backend here would pull Comfy runtime modules into pre-startup initialization.
 _SPARSE_PARITY_GEOMETRIES = ((128, 128), (128, 64), (64, 64))
-_BASELINE_GEOMETRY = (128, 128)
+_PRODUCTION_GEOMETRIES = ((64, 64), (128, 64))
 
 # Healthy INT8 error is ~0.016 relative L2; the mildest corruption injected in
 # testing produced 0.42. This sits between, well clear of both.
@@ -107,22 +111,46 @@ def _write_cache(cache):
         pass
 
 
+def _samples(device, seed=20260823):
+    generator = torch.Generator(device=device).manual_seed(seed)
+    return tuple(
+        torch.randn(
+            _BATCH, _Q_LEN, _HEADS, _HEAD_DIM,
+            device=device, dtype=torch.bfloat16, generator=generator,
+        ).transpose(1, 2)
+        for _ in range(3)
+    )
+
+
+def _full_route(native, device, q_tile, kv_tile):
+    kv_tiles = (_KV_LEN + kv_tile - 1) // kv_tile
+    q_tiles = (_Q_LEN + q_tile - 1) // q_tile
+    indices = torch.arange(kv_tiles, dtype=torch.int32, device=device)
+    return native.BlockSparseRoute(
+        indices=indices.view(1, 1, 1, -1)
+        .expand(_BATCH, _HEADS, q_tiles, -1)
+        .contiguous(),
+        counts=torch.full(
+            (_BATCH, _HEADS, q_tiles), kv_tiles,
+            dtype=torch.int32, device=device,
+        ),
+        q_tile=q_tile,
+        kv_tile=kv_tile,
+        encoding='absolute',
+    )
+
+
 def run(device=None, *, verbose=False):
-    """Return (backend_passed, detail). Never raises on a kernel fault."""
+    """Return (production_passed, detail). Never raises on a kernel fault."""
     from . import int8_attention as native
 
     device = torch.device('cuda' if device is None else device)
     detail = {}
     try:
-        generator = torch.Generator(device=device).manual_seed(20260823)
-        q, k, v = (
-            torch.randn(
-                _BATCH, _Q_LEN, _HEADS, _HEAD_DIM,
-                device=device, dtype=torch.bfloat16, generator=generator,
-            ).transpose(1, 2)
-            for _ in range(3)
-        )
+        q, k, v = _samples(device)
 
+        # At 640 rows this uses CTA_K=64, exactly the carrier required by the
+        # production 64x64 and 128x64 sparse geometries.
         dense_carrier = native.prequantize_int8_attention(q, k, v)
         dense = native.int8_attention_from_prequantized(dense_carrier)
         reference = torch.nn.functional.scaled_dot_product_attention(
@@ -130,12 +158,12 @@ def run(device=None, *, verbose=False):
         ).to(torch.bfloat16)
         int8_error = _relative_l2(dense, reference)
         detail['int8_vs_sdpa_rel_l2'] = round(int8_error, 6)
-        leg1 = int8_error < _INT8_TOLERANCE and bool(torch.isfinite(dense).all())
+        dense_ok = int8_error < _INT8_TOLERANCE and bool(torch.isfinite(dense).all())
+        detail['dense_int8_passed'] = bool(dense_ok)
 
         carriers = {}
         dense_by_kv = {}
         parity = {}
-        lse_case = None
         for q_tile, kv_tile in _SPARSE_PARITY_GEOMETRIES:
             key = _geometry_key(q_tile, kv_tile)
             try:
@@ -148,21 +176,7 @@ def run(device=None, *, verbose=False):
                         carrier
                     )
                 carrier = carriers[kv_tile]
-                kv_tiles = (_KV_LEN + kv_tile - 1) // kv_tile
-                q_tiles = (_Q_LEN + q_tile - 1) // q_tile
-                indices = torch.arange(kv_tiles, dtype=torch.int32, device=device)
-                route = native.BlockSparseRoute(
-                    indices=indices.view(1, 1, 1, -1)
-                    .expand(_BATCH, _HEADS, q_tiles, -1)
-                    .contiguous(),
-                    counts=torch.full(
-                        (_BATCH, _HEADS, q_tiles), kv_tiles,
-                        dtype=torch.int32, device=device,
-                    ),
-                    q_tile=q_tile,
-                    kv_tile=kv_tile,
-                    encoding='absolute',
-                )
+                route = _full_route(native, device, q_tile, kv_tile)
                 # The self-test is the authority that populates the geometry
                 # verdict, so bypass the runtime geometry gate here. Calling
                 # the normal gated path would recurse back into this test.
@@ -171,8 +185,6 @@ def run(device=None, *, verbose=False):
                 )
                 torch.cuda.synchronize(device)
                 parity[key] = torch.equal(routed, dense_by_kv[kv_tile])
-                if (q_tile, kv_tile) == _BASELINE_GEOMETRY:
-                    lse_case = carrier, route, routed
             except Exception as error:  # geometry-local rejection when possible
                 parity[key] = False
                 detail.setdefault('geometry_errors', {})[key] = (
@@ -180,46 +192,70 @@ def run(device=None, *, verbose=False):
                 )
         detail['full_route_bit_identical'] = parity
 
-        baseline_key = _geometry_key(*_BASELINE_GEOMETRY)
-        leg2 = bool(parity.get(baseline_key, False))
-        if lse_case is None:
-            leg3 = False
-            detail['sparse_lse_output_bit_identical'] = False
-            detail['sparse_lse_max_abs'] = None
-        else:
-            parity_carrier, route, routed = lse_case
-            routed_lse_output, routed_lse = (
-                native.block_sparse_int8_attention_with_lse_from_prequantized(
-                    parity_carrier,
-                    route,
-                    validate_geometry=False,
-                )
-            )
-            lse_reference = _carrier_lse_reference(parity_carrier)
-            lse_error = (routed_lse - lse_reference).abs().max().item()
-            leg3 = (
-                torch.equal(routed_lse_output, routed)
-                and bool(torch.isfinite(routed_lse).all())
-                and lse_error < 0.02
-            )
-            detail['sparse_lse_output_bit_identical'] = torch.equal(
-                routed_lse_output, routed
-            )
-            detail['sparse_lse_max_abs'] = round(lse_error, 6)
-
+        production_sparse_ok = any(
+            bool(parity.get(_geometry_key(*geometry), False))
+            for geometry in _PRODUCTION_GEOMETRIES
+        )
+        detail['production_sparse_passed'] = bool(production_sparse_ok)
         torch.cuda.synchronize(device)
     except Exception as error:  # noqa: BLE001 - reporting is the job
         detail['error'] = '%s: %s' % (type(error).__name__, error)
+        detail.setdefault('dense_int8_passed', False)
+        detail.setdefault('production_sparse_passed', False)
         return False, detail
 
-    passed = bool(leg1 and leg2 and leg3)
+    passed = bool(dense_ok and production_sparse_ok)
     if verbose:
         print('  dense INT8 vs FP32 SDPA : rel_l2 %.6f (tolerance %s) %s'
-              % (int8_error, _INT8_TOLERANCE, 'ok' if leg1 else 'FAIL'))
+              % (int8_error, _INT8_TOLERANCE, 'ok' if dense_ok else 'FAIL'))
         print('  100%% route vs dense     : %s'
               % ', '.join('%s=%s' % item for item in parity.items()))
-        print('  sparse output + LSE      : %s'
-              % ('ok' if leg3 else 'FAIL'))
+        print('  production 64KV sparse  : %s'
+              % ('ok' if production_sparse_ok else 'FAIL'))
+    return passed, detail
+
+
+def run_lse(device=None):
+    """Validate the legacy 128x128 sparse-LSE path independently."""
+    from . import int8_attention as native
+
+    device = torch.device('cuda' if device is None else device)
+    detail = {}
+    try:
+        q, k, v = _samples(device, seed=20260824)
+        carrier = native.prequantize_int8_attention(q, k, v, cta_k=128)
+        dense = native.int8_attention_from_prequantized(carrier)
+        route = _full_route(native, device, 128, 128)
+        routed = native.block_sparse_int8_attention_from_prequantized(
+            carrier, route, validate_geometry=False
+        )
+        routed_lse_output, routed_lse = (
+            native.block_sparse_int8_attention_with_lse_from_prequantized(
+                carrier,
+                route,
+                validate_geometry=False,
+            )
+        )
+        lse_reference = _carrier_lse_reference(carrier)
+        lse_error = (routed_lse - lse_reference).abs().max().item()
+        parity = torch.equal(routed, dense)
+        output_parity = torch.equal(routed_lse_output, routed)
+        finite = bool(torch.isfinite(routed_lse).all())
+        torch.cuda.synchronize(device)
+    except Exception as error:  # noqa: BLE001 - reporting is the job
+        detail['error'] = '%s: %s' % (type(error).__name__, error)
+        detail['passed'] = False
+        return False, detail
+
+    passed = bool(parity and output_parity and finite and lse_error < 0.02)
+    detail.update(
+        {
+            '128x128_full_route_bit_identical': bool(parity),
+            'sparse_lse_output_bit_identical': bool(output_parity),
+            'sparse_lse_max_abs': round(lse_error, 6),
+            'passed': passed,
+        }
+    )
     return passed, detail
 
 
@@ -247,8 +283,8 @@ def _load_result(device=None, *, force=False):
         _result, _detail_result = passed, detail
         if not passed:
             logging.warning(
-                '%s NATIVE SELF-TEST FAILED on %s - refusing the native '
-                'backend. Detail: %s',
+                '%s NATIVE PRODUCTION SELF-TEST FAILED on %s - refusing the '
+                'native Kitchen production path. Detail: %s',
                 LOG_PREFIX, key, detail,
             )
         else:
@@ -259,15 +295,15 @@ def _load_result(device=None, *, force=False):
             ]
             if failed:
                 logging.warning(
-                    '%s native backend passed but sparse geometries %s failed; '
-                    'they will be skipped in the fallback ladder. Detail: %s',
+                    '%s native production path passed but sparse geometries %s '
+                    'failed; they will be skipped independently. Detail: %s',
                     LOG_PREFIX, ', '.join(failed), detail,
                 )
         return _result, _detail_result
 
 
 def check(device=None, *, force=False):
-    """Cached backend-wide gate for dense/native producer functionality."""
+    """Cached gate for the production Kitchen carrier + 64KV sparse path."""
     return _load_result(device, force=force)[0]
 
 
@@ -276,8 +312,26 @@ def sparse_geometry_check(q_tile, kv_tile, device=None, *, force=False):
     geometry = (int(q_tile), int(kv_tile))
     if geometry not in _SPARSE_PARITY_GEOMETRIES:
         return False
-    passed, detail = _load_result(device, force=force)
-    if not passed:
+    _passed, detail = _load_result(device, force=force)
+    if not bool(detail.get('dense_int8_passed', False)):
         return False
     parity = detail.get('full_route_bit_identical', {})
     return bool(parity.get(_geometry_key(*geometry), False))
+
+
+def sparse_lse_check(device=None, *, force=False):
+    """Whether the separately tested native 128x128 sparse-LSE path is healthy."""
+    if not torch.cuda.is_available() or not loader.is_available():
+        return False
+    key = _cache_key(device)
+    with _lse_lock:
+        if not force and key in _lse_results:
+            return bool(_lse_results[key]['passed'])
+        passed, detail = run_lse(device)
+        _lse_results[key] = detail
+        if not passed:
+            logging.warning(
+                '%s NATIVE SPARSE-LSE SELF-TEST FAILED on %s. Detail: %s',
+                LOG_PREFIX, key, detail,
+            )
+        return passed

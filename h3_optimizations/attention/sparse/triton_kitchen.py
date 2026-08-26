@@ -219,25 +219,30 @@ if TRITON_AVAILABLE:
         q_tiles,
         KV_BLOCKS: tl.constexpr,
         softmax_scale: tl.constexpr,
+        Q_TILE_: tl.constexpr,
+        KV_TILE_: tl.constexpr,
+        D: tl.constexpr,
+        LOG2E_: tl.constexpr,
+        S_U8_OFFSET_: tl.constexpr,
         OUTPUT_BF16: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
         work = tl.program_id(0).to(tl.int64)
         bh = tl.program_id(1).to(tl.int64)
-        subblocks = Q_TILE // BLOCK_M
+        subblocks = Q_TILE_ // BLOCK_M
         q_block = work // subblocks
         q_sub = work - q_block * subblocks
         if q_block >= q_tiles:
             return
 
-        q_rows = q_block * Q_TILE + q_sub * BLOCK_M + tl.arange(0, BLOCK_M)
-        dims = tl.arange(0, HEAD_DIM)
-        kv_rows = tl.arange(0, KV_TILE)
+        q_rows = q_block * Q_TILE_ + q_sub * BLOCK_M + tl.arange(0, BLOCK_M)
+        dims = tl.arange(0, D)
+        kv_rows = tl.arange(0, KV_TILE_)
         q_mask = q_rows < sequence
-        hnd_base = bh * sequence * HEAD_DIM
+        hnd_base = bh * sequence * D
 
         q = tl.load(
-            Q + hnd_base + q_rows[:, None] * HEAD_DIM + dims[None, :],
+            Q + hnd_base + q_rows[:, None] * D + dims[None, :],
             mask=q_mask[:, None],
             other=0,
         ).to(tl.int8)
@@ -251,7 +256,7 @@ if TRITON_AVAILABLE:
 
         m_i = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
         d_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
 
         route_row = bh * q_tiles + q_block
         lut_base = LUT + route_row * KV_BLOCKS
@@ -261,10 +266,10 @@ if TRITON_AVAILABLE:
 
         for slot in tl.range(0, valid):
             key_block += tl.load(lut_base + slot).to(tl.int32)
-            k_positions = key_block * KV_TILE + kv_rows
+            k_positions = key_block * KV_TILE_ + kv_rows
             k_valid = k_positions < sequence
             k = tl.load(
-                K + hnd_base + k_positions[None, :] * HEAD_DIM + dims[:, None],
+                K + hnd_base + k_positions[None, :] * D + dims[:, None],
                 mask=k_valid[None, :],
                 other=0,
             ).to(tl.int8)
@@ -278,12 +283,12 @@ if TRITON_AVAILABLE:
                 q_scale[:, None]
                 * k_scale[None, :]
                 * softmax_scale
-                * LOG2E
+                * LOG2E_
             )
             logits = tl.where(k_valid[None, :], logits, -float('inf'))
 
             tile_max = tl.max(logits, axis=1)
-            tile_m = tile_max - S_U8_OFFSET
+            tile_m = tile_max - S_U8_OFFSET_
             new_m = tl.maximum(m_i, tile_m)
             o_scale = tl.math.exp2(m_i - new_m)
             tile_scale = tl.math.exp2(tile_m - new_m)
@@ -297,7 +302,7 @@ if TRITON_AVAILABLE:
             v_positions = _v_perm16(k_positions)
             v = tl.load(
                 V
-                + (bh * HEAD_DIM + dims[None, :]) * padded_sequence
+                + (bh * D + dims[None, :]) * padded_sequence
                 + v_positions[:, None],
             ).to(tl.int8)
             v_sum = tl.sum(v.to(tl.int32), axis=0)
@@ -311,11 +316,11 @@ if TRITON_AVAILABLE:
             m_i = new_m
 
         v_scale = tl.load(
-            V_SCALE + bh * HEAD_DIM + dims
+            V_SCALE + bh * D + dims
         ).to(tl.float32)
         output = (acc / d_i[:, None]) * v_scale[None, :]
         tl.store(
-            O + hnd_base + q_rows[:, None] * HEAD_DIM + dims[None, :],
+            O + hnd_base + q_rows[:, None] * D + dims[None, :],
             output.to(O.type.element_ty),
             mask=q_mask[:, None],
         )
@@ -352,6 +357,11 @@ def _launch(carrier, lut, valid):
         q_tiles,
         KV_BLOCKS=kv_blocks,
         softmax_scale=float(carrier.attention_scale),
+        Q_TILE_=Q_TILE,
+        KV_TILE_=KV_TILE,
+        D=HEAD_DIM,
+        LOG2E_=LOG2E,
+        S_U8_OFFSET_=S_U8_OFFSET,
         OUTPUT_BF16=carrier.input_dtype == torch.bfloat16,
     )
     return output
