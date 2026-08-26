@@ -59,6 +59,7 @@ class PreparedStreamedDenseBF16QKV:
     v: torch.Tensor
     rope_freqs: torch.Tensor | None
     held: object
+    binding_factory: Callable[[], object] | None
     chunk_rows: int
     projection_mode: str
 
@@ -71,10 +72,28 @@ class PreparedStreamedDenseBF16QKV:
 
         for start in range(0, self.sequence, self.chunk_rows):
             end = min(start + self.chunk_rows, self.sequence)
-            yield start, end, project_q_hnd(
-                self.held,
-                self.x, self.rope_freqs, start, end
-            )
+            if self.held is not None:
+                q = project_q_hnd(
+                    self.held,
+                    self.x,
+                    self.rope_freqs,
+                    start,
+                    end,
+                )
+            else:
+                held = self.binding_factory()
+                held.__enter__()
+                try:
+                    q = project_q_hnd(
+                        held,
+                        self.x,
+                        self.rope_freqs,
+                        start,
+                        end,
+                    )
+                finally:
+                    held.__exit__(None, None, None)
+            yield start, end, q
 
     def release(self):
         held, self.held = self.held, None
@@ -82,6 +101,12 @@ class PreparedStreamedDenseBF16QKV:
             held.__exit__(None, None, None)
         self.x = None
         self.k = self.v = self.rope_freqs = None
+        self.binding_factory = None
+
+
+def _held_cast_handle(held):
+    binding = getattr(held, 'binding', held)
+    return getattr(binding, 'handle', None)
 
 
 class HeldBF16QKV:
@@ -469,15 +494,18 @@ class StreamedDenseBF16QKVProjector(ChunkedBF16QKVProjector):
         k_full = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
         v_full = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
         dtype = str(getattr(fmt, 'logical_dtype', '')).lower()
-        held = (
-            HeldBF16QKV(module, x[:1])
-            if (
-                self.projection_mode == PROJECTION_NATIVE
-                and fmt.plain_float
-                and ('bfloat16' in dtype or 'bf16' in dtype)
+        def binding_factory():
+            return (
+                HeldBF16QKV(module, x[:1])
+                if (
+                    self.projection_mode == PROJECTION_NATIVE
+                    and fmt.plain_float
+                    and ('bfloat16' in dtype or 'bf16' in dtype)
+                )
+                else create_held_qkv(module, x[:1], self.projection_mode)
             )
-            else create_held_qkv(module, x[:1], self.projection_mode)
-        )
+
+        held = binding_factory()
         held.__enter__()
         try:
             for start in range(0, sequence, self.chunk_rows):
@@ -496,15 +524,20 @@ class StreamedDenseBF16QKVProjector(ChunkedBF16QKVProjector):
                 k_full[:, :, start:end, :].copy_(k)
                 v_full[:, :, start:end, :].copy_(v)
                 del k, v
+            if _held_cast_handle(held) is not None:
+                held.__exit__(None, None, None)
+                held = None
             return PreparedStreamedDenseBF16QKV(
                 x=x,
                 k=k_full,
                 v=v_full,
                 rope_freqs=rope_freqs,
                 held=held,
+                binding_factory=(binding_factory if held is None else None),
                 chunk_rows=self.chunk_rows,
                 projection_mode=self.projection_mode,
             )
         except Exception:
-            held.__exit__(None, None, None)
+            if held is not None:
+                held.__exit__(None, None, None)
             raise

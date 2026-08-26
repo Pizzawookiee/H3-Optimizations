@@ -87,26 +87,28 @@ class StreamedSparseSageTests(unittest.TestCase):
         )
         route_plan, actual_meta = streamed._prepare_streamed_route_plan(
             router,
-            q_summary,
             k_summary,
             layout,
             0.5,
         )
-        pieces = list(
-            streamed._iter_streamed_lut_chunks(
-                router,
-                route_plan,
-                q_chunk_tiles=2,
-                device=q_summary.device,
+        pieces = []
+        for tile_start in range(0, q_summary.shape[-2], 2):
+            tile_end = min(tile_start + 2, q_summary.shape[-2])
+            pieces.append(
+                streamed._build_streamed_lut_chunk(
+                    router,
+                    route_plan,
+                    q_summary[..., tile_start:tile_end, :],
+                    tile_start=tile_start,
+                )
             )
-        )
-        actual_lut = torch.cat([piece[2] for piece in pieces], dim=2)
-        actual_valid = torch.cat([piece[3] for piece in pieces], dim=2)
+        actual_lut = torch.cat([piece[0] for piece in pieces], dim=2)
+        actual_valid = torch.cat([piece[1] for piece in pieces], dim=2)
 
         self.assertTrue(torch.equal(actual_lut, expected_lut))
         self.assertTrue(torch.equal(actual_valid, expected_valid))
         self.assertEqual(actual_meta.as_dict(), expected_meta.as_dict())
-        self.assertLess(route_plan.indices.numel(), expected_lut.numel())
+        self.assertEqual(route_plan.k_summary.data_ptr(), k_summary.data_ptr())
 
     def test_projector_keeps_no_full_q_carrier(self):
         sequence = 300
@@ -141,8 +143,7 @@ class StreamedSparseSageTests(unittest.TestCase):
         self.assertFalse(hasattr(projected, 'q_int8'))
         self.assertEqual(tuple(projected.k_int8.shape), (1, 2, sequence, 128))
         self.assertEqual(tuple(projected.k_scale.shape), (1, 2, 5))
-        self.assertEqual(tuple(projected.q_summary.shape), (1, 2, 3, 128))
-        self.assertEqual(float(projected.q_summary[0, 0, -1, 0]), 277.5)
+        self.assertFalse(hasattr(projected, 'q_summary'))
         self.assertEqual(float(projected.k_summary[0, 0, -1, 0]), 377.5)
         self.assertEqual(float(projected.v[0, 0, -1, 0]), 499.0)
         self.assertEqual(projected.query_chunk_rows, 256)

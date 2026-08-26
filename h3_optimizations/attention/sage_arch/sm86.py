@@ -26,6 +26,9 @@ class SageSM86MemoryEfficientBackend(ArchitectureBackend):
 
     name = "sage_mem_eff_sm86"
     capabilities = frozenset({(8, 6)})
+    projected_qkv_format = "sage_per_block_128_64"
+    projected_q_tile = 128
+    projected_k_tile = 64
 
     def __init__(
         self,
@@ -58,6 +61,17 @@ class SageSM86MemoryEfficientBackend(ArchitectureBackend):
             )
         self.api = api
 
+    def quantize_projected_qk(self, q, k):
+        return self.api.quantizer(
+            q,
+            k,
+            km=None,
+            BLKQ=128,
+            BLKK=64,
+            sm_scale=q.shape[-1] ** -0.5,
+            tensor_layout="HND",
+        )
+
     def prepare(
         self,
         q,
@@ -74,16 +88,9 @@ class SageSM86MemoryEfficientBackend(ArchitectureBackend):
         )
         q_source = guard_signed_offsets(q)
         k_source = guard_signed_offsets(k)
-        q_int8, q_scale, k_int8, k_scale = (
-            self.api.quantizer(
-                q_source,
-                k_source,
-                km=None,
-                BLKQ=128,
-                BLKK=64,
-                sm_scale=head_dim**-0.5,
-                tensor_layout="HND",
-            )
+        q_int8, q_scale, k_int8, k_scale = self.quantize_projected_qk(
+            q_source,
+            k_source,
         )
         v_source = independent_contiguous(v)
         del q_source, k_source

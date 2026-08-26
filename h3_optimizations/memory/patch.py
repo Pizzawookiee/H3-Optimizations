@@ -107,7 +107,7 @@ def install(model_patcher, config=None):
                 original_forward=block.forward,
             ),
         )
-    logging.info(
+    logging.debug(
         '[H3 Optimizations] patched %d MLP blocks: mode=%s chunk_rows=%d',
         len(blocks),
         config.mode,

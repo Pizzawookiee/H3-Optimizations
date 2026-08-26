@@ -19,6 +19,7 @@ from ..plan import (
 )
 
 QKV_STREAMED_SPARSE_SAGE = base.QKV_SPARSE_CONVROT_INT8
+DENSE_SAGE_PREFIX = 'dense_sage_sm'
 DENSE_SAGE_SM89 = 'dense_sage_sm89'
 
 _KITCHEN_CARRIER_CONSUMERS = {
@@ -226,11 +227,11 @@ def resolve_qkv_provider(
         return base._required_or_standard(request, 'the H3 model has no QKV projection inventory')
     if not inventory.homogeneous('qkv'):
         return base._required_or_standard(request, 'H3 QKV layers use mixed weight formats')
-    if backend_kind == DENSE_SAGE_SM89:
+    if backend_kind.startswith(DENSE_SAGE_PREFIX):
         if not triton_available:
             return base._required_or_standard(
                 request,
-                'the direct SageAttention Q/K carrier producer requires Triton',
+                'the direct SageAttention Q/K carrier producer is unavailable',
             )
         fmt = _native_stream_format(inventory)
         if fmt is None:

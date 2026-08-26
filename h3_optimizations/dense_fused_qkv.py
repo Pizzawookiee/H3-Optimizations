@@ -1,13 +1,14 @@
-"""Chunked Kitchen H3 QKV production for the dense SM89 SageAttention ABI.
+"""Chunked H3 QKV production for dense SageAttention2 carrier ABIs.
 
-Sparse Sage consumes one scale per 128Q/64KV tile. Dense SageAttention's
-quantization mode 3 consumes its per-thread scale layout instead. The production
-projector keeps each ConvRot QKV slab on the existing Kitchen linear path, then
-packs Q/K into Sage's carrier. The older all-in-one Triton experiment remains as
-``run_dense_fused_qkv`` for direct benchmarks only.
+The active architecture backend owns Q/K quantization granularity and tile
+geometry. The projector keeps each source QKV slab bounded, then packs Q/K into
+that backend's native carrier. The older SM89 all-in-one Triton experiment
+remains as ``run_dense_fused_qkv`` for direct benchmarks only.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 
@@ -223,7 +224,7 @@ def run_dense_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None)
 
 
 class DenseFusedQKVProjector:
-    """Chunk Kitchen QKV projection directly into the dense Sage carrier."""
+    """Chunk QKV projection directly into one dense Sage carrier contract."""
 
     name = "chunked_kitchen_dense_sage_qkv"
     qk_format = DENSE_QK_FORMAT
@@ -235,16 +236,37 @@ class DenseFusedQKVProjector:
         quantizer=None,
         project_chunk=None,
         projection_mode="native",
+        carrier_backend=None,
         allow_cpu_for_tests=False,
     ):
         self.chunk_rows = int(chunk_rows)
-        self.quantizer = quantizer or per_thread_int8_i64
+        self.carrier_backend = carrier_backend
+        self.quantizer = (
+            carrier_backend.quantize_projected_qk
+            if carrier_backend is not None
+            else (quantizer or per_thread_int8_i64)
+        )
         self.project_chunk = project_chunk
         self.projection_mode = projection_mode
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
         self.consumer_native_carrier = True
-        if self.chunk_rows <= 0 or self.chunk_rows % Q_TILE:
-            raise ValueError("dense Sage QKV chunk rows must be divisible by 128")
+        self.qk_format = (
+            carrier_backend.projected_qkv_format
+            if carrier_backend is not None
+            else DENSE_QK_FORMAT
+        )
+        q_tile = int(
+            getattr(carrier_backend, "projected_q_tile", Q_TILE)
+        )
+        k_tile = int(
+            getattr(carrier_backend, "projected_k_tile", K_TILE)
+        )
+        chunk_multiple = math.lcm(q_tile, k_tile)
+        if self.chunk_rows <= 0 or self.chunk_rows % chunk_multiple:
+            raise ValueError(
+                "dense Sage QKV chunk rows must be divisible by %d"
+                % chunk_multiple
+            )
 
     @property
     def installation_signature(self):
@@ -261,6 +283,7 @@ class DenseFusedQKVProjector:
             self.qk_format,
             self.chunk_rows,
             self.projection_mode,
+            self.qk_format,
             identity(self.quantizer),
             identity(self.project_chunk),
         )
@@ -270,11 +293,11 @@ class DenseFusedQKVProjector:
 
     def project(self, module, x, rope_freqs, *, layer_index, transformer_options):
         del transformer_options
-        if x.ndim != 2 or x.dtype != torch.bfloat16 or (
+        if x.ndim != 2 or x.dtype not in (torch.float16, torch.bfloat16) or (
             not self.allow_cpu_for_tests and not x.is_cuda
         ):
             raise DenseFusedQKVError(
-                "chunked dense Sage QKV requires rank-2 CUDA BF16 activations"
+                "chunked dense Sage QKV requires rank-2 CUDA BF16/FP16 activations"
             )
         if int(module.head_dim) != HEAD_DIM:
             raise DenseFusedQKVError("chunked dense Sage QKV requires head_dim 128")
@@ -285,10 +308,17 @@ class DenseFusedQKVProjector:
         q_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
         k_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
         v = torch.empty(shape, dtype=x.dtype, device=x.device)
-        q_scales = ((sequence + Q_TILE - 1) // Q_TILE) * Q_SCALES_PER_TILE
-        k_scales = ((sequence + K_TILE - 1) // K_TILE) * K_SCALES_PER_TILE
-        q_scale = torch.empty((1, heads, q_scales), dtype=torch.float32, device=x.device)
-        k_scale = torch.empty((1, heads, k_scales), dtype=torch.float32, device=x.device)
+        architecture_carrier = self.carrier_backend is not None
+        if architecture_carrier:
+            q_scale_chunks = []
+            k_scale_chunks = []
+            q_scale = None
+            k_scale = None
+        else:
+            q_scales = ((sequence + Q_TILE - 1) // Q_TILE) * Q_SCALES_PER_TILE
+            k_scales = ((sequence + K_TILE - 1) // K_TILE) * K_SCALES_PER_TILE
+            q_scale = torch.empty((1, heads, q_scales), dtype=torch.float32, device=x.device)
+            k_scale = torch.empty((1, heads, k_scales), dtype=torch.float32, device=x.device)
         q_scale_start = 0
         k_scale_start = 0
 
@@ -312,44 +342,58 @@ class DenseFusedQKVProjector:
                         start,
                         stop,
                     )
-                chunk_q, chunk_q_scale, chunk_k, chunk_k_scale = self.quantizer(
-                    q_chunk,
-                    k_chunk,
-                    None,
-                    BLKQ=Q_TILE,
-                    WARPQ=32,
-                    BLKK=K_TILE,
-                    WARPK=64,
-                    tensor_layout="HND",
-                )
+                if architecture_carrier:
+                    chunk_q, chunk_q_scale, chunk_k, chunk_k_scale = (
+                        self.quantizer(q_chunk, k_chunk)
+                    )
+                else:
+                    chunk_q, chunk_q_scale, chunk_k, chunk_k_scale = self.quantizer(
+                        q_chunk,
+                        k_chunk,
+                        None,
+                        BLKQ=Q_TILE,
+                        WARPQ=32,
+                        BLKK=K_TILE,
+                        WARPK=64,
+                        tensor_layout="HND",
+                    )
                 q_int8[:, :, start:stop, :].copy_(chunk_q)
                 k_int8[:, :, start:stop, :].copy_(chunk_k)
                 v[:, :, start:stop, :].copy_(v_chunk)
-                q_scale_stop = q_scale_start + int(chunk_q_scale.shape[-1])
-                k_scale_stop = k_scale_start + int(chunk_k_scale.shape[-1])
-                q_scale[:, :, q_scale_start:q_scale_stop].copy_(chunk_q_scale)
-                k_scale[:, :, k_scale_start:k_scale_stop].copy_(chunk_k_scale)
-                q_scale_start = q_scale_stop
-                k_scale_start = k_scale_stop
+                if architecture_carrier:
+                    q_scale_chunks.append(chunk_q_scale)
+                    k_scale_chunks.append(chunk_k_scale)
+                else:
+                    q_scale_stop = q_scale_start + int(chunk_q_scale.shape[-1])
+                    k_scale_stop = k_scale_start + int(chunk_k_scale.shape[-1])
+                    q_scale[:, :, q_scale_start:q_scale_stop].copy_(chunk_q_scale)
+                    k_scale[:, :, k_scale_start:k_scale_stop].copy_(chunk_k_scale)
+                    q_scale_start = q_scale_stop
+                    k_scale_start = k_scale_stop
                 del q_chunk, k_chunk, v_chunk, chunk_q, chunk_k
                 del chunk_q_scale, chunk_k_scale
         finally:
             if held is not None:
                 held.__exit__(None, None, None)
 
-        if q_scale_start != q_scales or k_scale_start != k_scales:
+        if architecture_carrier:
+            q_scale = torch.cat(q_scale_chunks, dim=-1).contiguous()
+            k_scale = torch.cat(k_scale_chunks, dim=-1).contiguous()
+        elif q_scale_start != q_scales or k_scale_start != k_scales:
             raise DenseFusedQKVError("chunked dense Sage Q/K scale layout is invalid")
-        return validate_prepared_dense_fused_qkv(
-            PreparedDenseFusedQKV(
-                q_int8=q_int8,
-                q_scale=q_scale,
-                k_int8=k_int8,
-                k_scale=k_scale,
-                v=v,
-                output_dtype=x.dtype,
-                sequence=sequence,
-                heads=heads,
-                head_dim=HEAD_DIM,
-                layer_index=int(layer_index),
-            )
+        projected = PreparedDenseFusedQKV(
+            q_int8=q_int8,
+            q_scale=q_scale,
+            k_int8=k_int8,
+            k_scale=k_scale,
+            v=v,
+            output_dtype=x.dtype,
+            sequence=sequence,
+            heads=heads,
+            head_dim=HEAD_DIM,
+            layer_index=int(layer_index),
+            qk_format=self.qk_format,
         )
+        if architecture_carrier:
+            return projected
+        return validate_prepared_dense_fused_qkv(projected)

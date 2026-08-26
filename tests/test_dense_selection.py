@@ -27,6 +27,7 @@ from h3_optimizations.dense_resolver import (  # noqa: E402
     ATTENTION_COMFY_KITCHEN_INT8,
     ATTENTION_EXISTING,
     ATTENTION_SAGE,
+    ATTENTION_SAGE_PREFIX,
     ATTENTION_SAGE_SM89,
     DenseResolution,
     install_dense_attention,
@@ -193,6 +194,45 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertEqual(resolution.backend_kind, ATTENTION_SAGE_SM89)
         self.assertIs(resolution.backend, backend)
 
+    def test_external_sage_selector_uses_capability_specific_backend_kind(self):
+        model = FakePatcher()
+        model.set_model_optimized_attention(sage_attention)
+        backend = SimpleNamespace(name='prepared_sage')
+
+        def lookup(name, _fallback):
+            return sage_attention if name == ATTENTION_SAGE else None
+
+        capabilities = (
+            (7, 5),
+            (8, 0),
+            (8, 6),
+            (8, 7),
+            (8, 9),
+            (9, 0),
+            (10, 0),
+            (12, 0),
+            (12, 1),
+        )
+        with patch(
+            'h3_optimizations.dense_resolver.get_attention_function',
+            side_effect=lookup,
+        ), patch(
+            'h3_optimizations.dense_resolver._prepared_sage_backend',
+            return_value=backend,
+        ):
+            for capability in capabilities:
+                with self.subTest(capability=capability):
+                    resolution = resolve_current_dense_attention(
+                        model,
+                        SimpleNamespace(capability=capability),
+                    )
+                    self.assertEqual(
+                        resolution.backend_kind,
+                        '%s%d%d'
+                        % (ATTENTION_SAGE_PREFIX, capability[0], capability[1]),
+                    )
+                    self.assertIs(resolution.backend, backend)
+
     def test_unavailable_kitchen_leaves_normal_comfy_selection(self):
         model = FakePatcher()
         with patch(
@@ -356,7 +396,16 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertEqual(attention.projector.name, 'streamed_dense_bf16_qkv')
         self.assertEqual(attention.projector.projection_mode, 'native')
 
-    def test_existing_dense_resolution_streams_the_declared_matrix(self):
+    def test_external_streamed_consumer_resolves_the_declared_matrix(self):
+        def override(*_args, **_kwargs):
+            return None
+
+        override.supports_streamed_h3_qkv = True
+        override.consume = lambda **_kwargs: None
+        model = FakePatcher()
+        model.model_options['transformer_options'][
+            'optimized_attention_override'
+        ] = override
         requests = (
             FUSED_QKV_AUTO,
             FUSED_QKV_FORCE_BF16,
@@ -374,7 +423,7 @@ class DenseSelectionTests(unittest.TestCase):
                     )
                     attention, _qkv = apply_module._resolve_dense(
                         plan,
-                        FakePatcher(),
+                        model,
                         self._source_inventory(source),
                     )
                     expected_mode = 'native'
@@ -452,6 +501,53 @@ class DenseSelectionTests(unittest.TestCase):
                         self.assertTrue(
                             attention.projector.consumer_native_carrier
                         )
+
+    def test_non_sm89_dense_sage_installs_architecture_carrier(self):
+        backend = SimpleNamespace(
+            name='sage_mem_eff_sm90',
+            projected_qkv_format='sage_per_thread_64_128',
+            projected_q_tile=64,
+            projected_k_tile=128,
+            requires_h3_triton=False,
+            quantize_projected_qk=lambda q, k: (q, q, k, k),
+        )
+        dense = DenseResolution(
+            ATTENTION_SAGE,
+            ATTENTION_SAGE,
+            backend,
+            'known SM90 Sage consumer',
+            'dense_sage_sm90',
+        )
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_PRESERVE_BF16,
+            )
+        )
+        environment = SimpleNamespace(
+            capability=(9, 0),
+            cuda_available=False,
+            device_index=None,
+        )
+        with patch.object(
+            apply_module,
+            'resolve_current_dense_attention',
+            return_value=dense,
+        ):
+            attention, qkv = apply_module._resolve_dense(
+                plan,
+                FakePatcher(),
+                self._source_inventory('convrot'),
+                environment,
+            )
+
+        self.assertTrue(qkv.fused)
+        self.assertIs(attention.backend, backend)
+        self.assertIs(attention.projector.carrier_backend, backend)
+        self.assertEqual(
+            attention.projector.qk_format,
+            'sage_per_thread_64_128',
+        )
 
     def test_streaming_off_preserves_upstream_qkv_and_attention(self):
         model = FakePatcher()

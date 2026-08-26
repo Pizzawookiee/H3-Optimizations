@@ -33,6 +33,10 @@ class SageSM90MemoryEfficientBackend(ArchitectureBackend):
 
     name = "sage_mem_eff_sm90"
     capabilities = frozenset({(9, 0)})
+    projected_qkv_format = "sage_per_thread_64_128"
+    projected_q_tile = 64
+    projected_k_tile = 128
+    requires_h3_triton = True
 
     def __init__(
         self,
@@ -73,6 +77,18 @@ class SageSM90MemoryEfficientBackend(ArchitectureBackend):
         self.api = api
         self.quantizer = quantizer or per_thread_int8_i64
 
+    def quantize_projected_qk(self, q, k):
+        return self.quantizer(
+            q,
+            k,
+            None,
+            BLKQ=64,
+            WARPQ=16,
+            BLKK=128,
+            WARPK=128,
+            tensor_layout="HND",
+        )
+
     def prepare(
         self,
         q,
@@ -87,16 +103,7 @@ class SageSM90MemoryEfficientBackend(ArchitectureBackend):
             k,
             v,
         )
-        q_int8, q_scale, k_int8, k_scale = self.quantizer(
-            q,
-            k,
-            None,
-            BLKQ=64,
-            WARPQ=16,
-            BLKK=128,
-            WARPK=128,
-            tensor_layout="HND",
-        )
+        q_int8, q_scale, k_int8, k_scale = self.quantize_projected_qk(q, k)
         v_source = independent_contiguous(v)
         self.log_once(
             self.api.version,

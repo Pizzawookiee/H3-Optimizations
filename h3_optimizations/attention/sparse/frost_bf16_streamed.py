@@ -14,7 +14,10 @@ from ...qkv.streamed import (
     project_q_hnd,
 )
 from .config import resolve_video_budget
-from .frost_route import build_full_absolute_route_from_summaries
+from .frost_route import (
+    build_full_absolute_route_chunk,
+    prepare_full_absolute_route_chunks,
+)
 from .router import SparseRouterError
 from .triton_route import TritonRouteError
 
@@ -31,7 +34,6 @@ class StreamedFrostBF16QKV:
     held_factory: object
     k: torch.Tensor | None
     v: torch.Tensor | None
-    q_summary: torch.Tensor | None
     k_summary: torch.Tensor | None
     sequence: int
     heads: int
@@ -63,19 +65,18 @@ class StreamedFrostBF16QKV:
         self.held_factory = None
         self.x = self.rope_freqs = None
         self.k = self.v = None
-        self.q_summary = self.k_summary = None
+        self.k_summary = None
 
 
 @dataclass
 class PreparedStreamedFrostBF16:
     projected: StreamedFrostBF16QKV
-    route: torch.Tensor | None
-    counts: torch.Tensor | None
+    route_plan: object
     metadata: dict
 
     def release(self):
         self.projected.release()
-        self.route = self.counts = None
+        self.route_plan = None
 
 
 def _validate_chunk_rows(chunk_rows, q_tile, kv_tile):
@@ -135,46 +136,42 @@ def _assemble_streamed_frost_qkv(
     v_storage = torch.empty(storage_shape, dtype=torch.bfloat16, device=x.device)
     k_full = k_storage.permute(0, 2, 1, 3)
     v_full = v_storage.permute(0, 2, 1, 3)
-    q_tiles = (sequence + int(spec.q_tile) - 1) // int(spec.q_tile)
     kv_tiles = (sequence + int(spec.kv_tile) - 1) // int(spec.kv_tile)
-    q_summary = torch.empty(
-        (1, heads, q_tiles, head_dim),
-        dtype=torch.bfloat16,
-        device=x.device,
-    )
     k_summary = torch.empty(
         (1, heads, kv_tiles, head_dim),
         dtype=torch.bfloat16,
         device=x.device,
     )
 
-    def consume(start, end, q, k, v):
+    def consume(start, end, k, v):
         start = int(start)
         end = int(end)
         if start % int(spec.q_tile) or start % int(spec.kv_tile):
             raise RuntimeError('streamed FROST QKV chunk is not tile-aligned')
         expected = (1, heads, end - start, head_dim)
-        if tuple(q.shape) != expected or tuple(k.shape) != expected or tuple(v.shape) != expected:
+        if tuple(k.shape) != expected or tuple(v.shape) != expected:
             raise RuntimeError('streamed FROST QKV chunk shape is invalid')
         k_full[..., start:end, :].copy_(k)
         v_full[..., start:end, :].copy_(v)
-        q_means = _tile_mean(q, spec.q_tile)
         k_means = _tile_mean(k, spec.kv_tile)
-        q_start = start // int(spec.q_tile)
         k_start = start // int(spec.kv_tile)
-        q_summary[..., q_start:q_start + q_means.shape[-2], :].copy_(q_means)
         k_summary[..., k_start:k_start + k_means.shape[-2], :].copy_(k_means)
 
     held = held_factory(module, x[:1], projection_mode)
     held.__enter__()
     try:
+        project_kv = getattr(held, 'project_kv_hnd', None)
         for start in range(0, sequence, chunk_rows):
             end = min(start + chunk_rows, sequence)
-            q, k, v = held.project_hnd(x, rope_freqs, start, end)
+            if callable(project_kv):
+                k, v = project_kv(x, rope_freqs, start, end)
+            else:
+                q, k, v = held.project_hnd(x, rope_freqs, start, end)
+                del q
             try:
-                consume(start, end, q, k, v)
+                consume(start, end, k, v)
             finally:
-                del q, k, v
+                del k, v
     finally:
         held.__exit__(None, None, None)
     return StreamedFrostBF16QKV(
@@ -185,7 +182,6 @@ def _assemble_streamed_frost_qkv(
         held_factory=held_factory,
         k=k_full,
         v=v_full,
-        q_summary=q_summary,
         k_summary=k_summary,
         sequence=sequence,
         heads=heads,
@@ -216,9 +212,8 @@ def prepare_streamed_frost_bf16(
     )
     try:
         with diagnostics.stage('sparse_route'):
-            route, counts, route_metadata = build_full_absolute_route_from_summaries(
+            route_plan = prepare_full_absolute_route_chunks(
                 backend.router,
-                projected.q_summary,
                 projected.k_summary,
                 snapshot.layout,
                 budget,
@@ -227,14 +222,12 @@ def prepare_streamed_frost_bf16(
         projected.release()
         raise
 
-    projected.q_summary = None
-    projected.k_summary = None
-    metadata = route_metadata.as_dict()
+    metadata = route_plan.metadata.as_dict()
     metadata.update(
         {
             'layer': int(layer_index),
             'sparse_backend': backend.name,
-            'route_format': 'absolute_full_int32_direct',
+            'route_format': 'absolute_full_int32_chunked_direct',
             'qkv_lifetime': 'streamed_q_global_sequence_major_bf16_kv',
             'query_chunk_rows': projected.chunk_rows,
             'out_proj_chunk_rows': OUT_PROJ_CHUNK_ROWS,
@@ -242,8 +235,7 @@ def prepare_streamed_frost_bf16(
     )
     return PreparedStreamedFrostBF16(
         projected=projected,
-        route=route,
-        counts=counts,
+        route_plan=route_plan,
         metadata=metadata,
     )
 
@@ -264,6 +256,17 @@ def execute_streamed_frost_bf16(module, backend, prepared):
             end = min(start + projected.chunk_rows, sequence)
             rows = end - start
             q = projected.project_q(start, end)
+            tile_start = start // q_tile
+            with diagnostics.stage('sparse_route'):
+                q_summary = _tile_mean(q, q_tile)
+                route, counts = build_full_absolute_route_chunk(
+                    backend.router,
+                    q_summary,
+                    projected.k_summary,
+                    prepared.route_plan,
+                    q_tile_start=tile_start,
+                )
+                del q_summary
             q_storage = torch.empty(
                 (1, rows, projected.heads, projected.head_dim),
                 dtype=torch.bfloat16,
@@ -272,11 +275,6 @@ def execute_streamed_frost_bf16(module, backend, prepared):
             q_sequence_major = q_storage.permute(0, 2, 1, 3)
             q_sequence_major.copy_(q)
             del q
-
-            tile_start = start // q_tile
-            tile_end = (end + q_tile - 1) // q_tile
-            route = prepared.route[..., tile_start:tile_end, :].contiguous()
-            counts = prepared.counts[..., tile_start:tile_end].contiguous()
             with diagnostics.stage('sparse_attention_kernel'):
                 chunk = backend.executor.prepare(
                     q_sequence_major,
@@ -293,6 +291,7 @@ def execute_streamed_frost_bf16(module, backend, prepared):
             if end == sequence:
                 projected.k = None
                 projected.v = None
+                projected.k_summary = None
 
             with diagnostics.stage('attention_out'):
                 for local_start in range(0, rows, OUT_PROJ_CHUNK_ROWS):

@@ -217,6 +217,14 @@ def guard_signed_offsets(tensor):
 class ArchitectureBackend:
     name = "sage_mem_eff_arch"
     capabilities = frozenset()
+    projected_qkv_format = None
+    projected_q_tile = 1
+    projected_k_tile = 1
+    requires_h3_triton = False
+    requires_registered_sage = True
+    requires_runtime_context = False
+    approximate = False
+    runtime_listeners = ()
 
     def __init__(self, allow_cpu_for_tests=False):
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
@@ -328,6 +336,106 @@ class ArchitectureBackend:
             heads=int(heads),
             head_dim=int(head_dim),
             softmax_scale=head_dim**-0.5,
+        )
+
+    def prepare_projected(
+        self,
+        projected,
+        *,
+        layer_index,
+        transformer_options,
+    ):
+        del transformer_options
+        if getattr(projected, "qk_format", None) != self.projected_qkv_format:
+            raise EfficientSageError(
+                "%s received projected Q/K format %r; expected %r"
+                % (
+                    self.name,
+                    getattr(projected, "qk_format", None),
+                    self.projected_qkv_format,
+                )
+            )
+        if int(projected.layer_index) != int(layer_index):
+            raise EfficientSageError(
+                "projected Sage QKV layer %d does not match attention layer %d"
+                % (projected.layer_index, layer_index)
+            )
+        shape = (
+            1,
+            int(projected.heads),
+            int(projected.sequence),
+            int(projected.head_dim),
+        )
+        if int(projected.head_dim) != 128:
+            raise EfficientSageError(
+                "%s supports projected head_dim 128" % self.name
+            )
+        if (
+            tuple(projected.q_int8.shape) != shape
+            or tuple(projected.k_int8.shape) != shape
+            or tuple(projected.v.shape) != shape
+        ):
+            raise EfficientSageError(
+                "%s received an invalid projected QKV shape" % self.name
+            )
+        if (
+            projected.q_int8.dtype != torch.int8
+            or projected.k_int8.dtype != torch.int8
+            or projected.q_scale.dtype != torch.float32
+            or projected.k_scale.dtype != torch.float32
+        ):
+            raise EfficientSageError(
+                "%s received an invalid projected Q/K dtype" % self.name
+            )
+        if projected.v.dtype != projected.output_dtype or projected.v.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise EfficientSageError(
+                "%s received an invalid projected V dtype" % self.name
+            )
+        tensors = (
+            projected.q_int8,
+            projected.q_scale,
+            projected.k_int8,
+            projected.k_scale,
+            projected.v,
+        )
+        if any(tensor.device != projected.q_int8.device for tensor in tensors):
+            raise EfficientSageError(
+                "%s received projected tensors on different devices" % self.name
+            )
+        if any(not tensor.is_contiguous() for tensor in tensors):
+            raise EfficientSageError(
+                "%s requires contiguous projected carriers" % self.name
+            )
+        if not self.allow_cpu_for_tests:
+            if not projected.q_int8.is_cuda:
+                raise EfficientSageError(
+                    "%s projected carriers require CUDA" % self.name
+                )
+            capability = tuple(
+                torch.cuda.get_device_capability(projected.q_int8.device)
+            )
+            if capability not in self.capabilities:
+                raise EfficientSageError(
+                    "%s does not support projected carriers on SM%d%d"
+                    % (self.name, capability[0], capability[1])
+                )
+
+        stats.observe_sequence(projected.sequence)
+        return PreparedArchitecture(
+            q_int8=projected.q_int8,
+            q_scale=projected.q_scale,
+            k_int8=projected.k_int8,
+            k_scale=projected.k_scale,
+            v_source=projected.v,
+            output_dtype=projected.output_dtype,
+            layer_index=int(layer_index),
+            sequence=int(projected.sequence),
+            heads=int(projected.heads),
+            head_dim=int(projected.head_dim),
+            softmax_scale=int(projected.head_dim) ** -0.5,
         )
 
     def log_once(self, version, detail):

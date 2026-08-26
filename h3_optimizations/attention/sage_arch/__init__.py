@@ -4,6 +4,7 @@ from .common import (
     KernelBinding,
     PreparedArchitecture,
 )
+from .sm75 import SageSM75MemoryEfficientBackend
 from .sm80 import (
     SM80API,
     SageSM80MemoryEfficientBackend,
@@ -24,6 +25,7 @@ from .sm12x import (
 __all__ = [
     "KernelBinding",
     "PreparedArchitecture",
+    "SageSM75MemoryEfficientBackend",
     "SM80API",
     "SM86API",
     "SM90API",

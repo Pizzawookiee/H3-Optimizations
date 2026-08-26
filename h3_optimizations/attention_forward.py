@@ -6,6 +6,10 @@ import comfy.quant_ops
 
 from . import diagnostics
 from .attention import AttentionBackendUnavailable
+from .external_consumer import (
+    consume_streamed_h3_qkv,
+    get_streamed_h3_qkv_consumer,
+)
 from .ordering_probe import has_ordering_observer, observe_attention
 
 
@@ -249,20 +253,34 @@ def _finish_streamed_dense_bf16_projected(
     module,
     projected,
     *,
+    layer_index,
     transformer_options,
     out_projection=None,
 ):
     """Consume Q slabs against complete BF16 K/V and project each output slab."""
     output = projected.x
+    external_consumer = get_streamed_h3_qkv_consumer(transformer_options)
     try:
         for start, end, q in projected.stream_q():
-            raw = _legacy_attention(
-                module,
-                q,
-                projected.k,
-                projected.v,
-                transformer_options,
-            )
+            if external_consumer is None:
+                raw = _legacy_attention(
+                    module,
+                    q,
+                    projected.k,
+                    projected.v,
+                    transformer_options,
+                )
+            else:
+                raw = consume_streamed_h3_qkv(
+                    external_consumer,
+                    q,
+                    projected.k,
+                    projected.v,
+                    q_start=start,
+                    q_total=projected.sequence,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
             out = flatten_attention_output(
                 module,
                 raw,
@@ -346,6 +364,7 @@ def make_forward(
                     return _finish_streamed_dense_bf16_projected(
                         module,
                         projected,
+                        layer_index=layer_index,
                         transformer_options=transformer_options,
                         out_projection=out_projection,
                     )

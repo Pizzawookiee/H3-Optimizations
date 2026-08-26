@@ -40,6 +40,8 @@ from h3_optimizations.kitchen_qkv import (  # noqa: E402
     ChunkedKitchenAttentionBackend,
 )
 import h3_optimizations.qkv.bf16 as bf16_module  # noqa: E402
+from h3_optimizations.qkv.fp8 import HeldFP8QKV  # noqa: E402
+from h3_optimizations.qkv.w4a8 import HeldW4A8QKV  # noqa: E402
 from h3_optimizations.qkv.bf16 import (  # noqa: E402
     BF16QKVBindingError,
     CHUNK_ROWS,
@@ -418,7 +420,7 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         self.assertEqual(calls, [(3, 7, 7), (3, 7, 7), (1, 7, 7)])
         torch.testing.assert_close(actual, expected)
 
-    def test_dense_streaming_reaches_external_attention_override(self):
+    def test_dense_streaming_uses_opted_in_external_consumer(self):
         module = self._module()
         source = torch.randn((7, 8), dtype=torch.bfloat16)
         projector = StreamedDenseBF16QKVProjector(
@@ -427,9 +429,24 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         )
         calls = []
 
-        def external_sage(_original, q, k, v, _heads, **_kwargs):
-            calls.append((int(q.shape[2]), int(k.shape[2]), int(v.shape[2])))
-            return q
+        def external_sage(*_args, **_kwargs):
+            raise AssertionError('streamed ABI must bypass the ordinary override')
+
+        def consume(q_chunk, global_k, global_v, q_start, q_total,
+                    layer_index, transformer_options):
+            calls.append((
+                int(q_chunk.shape[2]),
+                int(global_k.shape[2]),
+                int(global_v.shape[2]),
+                q_start,
+                q_total,
+                layer_index,
+                transformer_options['consumer_token'],
+            ))
+            return q_chunk
+
+        external_sage.supports_streamed_h3_qkv = True
+        external_sage.consume = consume
 
         forward = make_forward(
             module,
@@ -447,11 +464,50 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
                 output,
                 transformer_options={
                     'optimized_attention_override': external_sage,
+                    'consumer_token': 'kept',
                 },
             )
 
         self.assertIs(actual, output)
-        self.assertEqual(calls, [(3, 7, 7), (3, 7, 7), (1, 7, 7)])
+        self.assertEqual(calls, [
+            (3, 7, 7, 0, 7, 0, 'kept'),
+            (3, 7, 7, 3, 7, 0, 'kept'),
+            (1, 7, 7, 6, 7, 0, 'kept'),
+        ])
+
+    def test_full_q_projector_invokes_unknown_override_once(self):
+        module = self._module()
+        source = torch.randn((7, 8), dtype=torch.bfloat16)
+        projector = ChunkedBF16QKVProjector(chunk_rows=3)
+        calls = []
+
+        def unknown_override(_original, q, k, v, _heads, **_kwargs):
+            calls.append((int(q.shape[2]), int(k.shape[2]), int(v.shape[2])))
+            return q
+
+        forward = make_forward(
+            module,
+            0,
+            backend=ChunkedKitchenAttentionBackend(),
+            projector=projector,
+        )
+        with mock.patch.object(
+            bf16_module,
+            'HeldBF16QKV',
+            self._fake_held(),
+        ), mock.patch.object(
+            projector,
+            '_validate',
+            return_value=SimpleNamespace(plain_float=True),
+        ):
+            forward(
+                source.clone(),
+                transformer_options={
+                    'optimized_attention_override': unknown_override,
+                },
+            )
+
+        self.assertEqual(calls, [(7, 7, 7)])
 
     def test_dense_native_quantized_source_never_retains_full_q(self):
         module = self._module()
@@ -515,6 +571,110 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         )
         prepared.release()
         self.assertTrue(held.released)
+
+    def test_dense_streaming_reacquires_reusable_cast_binding_per_q_slab(self):
+        module = self._module()
+        source = torch.randn((7, 8), dtype=torch.bfloat16)
+        instances = []
+
+        class ReusableCastHeld:
+            def __init__(self):
+                self.binding = SimpleNamespace(handle=object())
+                self.released = False
+                self.calls = []
+                instances.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                self.released = True
+                self.binding.handle = None
+                return False
+
+            def project_hnd(self, x, _rope, start, end):
+                self.calls.append((start, end))
+                rows = end - start
+                values = x[start:end].view(rows, 2, 4).transpose(0, 1).unsqueeze(0)
+                return values, values + 1, values + 2
+
+        projector = StreamedDenseBF16QKVProjector(
+            chunk_rows=3,
+            allow_cpu_for_tests=True,
+        )
+        quantized_format = SimpleNamespace(
+            plain_float=False,
+            convrot_int8_256=False,
+            w4a8=True,
+            fp8=False,
+            logical_dtype='int4',
+            label='W4A8',
+        )
+        with mock.patch.object(
+            projector,
+            '_validate',
+            return_value=quantized_format,
+        ), mock.patch(
+            'h3_optimizations.qkv.streamed.create_held_qkv',
+            side_effect=lambda *_args: ReusableCastHeld(),
+        ):
+            prepared = projector.project(module, source, None)
+            self.assertTrue(instances[0].released)
+            self.assertIsNone(prepared.held)
+            for _start, _end, _q in prepared.stream_q():
+                self.assertTrue(instances[-1].released)
+
+        self.assertEqual(len(instances), 4)
+        self.assertTrue(all(item.released for item in instances))
+        prepared.release()
+
+    def test_convrot_exposes_kv_only_projection(self):
+        module = self._module()
+        source = torch.randn((7, 8), dtype=torch.bfloat16)
+        held = bf16_module.HeldConvRotINT8QKV(module, source[:1])
+        calls = []
+
+        class Binding:
+            def linear_range(self, rows, start, end):
+                calls.append((int(rows.shape[0]), start, end))
+                return torch.randn(
+                    (rows.shape[0], end - start),
+                    dtype=torch.bfloat16,
+                )
+
+        held.binding = Binding()
+        k, v = held.project_kv_hnd(source, None, 2, 5)
+
+        self.assertEqual(calls, [(3, 8, 24)])
+        self.assertEqual(tuple(k.shape), (1, 2, 3, 4))
+        self.assertEqual(tuple(v.shape), (1, 2, 3, 4))
+
+    def test_fp8_and_w4a8_expose_split_q_and_kv_projection(self):
+        module = self._module()
+        source = torch.randn((7, 8), dtype=torch.bfloat16)
+
+        for held_type in (HeldFP8QKV, HeldW4A8QKV):
+            with self.subTest(held_type=held_type.__name__):
+                held = held_type.__new__(held_type)
+                held.attention = module
+                calls = []
+
+                class Binding:
+                    def linear_range(self, rows, start, end):
+                        calls.append((int(rows.shape[0]), start, end))
+                        return torch.randn(
+                            (rows.shape[0], end - start),
+                            dtype=torch.bfloat16,
+                        )
+
+                held.binding = Binding()
+                q = held.project_q_hnd(source, None, 2, 5)
+                k, v = held.project_kv_hnd(source, None, 2, 5)
+
+                self.assertEqual(calls, [(3, 0, 8), (3, 8, 24)])
+                self.assertEqual(tuple(q.shape), (1, 2, 3, 4))
+                self.assertEqual(tuple(k.shape), (1, 2, 3, 4))
+                self.assertEqual(tuple(v.shape), (1, 2, 3, 4))
 
     def test_preserve_precision_has_an_internal_bf16_qkv_request(self):
         request = MemoryRequest(
@@ -596,7 +756,7 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         self.assertIn('QKV_BF16_CHUNKED', text)
         self.assertIn('StreamedDenseBF16QKVProjector', text)
         self.assertGreaterEqual(
-            text.count('_bounded_qkv_projector(qkv)'),
+            text.count('_bounded_qkv_projector('),
             5,
         )
         self.assertIn('projector=attention.projector', text)

@@ -26,16 +26,24 @@ control.
   the disposable block input. With sparse Kitchen,
   checkpoint-native ConvRot INT8 QKV streams BF16 projection, norm, and RoPE
   chunks into the routed INT8 carrier instead of materializing full-sequence
-  BF16 Q/K/V. A compatible selected SageAttention SM89 consumer uses bounded
-  source projection directly into Sage's per-thread INT8 Q/K carrier for BF16,
-  ConvRot-256 INT8, W4A8, and FP8 checkpoints. Other Sage configurations and
-  ordinary Comfy attention retain full BF16 K/V, stream bounded BF16 Q through
-  the unchanged consumer, and write each output-projection chunk into the
-  disposable block input. An external Comfy Kitchen selection instead uses its
-  streamed INT8 carrier for all four formats. `Off` leaves QKV projection and
-  attention entirely upstream; `Forced` may replace dense attention with the
-  private full-density Kitchen path. MLP auto keeps BF16/FP16 weights floating
-  and still uses bounded token chunking.
+  BF16 Q/K/V. Official SageAttention2 selections use a capability-specific
+  native Q/K carrier on SM75, SM80, SM86, SM87, SM89, SM90, SM100, SM120, and
+  SM121 for BF16, ConvRot-256 INT8, W4A8, and FP8 checkpoints when the installed
+  Sage and source projector expose the required contract. The carrier follows
+  each architecture's per-block, per-thread, or per-warp quantization and V
+  format. Comfy's known built-in attention consumers retain full BF16 K/V,
+  stream bounded BF16 Q, and write each output-projection chunk into the
+  disposable block input. Unknown explicit attention overrides preserve a
+  single full-Q invocation in Auto because their callable contract is opaque.
+  Overrides that explicitly implement the streamed-H3 consumer contract below
+  receive bounded Q against global K/V instead.
+  An external Comfy Kitchen selection uses its streamed INT8 carrier for all
+  four formats. `Off` leaves QKV projection and attention entirely upstream;
+  `Forced` may replace dense attention with the private full-density Kitchen
+  path. Native ConvRot, W4A8, and FP8 expose separate K/V-only and Q-only
+  projections, so bounded-query consumers do not repeat the complete QKV
+  linear. MLP auto keeps
+  BF16/FP16 weights floating and still uses bounded token chunking.
   Checkpoint-native ConvRot, FP8, and W4A8
   remain native where a compatible bounded MLP provider exists; unsupported
   quantized formats preserve upstream Comfy execution. `Auto` is the default.
@@ -237,6 +245,39 @@ satisfy its binding contract; in that case QKV returns to standard projection
 without changing the already selected attention backend.
 
 ## Compatibility
+
+### External streamed-H3 attention consumers
+
+An `optimized_attention_override` can opt into the Memory node's bounded-Q
+execution without being named or imported by this pack. The callable stored in
+`transformer_options["optimized_attention_override"]` must expose:
+
+```python
+override.supports_streamed_h3_qkv = True
+override.consume = consume
+
+def consume(
+    q_chunk,
+    global_k,
+    global_v,
+    q_start,
+    q_total,
+    layer_index,
+    transformer_options,
+):
+    ...
+```
+
+`q_chunk`, `global_k`, and `global_v` use HND layout. The consumer must support
+rectangular attention, return an HND tensor with the same shape and device as
+`q_chunk`, and treat `q_start` as the chunk's row offset within `q_total`.
+H3 Memory Optimization owns source-aware Q/K/V projection, carrier lifetime,
+chunk scheduling, and bounded output projection; the external consumer owns
+only its attention math and any state keyed by `layer_index` and global query
+rows. Advertising the marker without a callable `consume` is an error.
+Unmarked overrides retain full-Q, single-call behavior in Auto.
+
+### Requirements
 
 - Current ComfyUI with MiniMax H3 support and the `comfy_api.latest` extension API
 - Python 3.10 or newer

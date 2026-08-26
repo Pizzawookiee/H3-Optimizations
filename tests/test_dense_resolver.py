@@ -89,6 +89,75 @@ class FakeKitchen:
 
 
 class DenseResolverTests(unittest.TestCase):
+    def test_opted_in_external_consumer_gets_streamed_q(self):
+        def override(*_args, **_kwargs):
+            return None
+
+        override.supports_streamed_h3_qkv = True
+        override.consume = lambda **_kwargs: None
+        patcher = FakePatcher(override)
+
+        with mock.patch.object(
+            dense_resolver,
+            'is_comfy_kitchen_dense_attention',
+            return_value=False,
+        ), mock.patch.object(
+            dense_resolver,
+            'resolve_sage_fused_attention',
+        ) as resolve_sage:
+            resolution = dense_resolver.resolve_current_dense_attention(
+                patcher,
+                SimpleNamespace(capability=(8, 9)),
+            )
+
+        self.assertEqual(resolution.backend_kind, dense_resolver.ATTENTION_EXISTING)
+        self.assertIn('streamed-H3 QKV', resolution.reason)
+        resolve_sage.assert_not_called()
+
+    def test_unknown_external_consumer_keeps_full_q_single_call(self):
+        patcher = FakePatcher(lambda *_args, **_kwargs: None)
+
+        with mock.patch.object(
+            dense_resolver,
+            'is_comfy_kitchen_dense_attention',
+            return_value=False,
+        ), mock.patch.object(
+            dense_resolver,
+            'resolve_sage_fused_attention',
+            return_value=None,
+        ), mock.patch.object(
+            dense_resolver,
+            'is_known_comfy_dense_attention',
+            return_value=False,
+        ):
+            resolution = dense_resolver.resolve_current_dense_attention(
+                patcher,
+                SimpleNamespace(capability=(8, 9)),
+            )
+
+        self.assertEqual(
+            resolution.backend_kind,
+            dense_resolver.ATTENTION_EXISTING_FULL_Q,
+        )
+        self.assertIn('full-Q single-call', resolution.reason)
+
+    def test_advertised_consumer_requires_consume_callable(self):
+        def override(*_args, **_kwargs):
+            return None
+
+        override.supports_streamed_h3_qkv = True
+        patcher = FakePatcher(override)
+
+        with mock.patch.object(
+            dense_resolver,
+            'is_comfy_kitchen_dense_attention',
+            return_value=False,
+        ), self.assertRaisesRegex(TypeError, 'callable consume'):
+            dense_resolver.resolve_current_dense_attention(
+                patcher,
+                SimpleNamespace(capability=(8, 9)),
+            )
+
     def test_arbitrary_upstream_override_is_preserved_for_private_h3_kitchen(self):
         upstream = object()
         kitchen = object()

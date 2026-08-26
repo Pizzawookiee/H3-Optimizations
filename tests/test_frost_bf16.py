@@ -24,7 +24,9 @@ from h3_optimizations.attention.sparse.frost_bf16 import (
 from h3_optimizations.attention.sparse import frost_loader
 from h3_optimizations.attention.sparse.frost_route import (
     build_full_absolute_route,
+    build_full_absolute_route_chunk,
     build_full_absolute_route_from_summaries,
+    prepare_full_absolute_route_chunks,
 )
 from h3_optimizations.attention.sparse.router import SparseTileRouter
 
@@ -51,10 +53,27 @@ class FrostBF16Tests(unittest.TestCase):
         self.assertEqual(image[:4], b'\x7fELF')
         self.assertEqual(
             hashlib.sha256(image).hexdigest(),
-            '4be095512e6a117634a3c0dddac9cedeab2722543ea2f37537b6602dd5002cd3',
+            '64690d05f52335bd252c6ecd9ad5d470ad5cff1df0d48f59c35396d0f775188c',
         )
         self.assertTrue(symbol.startswith('kernel_cutlass__sdpa_kernel_'))
         self.assertIn('ptrbf16', symbol)
+
+    def test_source_patch_uses_route_aware_double_buffering(self):
+        source = (
+            PACK / 'native' / 'frost' / 'frost_h3.patch'
+        ).read_text(encoding='utf-8')
+        added = '\n'.join(
+            line[1:]
+            for line in source.splitlines()
+            if line.startswith('+') and not line.startswith('+++')
+        )
+
+        self.assertIn('route_ptr[prologue_route_slot]', added)
+        self.assertIn('route_ptr[safe_next_route_slot]', added)
+        self.assertIn('cp_async_wait(2)', source)
+        self.assertIn('cp_async_wait(1)', source)
+        self.assertNotIn('v_cur_gmem = v_cur_gmem -', added)
+        self.assertNotIn('k_next_gmem = k_next_gmem -', added)
 
     def test_preflight_is_explicitly_sm89(self):
         spec = preflight_frost_bf16(
@@ -129,6 +148,45 @@ class FrostBF16Tests(unittest.TestCase):
         self.assertEqual(actual[2], expected[2])
         self.assertTrue(torch.equal(actual[0], expected[0]))
         self.assertTrue(torch.equal(actual[1], expected[1]))
+
+    def test_chunked_summary_routes_match_full_summary_route(self):
+        torch.manual_seed(37)
+        packed = layout()
+        router = SparseTileRouter(q_tile=64, kv_tile=64)
+        q = torch.randn(1, 2, packed.seq_len, 16)
+        k = torch.randn_like(q)
+        q_summary = router._mean_pool(q, router.q_tile)
+        k_summary = router._mean_pool(k, router.kv_tile)
+        expected_route, expected_counts, _metadata = (
+            build_full_absolute_route_from_summaries(
+                router,
+                q_summary,
+                k_summary,
+                packed,
+                0.3,
+            )
+        )
+        plan = prepare_full_absolute_route_chunks(
+            router,
+            k_summary,
+            packed,
+            0.3,
+        )
+        routes = []
+        counts = []
+        for start in range(0, q_summary.shape[-2], 2):
+            route, count = build_full_absolute_route_chunk(
+                router,
+                q_summary[..., start:start + 2, :],
+                k_summary,
+                plan,
+                q_tile_start=start,
+            )
+            routes.append(route)
+            counts.append(count)
+
+        self.assertTrue(torch.equal(torch.cat(routes, dim=-2), expected_route))
+        self.assertTrue(torch.equal(torch.cat(counts, dim=-1), expected_counts))
 
     def test_executor_preserves_strided_hnd_inputs_and_writes_nhd(self):
         sequence = 129

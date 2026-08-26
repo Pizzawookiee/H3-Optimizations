@@ -109,7 +109,7 @@ class ComfyKitchenSelectorStreamingTests(unittest.TestCase):
         )
         self.assertIn('preserved the external Comfy Kitchen', attention.reason)
 
-    def test_non_kitchen_explicit_selector_gets_generic_streaming(self):
+    def test_unknown_explicit_selector_preserves_full_q_single_call(self):
         model = FakePatcher()
         model.set_model_optimized_attention(pytorch_attention)
         request = _memory_request_for_modes(
@@ -131,6 +131,39 @@ class ComfyKitchenSelectorStreamingTests(unittest.TestCase):
                 model,
                 convrot_inventory(),
             )
+        self.assertEqual(attention.selected, ATTENTION_EXISTING)
+        self.assertEqual(attention.projector.name, 'chunked_bf16_qkv')
+        self.assertIn('full-Q single-call', attention.reason)
+
+    def test_registered_comfy_selector_uses_bounded_q(self):
+        model = FakePatcher()
+        model.set_model_optimized_attention(pytorch_attention)
+        request = _memory_request_for_modes(
+            fused_qkv='auto',
+            mlp_memory='auto',
+            chunk_rows=4096,
+            precision_mode=PRECISION_MODE_PRESERVE,
+            qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
+        )
+        plan = H3OptimizationPlan().with_memory(request)
+
+        def lookup(name, _default):
+            return pytorch_attention if name == 'pytorch' else None
+
+        with patch(
+            'h3_optimizations.dense_resolver.get_attention_function',
+            side_effect=lookup,
+        ), patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=False,
+        ):
+            attention, _qkv = apply_module._resolve_dense(
+                plan,
+                model,
+                convrot_inventory(),
+            )
+
         self.assertEqual(attention.selected, ATTENTION_EXISTING)
         self.assertEqual(attention.projector.name, 'streamed_dense_bf16_qkv')
 

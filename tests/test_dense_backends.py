@@ -28,6 +28,7 @@ from h3_optimizations.attention.sage_arch import (  # noqa: E402
     SM86API,
     SM90API,
     SageSM12xMemoryEfficientBackend,
+    SageSM75MemoryEfficientBackend,
     SageSM80MemoryEfficientBackend,
     SageSM86MemoryEfficientBackend,
     SageSM90MemoryEfficientBackend,
@@ -233,6 +234,91 @@ class DenseBackendTests(unittest.TestCase):
         self.assertEqual(held.calls, [(0, 128), (128, 256), (256, 257)])
         self.assertTrue(held.released)
         self.assertEqual(prepared.qk_format, 'sage_per_thread_int8')
+
+    def test_architecture_backends_accept_their_direct_projected_carriers(self):
+        kernel = FakeKernel(expected_granularity=3)
+        fp8 = FakeFP8()
+
+        def per_block(q, k, **_kwargs):
+            return fake_thread_quantizer(q, k)
+
+        def attention(*_args, **_kwargs):
+            raise AssertionError('carrier preparation must not execute attention')
+
+        def per_warp(q, k, km=None, **_kwargs):
+            return fake_thread_quantizer(q, k, km)
+
+        backends = (
+            SageSM75MemoryEfficientBackend(
+                api=SM86API('2.2.test', per_block, attention),
+                allow_cpu_for_tests=True,
+            ),
+            SageSM80MemoryEfficientBackend(
+                api=SM80API(
+                    '2.2.test',
+                    KernelBinding(kernel, 'fake_sm80', 'test'),
+                ),
+                quantizer=fake_thread_quantizer,
+                allow_cpu_for_tests=True,
+            ),
+            SageSM86MemoryEfficientBackend(
+                api=SM86API('2.2.test', per_block, attention),
+                allow_cpu_for_tests=True,
+            ),
+            SageSM90MemoryEfficientBackend(
+                api=SM90API(
+                    '2.2.test',
+                    fp8,
+                    KernelBinding(kernel, 'fake_sm90', 'test'),
+                ),
+                quantizer=fake_thread_quantizer,
+                allow_cpu_for_tests=True,
+            ),
+            SageSM12xMemoryEfficientBackend(
+                api=SM12xAPI(
+                    '2.2.test',
+                    per_warp,
+                    fp8,
+                    KernelBinding(kernel, 'fake_sm12x', 'test'),
+                ),
+                allow_cpu_for_tests=True,
+            ),
+        )
+
+        def project_chunk(_module, _x, _rope, start, stop):
+            shape = (1, 2, stop - start, 128)
+            value = torch.zeros(shape, dtype=torch.bfloat16)
+            return value, value, value
+
+        module = type('Attention', (), {'heads': 2, 'head_dim': 128})()
+        source = torch.empty((257, 4), dtype=torch.bfloat16)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                projector = DenseFusedQKVProjector(
+                    chunk_rows=128,
+                    project_chunk=project_chunk,
+                    carrier_backend=backend,
+                    allow_cpu_for_tests=True,
+                )
+                projected = projector.project(
+                    module,
+                    source,
+                    None,
+                    layer_index=4,
+                    transformer_options={},
+                )
+                prepared = backend.prepare_projected(
+                    projected,
+                    layer_index=4,
+                    transformer_options={},
+                )
+
+                self.assertEqual(
+                    projected.qk_format,
+                    backend.projected_qkv_format,
+                )
+                self.assertIs(prepared.v_source, projected.v)
+                self.assertEqual(prepared.sequence, 257)
 
     def test_sm89_resolves_extension_alias_used_by_public_dispatcher(self):
         kernel = FakeKernel(expected_granularity=3)

@@ -4,8 +4,8 @@ This intentionally implements only the parts of the old experimental streamed
 Sparge path that remain useful and have a clean lifetime contract:
 
 * keep global K and the final V carrier, but never materialize full-sequence Q;
-* preserve the existing full-size router score calculation, then retain only
-  the selected Top-K indices and materialize Sparge LUT rows per Q chunk;
+* retain the global K summary and select each Q slab's route immediately before
+  its attention launch;
 * run Sparge with a bounded Q/output slab using its qo_len != kv_len support;
 * project the bounded attention output immediately and reuse the attention
   input tensor for the final hidden-size result.
@@ -30,6 +30,7 @@ from ...qkv.formats import describe_linear
 from ...qkv.streamed import (
     PROJECTION_NATIVE,
     create_held_qkv,
+    project_kv_hnd,
     project_q_hnd,
 )
 from . import fused_qkv as _fused_qkv_mod
@@ -53,7 +54,6 @@ class StreamedSparseSageQKV:
     k_int8: torch.Tensor
     k_scale: torch.Tensor
     v: torch.Tensor | None
-    q_summary: torch.Tensor | None
     k_summary: torch.Tensor | None
     output_dtype: torch.dtype
     sequence: int
@@ -69,12 +69,12 @@ class StreamedSparseSageQKV:
 class StreamedRoutePlan:
     geometry: object
     retained: int
-    indices: torch.Tensor | None
+    k_summary: torch.Tensor | None
     batch: int
     heads: int
 
     def release(self):
-        self.indices = None
+        self.k_summary = None
 
 
 @dataclass
@@ -87,7 +87,6 @@ class PreparedStreamedSparseSage:
 
     def release(self):
         projected = self.projected
-        projected.q_summary = None
         projected.k_summary = None
         projected.k_int8 = None
         projected.k_scale = None
@@ -131,17 +130,10 @@ def _validate_streamed_projected(projected, spec):
         raise SparseSageError(
             "streamed Sparse Sage requires rank-2 CUDA BF16 attention input"
         )
-    q_blocks = (sequence + int(spec.q_tile) - 1) // int(spec.q_tile)
     k_blocks = (sequence + int(spec.kv_tile) - 1) // int(spec.kv_tile)
     expected = (
         ("k_int8", projected.k_int8, (1, heads, sequence, head_dim), torch.int8),
         ("k_scale", projected.k_scale, (1, heads, k_blocks), torch.float32),
-        (
-            "q_summary",
-            projected.q_summary,
-            (1, heads, q_blocks, head_dim),
-            projected.output_dtype,
-        ),
         (
             "k_summary",
             projected.k_summary,
@@ -223,7 +215,6 @@ def _assemble_streamed_sparse_qkv(
     if sequence <= 0 or head_dim != HEAD_DIM:
         raise SparseSageError("streamed Sparse Sage QKV requires head_dim 128")
 
-    q_blocks = (sequence + int(spec.q_tile) - 1) // int(spec.q_tile)
     k_blocks = (sequence + int(spec.kv_tile) - 1) // int(spec.kv_tile)
     k_int8 = torch.empty(
         (1, heads, sequence, head_dim), dtype=torch.int8, device=x.device
@@ -234,23 +225,8 @@ def _assemble_streamed_sparse_qkv(
     v = torch.empty(
         (1, heads, sequence, head_dim), dtype=x.dtype, device=x.device
     )
-    q_summary = torch.empty(
-        (1, heads, q_blocks, head_dim), dtype=x.dtype, device=x.device
-    )
     k_summary = torch.empty(
         (1, heads, k_blocks, head_dim), dtype=x.dtype, device=x.device
-    )
-
-    max_rows = min(project_chunk_rows, sequence)
-    max_q_blocks = (max_rows + int(spec.q_tile) - 1) // int(spec.q_tile)
-    q_int8_scratch = torch.empty(
-        (1, heads, max_rows, head_dim), dtype=torch.int8, device=x.device
-    )
-    q_scale_scratch = torch.empty(
-        (1, heads, max_q_blocks), dtype=torch.float32, device=x.device
-    )
-    q_summary_scratch = torch.empty(
-        (1, heads, max_q_blocks, head_dim), dtype=x.dtype, device=x.device
     )
 
     held = None
@@ -260,60 +236,28 @@ def _assemble_streamed_sparse_qkv(
     try:
         for start in range(0, sequence, project_chunk_rows):
             end = min(start + project_chunk_rows, sequence)
-            rows = end - start
-            local_q_blocks = (rows + int(spec.q_tile) - 1) // int(spec.q_tile)
             if held is None:
-                q, k, chunk_v = project_chunk(
+                projected_chunk = project_chunk(
                     module,
                     x,
                     rope_freqs,
                     start,
                     end,
                 )
+                if len(projected_chunk) == 3:
+                    q, k, chunk_v = projected_chunk
+                    del q
+                else:
+                    k, chunk_v = projected_chunk
             else:
-                q, k, chunk_v = held.project_hnd(
+                k, chunk_v = project_kv_hnd(
+                    held,
                     x,
                     rope_freqs,
                     start,
                     end,
                 )
             try:
-                if rows == max_rows:
-                    q_local = q_int8_scratch
-                    q_scale_local = q_scale_scratch
-                    q_summary_local = q_summary_scratch
-                else:
-                    q_local = torch.empty(
-                        (1, heads, rows, head_dim),
-                        dtype=torch.int8,
-                        device=x.device,
-                    )
-                    q_scale_local = torch.empty(
-                        (1, heads, local_q_blocks),
-                        dtype=torch.float32,
-                        device=x.device,
-                    )
-                    q_summary_local = torch.empty(
-                        (1, heads, local_q_blocks, head_dim),
-                        dtype=x.dtype,
-                        device=x.device,
-                    )
-                # Q is packed only into bounded scratch so its exact tile means
-                # match the existing router without retaining full Q INT8.
-                packer(
-                    q,
-                    q_local,
-                    q_scale_local,
-                    q_summary_local,
-                    row_start=0,
-                    block_size=spec.q_tile,
-                )
-                q_block_start = start // int(spec.q_tile)
-                q_summary[
-                    ...,
-                    q_block_start:q_block_start + local_q_blocks,
-                    :,
-                ].copy_(q_summary_local)
                 packer(
                     k,
                     k_int8,
@@ -323,14 +267,11 @@ def _assemble_streamed_sparse_qkv(
                     block_size=spec.kv_tile,
                 )
                 v[..., start:end, :].copy_(chunk_v)
-                if rows != max_rows:
-                    del q_local, q_scale_local, q_summary_local
             finally:
-                del q, k, chunk_v
+                del k, chunk_v
     finally:
         if held is not None:
             held.__exit__(None, None, None)
-        del q_int8_scratch, q_scale_scratch, q_summary_scratch
 
     return StreamedSparseSageQKV(
         module=module,
@@ -339,7 +280,6 @@ def _assemble_streamed_sparse_qkv(
         k_int8=k_int8,
         k_scale=k_scale,
         v=v,
-        q_summary=q_summary,
         k_summary=k_summary,
         output_dtype=x.dtype,
         sequence=sequence,
@@ -452,29 +392,17 @@ class StreamedSparseSageQKVProjector:
 
 def _prepare_streamed_route_plan(
     router,
-    q_summary,
     k_summary,
     layout,
     video_budget,
 ):
-    """Keep exact current Top-K selection, but not the full Sparge LUT."""
-    if q_summary.ndim != 4 or k_summary.ndim != 4:
-        raise SparseRouterError("tile router summaries must be rank-4 HND tensors")
-    if q_summary.shape[:2] != k_summary.shape[:2]:
-        raise SparseRouterError("Q/K router summary batch and head shapes differ")
-    if q_summary.shape[-1] != k_summary.shape[-1]:
-        raise SparseRouterError("Q/K router summary dimensions differ")
-    if q_summary.device != k_summary.device:
-        raise SparseRouterError("Q/K router summary devices differ")
+    """Prepare K-owned routing state without projecting Q ahead of execution."""
+    if k_summary.ndim != 4:
+        raise SparseRouterError("K router summary must be a rank-4 HND tensor")
     if not 0.01 <= float(video_budget) <= 1.0:
         raise SparseRouterError("video_budget must be in [0.01, 1]")
 
     geometry = router.geometry(layout)
-    if tuple(q_summary.shape[-2:]) != (
-        geometry.q_tiles,
-        q_summary.shape[-1],
-    ):
-        raise SparseRouterError("Q router summary shape does not match layout")
     if tuple(k_summary.shape[-2:]) != (
         geometry.kv_tiles,
         k_summary.shape[-1],
@@ -483,77 +411,82 @@ def _prepare_streamed_route_plan(
 
     retained = router._retained(video_budget, geometry)
     metadata = router._metadata(geometry, video_budget, retained)
-    if retained == geometry.pure_video_kv_tiles:
-        indices = None
-    else:
-        # Deliberately use the existing selector as one full-M matmul.  Changing
-        # GEMM M can alter floating accumulation enough to flip near-tied Top-K
-        # choices; streamed LUT construction must not silently change quality.
-        indices = router._select_indices(
-            q_summary[..., geometry.pure_video_q_start:, :],
-            k_summary[..., geometry.pure_video_kv_start:, :],
-            retained,
-        )
     return (
         StreamedRoutePlan(
             geometry=geometry,
             retained=retained,
-            indices=indices,
-            batch=int(q_summary.shape[0]),
-            heads=int(q_summary.shape[1]),
+            k_summary=k_summary,
+            batch=int(k_summary.shape[0]),
+            heads=int(k_summary.shape[1]),
         ),
         metadata,
     )
 
 
-def _iter_streamed_lut_chunks(router, route_plan, *, q_chunk_tiles, device):
+def _build_streamed_lut_chunk(
+    router,
+    route_plan,
+    q_summary,
+    *,
+    tile_start,
+):
     geometry = route_plan.geometry
-    q_chunk_tiles = int(q_chunk_tiles)
-    if q_chunk_tiles <= 0:
-        raise SparseRouterError("q_chunk_tiles must be positive")
+    if route_plan.k_summary is None:
+        raise SparseRouterError("streamed route K summary was released")
+    if q_summary.ndim != 4:
+        raise SparseRouterError("Q router summary must be a rank-4 HND tensor")
+    tile_start = int(tile_start)
+    tile_count = int(q_summary.shape[-2])
+    tile_end = tile_start + tile_count
+    if (
+        tuple(q_summary.shape[:2]) != (route_plan.batch, route_plan.heads)
+        or q_summary.shape[-1] != route_plan.k_summary.shape[-1]
+        or q_summary.device != route_plan.k_summary.device
+        or tile_count <= 0
+        or not 0 <= tile_start < tile_end <= geometry.q_tiles
+    ):
+        raise SparseRouterError("Q router summary chunk does not match route plan")
     dense = torch.arange(
         geometry.kv_tiles,
-        device=device,
+        device=q_summary.device,
         dtype=torch.int32,
     )
     dense_delta = torch.cat((dense[:1], dense[1:] - dense[:-1]))
+    lut = dense_delta.view(1, 1, 1, -1).expand(
+        route_plan.batch,
+        route_plan.heads,
+        tile_count,
+        -1,
+    ).clone()
+    valid = torch.full(
+        (route_plan.batch, route_plan.heads, tile_count),
+        geometry.kv_tiles,
+        dtype=torch.int32,
+        device=q_summary.device,
+    )
 
-    for tile_start in range(0, geometry.q_tiles, q_chunk_tiles):
-        tile_end = min(tile_start + q_chunk_tiles, geometry.q_tiles)
-        tile_count = tile_end - tile_start
-        lut = dense_delta.view(1, 1, 1, -1).expand(
-            route_plan.batch,
-            route_plan.heads,
-            tile_count,
-            -1,
-        ).clone()
-        valid = torch.full(
-            (route_plan.batch, route_plan.heads, tile_count),
-            geometry.kv_tiles,
-            dtype=torch.int32,
-            device=device,
+    sparse_start = max(tile_start, geometry.pure_video_q_start)
+    if (
+        route_plan.retained < geometry.pure_video_kv_tiles
+        and sparse_start < tile_end
+    ):
+        local_start = sparse_start - tile_start
+        indices = router._select_indices(
+            q_summary[..., local_start:, :],
+            route_plan.k_summary[..., geometry.pure_video_kv_start:, :],
+            route_plan.retained,
         )
-
-        if route_plan.indices is not None:
-            sparse_start = max(tile_start, geometry.pure_video_q_start)
-            if sparse_start < tile_end:
-                local_start = sparse_start - tile_start
-                index_start = sparse_start - geometry.pure_video_q_start
-                index_end = tile_end - geometry.pure_video_q_start
-                indices = route_plan.indices[..., index_start:index_end, :]
-                sparse_rows = router._pack_rows(
-                    indices,
-                    geometry,
-                    dense,
-                    dense_delta,
-                )
-                lut[..., local_start:, :sparse_rows.shape[-1]].copy_(sparse_rows)
-                valid[..., local_start:] = (
-                    geometry.pure_video_kv_start + route_plan.retained
-                )
-                del sparse_rows
-
-        yield tile_start, tile_end, lut.contiguous(), valid.contiguous()
+        sparse_rows = router._pack_rows(
+            indices,
+            geometry,
+            dense,
+            dense_delta,
+        )
+        lut[..., local_start:, :sparse_rows.shape[-1]].copy_(sparse_rows)
+        valid[..., local_start:] = (
+            geometry.pure_video_kv_start + route_plan.retained
+        )
+    return lut.contiguous(), valid.contiguous()
 
 
 def prepare_streamed_sparse_sage(
@@ -580,7 +513,6 @@ def prepare_streamed_sparse_sage(
         with diagnostics.stage("sparse_route"):
             route_plan, mask_metadata = _prepare_streamed_route_plan(
                 backend.router,
-                projected.q_summary,
                 projected.k_summary,
                 snapshot.layout,
                 video_budget,
@@ -588,9 +520,8 @@ def prepare_streamed_sparse_sage(
     except SparseRouterError as exc:
         raise SparseSageError("sparse routing failed: %s" % exc) from exc
 
-    # Routing has consumed both summaries.  Drop them before V conversion so
-    # the route and V preparation do not overlap unnecessary summary storage.
-    projected.q_summary = None
+    # The route plan owns K summaries until the final Q slab has selected its
+    # route. The projected carrier no longer owns a second reference.
     projected.k_summary = None
     with diagnostics.stage("sparse_carrier_prepare"):
         v_carrier, v_scale = backend.executor._prepare_v(projected.v)
@@ -611,7 +542,7 @@ def prepare_streamed_sparse_sage(
         {
             "qkv_lifetime": "streamed_q_global_k",
             "attention_output": "chunked_out_proj_inplace",
-            "router_lifetime": "compact_selection_lazy_sparge_lut",
+            "router_lifetime": "k_summary_q_slab_selection_lazy_sparge_lut",
             "project_chunk_rows": projected.project_chunk_rows,
             "query_chunk_rows": projected.query_chunk_rows,
             "out_proj_chunk_rows": OUT_PROJ_CHUNK_ROWS,
@@ -885,14 +816,16 @@ def execute_streamed_sparse_sage(module, backend, prepared):
         (heads,), 50.0, dtype=torch.float32, device=result.device
     )
 
-    route_iter = _iter_streamed_lut_chunks(
-        backend.router,
-        prepared.route_plan,
-        q_chunk_tiles=max_q_tiles,
-        device=result.device,
-    )
     try:
-        for tile_start, tile_end, lut_chunk, valid_chunk in route_iter:
+        for tile_start in range(
+            0,
+            prepared.route_plan.geometry.q_tiles,
+            max_q_tiles,
+        ):
+            tile_end = min(
+                tile_start + max_q_tiles,
+                prepared.route_plan.geometry.q_tiles,
+            )
             row_start = int(tile_start) * q_tile
             row_end = min(int(tile_end) * q_tile, sequence)
             rows = row_end - row_start
@@ -939,6 +872,14 @@ def execute_streamed_sparse_sage(module, backend, prepared):
                 q_summary_scratch,
                 block_size=q_tile,
             )
+
+            with diagnostics.stage("sparse_route"):
+                lut_chunk, valid_chunk = _build_streamed_lut_chunk(
+                    backend.router,
+                    prepared.route_plan,
+                    q_summary_scratch,
+                    tile_start=tile_start,
+                )
 
             with diagnostics.stage("sparse_attention_kernel"):
                 spec.dispatch(
@@ -988,9 +929,6 @@ def execute_streamed_sparse_sage(module, backend, prepared):
             if not full_chunk:
                 del q_int8, q_scale, q_summary_scratch, output
     finally:
-        close = getattr(route_iter, "close", None)
-        if callable(close):
-            close()
         prepared.release()
         del (
             q_int8_buffer,

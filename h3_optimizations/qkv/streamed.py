@@ -66,6 +66,16 @@ def project_q_hnd(held, x, rope_freqs, start, end):
     return q
 
 
+def project_kv_hnd(held, x, rope_freqs, start, end):
+    """Project K/V without Q when the source binding exposes a split path."""
+    project_kv = getattr(held, "project_kv_hnd", None)
+    if callable(project_kv):
+        return project_kv(x, rope_freqs, start, end)
+    q, k, v = held.project_hnd(x, rope_freqs, start, end)
+    del q
+    return k, v
+
+
 __all__ = [
     "PROJECTION_FORCE_BF16",
     "PROJECTION_FORCE_FP8",
@@ -74,5 +84,6 @@ __all__ = [
     "PROJECTION_NATIVE",
     "StreamedQKVBindingError",
     "create_held_qkv",
+    "project_kv_hnd",
     "project_q_hnd",
 ]

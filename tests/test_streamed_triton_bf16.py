@@ -24,6 +24,11 @@ comfy.options.enable_args_parsing()
 
 from h3_optimizations.attention.sparse import triton_bf16  # noqa: E402
 from h3_optimizations.attention.sparse.router import SparseTileRouter  # noqa: E402
+from h3_optimizations.attention.sparse.triton_route import (  # noqa: E402
+    build_compact_absolute_route,
+    build_compact_absolute_route_chunk,
+    prepare_compact_absolute_route_chunks,
+)
 from h3_optimizations.attention.sparse.triton_bf16_streamed import (  # noqa: E402
     PreparedStreamedTritonBF16,
     _assemble_streamed_triton_qkv,
@@ -39,6 +44,7 @@ class FakeHeld:
         self.heads = heads
         self.head_dim = head_dim
         self.full_calls = []
+        self.kv_calls = []
         self.q_calls = []
         self.released = False
 
@@ -59,6 +65,13 @@ class FakeHeld:
             .unsqueeze(0)
             .contiguous()
         )
+
+    def project_kv_hnd(self, x, _rope, start, end):
+        self.kv_calls.append((start, end))
+        rows = end - start
+        base = x[start:end].reshape(rows, self.heads, self.head_dim)
+        k = base.transpose(0, 1).unsqueeze(0).contiguous() + 100
+        return k, k + 100
 
     def __exit__(self, *_args):
         self.released = True
@@ -85,6 +98,24 @@ class OutProjectionProxy:
 
     def __getattr__(self, name):
         return getattr(self._module, name)
+
+
+class DenseRoutePlan:
+    def __init__(self, k_summary, q_tiles):
+        self.k_summary = k_summary
+        self.batch = int(k_summary.shape[0])
+        self.heads = int(k_summary.shape[1])
+        self.retained = 0
+        self.geometry = SimpleNamespace(
+            q_tiles=q_tiles,
+            kv_tiles=int(k_summary.shape[-2]),
+            pure_video_q_start=q_tiles,
+            pure_video_kv_start=int(k_summary.shape[-2]),
+            pure_video_kv_tiles=0,
+        )
+
+    def release(self):
+        self.k_summary = None
 
 
 def packed_layout(sequence=130, video_start=64):
@@ -123,15 +154,57 @@ class StreamedTritonBF16Tests(unittest.TestCase):
             chunk_rows=64,
         )
 
-        self.assertEqual(held.full_calls, [(0, 64), (64, 128), (128, 130)])
+        self.assertEqual(held.full_calls, [])
+        self.assertEqual(held.kv_calls, [(0, 64), (64, 128), (128, 130)])
         self.assertFalse(hasattr(projected, "q"))
         self.assertEqual(tuple(projected.k.shape), (1, 2, 130, 128))
         self.assertEqual(tuple(projected.v.shape), (1, 2, 130, 128))
-        self.assertEqual(tuple(projected.q_summary.shape), (1, 2, 3, 128))
+        self.assertFalse(hasattr(projected, "q_summary"))
         self.assertEqual(tuple(projected.k_summary.shape), (1, 2, 3, 128))
         self.assertFalse(held.released)
         projected.release()
         self.assertTrue(held.released)
+
+    def test_chunk_routes_reconstruct_the_compact_absolute_route(self):
+        router = SparseTileRouter(q_tile=2, kv_tile=2)
+        layout = SimpleNamespace(
+            seq_len=12,
+            video_range=(4, 12),
+            segments=((0, 4, "text"), (4, 12, "video")),
+            video_shape=(1, 2, 4),
+            audio_t=0,
+        )
+        generator = torch.Generator().manual_seed(1234)
+        q_summary = torch.randn((1, 2, 6, 4), generator=generator)
+        k_summary = torch.randn((1, 2, 6, 4), generator=generator)
+        expected, expected_metadata = build_compact_absolute_route(
+            router,
+            q_summary,
+            k_summary,
+            layout,
+            0.5,
+        )
+        plan = prepare_compact_absolute_route_chunks(
+            router,
+            k_summary,
+            layout,
+            0.5,
+        )
+        pieces = []
+        for tile_start in range(0, q_summary.shape[-2], 2):
+            tile_end = min(tile_start + 2, q_summary.shape[-2])
+            route = build_compact_absolute_route_chunk(
+                router,
+                q_summary[..., tile_start:tile_end, :],
+                plan,
+                q_tile_start=tile_start,
+            )
+            if route.shape[-2]:
+                pieces.append(route)
+
+        actual = torch.cat(pieces, dim=-2)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(plan.metadata.as_dict(), expected_metadata.as_dict())
 
     def test_source_without_q_only_projection_still_returns_bounded_q(self):
         held = FullQKVOnlyHeld(self.heads)
@@ -213,9 +286,8 @@ class StreamedTritonBF16Tests(unittest.TestCase):
             transformer_options={},
         )
 
-        self.assertIsNone(projected.q_summary)
         self.assertIsNone(projected.k_summary)
-        self.assertEqual(prepared.sparse_lut.ndim, 4)
+        self.assertIsNotNone(prepared.route_plan.k_summary)
         self.assertEqual(
             prepared.metadata["qkv_lifetime"],
             "streamed_q_global_bf16_kv",
@@ -235,7 +307,7 @@ class StreamedTritonBF16Tests(unittest.TestCase):
         )
         prepared = PreparedStreamedTritonBF16(
             projected=projected,
-            sparse_lut=torch.empty((1, self.heads, 0, 0), dtype=torch.int32),
+            route_plan=DenseRoutePlan(projected.k_summary, 3),
             dense_q_tiles=3,
             sparse_q_tiles=0,
             sparse_selected=0,
@@ -247,7 +319,7 @@ class StreamedTritonBF16Tests(unittest.TestCase):
             launches.append((kwargs["q_row_start"], int(q.shape[-2])))
             return q.clone()
 
-        backend = SimpleNamespace()
+        backend = SimpleNamespace(router=object())
         with mock.patch.object(
             triton_bf16,
             "_launch_streamed_chunk",
@@ -279,7 +351,7 @@ class StreamedTritonBF16Tests(unittest.TestCase):
         )
         prepared = PreparedStreamedTritonBF16(
             projected=projected,
-            sparse_lut=torch.empty((1, self.heads, 0, 0), dtype=torch.int32),
+            route_plan=DenseRoutePlan(projected.k_summary, 3),
             dense_q_tiles=3,
             sparse_q_tiles=0,
             sparse_selected=0,
@@ -294,7 +366,7 @@ class StreamedTritonBF16Tests(unittest.TestCase):
         ):
             actual = execute_streamed_triton_bf16(
                 proxy,
-                SimpleNamespace(),
+                SimpleNamespace(router=object()),
                 prepared,
             )
 

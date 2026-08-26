@@ -225,6 +225,28 @@ class HeldConvRotINT8QKV:
             q = self._finish_single_qk(q, rope, self.attention.q_norm)
         return q.transpose(0, 1).unsqueeze(0)
 
+    def project_kv_hnd(self, x, rope_freqs, start, end):
+        inner = int(self.attention.heads) * int(self.attention.head_dim)
+        rope = None if rope_freqs is None else rope_freqs[:, start:end]
+        with diagnostics.stage("qkv_linear"):
+            projected = self.binding.linear_range(
+                x[start:end],
+                inner,
+                inner * 3,
+            )
+        k, v = projected.split(inner, dim=-1)
+        with diagnostics.stage("qk_norm_rope"):
+            k = self._finish_single_qk(k, rope, self.attention.k_norm)
+        v = v.view(
+            end - start,
+            self.attention.heads,
+            self.attention.head_dim,
+        )
+        return (
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+        )
+
     def project_rows(self, x, rope_freqs, rows):
         sample_x = x.index_select(0, rows)
         sample_rope = (

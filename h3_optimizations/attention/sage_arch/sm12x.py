@@ -29,10 +29,13 @@ class SM12xAPI:
 
 
 class SageSM12xMemoryEfficientBackend(ArchitectureBackend):
-    """Per-warp Q/K and upstream's SM89-family FP8 kernel."""
+    """SM100/120/121 per-warp Q/K and SM89-family FP8 kernel."""
 
     name = "sage_mem_eff_sm12x"
-    capabilities = frozenset({(12, 0), (12, 1)})
+    capabilities = frozenset({(10, 0), (12, 0), (12, 1)})
+    projected_qkv_format = "sage_per_warp_128_64"
+    projected_q_tile = 128
+    projected_k_tile = 64
 
     def __init__(
         self,
@@ -76,6 +79,17 @@ class SageSM12xMemoryEfficientBackend(ArchitectureBackend):
             )
         self.api = api
 
+    def quantize_projected_qk(self, q, k):
+        return self.api.per_warp_int8(
+            q,
+            k,
+            None,
+            tensor_layout="HND",
+            BLKQ=128,
+            WARPQ=32,
+            BLKK=64,
+        )
+
     def prepare(
         self,
         q,
@@ -92,16 +106,9 @@ class SageSM12xMemoryEfficientBackend(ArchitectureBackend):
         )
         q_source = guard_signed_offsets(q)
         k_source = guard_signed_offsets(k)
-        q_int8, q_scale, k_int8, k_scale = (
-            self.api.per_warp_int8(
-                q_source,
-                k_source,
-                None,
-                tensor_layout="HND",
-                BLKQ=128,
-                WARPQ=32,
-                BLKK=64,
-            )
+        q_int8, q_scale, k_int8, k_scale = self.quantize_projected_qk(
+            q_source,
+            k_source,
         )
         v_source = independent_contiguous(v)
         del q_source, k_source

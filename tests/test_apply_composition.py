@@ -166,12 +166,23 @@ class ApplyCompositionTests(unittest.TestCase):
             left = apply_in_order(FakeModel(), memory, sparse)
             right = apply_in_order(FakeModel(), sparse, memory)
 
-        armed_logs = [line for line in logs.output if ' armed: ' in line]
-        self.assertTrue(armed_logs)
+        applied_logs = [
+            line for line in logs.output if ' applied plan: ' in line
+        ]
+        self.assertTrue(applied_logs)
         self.assertTrue(all(
             'qkv_weights=TensorWiseINT8Layout+convrot256 qkv_layers=50' in line
-            for line in armed_logs
+            for line in applied_logs
         ))
+        self.assertTrue(all('qkv_provider=' in line for line in applied_logs))
+        self.assertTrue(any(
+            'features=memory+sparse' in line for line in applied_logs
+        ))
+        self.assertTrue(any(
+            'replaces_attention=comfy_kitchen_int8' in line
+            for line in applied_logs
+        ))
+        self.assertFalse(any(' armed: ' in line for line in logs.output))
         self.assertEqual(
             read_plan(left).signature,
             read_plan(right).signature,

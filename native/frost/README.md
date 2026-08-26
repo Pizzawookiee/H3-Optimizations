@@ -34,9 +34,9 @@ The CUDA Driver ABI parameter order is:
 q_tiles, kv_tiles, n_kv_tiles, softmax_scale_log2, sequence_q, sequence_kv,
 head_dim, band, inverse_softmax_scale`.
 
-The routed derivative drains each matching K/V tile into shared memory before
-computing it. NVIDIA's original cross-iteration prefetch assumes a contiguous
-KV range and is not used by this sparse specialization.
+The routed derivative retains NVIDIA's two-stage `cp.async` schedule. Current V
+and the next selected K tile are addressed independently through the absolute
+route, so arbitrary sparse selections do not rely on contiguous pointer state.
 
 ## Validation
 
@@ -45,3 +45,8 @@ for Q lengths 64, 65, and 129 against 193-row K/V, using both dense and
 noncontiguous absolute routes. Relative L2 error was at most 0.00258 and all
 outputs were finite. The streamed consumer also passed a three-slab
 `64 + 64 + 1` execution against global 129-row K/V with relative L2 0.00258.
+
+The pipelined artifact was bit-identical to the synchronous baseline for dense,
+noncontiguous, tail, single-entry, and unequal Q/KV sequence cases. At the
+kernel boundary on the same RTX 4070, a 4096-row Q slab against 54,006-row K/V
+at 30.3% tile density improved from 52.38 ms to 43.00 ms median (1.218x).

@@ -38,6 +38,9 @@ from .attention.sparse.kitchen_sparse import (
     preflight_sparse_kitchen,
 )
 from .dense_resolver import (
+    ATTENTION_EXISTING_FULL_Q,
+    ATTENTION_SAGE_PREFIX,
+    ATTENTION_SAGE_SM89,
     install_dense_attention,
     preserve_dense_attention,
     resolve_current_dense_attention,
@@ -71,6 +74,7 @@ from .plan import (
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
     QKV_STREAMING_OFF,
+    QKV_STREAMING_FORCED,
 )
 from .qkv.bf16 import (
     ChunkedBF16QKVProjector,
@@ -135,9 +139,9 @@ _BOUNDED_QKV_PROVIDERS = (
 )
 
 
-def _bounded_qkv_projector(qkv):
+def _bounded_qkv_projector(qkv, chunk_rows=4096):
     return ChunkedBF16QKVProjector(
-        chunk_rows=4096,
+        chunk_rows=chunk_rows,
         force_weights_bf16=qkv.provider_id == QKV_FORCE_BF16_CHUNKED,
         force_weights_fp8=qkv.provider_id == QKV_FORCE_FP8_CHUNKED,
         force_weights_int8=(
@@ -285,7 +289,7 @@ def _sparse_config_kwargs(plan):
 def describe_memory_options(attention):
     """The opt-in memory behaviour actually installed, short enough to log.
 
-    Without this the armed line looks identical whether or not the memory
+    Without this the plan summary looks identical whether or not the memory
     defaults are in force, which is exactly the question someone asks after
     pulling: did I get the new code? Report the behaviour, not the version.
     """
@@ -323,9 +327,19 @@ def _resolve_dense(plan, model, inventory, environment=None):
             else resolve_dense_attention(model)
         )
     )
-    dense_triton_available = False
-    if dense.backend_kind == 'dense_sage_sm89':
-        from .dense_fused_qkv import TRITON_AVAILABLE as dense_triton_available
+    dense_sage = dense.backend_kind.startswith(ATTENTION_SAGE_PREFIX)
+    dense_carrier_available = False
+    if dense_sage:
+        requires_h3_triton = (
+            dense.backend_kind == ATTENTION_SAGE_SM89
+            or bool(getattr(dense.backend, 'requires_h3_triton', False))
+        )
+        if requires_h3_triton:
+            from .attention.triton_i64 import TRITON_AVAILABLE
+
+            dense_carrier_available = bool(TRITON_AVAILABLE)
+        else:
+            dense_carrier_available = True
     qkv = resolve_qkv_provider(
         inventory,
         request=_qkv_request(plan),
@@ -333,33 +347,46 @@ def _resolve_dense(plan, model, inventory, environment=None):
         kitchen_producer_available=producer_api_available(
             device=getattr(environment, 'device_index', None)
         ),
-        triton_available=bool(dense_triton_available),
+        triton_available=dense_carrier_available,
         memory_optimize=memory is not None,
         fp8_available=_fp8_execution_available(environment),
     )
     backend = None
     projector = None
     if (
-        dense.backend_kind == 'dense_sage_sm89'
+        dense_sage
         and qkv.provider_id != QKV_STANDARD
     ):
-        from .dense_backend import ProjectedSM89SageBackend
         from .dense_fused_qkv import DenseFusedQKVProjector
 
-        backend = ProjectedSM89SageBackend(dense.backend)
+        if dense.backend_kind == ATTENTION_SAGE_SM89:
+            from .dense_backend import ProjectedSM89SageBackend
+
+            backend = ProjectedSM89SageBackend(dense.backend)
+            carrier_backend = None
+        else:
+            backend = dense.backend
+            carrier_backend = dense.backend
         projector = DenseFusedQKVProjector(
             chunk_rows=memory.chunk_rows,
             projection_mode=_streamed_projection_mode(qkv, inventory),
+            carrier_backend=carrier_backend,
         )
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
-        # Preserve the selected dense attention while retaining complete BF16
-        # K/V, consuming bounded source-aware Q slabs, and writing each output
-        # projection slab into the disposable block input.
         backend = ChunkedKitchenAttentionBackend()
-        projector = StreamedDenseBF16QKVProjector(
-            chunk_rows=memory.chunk_rows,
-            projection_mode=_streamed_projection_mode(qkv, inventory),
-        )
+        if (
+            dense.backend_kind != ATTENTION_EXISTING_FULL_Q
+            and dense.backend_kind != 'sage'
+        ) or memory.qkv_streaming == QKV_STREAMING_FORCED:
+            projector = StreamedDenseBF16QKVProjector(
+                chunk_rows=memory.chunk_rows,
+                projection_mode=_streamed_projection_mode(qkv, inventory),
+            )
+        else:
+            projector = _bounded_qkv_projector(
+                qkv,
+                chunk_rows=memory.chunk_rows,
+            )
     elif qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
         QKV_DENSE_FP8_CHUNKED,
@@ -933,6 +960,13 @@ def apply_plan(model, plan: H3OptimizationPlan):
     inventory = inspect_h3_linears(blocks)
     environment = RuntimeEnvironment.detect()
     attention, qkv = _resolve_attention(plan, model, inventory, environment)
+    previous_options = model.model_options.get('transformer_options', {})
+    previous_status = previous_options.get(STATUS_KEY)
+    previous_attention = previous_options.get(
+        'h3_optimizations_attention_backend'
+    )
+    if previous_attention is None and previous_status is not None:
+        previous_attention = previous_status['attention']['selected']
 
     patched = model.clone()
     attention_blocks = 0
@@ -1014,10 +1048,31 @@ def apply_plan(model, plan: H3OptimizationPlan):
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
     _warn_about_slow_paths(attention, qkv)
     qkv_labels = inventory.labels('qkv')
-    logging.info(
-        '%s armed: attention=%s qkv="%s" qkv_route=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s memory=%s device=%s',
-        LOG_PREFIX,
+    features = '+'.join(
+        name
+        for name, request in (
+            ('memory', plan.memory),
+            ('sparse', plan.sparse),
+        )
+        if request is not None
+    ) or 'none'
+    attention_name = getattr(
+        attention.backend,
+        'name',
         attention.selected,
+    )
+    replacement = (
+        ' replaces_attention=%s' % previous_attention
+        if previous_attention is not None
+        and previous_attention != attention_name
+        else ''
+    )
+    logging.info(
+        '%s applied plan: features=%s attention=%s%s qkv="%s" qkv_provider=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s memory=%s device=%s',
+        LOG_PREFIX,
+        features,
+        attention_name,
+        replacement,
         format_qkv_execution(options[STATUS_KEY]),
         qkv.provider_id,
         ','.join(sorted(set(qkv_labels))) or 'unknown',

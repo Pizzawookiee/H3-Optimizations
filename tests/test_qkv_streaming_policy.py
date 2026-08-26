@@ -402,27 +402,43 @@ class QKVStreamingPolicyTests(unittest.TestCase):
             FUSED_QKV_FORCE_QUANT,
         )
         weights = (self.bf16, self.convrot, self.w4a8, self.fp8)
-        for request in requests:
-            for weight in weights:
-                with self.subTest(request=request, layout=weight._layout_cls):
-                    resolved = resolve_qkv_provider(
-                        inventory(weight),
+        backends = (
+            'dense_sage_sm75',
+            'dense_sage_sm80',
+            'dense_sage_sm86',
+            'dense_sage_sm87',
+            'dense_sage_sm89',
+            'dense_sage_sm90',
+            'dense_sage_sm100',
+            'dense_sage_sm120',
+            'dense_sage_sm121',
+        )
+        for backend_kind in backends:
+            for request in requests:
+                for weight in weights:
+                    with self.subTest(
+                        backend_kind=backend_kind,
                         request=request,
-                        backend_kind='dense_sage_sm89',
-                        triton_available=True,
-                        memory_optimize=True,
-                        fp8_available=True,
-                    )
-                    expected = QKV_BF16_CHUNKED
-                    if request == FUSED_QKV_FORCE_BF16:
-                        expected = QKV_FORCE_BF16_CHUNKED
-                    elif request == FUSED_QKV_FORCE_QUANT and weight is self.bf16:
-                        expected = QKV_FORCE_CONVROT_INT8_CHUNKED
-                    elif weight is self.convrot:
-                        expected = QKV_DENSE_CONVROT_INT8
-                    self.assertEqual(resolved.provider_id, expected)
-                    self.assertTrue(resolved.fused)
-                    self.assertIn('SageAttention native Q/K carrier', resolved.reason)
+                        layout=weight._layout_cls,
+                    ):
+                        resolved = resolve_qkv_provider(
+                            inventory(weight),
+                            request=request,
+                            backend_kind=backend_kind,
+                            triton_available=True,
+                            memory_optimize=True,
+                            fp8_available=True,
+                        )
+                        expected = QKV_BF16_CHUNKED
+                        if request == FUSED_QKV_FORCE_BF16:
+                            expected = QKV_FORCE_BF16_CHUNKED
+                        elif request == FUSED_QKV_FORCE_QUANT and weight is self.bf16:
+                            expected = QKV_FORCE_CONVROT_INT8_CHUNKED
+                        elif weight is self.convrot:
+                            expected = QKV_DENSE_CONVROT_INT8
+                        self.assertEqual(resolved.provider_id, expected)
+                        self.assertTrue(resolved.fused)
+                        self.assertIn('SageAttention native Q/K carrier', resolved.reason)
 
     def test_dense_sage_direct_carrier_requires_triton(self):
         resolved = resolve_qkv_provider(
@@ -435,7 +451,7 @@ class QKVStreamingPolicyTests(unittest.TestCase):
 
         self.assertEqual(resolved.provider_id, QKV_STANDARD)
         self.assertFalse(resolved.fused)
-        self.assertIn('requires Triton', resolved.reason)
+        self.assertIn('producer is unavailable', resolved.reason)
 
     def test_dense_sage_native_fp8_requires_accelerated_projection(self):
         resolved = resolve_qkv_provider(

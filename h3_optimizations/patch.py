@@ -178,7 +178,7 @@ def configure_backend(
         'name',
         type(backend).__name__,
     )
-    logging.info(
+    logging.debug(
         '[H3 Optimizations] resolved %d attention forwards: backend=%s '
         'projector=%s',
         len(modules),

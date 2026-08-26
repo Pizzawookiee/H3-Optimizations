@@ -31,6 +31,9 @@ from h3_optimizations.attention.sparse.frost_bf16_streamed import (  # noqa: E40
     execute_streamed_frost_bf16,
     prepare_streamed_frost_bf16,
 )
+from h3_optimizations.attention.sparse.frost_route import (  # noqa: E402
+    prepare_full_absolute_route_chunks,
+)
 from h3_optimizations.attention.sparse.router import SparseTileRouter  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -42,6 +45,7 @@ class FakeHeld:
         self.heads = heads
         self.head_dim = head_dim
         self.full_calls = []
+        self.kv_calls = []
         self.q_calls = []
         self.active = False
 
@@ -68,19 +72,29 @@ class FakeHeld:
         q = self._q(x, start, end)
         return q, q + 100, q + 200
 
+    def project_kv_hnd(self, x, _rope, start, end):
+        self.kv_calls.append((start, end))
+        q = self._q(x, start, end)
+        return q + 100, q + 200
+
     def project_q_hnd(self, x, _rope, start, end):
         self.q_calls.append((start, end))
         return self._q(x, start, end)
 
 
 class FakeHeldFactory:
-    def __init__(self):
+    def __init__(self, binding_type=FakeHeld):
+        self.binding_type = binding_type
         self.bindings = []
 
     def __call__(self, _module, _sample, _projection_mode):
-        held = FakeHeld(self)
+        held = self.binding_type(self)
         self.bindings.append(held)
         return held
+
+
+class FakeFullOnlyHeld(FakeHeld):
+    project_kv_hnd = None
 
 
 def packed_layout(sequence=130, video_start=64):
@@ -120,23 +134,36 @@ class StreamedFrostBF16Tests(unittest.TestCase):
             held_factory=factory,
         )
 
-    def test_projection_retains_sequence_major_kv_and_summaries_but_no_q(self):
+    def test_projection_retains_sequence_major_kv_and_k_summary_but_no_q(self):
         factory = FakeHeldFactory()
         projected = self.project(factory)
 
-        self.assertEqual(factory.bindings[0].full_calls, [(0, 64), (64, 128), (128, 130)])
+        self.assertEqual(factory.bindings[0].kv_calls, [(0, 64), (64, 128), (128, 130)])
+        self.assertEqual(factory.bindings[0].full_calls, [])
         self.assertFalse(factory.bindings[0].active)
         self.assertFalse(hasattr(projected, 'q'))
+        self.assertFalse(hasattr(projected, 'q_summary'))
         self.assertEqual(tuple(projected.k.shape), (1, 2, 130, 128))
         self.assertEqual(tuple(projected.v.shape), (1, 2, 130, 128))
         expected_stride = (130 * 2 * 128, 128, 2 * 128, 1)
         self.assertEqual(projected.k.stride(), expected_stride)
         self.assertEqual(projected.v.stride(), expected_stride)
-        self.assertEqual(tuple(projected.q_summary.shape), (1, 2, 3, 128))
         self.assertEqual(tuple(projected.k_summary.shape), (1, 2, 3, 128))
         projected.release()
 
-    def test_prepare_builds_absolute_route_from_summaries(self):
+    def test_projection_falls_back_to_bounded_full_qkv_when_kv_slice_is_absent(self):
+        factory = FakeHeldFactory(FakeFullOnlyHeld)
+        projected = self.project(factory)
+
+        self.assertEqual(
+            factory.bindings[0].full_calls,
+            [(0, 64), (64, 128), (128, 130)],
+        )
+        self.assertEqual(factory.bindings[0].kv_calls, [])
+        self.assertFalse(hasattr(projected, 'q'))
+        projected.release()
+
+    def test_prepare_builds_chunked_absolute_route_plan(self):
         factory = FakeHeldFactory()
         projected = self.project(factory)
         backend = SimpleNamespace(
@@ -165,10 +192,9 @@ class StreamedFrostBF16Tests(unittest.TestCase):
             transformer_options={},
         )
 
-        self.assertIsNone(projected.q_summary)
-        self.assertIsNone(projected.k_summary)
-        self.assertEqual(tuple(prepared.route.shape), (1, 2, 3, 3))
-        self.assertEqual(tuple(prepared.counts.shape), (1, 2, 3))
+        self.assertIsNotNone(projected.k_summary)
+        self.assertEqual(prepared.route_plan.geometry.q_tiles, 3)
+        self.assertEqual(prepared.route_plan.geometry.kv_tiles, 3)
         self.assertEqual(
             prepared.metadata['qkv_lifetime'],
             'streamed_q_global_sequence_major_bf16_kv',
@@ -179,14 +205,15 @@ class StreamedFrostBF16Tests(unittest.TestCase):
         factory = FakeHeldFactory()
         original = self.x.clone()
         projected = self.project(factory)
-        route = torch.arange(3, dtype=torch.int32).view(1, 1, 1, 3).expand(
-            1, self.heads, 3, 3
-        ).contiguous()
-        counts = torch.full((1, self.heads, 3), 3, dtype=torch.int32)
+        router = SparseTileRouter(q_tile=64, kv_tile=64)
         prepared = PreparedStreamedFrostBF16(
             projected=projected,
-            route=route,
-            counts=counts,
+            route_plan=prepare_full_absolute_route_chunks(
+                router,
+                projected.k_summary,
+                packed_layout(),
+                0.5,
+            ),
             metadata={},
         )
         launches = []
@@ -212,6 +239,7 @@ class StreamedFrostBF16Tests(unittest.TestCase):
 
         backend = SimpleNamespace(
             spec=self.spec,
+            router=router,
             executor=Executor(),
         )
         actual = execute_streamed_frost_bf16(

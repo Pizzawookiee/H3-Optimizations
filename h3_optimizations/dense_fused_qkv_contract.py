@@ -1,4 +1,4 @@
-"""Dense SM89 Sage projected-QKV carrier contract."""
+"""Dense Sage projected-QKV carrier data and legacy SM89 validation."""
 
 from dataclasses import dataclass
 

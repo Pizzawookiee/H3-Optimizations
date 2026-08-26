@@ -301,6 +301,7 @@ def _launch_streamed_chunk(
     sparse_selected,
     sequence,
     q_row_start,
+    sparse_lut_q_start=0,
 ):
     if not TRITON_AVAILABLE:
         raise TritonBF16Error('BF16 Triton sparse attention requires Triton')
@@ -339,12 +340,8 @@ def _launch_streamed_chunk(
 
     heads = int(q.shape[1])
     kv_tiles = (int(sequence) + KV_TILE - 1) // KV_TILE
-    expected = (
-        1,
-        heads,
-        int(sparse_q_tiles),
-        int(sparse_selected),
-    )
+    sparse_lut_q_start = int(sparse_lut_q_start)
+    expected = (1, heads, int(sparse_lut.shape[-2]), int(sparse_selected))
     if tuple(sparse_lut.shape) != expected:
         raise TritonBF16Error('streamed BF16 Triton sparse route shape differs')
     output = torch.empty_like(q)
@@ -389,7 +386,13 @@ def _launch_streamed_chunk(
     sparse_count = q_tile_count - dense_count
     if sparse_count:
         sparse_global_start = q_tile_start + dense_count
-        route_start = sparse_global_start - int(dense_q_tiles)
+        route_start = (
+            sparse_global_start
+            - int(dense_q_tiles)
+            - sparse_lut_q_start
+        )
+        if route_start < 0 or route_start + sparse_count > sparse_lut.shape[-2]:
+            raise TritonBF16Error('streamed BF16 Triton sparse route slab differs')
         route = sparse_lut[
             ...,
             route_start:route_start + sparse_count,

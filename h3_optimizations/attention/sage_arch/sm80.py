@@ -28,7 +28,11 @@ class SageSM80MemoryEfficientBackend(ArchitectureBackend):
     """Per-thread INT8 Q/K and FP16 V with FP32 accumulation."""
 
     name = "sage_mem_eff_sm80"
-    capabilities = frozenset({(8, 0)})
+    capabilities = frozenset({(8, 0), (8, 7)})
+    projected_qkv_format = "sage_per_thread_128_64"
+    projected_q_tile = 128
+    projected_k_tile = 64
+    requires_h3_triton = True
 
     def __init__(
         self,
@@ -56,6 +60,18 @@ class SageSM80MemoryEfficientBackend(ArchitectureBackend):
         self.api = api
         self.quantizer = quantizer or per_thread_int8_i64
 
+    def quantize_projected_qk(self, q, k):
+        return self.quantizer(
+            q,
+            k,
+            None,
+            BLKQ=128,
+            WARPQ=32,
+            BLKK=64,
+            WARPK=64,
+            tensor_layout="HND",
+        )
+
     def prepare(
         self,
         q,
@@ -70,16 +86,7 @@ class SageSM80MemoryEfficientBackend(ArchitectureBackend):
             k,
             v,
         )
-        q_int8, q_scale, k_int8, k_scale = self.quantizer(
-            q,
-            k,
-            None,
-            BLKQ=128,
-            WARPQ=32,
-            BLKK=64,
-            WARPK=64,
-            tensor_layout="HND",
-        )
+        q_int8, q_scale, k_int8, k_scale = self.quantize_projected_qk(q, k)
         v_source = independent_contiguous(v)
         self.log_once(
             self.api.version,

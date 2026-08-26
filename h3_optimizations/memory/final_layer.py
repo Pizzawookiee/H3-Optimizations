@@ -131,7 +131,7 @@ def install(model_patcher, chunk_rows):
         FINAL_LAYER_KEY,
         make_forward(layer, chunk_rows),
     )
-    logging.info(
+    logging.debug(
         '[H3 Optimizations] patched FinalLayer: chunk_rows=%d',
         chunk_rows,
     )

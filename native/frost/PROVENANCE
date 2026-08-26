@@ -1,5 +1,5 @@
 Artifact: h3_frost_bf16_sm89.cubin
-SHA256: 4be095512e6a117634a3c0dddac9cedeab2722543ea2f37537b6602dd5002cd3
+SHA256: 64690d05f52335bd252c6ecd9ad5d470ad5cff1df0d48f59c35396d0f775188c
 Upstream: NVIDIA/cudnn-frontend
 Upstream commit: ae8705effeea3804585b6aca554beaca1a76a3da
 Upstream source: python/cudnn/sdpa/fwd/kernels/prefill_f16_sm80.py
@@ -17,6 +17,6 @@ Toolchain: nvcr.io/nvidia/pytorch:26.07-py3, CUDA 13,
   nvidia-cutlass-dsl[cu13] 4.7.0, nvidia-cudnn-frontend 1.26.0
 
 The H3 patch adapts NVIDIA's open SM80 FROST SDPA template to consume the
-H3 sparse route through a correctness-first synchronous K/V staging loop and
-a stable raw-pointer CUDA Driver ABI. The artifact was compiled by this project
-and is not an NVIDIA-distributed binary.
+H3 sparse route through route-aware double-buffered K/V staging and a stable
+raw-pointer CUDA Driver ABI. The artifact was compiled by this project and is
+not an NVIDIA-distributed binary.

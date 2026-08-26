@@ -7,11 +7,15 @@ from dataclasses import dataclass
 import comfy.model_management
 from comfy.ldm.modules.attention import get_attention_function
 
+from .external_consumer import get_streamed_h3_qkv_consumer
+
 
 ATTENTION_AUTO = 'auto'
 ATTENTION_COMFY_KITCHEN_INT8 = 'comfy_kitchen_int8'
 ATTENTION_EXISTING = 'existing'
+ATTENTION_EXISTING_FULL_Q = 'existing_full_q'
 ATTENTION_SAGE = 'sage'
+ATTENTION_SAGE_PREFIX = 'dense_sage_sm'
 ATTENTION_SAGE_SM89 = 'dense_sage_sm89'
 OVERRIDE_MARKER = '_h3_optimizations_dense_backend'
 
@@ -25,13 +29,13 @@ class DenseResolution:
     backend_kind: str
 
 
-def _existing_resolution(requested, reason):
+def _existing_resolution(requested, reason, *, backend_kind=ATTENTION_EXISTING):
     return DenseResolution(
         requested,
         ATTENTION_EXISTING,
         None,
         reason,
-        ATTENTION_EXISTING,
+        backend_kind,
     )
 
 
@@ -54,36 +58,68 @@ def sage_attention_selected(model_patcher):
     return bool(comfy.model_management.sage_attention_enabled())
 
 
+def _prepared_sage_backend(capability):
+    if capability == (8, 9):
+        from .attention.sage_mem_eff import SM89SageMemoryEfficientBackend
+
+        return SM89SageMemoryEfficientBackend()
+
+    from .attention.sage_arch import (
+        SageSM12xMemoryEfficientBackend,
+        SageSM75MemoryEfficientBackend,
+        SageSM80MemoryEfficientBackend,
+        SageSM86MemoryEfficientBackend,
+        SageSM90MemoryEfficientBackend,
+    )
+
+    backend_type = {
+        (7, 5): SageSM75MemoryEfficientBackend,
+        (8, 0): SageSM80MemoryEfficientBackend,
+        (8, 6): SageSM86MemoryEfficientBackend,
+        (8, 7): SageSM80MemoryEfficientBackend,
+        (9, 0): SageSM90MemoryEfficientBackend,
+        (10, 0): SageSM12xMemoryEfficientBackend,
+        (12, 0): SageSM12xMemoryEfficientBackend,
+        (12, 1): SageSM12xMemoryEfficientBackend,
+    }.get(capability)
+    return None if backend_type is None else backend_type()
+
+
 def resolve_sage_fused_attention(model_patcher, environment):
     if not sage_attention_selected(model_patcher):
         return None
-    if tuple(getattr(environment, 'capability', ()) or ()) != (8, 9):
-        return DenseResolution(
-            ATTENTION_SAGE,
-            ATTENTION_SAGE,
-            None,
-            'native dense fused QKV requires SM89',
-            ATTENTION_SAGE,
-        )
+    capability = tuple(getattr(environment, 'capability', ()) or ())
+    architecture = (
+        'unknown'
+        if len(capability) != 2
+        else 'SM%d%d' % capability
+    )
     try:
-        from .attention.sage_mem_eff import SM89SageMemoryEfficientBackend
-
-        backend = SM89SageMemoryEfficientBackend()
+        backend = _prepared_sage_backend(capability)
     except Exception as exc:
         return DenseResolution(
             ATTENTION_SAGE,
             ATTENTION_SAGE,
             None,
-            'native dense fused Sage preflight failed: %s: %s'
-            % (type(exc).__name__, exc),
+            'native-carrier SageAttention preflight failed on %s: %s: %s'
+            % (architecture, type(exc).__name__, exc),
+            ATTENTION_SAGE,
+        )
+    if backend is None:
+        return DenseResolution(
+            ATTENTION_SAGE,
+            ATTENTION_SAGE,
+            None,
+            'no native-carrier SageAttention2 adapter for %s' % architecture,
             ATTENTION_SAGE,
         )
     return DenseResolution(
         ATTENTION_SAGE,
         ATTENTION_SAGE,
         backend,
-        'selected SageAttention with direct native-carrier QKV support',
-        ATTENTION_SAGE_SM89,
+        'selected SageAttention2 %s with direct native-carrier QKV support'
+        % architecture,
+        '%s%d%d' % (ATTENTION_SAGE_PREFIX, capability[0], capability[1]),
     )
 
 
@@ -134,6 +170,20 @@ def is_comfy_kitchen_dense_attention(transformer_options):
     return _override_wraps_backend(override, backend)
 
 
+def is_known_comfy_dense_attention(transformer_options):
+    options = transformer_options or {}
+    override = options.get('optimized_attention_override')
+    if override is None:
+        return True
+    for name in ('pytorch', 'sub_quad', 'split', 'flash', 'xformers'):
+        if _override_wraps_backend(
+            override,
+            get_attention_function(name, None),
+        ):
+            return True
+    return False
+
+
 def resolve_current_dense_attention(model_patcher, environment):
     """Preserve Comfy's selected backend while recognizing external Kitchen."""
     options = (
@@ -149,9 +199,22 @@ def resolve_current_dense_attention(model_patcher, environment):
             'preserved the external Comfy Kitchen attention selection',
             ATTENTION_COMFY_KITCHEN_INT8,
         )
+    if get_streamed_h3_qkv_consumer(options) is not None:
+        return _existing_resolution(
+            ATTENTION_EXISTING,
+            'preserved an external attention consumer with streamed-H3 QKV '
+            'support',
+        )
     sage = resolve_sage_fused_attention(model_patcher, environment)
     if sage is not None:
         return sage
+    if not is_known_comfy_dense_attention(options):
+        return _existing_resolution(
+            ATTENTION_EXISTING,
+            'preserved an unknown optimized-attention override with full-Q '
+            'single-call semantics',
+            backend_kind=ATTENTION_EXISTING_FULL_Q,
+        )
     return _existing_resolution(
         ATTENTION_EXISTING,
         'preserved ComfyUI\'s current dense attention selection',

@@ -265,7 +265,7 @@ def install_runtime_wrapper(model_patcher, session=None):
         model_patcher.model_options.get('transformer_options', {}).copy()
     )
     options[RUNTIME_SESSION_KEY] = session
-    logging.info(
+    logging.debug(
         '%s installed sampler-step and packed-layout runtime context',
         LOG_PREFIX,
     )

@@ -247,7 +247,7 @@ class SparseBackendSelectionTests(unittest.TestCase):
         kitchen.assert_not_called()
         frost.assert_called_once_with(plan, self.environment, self.inventory)
 
-    def test_kitchen_resolver_selects_chunked_producer(self):
+    def test_kitchen_resolver_selects_streamed_sparse_producer(self):
         plan = H3OptimizationPlan(
             sparse=SparseRequest(
                 backend=SPARSE_BACKEND_KITCHEN,
@@ -284,7 +284,7 @@ class SparseBackendSelectionTests(unittest.TestCase):
                 inventory,
             )
 
-        self.assertEqual(qkv.provider_id, 'chunked_kitchen_qkv')
+        self.assertEqual(qkv.provider_id, 'streamed_bf16_kitchen_qkv')
         self.assertTrue(qkv.fused)
         self.assertTrue(attention.projector.routing_summaries)
         self.assertTrue(attention.projector.stream_output)
