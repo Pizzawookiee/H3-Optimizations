@@ -4,6 +4,7 @@ The benchmark starts from one already-prequantized Kitchen carrier. This keeps
 the comparison focused on attention execution:
 
 * native Kitchen dense attention;
+* native Kitchen 64Q x 64KV attention on the same full route;
 * PR #41's Kitchen-parity Triton kernel on an explicit full route;
 * the experimental one-program-per-64Q Sol-shaped pointer kernel.
 
@@ -27,7 +28,12 @@ sys.path.insert(0, str(PACK))
 sys.path.insert(0, str(ROOT))
 
 
-ARM_ORDER = ('kitchen', 'pr41_triton', 'sol_pointer')
+ARM_ORDER = (
+    'kitchen_dense',
+    'kitchen_64x64_full',
+    'pr41_triton',
+    'sol_pointer',
+)
 
 
 def parse_args(argv=None):
@@ -35,6 +41,11 @@ def parse_args(argv=None):
     parser.add_argument('--i-understand-this-uses-gpu', action='store_true')
     parser.add_argument('--parity-sequence', type=int, default=257)
     parser.add_argument('--benchmark', action='store_true')
+    parser.add_argument(
+        '--benchmark-inexact',
+        action='store_true',
+        help='time kernels even when the Kitchen bit-exact numerical gate fails',
+    )
     parser.add_argument('--benchmark-sequence', type=int, default=4096)
     parser.add_argument('--heads', type=int, default=2)
     parser.add_argument('--warmup', type=int, default=3)
@@ -49,6 +60,8 @@ def parse_args(argv=None):
             parser.error('--%s must be positive' % name.replace('_', '-'))
     if args.warmup < 0:
         parser.error('--warmup cannot be negative')
+    if args.benchmark_inexact and not args.benchmark:
+        parser.error('--benchmark-inexact requires --benchmark')
     return args
 
 
@@ -112,14 +125,24 @@ def numerical_gate(torch, native, pr41_launch, sol, args, device):
     lut, valid = dense_delta_route(
         torch, args.parity_sequence, args.heads, device
     )
+    route = native.BlockSparseRoute(
+        indices=lut,
+        counts=valid,
+        q_tile=64,
+        kv_tile=64,
+        encoding='delta',
+    )
     prepared = sol.prepare_carrier(carrier)
     outputs = {
-        'kitchen': native.int8_attention_from_prequantized(carrier),
+        'kitchen_dense': native.int8_attention_from_prequantized(carrier),
+        'kitchen_64x64_full': (
+            native.block_sparse_int8_attention_from_prequantized(carrier, route)
+        ),
         'pr41_triton': pr41_launch(carrier, lut, valid),
         'sol_pointer': sol.launch_prepared(prepared),
     }
     torch.cuda.synchronize(device)
-    reference = outputs['kitchen']
+    reference = outputs['kitchen_64x64_full']
     result = {
         name: tensor_metrics(torch, value, reference)
         for name, value in outputs.items()
@@ -150,9 +173,19 @@ def benchmark(torch, native, pr41_launch, sol, args, device):
     lut, valid = dense_delta_route(
         torch, args.benchmark_sequence, args.heads, device
     )
+    route = native.BlockSparseRoute(
+        indices=lut,
+        counts=valid,
+        q_tile=64,
+        kv_tile=64,
+        encoding='delta',
+    )
     prepared = sol.prepare_carrier(carrier)
     arms = {
-        'kitchen': lambda: native.int8_attention_from_prequantized(carrier),
+        'kitchen_dense': lambda: native.int8_attention_from_prequantized(carrier),
+        'kitchen_64x64_full': lambda: (
+            native.block_sparse_int8_attention_from_prequantized(carrier, route)
+        ),
         'pr41_triton': lambda: pr41_launch(carrier, lut, valid),
         'sol_pointer': lambda: sol.launch_prepared(prepared),
     }
@@ -250,12 +283,14 @@ def main(argv=None):
         raise SystemExit('INT8 Triton requires compute capability >= 8.0')
     if not carrier_selftest.check(device):
         raise SystemExit('Kitchen carrier self-test failed')
+    if not native.int8_attention_is_available(device):
+        raise SystemExit('native Kitchen 64x64 sparse attention is unavailable')
 
     parity = numerical_gate(torch, native, pr41_launch, sol, args, device)
     failed = [name for name, metrics in parity.items() if not metrics['exact']]
     timings = (
         benchmark(torch, native, pr41_launch, sol, args, device)
-        if args.benchmark and not failed
+        if args.benchmark and (not failed or args.benchmark_inexact)
         else None
     )
     result = {

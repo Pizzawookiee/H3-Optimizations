@@ -73,8 +73,18 @@ class TritonSolPointerTests(unittest.TestCase):
         bench = load_benchmark()
         args = bench.parse_args(['--i-understand-this-uses-gpu'])
         self.assertFalse(args.benchmark)
+        self.assertFalse(args.benchmark_inexact)
         self.assertEqual(args.parity_sequence, 257)
         self.assertEqual(args.heads, 2)
+
+    def test_inexact_timing_requires_benchmark_mode(self):
+        bench = load_benchmark()
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                bench.parse_args([
+                    '--i-understand-this-uses-gpu',
+                    '--benchmark-inexact',
+                ])
 
     def test_benchmark_requires_explicit_gpu_acknowledgement(self):
         bench = load_benchmark()
