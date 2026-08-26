@@ -25,6 +25,102 @@ def _provider_text(section, fallback_label):
     return provider if not reason else '%s - %s' % (provider, reason)
 
 
+def _qkv_weights_text(status):
+    labels = sorted(
+        set((status.get('weight_formats') or {}).get('qkv') or ())
+    )
+    if not labels:
+        return 'unknown weights'
+    lowered = [label.lower() for label in labels]
+    if all('bfloat16' in label or 'bf16' in label for label in lowered):
+        return 'BF16 weights'
+    if all('float16' in label or 'fp16' in label for label in lowered):
+        return 'FP16 weights'
+    if all(
+        'tensorwiseint8layout' in label and 'convrot256' in label
+        for label in lowered
+    ):
+        return 'ConvRot-256 INT8 weights'
+    if all('asymw4a8int8layout' in label or 'w4a8' in label for label in lowered):
+        return 'W4A8 weights'
+    if all('float8' in label or 'fp8' in label for label in lowered):
+        return 'FP8 weights'
+    if all('nvfp4' in label for label in lowered):
+        return 'NVFP4 weights'
+    if len(labels) == 1:
+        return '%s weights' % labels[0]
+    return 'mixed QKV weights'
+
+
+def format_qkv_execution(status):
+    qkv = status.get('fused_qkv') or {}
+    provider = qkv.get('provider') or 'standard_h3_qkv'
+    projector = qkv.get('projector')
+    weights = _qkv_weights_text(status)
+    chunk_rows = int(qkv.get('chunk_rows') or 4096)
+
+    if provider == 'standard_h3_qkv':
+        text = '%s -> standard QKV path' % weights
+        reason = str(qkv.get('reason') or '').strip()
+        return text if not reason else '%s (%s)' % (text, reason)
+
+    if provider in (
+        'chunked_kitchen_qkv',
+        'streamed_bf16_kitchen_qkv',
+        'chunked_fp8_kitchen_qkv',
+    ):
+        projection = (
+            'FP8 projection -> %d-row BF16 chunks' % chunk_rows
+            if provider == 'chunked_fp8_kitchen_qkv'
+            else '%d-row BF16 chunks' % chunk_rows
+        )
+        text = '%s -> %s -> Kitchen INT8 carrier' % (
+            weights,
+            projection,
+        )
+        details = []
+        if qkv.get('v_mode') == 'retain':
+            details.append('V retained in BF16')
+        elif qkv.get('v_mode') == 'two_pass':
+            details.append('V packed in two passes')
+        if qkv.get('output_streamed'):
+            details.append('output streamed')
+        return text if not details else '%s; %s' % (text, '; '.join(details))
+
+    if provider in ('chunked_bf16_qkv', 'force_bf16_qkv'):
+        prefix = 'forced BF16 projection' if provider == 'force_bf16_qkv' else 'BF16 projection'
+        if projector == 'streamed_dense_bf16_qkv':
+            return '%s -> %s in %d-row chunks; full BF16 K/V; Q and output streamed' % (
+                weights,
+                prefix,
+                chunk_rows,
+            )
+        return '%s -> %s in %d-row chunks -> full BF16 Q/K/V' % (
+            weights,
+            prefix,
+            chunk_rows,
+        )
+
+    if provider == 'force_quant_qkv':
+        return '%s -> forced FP8 projection in %d-row chunks -> full BF16 Q/K/V' % (
+            weights,
+            chunk_rows,
+        )
+    if provider == 'convrot_int8_dense_sage':
+        return '%s -> dense Sage carrier; V retained in BF16' % weights
+    if provider in ('convrot_int8_sparse_sage', 'chunked_fp8_sparse_sage'):
+        return '%s -> %d-row projection -> Sparse Sage carrier; V retained in BF16' % (
+            weights,
+            chunk_rows,
+        )
+    if provider == 'chunked_triton_int8_sparse':
+        return '%s -> %d-row projection -> Triton INT8 carrier' % (
+            weights,
+            chunk_rows,
+        )
+    return '%s -> %s' % (weights, provider)
+
+
 def _mark_runtime_fallback(qkv, line):
     if qkv.get('provider') in (
         'chunked_fp8_kitchen_qkv',
@@ -45,22 +141,13 @@ def format_memory_status(model):
     final_layer = status.get('final_layer') or {}
     lines = [
         'Attention: %s' % (attention.get('selected') or 'preserve incoming'),
-        'QKV: %s' % _provider_text(qkv, 'standard_h3_qkv'),
+        'QKV: %s' % format_qkv_execution(status),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
     if final_layer.get('chunked'):
         lines.append(
             'FinalLayer: chunked (%d-row chunks)'
             % int(final_layer.get('chunk_rows') or 4096)
-        )
-    if qkv.get('provider') in (
-        'chunked_kitchen_qkv',
-        'chunked_fp8_kitchen_qkv',
-        'streamed_bf16_kitchen_qkv',
-    ):
-        lines[1] += ' (%d-row chunks, Kitchen %s)' % (
-            int(qkv.get('chunk_rows') or 4096),
-            qkv.get('producer_abi') or 'producer ABI unavailable',
         )
     lines[1] = _mark_runtime_fallback(qkv, lines[1])
     chunk_rows = mlp.get('chunk_rows')
@@ -98,13 +185,15 @@ def format_sparse_status(model):
         attention_line = 'Attention: INT8 Triton Sparse'
     elif selected == 'flex_attention_fp8':
         attention_line = 'Attention: FP8 FlexAttention'
+    elif selected == 'frost_bf16_sm89':
+        attention_line = 'Attention: FROST BF16 (SM89)'
     else:
         attention_line = 'Attention: %s' % selected
 
     lines = [
         attention_line,
         'Requested video KV budget: %.1f%%' % (float(budget) * 100.0),
-        'QKV: %s' % _provider_text(qkv, 'standard_h3_qkv'),
+        'QKV: %s' % format_qkv_execution(status),
         (
             'Effective density rounds up to a whole KV-tile count at runtime; '
             'non-video context and mixed boundary tiles remain dense.'
@@ -125,18 +214,10 @@ def format_sparse_status(model):
                 max(layer_budgets) * 100.0,
             ),
         )
-    if qkv.get('provider') in (
-        'convrot_int8_sparse_sage',
-        'chunked_fp8_sparse_sage',
-        'chunked_triton_int8_sparse',
-    ):
-        qkv_index = next(
-            index for index, line in enumerate(lines) if line.startswith('QKV:')
-        )
-        lines[qkv_index] += ' (%d-row chunks)' % int(
-            qkv.get('chunk_rows') or 4096
-        )
-        lines[qkv_index] = _mark_runtime_fallback(qkv, lines[qkv_index])
+    qkv_index = next(
+        index for index, line in enumerate(lines) if line.startswith('QKV:')
+    )
+    lines[qkv_index] = _mark_runtime_fallback(qkv, lines[qkv_index])
 
     early_steps = sparse.get('early_steps')
     if early_steps is None:

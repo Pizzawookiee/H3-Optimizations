@@ -214,6 +214,7 @@ def test_advanced_node_schema_and_request():
         and backend.options
         == [
             'Kitchen INT8',
+            'FROST BF16 (SM89)',
             'Sparse Sage',
             'INT8 Triton',
             'FP8 FlexAttention',

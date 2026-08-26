@@ -22,8 +22,11 @@ control.
   quantized checkpoint formats. With sparse Kitchen,
   checkpoint-native ConvRot INT8 QKV streams BF16 projection, norm, and RoPE
   chunks into the routed INT8 carrier instead of materializing full-sequence
-  BF16 Q/K/V. Other dense QKV stays on the upstream Comfy path, while MLP auto
-  keeps BF16/FP16 weights floating and still uses bounded token chunking.
+  BF16 Q/K/V. With existing dense attention, checkpoint-native BF16 keeps full
+  BF16 K/V, streams BF16 Q through the selected Comfy attention backend, and
+  writes each output-projection chunk into the disposable block input. Other
+  dense QKV stays on the upstream Comfy path, while MLP auto keeps BF16/FP16
+  weights floating and still uses bounded token chunking.
   Checkpoint-native ConvRot, FP8, and W4A8
   remain native where a compatible bounded MLP provider exists; unsupported
   quantized formats preserve upstream Comfy execution. `Auto` is the default.
@@ -57,8 +60,12 @@ control.
   steps; Early steps/Early KV and Late steps/Late KV independently control the
   edges. The defaults are two early steps at 50 percent KV and two late steps at
   50 percent KV. If the two windows overlap, the denser of the two requested
-  edge budgets is used. The backend selector exposes Kitchen INT8, Sparse Sage,
-  INT8 Triton, and FP8 FlexAttention. Kitchen INT8 at 64Q x 64KV is the default.
+  edge budgets is used. The backend selector exposes Kitchen INT8, FROST BF16,
+  Sparse Sage, INT8 Triton, and FP8 FlexAttention. Kitchen INT8 at 64Q x 64KV
+  is the default. FROST BF16 is an explicit SM89-only 64Q x 64KV backend. It
+  uses the packaged cubin compiled by this project from NVIDIA's open
+  Apache-2.0 FROST SM80 template, consumes BF16 Q/K/V directly, and writes
+  sequence-major BF16 output.
   FlexAttention uses FP8 carriers on
   supported NVIDIA runtimes and native BF16/FP16 Q/K/V through Triton on ROCm.
   Explicit backend selections are hard requirements and error if unavailable;
@@ -211,9 +218,11 @@ allocator hold". The allocator-level figures elsewhere in this README are
 measured separately and are not comparable to these.
 
 Reproduce with `benchmarks/bench_attention_arms.py`, which drives a running
-ComfyUI server over its prompt API. The SageAttention row additionally requires
-a `sageattention` package and a server started with `--use-sage-attention`; it
-is measured here as plain dense SageAttention, not Sparge/`spas_sage_attn`.
+ComfyUI server over its prompt API. Install and enable the sibling
+`ComfyUI-H3-Extended` pack, which owns the benchmark-only control nodes. The
+SageAttention row additionally requires a `sageattention` package and a server
+started with `--use-sage-attention`; it is measured here as plain dense
+SageAttention, not Sparge/`spas_sage_attn`.
 
 ## Install
 
@@ -315,7 +324,9 @@ H3SparseAttention, and H3SparseAttentionAdvanced. H3-Extended is not required.
 ## Validation
 
 CPU tests cover node schemas, AIMDO limiter arithmetic and load callbacks, plan
-composition, backend classification, native shipping contracts, explicit
+composition, backend classification, native BF16 sliced-KV/streamed-Q
+projection, the FROST BF16 ABI and absolute-route parity, native shipping
+contracts, explicit
 sparse-backend selection, chunk boundaries and RoPE slices, non-H3 no-op
 behavior, sparse contract and route geometry, runtime step/layout publication,
 explicit early/middle/late density schedules,

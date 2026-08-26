@@ -141,6 +141,7 @@ class NodeTests(unittest.TestCase):
             backend.options,
             [
                 'Kitchen INT8',
+                'FROST BF16 (SM89)',
                 'Sparse Sage',
                 'INT8 Triton',
                 'FP8 FlexAttention',
@@ -153,6 +154,7 @@ class NodeTests(unittest.TestCase):
             'INT8 Triton and FP8 FlexAttention also use 64Q x 64KV',
             backend.tooltip,
         )
+        self.assertIn('FROST BF16 uses 64Q x 64KV', backend.tooltip)
         self.assertNotIn('experimental', ' '.join(backend.options).lower())
         self.assertTrue(H3SparseAttentionAdvanced.validate_inputs('auto'))
         self.assertTrue(

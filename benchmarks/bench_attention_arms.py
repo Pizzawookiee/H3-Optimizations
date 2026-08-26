@@ -13,9 +13,8 @@ Every arm deliberately shares two benchmark controls:
   amplify activation-memory differences by retaining a different amount of H3
   weights between arms.
 
-The benchmark-only config node is not registered in normal ComfyUI sessions.
-Start ComfyUI with ``H3_OPTIMIZATIONS_BENCHMARK_NODES=1`` before running this
-script.
+The benchmark-only controls are registered by the sibling
+``ComfyUI-H3-Extended`` pack. Keep both packs enabled for this script.
 
 The default ladder is:
 
@@ -48,7 +47,7 @@ encoder back onto the card during the next measurement.
 
 Run from the ComfyUI root against an already-running server, for example:
 
-    H3_OPTIMIZATIONS_BENCHMARK_NODES=1 python main.py --use-sage-attention
+    python main.py --use-sage-attention
     .\\.venv\\Scripts\\python.exe custom_nodes\\H3-Optimizations\\benchmarks\\bench_attention_arms.py --i-understand-this-uses-gpu
 
 This script never imports torch and never touches CUDA in-process. All GPU work
@@ -162,8 +161,7 @@ class Schemas:
             async with self.session.get(url) as response:
                 if response.status != 200:
                     suffix = (
-                        '; restart ComfyUI with '
-                        'H3_OPTIMIZATIONS_BENCHMARK_NODES=1'
+                        '; install and enable ComfyUI-H3-Extended'
                         if node_type == 'H3BenchmarkForceQKVConfig0'
                         else ''
                     )

@@ -13,6 +13,7 @@ import comfy.quant_ops
 from .attention.sparse import (
     FP8FlexBackend,
     FP8FlexError,
+    FrostBF16Backend,
     HybridSparseBackend,
     HybridSparseConfig,
     MODE_SAGE128,
@@ -23,6 +24,7 @@ from .attention.sparse import (
     TritonSparseBackend,
     TritonSparseError,
     preflight_fp8_flex,
+    preflight_frost_bf16,
     preflight_sparse_sage,
     preflight_sol_residual,
     preflight_triton_sparse,
@@ -70,6 +72,7 @@ from .plan import (
     SPARSE_BACKEND_NATIVE_64X64,
     SPARSE_BACKEND_NATIVE_HARD,
     SPARSE_BACKEND_FLEX,
+    SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_SOL,
@@ -79,7 +82,11 @@ from .plan import (
     STATUS_KEY,
     QKV_STREAMING_OFF,
 )
-from .qkv.bf16 import ChunkedBF16QKVProjector
+from .qkv.bf16 import (
+    ChunkedBF16QKVProjector,
+    FrostBF16QKVProjector,
+    StreamedDenseBF16QKVProjector,
+)
 from .qkv.formats import inspect_h3_linears
 from .qkv.providers import (
     MLP_OFF,
@@ -103,11 +110,13 @@ from .runtime.context import (
     RUNTIME_SESSION_KEY,
     install_runtime_wrapper,
 )
+from .status import format_qkv_execution
 
 LOG_PREFIX = '[H3 Optimizations]'
 ATTENTION_SPARSE = 'sparse_sage'
 ATTENTION_TRITON_SPARSE = 'triton_sparse_int8'
 ATTENTION_FP8_FLEX = 'flex_attention_fp8'
+ATTENTION_FROST_BF16 = 'frost_bf16_sm89'
 ATTENTION_KITCHEN_SPARSE = 'sparse_kitchen_int8'
 ATTENTION_NATIVE_128X64 = 'native_int8_128x64'
 ATTENTION_NATIVE_64X64 = 'native_int8_64x64'
@@ -120,6 +129,7 @@ SPARSE_EXECUTION_BACKENDS = (
     ATTENTION_SPARSE,
     ATTENTION_TRITON_SPARSE,
     ATTENTION_FP8_FLEX,
+    ATTENTION_FROST_BF16,
     ATTENTION_KITCHEN_SPARSE,
     ATTENTION_NATIVE_128X64,
     ATTENTION_NATIVE_64X64,
@@ -142,6 +152,24 @@ def _bounded_qkv_projector(qkv):
         force_weights_bf16=qkv.provider_id == QKV_FORCE_BF16_CHUNKED,
         force_weights_fp8=qkv.provider_id == QKV_FORCE_QUANT_CHUNKED,
     )
+
+
+def _frost_qkv_projector(qkv):
+    return FrostBF16QKVProjector(
+        chunk_rows=4096,
+        force_weights_bf16=qkv.provider_id == QKV_FORCE_BF16_CHUNKED,
+        force_weights_fp8=qkv.provider_id == QKV_FORCE_QUANT_CHUNKED,
+    )
+
+
+def _native_bf16_qkv(inventory):
+    if not inventory.qkv:
+        return False
+    for item in inventory.qkv:
+        dtype = str(item.logical_dtype).lower()
+        if not item.plain_float or not ('bfloat16' in dtype or 'bf16' in dtype):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -313,6 +341,17 @@ def _resolve_dense(plan, model, inventory, environment=None):
 
         backend = ProjectedSM89SageBackend(dense.backend)
         projector = DenseFusedQKVProjector(chunk_rows=memory.chunk_rows)
+    elif (
+        qkv.provider_id == QKV_BF16_CHUNKED
+        and _native_bf16_qkv(inventory)
+    ):
+        # Native BF16 dense attention keeps complete K/V, then feeds bounded Q
+        # slabs to the selected Comfy attention backend and projects each
+        # output slab directly into the disposable block input.
+        backend = ChunkedKitchenAttentionBackend()
+        projector = StreamedDenseBF16QKVProjector(
+            chunk_rows=memory.chunk_rows,
+        )
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         # Reuse the package-owned attention-forward slot without changing the
         # selected dense attention. attention_forward recognizes the BF16
@@ -391,6 +430,45 @@ def _resolve_sparse(plan, environment, inventory):
             backend=backend,
             reason='explicit fixed-density Sparse Sage attention',
             backend_kind=ATTENTION_SPARSE,
+            projector=projector,
+        ),
+        qkv,
+    )
+
+
+def _resolve_frost_bf16(plan, environment, inventory):
+    spec = preflight_frost_bf16(
+        cuda_available=lambda: environment.cuda_available,
+        capability_getter=lambda: environment.capability,
+    )
+    qkv = resolve_qkv_provider(
+        inventory,
+        request=_qkv_request(plan),
+        backend_kind=ATTENTION_FROST_BF16,
+        memory_optimize=plan.memory is not None,
+        fp8_available=_fp8_execution_available(environment),
+    )
+    projector = (
+        _frost_qkv_projector(qkv)
+        if qkv.provider_id in _BOUNDED_QKV_PROVIDERS
+        else None
+    )
+    config = HybridSparseConfig(
+        mode=MODE_SAGE128,
+        **_sparse_config_kwargs(plan),
+    )
+    backend = FrostBF16Backend(
+        config,
+        spec=spec,
+        projector=projector,
+    )
+    return (
+        ResolvedAttention(
+            requested=ATTENTION_SPARSE,
+            selected=ATTENTION_FROST_BF16,
+            backend=backend,
+            reason='explicit FROST BF16 SM89 64Q x 64KV sparse attention',
+            backend_kind=ATTENTION_FROST_BF16,
             projector=projector,
         ),
         qkv,
@@ -722,6 +800,8 @@ def _resolve_attention(plan, model, inventory, environment):
                 None,
                 None,
             )
+        if backend_request == SPARSE_BACKEND_FROST:
+            return _resolve_frost_bf16(plan, environment, inventory)
         if backend_request == SPARSE_BACKEND_NATIVE_128X64:
             return _resolve_native_geometry(
                 plan,
@@ -943,6 +1023,10 @@ def _status(
                 attention.projector, 'strided_qk_input', None
             ),
             'v_mode': getattr(attention.projector, 'v_mode', None),
+            'output_streamed': bool(
+                getattr(attention.projector, 'stream_output', False)
+                or getattr(attention.backend, 'stream_output', False)
+            ),
             'producer_abi': (
                 KITCHEN_PRODUCER_ABI
                 if qkv.provider_id in (
@@ -1095,12 +1179,15 @@ def apply_plan(model, plan: H3OptimizationPlan):
     )
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
     _warn_about_slow_paths(attention, qkv)
+    qkv_labels = inventory.labels('qkv')
     logging.info(
-        '%s armed: attention=%s qkv=%s qkv_weights=%s mlp=%s memory=%s device=%s',
+        '%s armed: attention=%s qkv="%s" qkv_route=%s qkv_weights=%s qkv_layers=%d mlp=%s memory=%s device=%s',
         LOG_PREFIX,
         attention.selected,
+        format_qkv_execution(options[STATUS_KEY]),
         qkv.provider_id,
-        ','.join(inventory.labels('qkv')) or 'unknown',
+        ','.join(sorted(set(qkv_labels))) or 'unknown',
+        len(qkv_labels),
         mlp.provider_id,
         describe_memory_options(attention),
         environment.device_name,

@@ -17,13 +17,10 @@ SPEC.loader.exec_module(bench)
 
 
 class FullForwardExperimentsBenchmarkTests(unittest.TestCase):
-    def test_launcher_enables_benchmark_nodes(self):
+    def test_launcher_whitelists_extended_benchmark_nodes(self):
         source = SCRIPT.read_text(encoding='utf-8')
-        self.assertIn(
-            "environment['H3_OPTIMIZATIONS_BENCHMARK_NODES'] = '1'",
-            source,
-        )
-        self.assertNotIn('H3_ENABLE_BENCHMARK_NODES', source)
+        self.assertIn("'ComfyUI-H3-Extended'", source)
+        self.assertNotIn('H3_OPTIMIZATIONS_BENCHMARK_NODES', source)
 
     def test_matrix_uses_real_five_second_request(self):
         self.assertEqual(bench.benchmark.WORKLOADS, {'5s': 124})

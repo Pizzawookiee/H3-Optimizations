@@ -27,6 +27,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_FORCE_QUANT_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
     QKV_STANDARD,
+    QKV_STREAMED_BF16_KITCHEN,
     QKV_TRITON_SPARSE_CHUNKED,
 )
 
@@ -121,6 +122,22 @@ class QKVStreamingPolicyTests(unittest.TestCase):
         )
         self.assertEqual(resolved.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
         self.assertNotEqual(resolved.provider_id, QKV_DENSE_FP8_CHUNKED)
+        self.assertIn('BF16 Q/K/V chunks', resolved.reason)
+
+    def test_sparse_kitchen_uses_the_streamed_bf16_provider(self):
+        resolved = resolve_qkv_provider(
+            inventory(self.bf16),
+            request=FUSED_QKV_PRESERVE_BF16,
+            backend_kind='sparse_kitchen_int8',
+            kitchen_producer_available=True,
+            memory_optimize=True,
+        )
+
+        self.assertEqual(
+            resolved.provider_id,
+            QKV_STREAMED_BF16_KITCHEN,
+        )
+        self.assertTrue(resolved.fused)
         self.assertIn('BF16 Q/K/V chunks', resolved.reason)
 
     def test_lower_precision_checkpoints_still_use_bf16_stream_contract(self):

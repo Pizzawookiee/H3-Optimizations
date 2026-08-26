@@ -35,6 +35,7 @@ from .plan import (
     MLP_MEMORY_PRESERVE,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
+    SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
@@ -52,6 +53,7 @@ DEFAULT_CHUNK_ROWS = 4096
 NODE_CATEGORY = 'H3-Optimizations/Model Patches'
 ADVANCED_SPARSE_BACKEND_OPTIONS = (
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     SPARSE_BACKEND_FLEX,
@@ -700,7 +702,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'Kitchen INT8 is the default and uses the native 64Q x '
                         '64KV block-sparse kernel. It '
                         'consumes compatible chunked Kitchen QKV carriers '
-                        'directly. INT8 Triton and FP8 FlexAttention also use '
+                        'directly. FROST BF16 uses 64Q x 64KV routing and is '
+                        'available only on SM89. INT8 Triton and FP8 FlexAttention also use '
                         '64Q x 64KV routing. '
                         'Bypass this node to force dense attention.'
                     ),

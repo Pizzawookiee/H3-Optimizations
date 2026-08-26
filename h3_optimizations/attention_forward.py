@@ -213,6 +213,37 @@ def _finish_bf16_projected(
         return module.out_proj(out.squeeze(0))
 
 
+def _finish_streamed_dense_bf16_projected(
+    module,
+    projected,
+    *,
+    transformer_options,
+):
+    """Consume Q slabs against complete BF16 K/V and project each output slab."""
+    output = projected.x
+    try:
+        for start, end, q in projected.stream_q():
+            raw = _legacy_attention(
+                module,
+                q,
+                projected.k,
+                projected.v,
+                transformer_options,
+            )
+            out = flatten_attention_output(
+                module,
+                raw,
+                'streamed_dense_bf16',
+            )
+            del raw
+            with diagnostics.stage('attention_out'):
+                output[start:end].copy_(module.out_proj(out.squeeze(0)))
+            del q, out
+        return output
+    finally:
+        projected.release()
+
+
 def make_forward(
     module,
     layer_index,
@@ -249,7 +280,17 @@ def make_forward(
                 transformer_options=transformer_options,
             )
             if projected is not None:
-                from .qkv.bf16 import PreparedBF16QKV
+                from .qkv.bf16 import (
+                    PreparedBF16QKV,
+                    PreparedStreamedDenseBF16QKV,
+                )
+
+                if isinstance(projected, PreparedStreamedDenseBF16QKV):
+                    return _finish_streamed_dense_bf16_projected(
+                        module,
+                        projected,
+                        transformer_options=transformer_options,
+                    )
 
                 if isinstance(projected, PreparedBF16QKV):
                     return _finish_bf16_projected(

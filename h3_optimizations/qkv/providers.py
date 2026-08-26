@@ -151,6 +151,7 @@ def _resolve_preserve_precision_qkv(
         'sparse_sage',
         'triton_sparse_int8',
         'flex_attention_fp8',
+        'frost_bf16_sm89',
     }
     if backend_kind not in consumers:
         return _standard_qkv(

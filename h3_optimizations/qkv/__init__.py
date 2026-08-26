@@ -5,6 +5,8 @@ from .bf16 import (
     ChunkedBF16QKVProjector,
     HeldBF16QKV,
     PreparedBF16QKV,
+    PreparedStreamedDenseBF16QKV,
+    StreamedDenseBF16QKVProjector,
 )
 from .formats import (
     H3LinearInventory,
@@ -27,6 +29,8 @@ __all__ = [
     "ChunkedBF16QKVProjector",
     "HeldBF16QKV",
     "PreparedBF16QKV",
+    "PreparedStreamedDenseBF16QKV",
+    "StreamedDenseBF16QKVProjector",
     "H3LinearInventory",
     "LinearWeightFormat",
     "describe_linear",

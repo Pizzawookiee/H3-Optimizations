@@ -1,8 +1,8 @@
 '''Run FinalLayer and streamed Kitchen experiments through complete H3 forwards.
 
 Every arm uses H3 Memory Optimization, explicit Kitchen INT8 sparse attention,
-and H3 AIMDO Residency Limiter at 0 blocks. The experiment nodes are available
-only in the temporary server launched by this script.
+and H3 AIMDO Residency Limiter at 0 blocks. The experiment nodes are supplied
+by the sibling ComfyUI-H3-Extended pack.
 '''
 
 from __future__ import annotations
@@ -308,13 +308,13 @@ def _launch_and_run(launcher, benchmark_argv):
         '--temp-directory', str(root / 'temp'),
         '--extra-model-paths-config', str(model_paths),
         '--disable-all-custom-nodes',
-        '--whitelist-custom-nodes', 'H3-Optimizations', 'comfyui-kjnodes',
+        '--whitelist-custom-nodes',
+        'H3-Optimizations', 'ComfyUI-H3-Extended', 'comfyui-kjnodes',
         '--disable-cuda-malloc',
         '--disable-auto-launch',
         '--disable-metadata',
     ]
     environment = os.environ.copy()
-    environment['H3_OPTIMIZATIONS_BENCHMARK_NODES'] = '1'
     environment['PYTHONUNBUFFERED'] = '1'
     environment.setdefault('PYTORCH_CUDA_ALLOC_CONF', PRODUCTION_ALLOC_CONF)
 

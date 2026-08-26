@@ -45,6 +45,22 @@ class NativeShippingTests(unittest.TestCase):
         metadata = tomllib.loads((PACK / 'pyproject.toml').read_text(encoding='utf-8'))
         self.assertEqual(metadata['project']['version'], __version__)
 
+    def test_frost_artifact_has_reproducible_source_and_license(self):
+        frost = PACK / 'native' / 'frost'
+        for name in (
+            'h3_frost_bf16_sm89.cubin',
+            'h3_frost_bf16_sm89.symbol',
+            'frost_h3.patch',
+            'compile_sm89.py',
+            'Dockerfile',
+            'PROVENANCE',
+            'LICENSE.txt',
+        ):
+            self.assertTrue((frost / name).is_file(), name)
+        provenance = (frost / 'PROVENANCE').read_text(encoding='utf-8')
+        self.assertIn('ae8705effeea3804585b6aca554beaca1a76a3da', provenance)
+        self.assertIn('a6056f00245c01720214e56894a86656a58b87811c849cef61605c888f8a0af5', provenance)
+
     def test_native_availability_requires_selftest(self):
         with (
             mock.patch.object(int8_attention.torch.cuda, 'is_available', return_value=True),

@@ -33,6 +33,7 @@ from h3_optimizations.plan import (  # noqa: E402
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
+    SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_TRITON,
@@ -199,6 +200,47 @@ class SparseBackendSelectionTests(unittest.TestCase):
             self.environment,
             self.inventory,
         )
+
+    def test_forced_frost_is_a_hard_bf16_backend_selection(self):
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_FROST)
+        )
+        target = (resolved(apply_module.ATTENTION_FROST_BF16), self.qkv)
+        with mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+        ) as dense, mock.patch.object(
+            apply_module,
+            '_resolve_sparse',
+        ) as sage, mock.patch.object(
+            apply_module,
+            '_resolve_triton_sparse',
+        ) as triton, mock.patch.object(
+            apply_module,
+            '_resolve_fp8_flex',
+        ) as flex, mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+        ) as kitchen, mock.patch.object(
+            apply_module,
+            '_resolve_frost_bf16',
+            return_value=target,
+        ) as frost:
+            self.assertIs(
+                apply_module._resolve_attention(
+                    plan,
+                    self.model,
+                    self.inventory,
+                    self.environment,
+                ),
+                target,
+            )
+        dense.assert_not_called()
+        sage.assert_not_called()
+        triton.assert_not_called()
+        flex.assert_not_called()
+        kitchen.assert_not_called()
+        frost.assert_called_once_with(plan, self.environment, self.inventory)
 
     def test_kitchen_resolver_selects_chunked_producer(self):
         plan = H3OptimizationPlan(
@@ -589,6 +631,35 @@ class SparseBackendSelectionTests(unittest.TestCase):
         )
         text = format_sparse_status(model)
         self.assertIn('Requested sparse backend: INT8 Triton', text)
+        self.assertNotIn('Sparse fallback:', text)
+
+    def test_frost_status_uses_the_public_backend_name(self):
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_FROST)
+        )
+        model = FakeModel(
+            {
+                PLAN_KEY: plan,
+                'transformer_options': {
+                    STATUS_KEY: {
+                        'attention': {
+                            'selected': apply_module.ATTENTION_FROST_BF16,
+                            'reason': 'explicit selection',
+                        },
+                        'sparse': {
+                            'backend': SPARSE_BACKEND_FROST,
+                            'video_budget': 0.3,
+                        },
+                        'fused_qkv': {'provider': 'standard_h3_qkv'},
+                        'mlp': {'provider': 'off'},
+                    }
+                },
+            }
+        )
+
+        text = format_sparse_status(model)
+        self.assertIn('Attention: FROST BF16 (SM89)', text)
+        self.assertIn('Requested sparse backend: FROST BF16 (SM89)', text)
         self.assertNotIn('Sparse fallback:', text)
 
 

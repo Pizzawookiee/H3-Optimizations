@@ -40,6 +40,7 @@ from h3_optimizations.plan import (  # noqa: E402
     QKV_STREAMING_OFF,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
+    QKV_BF16_CHUNKED,
     QKV_DENSE_CONVROT_INT8,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_STANDARD,
@@ -85,6 +86,23 @@ class DenseSelectionTests(unittest.TestCase):
             qkv_plain_float=False,
             homogeneous=lambda name: name == 'qkv',
             labels=lambda _name: ('TensorWiseINT8Layout+convrot256',),
+        )
+
+    @staticmethod
+    def _bf16_inventory():
+        item = SimpleNamespace(
+            plain_float=True,
+            logical_dtype='torch.bfloat16',
+            label='Tensor:torch.bfloat16',
+        )
+        return SimpleNamespace(
+            qkv=(item,),
+            qkv_convrot_int8_256=False,
+            qkv_w4a8=False,
+            qkv_fp8=False,
+            qkv_plain_float=True,
+            homogeneous=lambda name: name == 'qkv',
+            labels=lambda _name: (item.label,),
         )
 
     def test_public_lookup_and_setter_retain_container_function(self):
@@ -232,6 +250,60 @@ class DenseSelectionTests(unittest.TestCase):
             )
         self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
         self.assertEqual(attention.projector.name, 'chunked_kitchen_qkv')
+
+    def test_existing_dense_bf16_streams_q_against_full_kv(self):
+        model = FakePatcher()
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_PRESERVE_BF16,
+                chunk_rows=2048,
+            )
+        )
+
+        attention, qkv = apply_module._resolve_dense(
+            plan,
+            model,
+            self._bf16_inventory(),
+        )
+
+        self.assertEqual(qkv.provider_id, QKV_BF16_CHUNKED)
+        self.assertEqual(attention.selected, ATTENTION_EXISTING)
+        self.assertEqual(attention.projector.name, 'streamed_dense_bf16_qkv')
+        self.assertEqual(attention.projector.chunk_rows, 2048)
+
+    def test_existing_dense_non_bf16_keeps_materialized_qkv(self):
+        model = FakePatcher()
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_PRESERVE_BF16,
+                chunk_rows=2048,
+            )
+        )
+        inventory = self._convrot_inventory()
+        inventory.qkv = (SimpleNamespace(
+            plain_float=False,
+            logical_dtype='TensorWiseINT8Layout+convrot256',
+        ),)
+
+        with patch.object(
+            apply_module,
+            'resolve_qkv_provider',
+            return_value=SimpleNamespace(
+                provider_id=QKV_BF16_CHUNKED,
+                fused=False,
+                reason='test non-BF16 bounded provider',
+            ),
+        ):
+            attention, qkv = apply_module._resolve_dense(
+                plan,
+                model,
+                inventory,
+            )
+
+        self.assertEqual(qkv.provider_id, QKV_BF16_CHUNKED)
+        self.assertEqual(attention.projector.name, 'chunked_bf16_qkv')
 
     def test_streaming_off_preserve_native_uses_fused_dense_sage(self):
         model = FakePatcher()

@@ -70,7 +70,11 @@ def _stream_kitchen(
             )
         return None
     return base.QKVProviderResolution(
-        base.QKV_DENSE_KITCHEN_CHUNKED,
+        (
+            base.QKV_STREAMED_BF16_KITCHEN
+            if backend_kind == 'sparse_kitchen_int8'
+            else base.QKV_DENSE_KITCHEN_CHUNKED
+        ),
         backend_kind != 'comfy_kitchen_int8',
         (
             'checkpoint-native %s weights project into bounded BF16 Q/K/V '

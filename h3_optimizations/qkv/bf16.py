@@ -51,6 +51,34 @@ class PreparedBF16QKV:
         return int(self.q.shape[-1])
 
 
+@dataclass
+class PreparedStreamedDenseBF16QKV:
+    x: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    rope_freqs: torch.Tensor | None
+    held: object
+    chunk_rows: int
+
+    @property
+    def sequence(self):
+        return int(self.k.shape[-2])
+
+    def stream_q(self):
+        for start in range(0, self.sequence, self.chunk_rows):
+            end = min(start + self.chunk_rows, self.sequence)
+            yield start, end, self.held.project_q_hnd(
+                self.x, self.rope_freqs, start, end
+            )
+
+    def release(self):
+        held, self.held = self.held, None
+        if held is not None:
+            held.__exit__(None, None, None)
+        self.x = None
+        self.k = self.v = self.rope_freqs = None
+
+
 class HeldBF16QKV:
     """Acquire one floating H3 QKV weight once across all token chunks."""
 
@@ -129,6 +157,57 @@ class HeldBF16QKV:
         with diagnostics.stage('qk_norm_rope'):
             return to_hnd(*finish_qkv_projection(self.attention, projected, rope))
 
+    def _project_slice(self, rows, start, end):
+        if self.weight is None:
+            raise RuntimeError('held BF16 QKV binding is not active')
+        bias = None if self.bias is None else self.bias[start:end]
+        comfy.ops.run_every_op()
+        with diagnostics.stage('qkv_linear'):
+            return F.linear(rows, self.weight[start:end], bias)
+
+    def _finish_single_qk(self, projected, rope, norm):
+        seq = int(projected.shape[0])
+        projected = projected.view(1, seq, self.attention.heads, self.attention.head_dim)
+        if rope is None:
+            return norm(projected[0])
+        scale = comfy.model_management.cast_to(
+            norm.weight,
+            device=projected.device,
+        )
+        projected = F.rms_norm(
+            projected,
+            (self.attention.head_dim,),
+            weight=scale,
+            eps=norm.eps,
+        )
+        rot_dim = int(rope.shape[-3]) * 2
+        comfy.quant_ops.ck.apply_rope_split_half1_(
+            projected[..., :rot_dim],
+            rope,
+        )
+        return projected[0]
+
+    def project_kv_hnd(self, x, rope_freqs, start, end):
+        inner = int(self.attention.heads) * int(self.attention.head_dim)
+        rope = None if rope_freqs is None else rope_freqs[:, start:end]
+        projected = self._project_slice(x[start:end], inner, inner * 3)
+        k, v = projected.split(inner, dim=-1)
+        with diagnostics.stage('qk_norm_rope'):
+            k = self._finish_single_qk(k, rope, self.attention.k_norm)
+        v = v.view(end - start, self.attention.heads, self.attention.head_dim)
+        return (
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+        )
+
+    def project_q_hnd(self, x, rope_freqs, start, end):
+        inner = int(self.attention.heads) * int(self.attention.head_dim)
+        rope = None if rope_freqs is None else rope_freqs[:, start:end]
+        q = self._project_slice(x[start:end], 0, inner)
+        with diagnostics.stage('qk_norm_rope'):
+            q = self._finish_single_qk(q, rope, self.attention.q_norm)
+        return q.transpose(0, 1).unsqueeze(0)
+
     def project_hnd(self, x, rope_freqs, start, end):
         rope = None if rope_freqs is None else rope_freqs[:, start:end]
         return self._finish(x[start:end], rope)
@@ -177,10 +256,14 @@ class ChunkedBF16QKVProjector:
             self.force_weights_fp8,
         )
 
-    def _validate(self, module, x, rope_freqs):
+    def _validate(self, module, x, rope_freqs, *, allow_cpu=False):
         if comfy.model_management.in_training:
             raise BF16QKVBindingError('chunked BF16 QKV is inference-only')
-        if x.ndim != 2 or not x.is_cuda or x.dtype != torch.bfloat16:
+        if (
+            x.ndim != 2
+            or (not x.is_cuda and not allow_cpu)
+            or x.dtype != torch.bfloat16
+        ):
             raise BF16QKVBindingError(
                 'chunked BF16 QKV requires rank-2 CUDA BF16 activations'
             )
@@ -273,3 +356,95 @@ class ChunkedBF16QKVProjector:
             if self.force_weights_bf16 or self.force_weights_fp8:
                 raise
             return None
+
+
+class FrostBF16QKVProjector(ChunkedBF16QKVProjector):
+    """Produce HND views over FROST's native sequence-major storage."""
+
+    name = 'frost_bf16_qkv'
+
+    def project(self, module, x, rope_freqs):
+        self._validate(module, x, rope_freqs)
+        sequence = int(x.shape[0])
+        storage_shape = (
+            1,
+            sequence,
+            int(module.heads),
+            int(module.head_dim),
+        )
+        q_storage = torch.empty(storage_shape, dtype=torch.bfloat16, device=x.device)
+        k_storage = torch.empty(storage_shape, dtype=torch.bfloat16, device=x.device)
+        v_storage = torch.empty(storage_shape, dtype=torch.bfloat16, device=x.device)
+        q_full, k_full, v_full = (
+            tensor.permute(0, 2, 1, 3)
+            for tensor in (q_storage, k_storage, v_storage)
+        )
+
+        def consume(start, end, q, k, v):
+            q_full[:, :, start:end, :].copy_(q)
+            k_full[:, :, start:end, :].copy_(k)
+            v_full[:, :, start:end, :].copy_(v)
+
+        self.stream(module, x, rope_freqs, consume)
+        return PreparedBF16QKV(q=q_full, k=k_full, v=v_full)
+
+
+class StreamedDenseBF16QKVProjector(ChunkedBF16QKVProjector):
+    """Keep full BF16 K/V while projecting and consuming Q in bounded slabs."""
+
+    name = 'streamed_dense_bf16_qkv'
+
+    def __init__(self, chunk_rows=CHUNK_ROWS, *, allow_cpu_for_tests=False):
+        super().__init__(chunk_rows)
+        self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
+
+    @property
+    def installation_signature(self):
+        return (self.name, self.chunk_rows)
+
+    def _validate(self, module, x, rope_freqs):
+        fmt = super()._validate(
+            module,
+            x,
+            rope_freqs,
+            allow_cpu=self.allow_cpu_for_tests,
+        )
+        if rope_freqs is not None and not callable(
+            getattr(comfy.quant_ops.ck, 'apply_rope_split_half1_', None)
+        ):
+            raise BF16QKVBindingError(
+                'streamed dense BF16 QKV requires apply_rope_split_half1_'
+            )
+        dtype = str(getattr(fmt, 'logical_dtype', '')).lower()
+        if not fmt.plain_float or not ('bfloat16' in dtype or 'bf16' in dtype):
+            raise BF16QKVBindingError(
+                'streamed dense BF16 QKV requires native BF16 weights'
+            )
+        return fmt
+
+    def project(self, module, x, rope_freqs):
+        self._validate(module, x, rope_freqs)
+        sequence = int(x.shape[0])
+        shape = (1, int(module.heads), sequence, int(module.head_dim))
+        k_full = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
+        v_full = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
+        held = HeldBF16QKV(module, x[:1])
+        held.__enter__()
+        try:
+            for start in range(0, sequence, self.chunk_rows):
+                end = min(start + self.chunk_rows, sequence)
+                k, v = held.project_kv_hnd(x, rope_freqs, start, end)
+                k_full[:, :, start:end, :].copy_(k)
+                v_full[:, :, start:end, :].copy_(v)
+                del k, v
+            return PreparedStreamedDenseBF16QKV(
+                x=x,
+                k=k_full,
+                v=v_full,
+                rope_freqs=rope_freqs,
+                held=held,
+                chunk_rows=self.chunk_rows,
+            )
+        except Exception:
+            held.__exit__(None, None, None)
+            raise

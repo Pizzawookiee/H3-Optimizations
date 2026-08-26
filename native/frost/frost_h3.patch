@@ -1,0 +1,374 @@
+diff --git a/python/cudnn/sdpa/fwd/kernels/prefill_f16_sm80.py b/python/cudnn/sdpa/fwd/kernels/prefill_f16_sm80.py
+index 9af33a0..e8f6b95 100644
+--- a/python/cudnn/sdpa/fwd/kernels/prefill_f16_sm80.py
++++ b/python/cudnn/sdpa/fwd/kernels/prefill_f16_sm80.py
+@@ -164,6 +164,8 @@ def _sdpa_kernel(
+     K: cute.Tensor,  # [B, SKV, HQ, D_QK] fp16    (MHA: HK == HQ)
+     V: cute.Tensor,  # [B, SKV, HQ, D_V]  fp16
+     O: cute.Tensor,  # [B, SQ,  HQ, D_V]  fp16  (output)
++    route_lut: cute.Pointer,
++    route_counts: cute.Pointer,
+     LSE: Optional[cute.Tensor],  # [B, HQ, SQ] fp32 (LSE in natural log); THD
+     # packed [1, HQ, T].  None ⇒ no Stats output —
+     # the whole LSE compute + store is compiled out.
+@@ -196,6 +198,8 @@ def _sdpa_kernel(
+     # a 1-elem dummy is passed otherwise.  Applied as
+     # the half-split rotate_half to Q AND K in SMEM
+     # before ldmatrix (dense-only; no THD).
++    route_q_tiles: cutlass.Int32,
++    route_kv_tiles: cutlass.Int32,
+     tile_m: cutlass.Constexpr[int],  # Q rows / CTA  (64 or 128)
+     num_warps: cutlass.Constexpr[int],  # warps / CTA   (4  or 8)
+     tile_n: cutlass.Constexpr[int],  # KV rows / iter (64 default; 128 doubles
+@@ -506,6 +510,13 @@ def _sdpa_kernel(
+     o_gmem = O_view.data_ptr() + O_BASE
+     k_gmem_batch_head = K_view.data_ptr() + K_BATCH_OFF + K_HEAD_OFF
+     v_gmem_batch_head = V_view.data_ptr() + V_BATCH_OFF + V_HEAD_OFF
++    route_row = (
++        (cutlass.Int64(batch_idx) * cutlass.Int64(H) + cutlass.Int64(head_idx))
++        * route_q_tiles.to(cutlass.Int64)
++        + cutlass.Int64(q_tile_idx)
++    )
++    route_ptr = route_lut + route_row * route_kv_tiles.to(cutlass.Int64)
++    route_count = cutlass.Int32(route_counts[route_row])
+     # Per-iter element advance: ``+ TILE_N rows`` on a Float16-typed ptr.
+     # K and V have separate tile strides when d_qk != d_v (DSv3).  Stays
+     # in Int32 (max value ``128 (max kv_iter) * 64 (TILE_N) * 64 (max H) *
+@@ -764,50 +775,7 @@ def _sdpa_kernel(
+         row_base=q_row_base_i,
+     )
+     cp_async_commit()  # group 0: Q
+-    # ---- REVERSE iter direction (FA-style) ------------------------------
+-    # The mainloop walks kv_iter from kv_right - 1 down to kv_left.  Why
+-    # reverse?  For MASK_CAUSAL / MASK_SWA the boundary tiles (where the
+-    # mask actually kicks in) sit at the END of the [kv_left, kv_right)
+-    # range.  Iterating reverse places those at the TOP of the loop;
+-    # combined with the two-loop split that immediately follows the
+-    # boundary, the bulk-interior loop carries no mask code at all.
+-    #
+-    # SMEM-stage alternation uses the LOOP COUNTER ``i`` (0..N-1), NOT
+-    # ``kv_iter``, so the prologue can always seed stage 0 regardless of
+-    # kv_right's parity.
+-    # max(kv_right-1, 0): an empty loop (kv_left==kv_right==0, fully-masked CTA)
+-    # still seeds tile 0 — a valid, in-bounds load the 0-iter mainloop ignores.
+-    prologue_kv_iter = kv_right - cutlass.Int32(1)
+-    prologue_kv_iter = cutlass.Int32(
+-        arith.select(
+-            (prologue_kv_iter < cutlass.Int32(0)).ir_value(),
+-            cutlass.Int32(0).ir_value(),
+-            prologue_kv_iter.ir_value(),
+-        )
+-    )
+-    prologue_kv_i64 = prologue_kv_iter.to(cutlass.Int64)
+-    k_prologue_off64 = prologue_kv_i64 * K_TILE_STRIDE_E.to(cutlass.Int64)
+-    v_prologue_off64 = prologue_kv_i64 * V_TILE_STRIDE_E.to(cutlass.Int64)
+-    k_prologue_gmem = k_gmem_batch_head + k_prologue_off64
+-    kv_prologue_row_abs = prologue_kv_iter * cutlass.Int32(tile_n)
+-    load_tile_2d(
+-        sK_buf,
+-        k_prologue_gmem,
+-        rows=tile_n,
+-        elems_per_row=ELEMS_PER_ROW_K,
+-        gmem_row_stride_elems=K_ROW_STRIDE_E,
+-        tidx=tidx,
+-        num_threads=threads,
+-        elems_per_copy=ELEMS_PER_LD,
+-        elem_bytes=ELEM_BYTES,
+-        cache=nvvm.LoadCacheModifier.CG,
+-        swizzle=True,
+-        valid_rows=kv_valid_rows,
+-        valid_cols=valid_cols,
+-        row_base=kv_prologue_row_abs,
+-    )
+-    cp_async_commit()  # group 1: K[kv_right-1]
+-    cp_async_wait(1)  # leave K in flight
++    cp_async_wait(0)
+     nvvm.barrier_cta_sync()
+ 
+     # ---- RoPE: rotate Q in SMEM (before ldmatrix Q) -----------------------
+@@ -880,70 +848,25 @@ def _sdpa_kernel(
+         return cutlass.Int32(arith.select((a < b).ir_value(), a.ir_value(), b.ir_value()))
+ 
+     # ---- MAINLOOP ---------------------------------------------------------
+-    # Both K and V are double-buffered (sK_buf split halves, sQ_buf split
+-    # halves).  At iter-i top we issue cp.async for both V[i] AND K[i+1]
+-    # (the next K), giving K[i+1] a full-iter drain window (QK + softmax +
+-    # V-wait + SV).  V[i] gets its usual half-iter drain (QK + softmax)
+-    # before the V-wait.
+-    #
+-    # ``n_kv_tiles`` is a RUNTIME value (host computes ``round_up(SKV /
+-    # TILE_N)`` and passes it in) so the kernel's outer loop uses a
+-    # runtime ``cutlass.range(..., unroll=1)`` — this collapses JIT
+-    # compile time from ~60 s (constexpr unroll over 128 iters at
+-    # SQ=8192) to a few seconds (one shared loop body trace).
+-    # Stage selection ``cur_stage = kv_iter & 1`` is therefore a runtime
+-    # bit-test, and stage pointers come from runtime ptr arithmetic.
+-    #
+-    # EXP-A: running pointers — V starts at v_gmem_batch_head (iter-0
+-    # K/V row), K-next starts at +TILE_N (iter-0 K[1] prefetch).  Each
+-    # iter advances both by KV_TILE_STRIDE_E.  If cute traces Python
+-    # rebind correctly across runtime ``cutlass.range`` iters, this
+-    # drops one Int32 mul per iter as well.  Tested: validation must
+-    # PASS (FAIL = rebind doesn't carry, revert).
+-    # Reverse iter: kv_iter walks kv_right-1 down to kv_left.  Running
+-    # pointers START at the kv_right-1 V/K block and DECREMENT each iter.
+-    # The K[i-1] prefetch (PREDECESSOR, not successor) is the one we issue
+-    # mid-loop; on the LAST iter (kv_iter == kv_left), the predecessor
+-    # K[kv_left - 1] would go OOB so we predicate it with cp_size=0.
+     K_STRIDE_64 = K_TILE_STRIDE_E.to(cutlass.Int64)
+     V_STRIDE_64 = V_TILE_STRIDE_E.to(cutlass.Int64)
+-    v_cur_gmem = v_gmem_batch_head + v_prologue_off64
+-    # K[i-1] prefetch starts at K[kv_right - 2] (= prologue's K - 1 stride).
+-    k_next_gmem = k_gmem_batch_head + k_prologue_off64 - K_STRIDE_64
+-    iter_count = kv_right - kv_left
+-    for i in cutlass.range(cutlass.Int32(0), iter_count, cutlass.Int32(1), unroll=1):
+-        kv_iter = prologue_kv_iter - i
+-        # SMEM stage alternates on the LOOP COUNTER so prologue's stage-0
+-        # write is the iter-0 read regardless of kv_right's parity.
+-        cur_stage = i & cutlass.Int32(1)
+-        next_stage = cutlass.Int32(1) - cur_stage
+-        sK_cur = sK_buf.subview(cur_stage * cutlass.Int32(ELEMS_KV_K))
+-        sK_next = sK_buf.subview(next_stage * cutlass.Int32(ELEMS_KV_K))
+-        sV_cur = sQ_buf.subview(cur_stage * cutlass.Int32(ELEMS_KV_V))
+-        sV_next = sQ_buf.subview(next_stage * cutlass.Int32(ELEMS_KV_V))
+-
+-        # ---- QK mma : S[M=m_per_warp, N=TILE_N] per warp, regs accumulator
+-        # mma_step internally loops m_blocks m16n8k16 sub-calls per k_step,
+-        # so the kernel-side call is the same one-line shape it was at
+-        # TILE_M=64.  S_acc is flat, m-block major:
+-        #   ``S_acc[m_block * QK_N_FRAGS*4 + n_frag*4 + i]``.
+-        S_acc = cutlass.Array(cutlass.Float32, m_blocks * QK_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
+-        for i in cutlass.range_constexpr(m_blocks * QK_N_FRAGS * 4):
+-            S_acc[i] = cutlass.Float32(0.0)
+-
+-        # ---- Step 1: issue V[i] cp.async ---------------------------------
+-        # V[i] writes into sV_cur (= sV[i%2]).  Iter (i-2)'s SV-mma read
+-        # of this same slot is fenced by iter (i-1)'s K-wait + V-wait
+-        # barriers, so no per-iter end-of-iter barrier is needed.
+-        # v_cur_gmem advanced at iter-end below (running-pointer form).
+-        # row_base = kv_iter * tile_n (V[i]'s absolute starting row).
++    iter_count = route_count
++    for route_iter in cutlass.range(cutlass.Int32(0), iter_count, cutlass.Int32(1), unroll=1):
++        route_slot = route_count - cutlass.Int32(1) - route_iter
++        kv_iter = cutlass.Int32(cute.arch.shuffle_sync(route_ptr[route_slot], 0))
++        kv_iter_i64 = kv_iter.to(cutlass.Int64)
++        k_cur_gmem = k_gmem_batch_head + kv_iter_i64 * K_STRIDE_64
++        v_cur_gmem = v_gmem_batch_head + kv_iter_i64 * V_STRIDE_64
+         kv_row_base_cur = kv_iter * cutlass.Int32(tile_n)
++        sK_cur = sK_buf
++        sV_cur = sQ_buf
++
+         load_tile_2d(
+-            sV_cur,
+-            v_cur_gmem,
++            sK_cur,
++            k_cur_gmem,
+             rows=tile_n,
+-            elems_per_row=ELEMS_PER_ROW_V,
+-            gmem_row_stride_elems=V_ROW_STRIDE_E,
++            elems_per_row=ELEMS_PER_ROW_K,
++            gmem_row_stride_elems=K_ROW_STRIDE_E,
+             tidx=tidx,
+             num_threads=threads,
+             elems_per_copy=ELEMS_PER_LD,
+@@ -951,59 +874,43 @@ def _sdpa_kernel(
+             cache=nvvm.LoadCacheModifier.CG,
+             swizzle=True,
+             valid_rows=kv_valid_rows,
+-            valid_cols=None,  # V is always the full compile-time d_v wide (asserted)
++            valid_cols=valid_cols,
+             row_base=kv_row_base_cur,
+         )
+-        cp_async_commit()  # group: V[i]
+-
+-        # ---- Step 1.5: prefetch K[i-1] (predicated via cp_size) ----------
+-        # Always issue the prefetch cp.async and predicate it via
+-        # ``cp_size_bytes``: PTX cp.async with source-bytes < dst-bytes
+-        # zero-fills the remainder (here ALL bytes), making the predicated
+-        # instruction a benign SMEM zero-store with NO GMEM dereference.
+-        # Issued before this iter's K-wait so its drain is covered by the
+-        # whole QK + softmax + SV pipeline of this iteration.
+-        bytes_per_copy_full = ELEMS_PER_LD * ELEM_BYTES  # 16
+-        # Reverse iter: prefetch K[i-1] (the PREDECESSOR, not successor).
+-        # On the LAST iter (kv_iter == kv_left), K[kv_left-1] would go OOB
+-        # → predicate with cp_size=0.  Row predication (when ~is_even_mn)
+-        # ALSO zeroes OOB rows within the LAST valid K tile — they compose
+-        # multiplicatively inside load_tile_2d.
+-        not_last = cutlass.Int32(kv_iter > kv_left)
+-        cp_size_bytes = not_last * cutlass.Int32(bytes_per_copy_full)
+-        # k_next_gmem holds iter-i's K[i-1] base (decremented at iter-end).
+-        kv_row_base_prev = (kv_iter - cutlass.Int32(1)) * cutlass.Int32(tile_n)
++        cp_async_commit()
+         load_tile_2d(
+-            sK_next,
+-            k_next_gmem,
++            sV_cur,
++            v_cur_gmem,
+             rows=tile_n,
+-            elems_per_row=ELEMS_PER_ROW_K,
+-            gmem_row_stride_elems=K_ROW_STRIDE_E,
++            elems_per_row=ELEMS_PER_ROW_V,
++            gmem_row_stride_elems=V_ROW_STRIDE_E,
+             tidx=tidx,
+             num_threads=threads,
+             elems_per_copy=ELEMS_PER_LD,
+             elem_bytes=ELEM_BYTES,
+             cache=nvvm.LoadCacheModifier.CG,
+             swizzle=True,
+-            cp_size_bytes=cp_size_bytes,
+             valid_rows=kv_valid_rows,
+-            valid_cols=valid_cols,
+-            row_base=kv_row_base_prev,
++            valid_cols=None,
++            row_base=kv_row_base_cur,
+         )
+-        cp_async_commit()  # group: K[i-1] (no-op on first kv_iter == kv_left)
+-
+-        # ---- Step 2: wait for K[i] ---------------------------------------
+-        # Pending groups (oldest first): K[i] (from the prev iter's prefetch
+-        # or the prologue), V[i] (Step 1), K[i-1] (the prefetch just issued).
+-        # wait_group(2) drains exactly K[i]; V[i] and K[i-1] keep streaming
+-        # through QK + softmax.
+-        cp_async_wait(2)
++        cp_async_commit()
++        cp_async_wait(0)
+         nvvm.barrier_cta_sync()
+ 
++        # ---- QK mma : S[M=m_per_warp, N=TILE_N] per warp, regs accumulator
++        # mma_step internally loops m_blocks m16n8k16 sub-calls per k_step,
++        # so the kernel-side call is the same one-line shape it was at
++        # TILE_M=64.  S_acc is flat, m-block major:
++        #   ``S_acc[m_block * QK_N_FRAGS*4 + n_frag*4 + i]``.
++        S_acc = cutlass.Array(cutlass.Float32, m_blocks * QK_N_FRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
++        for i in cutlass.range_constexpr(m_blocks * QK_N_FRAGS * 4):
++            S_acc[i] = cutlass.Float32(0.0)
++
+         # ---- RoPE: rotate K[i] in SMEM (before ldmatrix K) ----------------
+         # Each K tile is loaded once and consumed once, so rotating sK_cur in
+-        # place per kv-iter is correct (the prefetch wrote sK_next, a disjoint
+-        # ring slot).  Position of K row 0 in this tile = kv_iter*tile_n.  The
++        # place per kv-iter is correct. Position of K row 0 in this tile =
++        # kv_iter*tile_n. The
+         # extra barrier fences the rotation writes against the ldmatrix reads.
+         if cutlass.const_expr(has_rope):
+             rope_rotate_smem_tile(
+@@ -1291,17 +1198,9 @@ def _sdpa_kernel(
+             row_sum[row_state_lo] = row_sum[row_state_lo] * alpha_top + l_top_iter
+             row_sum[row_state_hi] = row_sum[row_state_hi] * alpha_bot + l_bot_iter
+ 
+-        # ---- Step 5: wait for V[i] --------------------------------------
+-        # Pending: V[i], K[i+1] (always — even if last iter where K[i+1]
+-        # is a cp_size=0 no-op).  wait_group(1) drains V[i] (oldest) and
+-        # leaves K[i+1] streaming through SV mma + next iter (or harmless
+-        # zero-fill no-op on the last iter).
+-        cp_async_wait(1)
+-        nvvm.barrier_cta_sync()
+-
+         # ---- Step 6: SV mma ---------------------------------------------
+-        # V[i] is now resident in sV_cur (= sV[i%2]).  Same one-ahead
+-        # V-frag ldmatrix prefetch within the k-loop as QK does for K.
++        # V[i] is resident in sV_cur. Same one-ahead V-frag ldmatrix
++        # prefetch within the k-loop as QK does for K.
+         # SV B-operand (V) also via ldmatrix.x4 — bigger win here than QK
+         # because d_v // 8 is large (32 at d_v=256, 16 at d_v=128), so the
+         # halving cuts the per-k-step ldmatrix count from {32,16} to {16,8}.
+@@ -1315,16 +1214,7 @@ def _sdpa_kernel(
+             if cutlass.const_expr(k_chunk + 1 < SV_K_CHUNKS):
+                 V_frag_cur = V_frag_next
+ 
+-        # No per-iter end-of-iter barrier:  with V double-buffered, iter
+-        # (i+2)'s V cp.async write to sV[i%2] is naturally fenced by
+-        # iter (i+1)'s K-wait + V-wait barriers — every warp finishes
+-        # iter i's SV-mma read before iter (i+2) issues its V cp.async.
+-
+-        # EXP-A: advance running pointers for iter (i+1).  Int64 add only
+-        # (K/V stride already cast outside the loop).  K and V have separate
+-        # strides for asymmetric d_qk != d_v (DSv3).
+-        v_cur_gmem = v_cur_gmem - V_STRIDE_64
+-        k_next_gmem = k_next_gmem - K_STRIDE_64
++        nvvm.barrier_cta_sync()
+ 
+     # ---- Post-mainloop sync ----------------------------------------------
+     # One barrier here replaces the (dropped) per-iter end-of-iter barrier:
+@@ -1567,6 +1457,8 @@ def _sdpa_host(
+     K: cute.Tensor,
+     V: cute.Tensor,
+     O: cute.Tensor,
++    route_lut: cute.Tensor,
++    route_counts: cute.Tensor,
+     LSE: Optional[cute.Tensor],
+     seq_kv_lens: cute.Tensor,
+     seq_len_q: cute.Tensor,
+@@ -1575,6 +1467,8 @@ def _sdpa_host(
+     cu_q: cute.Tensor,
+     cu_k: cute.Tensor,
+     rope_cs: cute.Tensor,
++    route_q_tiles: cutlass.Int32,
++    route_kv_tiles: cutlass.Int32,
+     tile_m: cutlass.Constexpr[int],
+     num_warps: cutlass.Constexpr[int],
+     tile_n: cutlass.Constexpr[int],
+@@ -1628,6 +1522,8 @@ def _sdpa_host(
+         K,
+         V,
+         O,
++        route_lut.iterator,
++        route_counts.iterator,
+         LSE,
+         seq_kv_lens,
+         seq_len_q,
+@@ -1636,6 +1532,8 @@ def _sdpa_host(
+         cu_q,
+         cu_k,
+         rope_cs,
++        route_q_tiles,
++        route_kv_tiles,
+         tile_m,
+         num_warps,
+         tile_n,
+@@ -1762,6 +1660,18 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the
+         stride_order=(3, 2, 1, 0),
+         assumed_align=16,
+     )
++    fake_route_lut = cute.runtime.make_fake_compact_tensor(
++        cutlass.Int32,
++        (_b, h, (_sq + p.tile_m - 1) // p.tile_m, (_skv + p.tile_n - 1) // p.tile_n),
++        stride_order=(3, 2, 1, 0),
++        assumed_align=16,
++    )
++    fake_route_counts = cute.runtime.make_fake_compact_tensor(
++        cutlass.Int32,
++        (_b, h, (_sq + p.tile_m - 1) // p.tile_m),
++        stride_order=(2, 1, 0),
++        assumed_align=16,
++    )
+     # LSE: dense [B, H, SQ]; THD packed [1, H, T] (shares the Q/O token
+     # symbol, which is exactly what the kernel's LSE.shape[2] read needs).
+     if p.has_lse:
+@@ -1816,6 +1726,8 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the
+         stride_order=((2, 1, 0) if p.has_rope else (0,)),
+         assumed_align=16,
+     )
++    fake_route_q_tiles = cutlass.Int32(0)
++    fake_route_kv_tiles = cutlass.Int32(0)
+     fake_n_kv_tiles = cutlass.Int32(0)
+     fake_scale = cutlass.Float32(0.0)
+     fake_sq_rt = cutlass.Int32(0)
+@@ -1834,6 +1746,8 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the
+         fake_k,
+         fake_v,
+         fake_o,
++        fake_route_lut,
++        fake_route_counts,
+         fake_lse,
+         fake_seq_kv_lens,
+         fake_seq_len_q,
+@@ -1842,6 +1756,8 @@ def compile(  # noqa: A001 — the template contract's entry point (matches the
+         fake_cu_q,
+         fake_cu_k,
+         fake_rope_cs,
++        fake_route_q_tiles,
++        fake_route_kv_tiles,
+         p.tile_m,
+         p.num_warps,
+         p.tile_n,

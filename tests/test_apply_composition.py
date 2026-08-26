@@ -87,7 +87,7 @@ class ApplyCompositionTests(unittest.TestCase):
         inventory = SimpleNamespace(
             labels=lambda _name: (
                 'TensorWiseINT8Layout+convrot256',
-            ),
+            ) * 50,
         )
         qkv = QKVProviderResolution(
             'standard_h3_qkv',
@@ -149,10 +149,16 @@ class ApplyCompositionTests(unittest.TestCase):
             apply_module,
             '_ensure_sparse_runtime',
             return_value=(object(), True),
-        ):
+        ), self.assertLogs(level='INFO') as logs:
             left = apply_in_order(FakeModel(), memory, sparse)
             right = apply_in_order(FakeModel(), sparse, memory)
 
+        armed_logs = [line for line in logs.output if ' armed: ' in line]
+        self.assertTrue(armed_logs)
+        self.assertTrue(all(
+            'qkv_weights=TensorWiseINT8Layout+convrot256 qkv_layers=50' in line
+            for line in armed_logs
+        ))
         self.assertEqual(
             read_plan(left).signature,
             read_plan(right).signature,
