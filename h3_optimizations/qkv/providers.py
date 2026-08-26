@@ -19,7 +19,12 @@ from ..plan import (
 QKV_STANDARD = 'standard_h3_qkv'
 QKV_BF16_CHUNKED = 'chunked_bf16_qkv'
 QKV_FORCE_BF16_CHUNKED = 'force_bf16_qkv'
-QKV_FORCE_QUANT_CHUNKED = 'force_quant_qkv'
+QKV_FORCE_BF16_STREAMED_KITCHEN = 'force_bf16_streamed_kitchen_qkv'
+QKV_FORCE_FP8_CHUNKED = 'force_fp8_qkv'
+QKV_FORCE_QUANT_CHUNKED = QKV_FORCE_FP8_CHUNKED
+QKV_FORCE_CONVROT_INT8_CHUNKED = 'force_convrot_int8_qkv'
+QKV_FORCE_CONVROT_INT8_KITCHEN = 'force_convrot_int8_kitchen_qkv'
+QKV_FORCE_CONVROT_INT8_TRITON = 'force_convrot_int8_triton_qkv'
 QKV_DENSE_CONVROT_INT8 = 'convrot_int8_dense_sage'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_STREAMED_BF16_KITCHEN = 'streamed_bf16_kitchen_qkv'
@@ -35,6 +40,7 @@ MLP_OFF = 'off'
 MLP_PRESERVE_UPSTREAM = 'preserve_upstream_mlp'
 MLP_FLOAT_CHUNKED = 'float_chunked'
 MLP_FP8_CHUNKED = 'fp8_chunked'
+MLP_RUNTIME_CONVROT_INT8_CHUNKED = 'runtime_convrot_int8_chunked'
 MLP_W4A8_CHUNKED = 'w4a8_chunked'
 MLP_CONVROT_INT8_TWO_SLICE = 'convrot_int8_two_slice'
 
@@ -434,14 +440,13 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
         )
     if request == MLP_MEMORY_FORCE_QUANT:
         if inventory.mlp_plain_float:
-            if not fp8_available:
-                raise RuntimeError(
-                    'Force quant requires accelerated FP8 execution for floating MLP weights'
-                )
             return MLPProviderResolution(
-                MLP_FP8_CHUNKED,
-                'mlp_chunked_fp8',
-                'floating H3 MLP weights are forced to FP8 E4M3',
+                MLP_RUNTIME_CONVROT_INT8_CHUNKED,
+                'mlp_chunked_convrot_int8_runtime',
+                (
+                    'floating H3 MLP weights are converted to execution-scoped '
+                    'ConvRot-256 INT8 while activations remain BF16'
+                ),
             )
         resolved = _resolve_preserve_precision_mlp(inventory, fp8_available)
         if resolved.provider_id == MLP_PRESERVE_UPSTREAM:

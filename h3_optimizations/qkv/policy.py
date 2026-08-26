@@ -43,6 +43,8 @@ def is_dense_streamed_provider(provider_id):
     return provider_id in (
         base.QKV_DENSE_KITCHEN_CHUNKED,
         base.QKV_DENSE_FP8_CHUNKED,
+        base.QKV_FORCE_BF16_STREAMED_KITCHEN,
+        base.QKV_FORCE_CONVROT_INT8_KITCHEN,
     )
 
 
@@ -209,6 +211,25 @@ def resolve_qkv_provider(
             memory_optimize=memory_optimize,
             fp8_available=fp8_available,
         )
+    if (
+        request == FUSED_QKV_FORCE_BF16
+        and backend_kind in _KITCHEN_CARRIER_CONSUMERS
+        and kitchen_producer_available
+        and (
+            inventory.qkv_plain_float
+            or inventory.qkv_convrot_int8_256
+            or inventory.qkv_w4a8
+            or inventory.qkv_fp8
+        )
+    ):
+        return base.QKVProviderResolution(
+            base.QKV_FORCE_BF16_STREAMED_KITCHEN,
+            True,
+            (
+                'QKV weights are materialized as BF16 and projected in bounded '
+                'chunks streamed directly into the Kitchen carrier'
+            ),
+        )
     if request == FUSED_QKV_FORCE_BF16:
         if not (
             inventory.qkv_plain_float
@@ -219,20 +240,74 @@ def resolve_qkv_provider(
             raise RuntimeError(
                 'BF16 mode cannot materialize the checkpoint QKV format as BF16'
             )
+        if (
+            backend_kind == 'triton_sparse_bf16'
+            and triton_available
+            and base._qkv_is_native_bf16(inventory)
+        ):
+            return base.QKVProviderResolution(
+                base.QKV_FORCE_BF16_CHUNKED,
+                True,
+                (
+                    'native BF16 QKV retains complete K/V and streams bounded '
+                    'BF16 Q slabs into Triton without weight conversion'
+                ),
+            )
         return base.QKVProviderResolution(
             base.QKV_FORCE_BF16_CHUNKED,
             False,
             'QKV weights are materialized as BF16 for bounded BF16 projection',
         )
     if request == FUSED_QKV_FORCE_QUANT and inventory.qkv_plain_float:
-        if not fp8_available:
-            raise RuntimeError(
-                'Force quant requires accelerated FP8 execution for floating QKV weights'
+        if backend_kind in _KITCHEN_CARRIER_CONSUMERS:
+            if not kitchen_producer_available:
+                raise RuntimeError(
+                    'Force quant requires the Kitchen QKV producer for the selected attention backend'
+                )
+            return base.QKVProviderResolution(
+                base.QKV_FORCE_CONVROT_INT8_KITCHEN,
+                True,
+                (
+                    'floating QKV weights are converted to execution-scoped '
+                    'ConvRot-256 INT8 and streamed into the Kitchen INT8 carrier'
+                ),
+            )
+        if backend_kind == 'sparse_sage':
+            if not fp8_available:
+                raise RuntimeError(
+                    'Force quant requires accelerated FP8 execution for Sparse Sage QKV'
+                )
+            return base.QKVProviderResolution(
+                base.QKV_SPARSE_FP8_CHUNKED,
+                True,
+                'floating QKV weights are forced to FP8 E4M3 for Sparse Sage projection',
+            )
+        if backend_kind == 'triton_sparse_bf16':
+            return base.QKVProviderResolution(
+                base.QKV_FORCE_CONVROT_INT8_TRITON,
+                True,
+                (
+                    'floating QKV weights are converted to execution-scoped '
+                    'ConvRot-256 INT8 and streamed as BF16 Q/K/V into Triton'
+                ),
+            )
+        if backend_kind == 'flex_attention_fp8':
+            if not fp8_available:
+                raise RuntimeError(
+                    'Force quant requires accelerated FP8 execution for FlexAttention QKV'
+                )
+            return base.QKVProviderResolution(
+                base.QKV_FORCE_FP8_CHUNKED,
+                False,
+                'floating QKV weights are forced to FP8 E4M3 for FP8 FlexAttention',
             )
         return base.QKVProviderResolution(
-            base.QKV_FORCE_QUANT_CHUNKED,
+            base.QKV_FORCE_CONVROT_INT8_CHUNKED,
             False,
-            'floating QKV weights are forced to FP8 E4M3 for bounded projection',
+            (
+                'floating QKV weights are converted to execution-scoped '
+                'ConvRot-256 INT8 and projected as bounded BF16 Q/K/V'
+            ),
         )
 
     streamed = _stream_kitchen(

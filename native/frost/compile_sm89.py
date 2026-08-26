@@ -31,5 +31,5 @@ params = config_sm80.params_for_flavor(
 )
 kernel_path = source_cudnn / 'sdpa' / 'fwd' / 'kernels' / 'prefill_f16_sm80.py'
 module = load_template(kernel_path, params, tag='h3_sm89_bf16_64x64')
-compiled = module.compile(b=1, h=42, h_kv=42, sq=193, skv=193, d=128)
+compiled = module.compile(b=1, h=56, h_kv=56, sq=193, skv=193, d=128)
 print(compiled)

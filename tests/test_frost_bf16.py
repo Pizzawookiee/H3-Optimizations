@@ -22,6 +22,7 @@ from h3_optimizations.attention.sparse.frost_bf16 import (
     preflight_frost_bf16,
 )
 from h3_optimizations.attention.sparse import frost_loader
+from h3_optimizations.attention.sparse import frost_bf16
 from h3_optimizations.attention.sparse.frost_route import (
     build_full_absolute_route,
 )
@@ -50,23 +51,33 @@ class FrostBF16Tests(unittest.TestCase):
         self.assertEqual(image[:4], b'\x7fELF')
         self.assertEqual(
             hashlib.sha256(image).hexdigest(),
-            'a6056f00245c01720214e56894a86656a58b87811c849cef61605c888f8a0af5',
+            '4be095512e6a117634a3c0dddac9cedeab2722543ea2f37537b6602dd5002cd3',
         )
         self.assertTrue(symbol.startswith('kernel_cutlass__sdpa_kernel_'))
         self.assertIn('ptrbf16', symbol)
 
     def test_preflight_is_explicitly_sm89(self):
-        spec = preflight_frost_bf16(
-            cuda_available=lambda: True,
-            capability_getter=lambda: (8, 9),
-            driver_probe=lambda: True,
-        )
-        self.assertEqual(spec.signature, ('frost_bf16_sm89', 1, 64, 64, 42, 128))
+        with mock.patch.object(frost_bf16, '_ARTIFACT_GPU_VALIDATED', True):
+            spec = preflight_frost_bf16(
+                cuda_available=lambda: True,
+                capability_getter=lambda: (8, 9),
+                driver_probe=lambda: True,
+            )
+        self.assertEqual(spec.signature, ('frost_bf16_sm89', 1, 64, 64, 56, 128))
 
-        with self.assertRaisesRegex(FrostBF16Error, 'compiled for SM89'):
+        with mock.patch.object(frost_bf16, '_ARTIFACT_GPU_VALIDATED', True):
+            with self.assertRaisesRegex(FrostBF16Error, 'compiled for SM89'):
+                preflight_frost_bf16(
+                    cuda_available=lambda: True,
+                    capability_getter=lambda: (8, 6),
+                    driver_probe=lambda: True,
+                )
+
+    def test_preflight_disables_unvalidated_artifact(self):
+        with self.assertRaisesRegex(FrostBF16Error, 'disabled pending GPU parity'):
             preflight_frost_bf16(
                 cuda_available=lambda: True,
-                capability_getter=lambda: (8, 6),
+                capability_getter=lambda: (8, 9),
                 driver_probe=lambda: True,
             )
 
@@ -112,12 +123,12 @@ class FrostBF16Tests(unittest.TestCase):
     def test_executor_preserves_strided_hnd_inputs_and_writes_nhd(self):
         sequence = 129
         storages = [
-            torch.empty(1, sequence, 42, 128, dtype=torch.bfloat16)
+            torch.empty(1, sequence, 56, 128, dtype=torch.bfloat16)
             for _ in range(3)
         ]
         q, k, v = (tensor.permute(0, 2, 1, 3) for tensor in storages)
-        route = torch.zeros(1, 42, 3, 3, dtype=torch.int32)
-        counts = torch.ones(1, 42, 3, dtype=torch.int32)
+        route = torch.zeros(1, 56, 3, 3, dtype=torch.int32)
+        counts = torch.ones(1, 56, 3, dtype=torch.int32)
         launches = []
 
         def launcher(*args, **kwargs):
@@ -134,9 +145,9 @@ class FrostBF16Tests(unittest.TestCase):
         )
         output = executor.execute(prepared)
 
-        self.assertEqual(tuple(output.shape), (1, 42, sequence, 128))
-        self.assertEqual(tuple(prepared.output_storage.shape), (1, sequence, 42, 128))
-        self.assertEqual(output.stride(), (sequence * 42 * 128, 128, 42 * 128, 1))
+        self.assertEqual(tuple(output.shape), (1, 56, sequence, 128))
+        self.assertEqual(tuple(prepared.output_storage.shape), (1, sequence, 56, 128))
+        self.assertEqual(output.stride(), (sequence * 56 * 128, 128, 56 * 128, 1))
         self.assertTrue(torch.all(output == 2))
         self.assertEqual(launches[0][1]['stream'], 77)
         self.assertAlmostEqual(
@@ -146,19 +157,33 @@ class FrostBF16Tests(unittest.TestCase):
 
     def test_executor_rejects_non_bf16(self):
         executor = FrostBF16Executor(allow_cpu_for_tests=True)
-        q = torch.empty(1, 42, 128, 128)
-        route = torch.zeros(1, 42, 1, 2, dtype=torch.int32)
-        counts = torch.ones(1, 42, 1, dtype=torch.int32)
+        q = torch.empty(1, 56, 128, 128)
+        route = torch.zeros(1, 56, 1, 2, dtype=torch.int32)
+        counts = torch.ones(1, 56, 1, dtype=torch.int32)
         with self.assertRaisesRegex(FrostBF16Error, 'requires BF16'):
+            executor.prepare(
+                q, q, q, route, counts, layer_index=0, metadata={}
+            )
+
+    def test_executor_reports_wrong_head_count(self):
+        executor = FrostBF16Executor(allow_cpu_for_tests=True)
+        storage = torch.empty(1, 65, 42, 128, dtype=torch.bfloat16)
+        q = storage.permute(0, 2, 1, 3)
+        route = torch.zeros(1, 42, 2, 2, dtype=torch.int32)
+        counts = torch.ones(1, 42, 2, dtype=torch.int32)
+        with self.assertRaisesRegex(
+            FrostBF16Error,
+            r'requires \[1,56,S,128\].*got \(1, 42, 65, 128\)',
+        ):
             executor.prepare(
                 q, q, q, route, counts, layer_index=0, metadata={}
             )
 
     def test_executor_rejects_contiguous_hnd_storage(self):
         executor = FrostBF16Executor(allow_cpu_for_tests=True)
-        q = torch.empty(1, 42, 129, 128, dtype=torch.bfloat16)
-        route = torch.zeros(1, 42, 3, 3, dtype=torch.int32)
-        counts = torch.ones(1, 42, 3, dtype=torch.int32)
+        q = torch.empty(1, 56, 129, 128, dtype=torch.bfloat16)
+        route = torch.zeros(1, 56, 3, 3, dtype=torch.int32)
+        counts = torch.ones(1, 56, 3, dtype=torch.int32)
         with self.assertRaisesRegex(FrostBF16Error, 'sequence-major storage'):
             executor.prepare(
                 q, q, q, route, counts, layer_index=0, metadata={}
@@ -184,14 +209,14 @@ class FrostBF16Tests(unittest.TestCase):
 
         sequence = 129
         q, k, v = (
-            torch.empty(1, sequence, 42, 128, dtype=torch.bfloat16).permute(
+            torch.empty(1, sequence, 56, 128, dtype=torch.bfloat16).permute(
                 0, 2, 1, 3
             )
             for _ in range(3)
         )
-        output = torch.empty(1, sequence, 42, 128, dtype=torch.bfloat16)
-        route = torch.zeros(1, 42, 3, 3, dtype=torch.int32)
-        counts = torch.ones(1, 42, 3, dtype=torch.int32)
+        output = torch.empty(1, sequence, 56, 128, dtype=torch.bfloat16)
+        route = torch.zeros(1, 56, 3, 3, dtype=torch.int32)
+        counts = torch.ones(1, 56, 3, dtype=torch.int32)
         driver = Driver()
 
         with mock.patch.object(
@@ -206,7 +231,7 @@ class FrostBF16Tests(unittest.TestCase):
             )
 
         launch = decoded['launch']
-        self.assertEqual(launch[1:7], (3, 42, 1, frost_loader.THREADS, 1, 1))
+        self.assertEqual(launch[1:7], (3, 56, 1, frost_loader.THREADS, 1, 1))
         self.assertEqual(launch[7], 64 * 1024)
         self.assertEqual(launch[8].value, 99)
         params = decoded['params']

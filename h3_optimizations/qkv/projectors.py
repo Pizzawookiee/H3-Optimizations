@@ -99,28 +99,38 @@ class SparseFusedQKVProjector:
 
 
 class TritonSparseQKVProjector:
-    """Stream bounded projection chunks into the final BF16 HND carrier."""
+    """Provide either full BF16 carriers or low-VRAM streamed Q to Triton."""
 
     name = "chunked_triton_sparse_qkv"
     qk_format = "bf16_hnd"
-    streamed_qkv = True
+    streamed_qkv = False
 
     def __init__(
         self,
         required=False,
         chunk_rows=4096,
         v_scale_group_size=None,
+        force_weights_int8=False,
+        stream_native_bf16=False,
     ):
         from .bf16 import ChunkedBF16QKVProjector
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
+        self.force_weights_int8 = bool(force_weights_int8)
+        self.stream_native_bf16 = bool(stream_native_bf16)
+        if self.force_weights_int8 and self.stream_native_bf16:
+            raise ValueError(
+                "Triton QKV cannot force INT8 and preserve native BF16 weights"
+            )
+        self.streamed_q = self.force_weights_int8 or self.stream_native_bf16
         if v_scale_group_size is not None:
             raise ValueError(
                 'BF16 Triton does not use an INT8 V scale group'
             )
         self._implementation = ChunkedBF16QKVProjector(
-            chunk_rows=self.chunk_rows
+            chunk_rows=self.chunk_rows,
+            force_weights_int8=self.force_weights_int8,
         )
 
     @property
@@ -134,6 +144,7 @@ class TritonSparseQKVProjector:
             self.qk_format,
             self.v_format,
             bool(self.required),
+            bool(self.stream_native_bf16),
             self._implementation.installation_signature,
         )
 
@@ -170,6 +181,43 @@ class TritonSparseQKVProjector:
             return _unsupported(
                 self.required,
                 "QKV format is %s" % actual.label,
+            )
+        if self.force_weights_int8:
+            if not actual.plain_float:
+                return _unsupported(
+                    self.required,
+                    "runtime ConvRot INT8 streaming requires floating QKV weights",
+                )
+            from ..attention.sparse.triton_bf16_streamed import (
+                run_streamed_triton_qkv,
+            )
+
+            return run_streamed_triton_qkv(
+                module,
+                x,
+                rope_freqs,
+                layer_index=layer_index,
+                chunk_rows=self.chunk_rows,
+            )
+        if self.stream_native_bf16:
+            dtype = str(getattr(actual, "logical_dtype", "")).lower()
+            if not actual.plain_float or not (
+                "bfloat16" in dtype or "bf16" in dtype
+            ):
+                return _unsupported(
+                    self.required,
+                    "native BF16 query streaming requires BF16 QKV weights",
+                )
+            from ..attention.sparse.triton_bf16_streamed import (
+                run_streamed_bf16_triton_qkv,
+            )
+
+            return run_streamed_bf16_triton_qkv(
+                module,
+                x,
+                rope_freqs,
+                layer_index=layer_index,
+                chunk_rows=self.chunk_rows,
             )
         try:
             projected = self._implementation.try_project(

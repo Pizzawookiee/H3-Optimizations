@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -22,6 +23,7 @@ comfy.options.enable_args_parsing()
 
 import torch  # noqa: E402
 from h3_optimizations.attention.sparse import triton_bf16  # noqa: E402
+from h3_optimizations.attention.sparse import triton_bf16_streamed  # noqa: E402
 from h3_optimizations.attention.sparse import triton_sparse  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     SPARSE_BACKEND_TRITON,
@@ -68,7 +70,8 @@ class TritonBF16Tests(unittest.TestCase):
         projector = TritonSparseQKVProjector(chunk_rows=4096)
         self.assertEqual(projector.qk_format, 'bf16_hnd')
         self.assertEqual(projector.v_format, 'bf16_hnd')
-        self.assertTrue(projector.streamed_qkv)
+        self.assertFalse(projector.streamed_qkv)
+        self.assertFalse(projector.streamed_q)
         self.assertIsInstance(projector._implementation, ChunkedBF16QKVProjector)
 
     def test_projector_exposes_the_bounded_chunk_stream_contract(self):
@@ -86,6 +89,84 @@ class TritonBF16Tests(unittest.TestCase):
             self.assertIsNone(projector.stream(module, 'x', 'rope', consume))
         projector._implementation.stream.assert_called_once_with(
             module, 'x', 'rope', consume
+        )
+
+    def test_force_int8_projector_selects_the_real_low_vram_payload(self):
+        projector = TritonSparseQKVProjector(
+            chunk_rows=4096,
+            force_weights_int8=True,
+        )
+        expected = object()
+        fmt = mock.Mock(
+            convrot_int8_256=False,
+            w4a8=False,
+            fp8=False,
+            plain_float=True,
+        )
+        with mock.patch.object(
+            projector_module,
+            'describe_linear',
+            return_value=fmt,
+        ), mock.patch.object(
+            triton_bf16_streamed,
+            'run_streamed_triton_qkv',
+            return_value=expected,
+        ) as run:
+            actual = projector.try_project(
+                SimpleNamespace(qkv_proj=object()),
+                'x',
+                'rope',
+                layer_index=7,
+                transformer_options={},
+            )
+
+        self.assertIs(actual, expected)
+        run.assert_called_once_with(
+            mock.ANY,
+            'x',
+            'rope',
+            layer_index=7,
+            chunk_rows=4096,
+        )
+
+    def test_native_bf16_projector_selects_the_real_low_vram_payload(self):
+        projector = TritonSparseQKVProjector(
+            chunk_rows=4096,
+            stream_native_bf16=True,
+        )
+        expected = object()
+        fmt = mock.Mock(
+            convrot_int8_256=False,
+            w4a8=False,
+            fp8=False,
+            plain_float=True,
+            logical_dtype=torch.bfloat16,
+        )
+        with mock.patch.object(
+            projector_module,
+            'describe_linear',
+            return_value=fmt,
+        ), mock.patch.object(
+            triton_bf16_streamed,
+            'run_streamed_bf16_triton_qkv',
+            return_value=expected,
+        ) as run:
+            actual = projector.try_project(
+                SimpleNamespace(qkv_proj=object()),
+                'x',
+                'rope',
+                layer_index=7,
+                transformer_options={},
+            )
+
+        self.assertIs(actual, expected)
+        self.assertTrue(projector.streamed_q)
+        run.assert_called_once_with(
+            mock.ANY,
+            'x',
+            'rope',
+            layer_index=7,
+            chunk_rows=4096,
         )
 
     def test_full_bf16_carrier_is_filled_by_the_stream_contract(self):
@@ -135,6 +216,16 @@ class TritonBF16Tests(unittest.TestCase):
         self.assertNotIn('prepared.q.contiguous()', source)
         self.assertNotIn('prepared.k.contiguous()', source)
         self.assertNotIn('prepared.v.contiguous()', source)
+
+    def test_kernel_separates_global_query_rows_from_slab_storage(self):
+        source = (
+            PACK / 'h3_optimizations' / 'attention' / 'sparse' / 'triton_bf16.py'
+        ).read_text(encoding='utf-8')
+        self.assertIn('Q_STORAGE_ROW_START', source)
+        self.assertIn('Q_STORAGE_ROWS', source)
+        self.assertIn('global_q_rows - Q_STORAGE_ROW_START', source)
+        self.assertIn('stride_oh: tl.constexpr', source)
+        self.assertIn('def _launch_streamed_chunk(', source)
 
 
 if __name__ == '__main__':

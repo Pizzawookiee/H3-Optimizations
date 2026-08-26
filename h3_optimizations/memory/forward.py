@@ -21,6 +21,10 @@ from .linear import (
     swiglu_eager,
 )
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
+from ..qkv.int8 import (
+    ConvRotINT8BindingError,
+    HeldConvRotINT8MLP,
+)
 
 LOG_PREFIX = '[H3 Optimizations]'
 
@@ -82,7 +86,31 @@ def _open_fp8(block, sample, config):
         return None, '%s: %s' % (type(exc).__name__, exc)
 
 
+def _open_runtime_convrot_int8(block, sample, config):
+    held = HeldConvRotINT8MLP(
+        block.mlp,
+        sample,
+        allow_float_conversion=True,
+    )
+    try:
+        held.__enter__()
+        return held, None
+    except (
+        ConvRotINT8BindingError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        if config.strict:
+            raise
+        held.release()
+        return None, '%s: %s' % (type(exc).__name__, exc)
+
+
 def _open_mlp(block, sample, config):
+    if config.runtime_convrot_int8:
+        held, error = _open_runtime_convrot_int8(block, sample, config)
+        return held, 'int8' if held is not None else 'module', error
     if config.fp8:
         held, error = _open_fp8(block, sample, config)
         return held, 'fp8' if held is not None else 'module', error
@@ -109,7 +137,7 @@ def _run_mlp(block, h, held, mlp_path, config):
     expanded = None
     if mlp_path == 'convrot':
         out, path = held.fc1_fc2(h)
-    elif mlp_path == 'fp8':
+    elif mlp_path in ('fp8', 'int8'):
         out, path = held.fc1_fc2(h, swiglu_eager)
     elif mlp_path == 'held':
         expanded = held.fc1(h)
@@ -131,7 +159,7 @@ def _run_fc1_swiglu(block, h, held, mlp_path):
     """Diagnostic-only SwiGLU activation for a small row subset."""
     if mlp_path == 'convrot':
         return held.fc1_swiglu(h)
-    if mlp_path == 'fp8':
+    if mlp_path in ('fp8', 'int8'):
         return swiglu_eager(held.fc1_binding.linear(h))
     if mlp_path == 'held':
         return swiglu_eager(held.fc1(h))
@@ -142,7 +170,7 @@ def _run_fc2_activation(block, activated, held, mlp_path):
     """Diagnostic-only fc2 applied to an already-activated SwiGLU vector."""
     if mlp_path == 'convrot':
         return held.fc2_activation(activated)
-    if mlp_path == 'fp8':
+    if mlp_path in ('fp8', 'int8'):
         return held.fc2_binding.linear(activated)
     if mlp_path == 'held':
         return held.fc2_weight.linear(activated)

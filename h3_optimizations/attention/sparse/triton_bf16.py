@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import torch
 
@@ -138,12 +139,16 @@ if TRITON_AVAILABLE:
         sequence,
         Q_BLOCK_START,
         Q_BLOCK_COUNT,
+        Q_STORAGE_ROW_START,
+        Q_STORAGE_ROWS,
         stride_qh: tl.constexpr,
         stride_qn: tl.constexpr,
         stride_kh: tl.constexpr,
         stride_kn: tl.constexpr,
         stride_vh: tl.constexpr,
         stride_vn: tl.constexpr,
+        stride_oh: tl.constexpr,
+        stride_on: tl.constexpr,
         N_SELECTED: tl.constexpr,
         USE_ROUTE: tl.constexpr,
         softmax_scale: tl.constexpr,
@@ -155,10 +160,15 @@ if TRITON_AVAILABLE:
         q_block = Q_BLOCK_START + local_q_block
         bh = tl.program_id(1)
 
-        q_rows = q_block * Q_TILE_ + tl.arange(0, Q_TILE_)
+        global_q_rows = q_block * Q_TILE_ + tl.arange(0, Q_TILE_)
+        q_rows = global_q_rows - Q_STORAGE_ROW_START
         kv_rows = tl.arange(0, KV_TILE_)
         dims = tl.arange(0, D)
-        q_mask = q_rows < sequence
+        q_mask = (
+            (global_q_rows < sequence)
+            & (q_rows >= 0)
+            & (q_rows < Q_STORAGE_ROWS)
+        )
         q = tl.load(
             Q + bh * stride_qh + q_rows[:, None] * stride_qn + dims[None, :],
             mask=q_mask[:, None],
@@ -204,7 +214,7 @@ if TRITON_AVAILABLE:
             row_max = new_row_max
 
         tl.store(
-            O + (bh * sequence + q_rows[:, None]) * D + dims[None, :],
+            O + bh * stride_oh + q_rows[:, None] * stride_on + dims[None, :],
             (output / row_sum[:, None]).to(O.type.element_ty),
             mask=q_mask[:, None],
         )
@@ -250,12 +260,16 @@ def _launch(prepared):
             sequence,
             q_start,
             q_count,
+            0,
+            sequence,
             stride_qh=prepared.q.stride(1),
             stride_qn=prepared.q.stride(2),
             stride_kh=prepared.k.stride(1),
             stride_kn=prepared.k.stride(2),
             stride_vh=prepared.v.stride(1),
             stride_vn=prepared.v.stride(2),
+            stride_oh=output.stride(1),
+            stride_on=output.stride(2),
             N_SELECTED=selected,
             USE_ROUTE=use_route,
             softmax_scale=HEAD_DIM**-0.5,
@@ -276,6 +290,121 @@ def _launch(prepared):
     return output
 
 
+def _launch_streamed_chunk(
+    q,
+    k,
+    v,
+    sparse_lut,
+    *,
+    dense_q_tiles,
+    sparse_q_tiles,
+    sparse_selected,
+    sequence,
+    q_row_start,
+):
+    if not TRITON_AVAILABLE:
+        raise TritonBF16Error('BF16 Triton sparse attention requires Triton')
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or k.shape != v.shape:
+        raise TritonBF16Error('streamed BF16 Triton Q/K/V ranks differ')
+    if (
+        q.shape[0] != 1
+        or k.shape[0] != 1
+        or q.shape[1] != k.shape[1]
+        or q.shape[-1] != HEAD_DIM
+        or k.shape[-1] != HEAD_DIM
+        or int(k.shape[-2]) != int(sequence)
+    ):
+        raise TritonBF16Error('streamed BF16 Triton Q/K/V shapes differ')
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+        or q.device != k.device
+        or q.device != v.device
+        or not q.is_cuda
+    ):
+        raise TritonBF16Error('streamed BF16 Triton requires CUDA BF16 Q/K/V')
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise TritonBF16Error('streamed BF16 Triton head dimensions must be contiguous')
+
+    q_row_start = int(q_row_start)
+    rows = int(q.shape[-2])
+    if q_row_start < 0 or q_row_start % Q_TILE or not 0 < rows <= int(sequence):
+        raise TritonBF16Error('streamed BF16 Triton Q slab is invalid')
+    q_tile_start = q_row_start // Q_TILE
+    q_tile_count = (rows + Q_TILE - 1) // Q_TILE
+    total_q_tiles = int(dense_q_tiles) + int(sparse_q_tiles)
+    if q_tile_start + q_tile_count > total_q_tiles:
+        raise TritonBF16Error('streamed BF16 Triton Q slab exceeds its route')
+
+    heads = int(q.shape[1])
+    kv_tiles = (int(sequence) + KV_TILE - 1) // KV_TILE
+    expected = (
+        1,
+        heads,
+        int(sparse_q_tiles),
+        int(sparse_selected),
+    )
+    if tuple(sparse_lut.shape) != expected:
+        raise TritonBF16Error('streamed BF16 Triton sparse route shape differs')
+    output = torch.empty_like(q)
+
+    def launch_group(q_start, q_count, selected, use_route, lut):
+        if not q_count:
+            return
+        _bf16_sparse_kernel[(q_count, heads)](
+            q,
+            k,
+            v,
+            lut,
+            output,
+            int(sequence),
+            q_start,
+            q_count,
+            q_row_start,
+            rows,
+            stride_qh=q.stride(1),
+            stride_qn=q.stride(2),
+            stride_kh=k.stride(1),
+            stride_kn=k.stride(2),
+            stride_vh=v.stride(1),
+            stride_vn=v.stride(2),
+            stride_oh=output.stride(1),
+            stride_on=output.stride(2),
+            N_SELECTED=selected,
+            USE_ROUTE=use_route,
+            softmax_scale=HEAD_DIM**-0.5,
+            Q_TILE_=Q_TILE,
+            KV_TILE_=KV_TILE,
+            D=HEAD_DIM,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    dense_count = max(
+        0,
+        min(q_tile_start + q_tile_count, int(dense_q_tiles)) - q_tile_start,
+    )
+    launch_group(q_tile_start, dense_count, kv_tiles, False, sparse_lut)
+    sparse_count = q_tile_count - dense_count
+    if sparse_count:
+        sparse_global_start = q_tile_start + dense_count
+        route_start = sparse_global_start - int(dense_q_tiles)
+        route = sparse_lut[
+            ...,
+            route_start:route_start + sparse_count,
+            :,
+        ].contiguous()
+        launch_group(
+            sparse_global_start,
+            sparse_count,
+            int(sparse_selected),
+            True,
+            route,
+        )
+    return output
+
+
 class TritonBF16Backend:
     name = 'triton_sparse_bf16'
     requires_runtime_context = True
@@ -289,6 +418,7 @@ class TritonBF16Backend:
         if not isinstance(self.spec, TritonBF16Spec):
             raise TypeError('spec must be TritonBF16Spec')
         self.projector = projector
+        self._streamed_q_announced = False
         self.router = router or SparseTileRouter(
             self.config, q_tile=Q_TILE, kv_tile=KV_TILE
         )
@@ -356,6 +486,24 @@ class TritonBF16Backend:
     def prepare_projected(
         self, projected, *, layer_index, transformer_options
     ):
+        from .triton_bf16_streamed import (
+            StreamedTritonBF16QKV,
+            prepare_streamed_triton_bf16,
+        )
+
+        if isinstance(projected, StreamedTritonBF16QKV):
+            try:
+                return prepare_streamed_triton_bf16(
+                    self,
+                    projected,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+            except Exception as exc:
+                projected.release()
+                raise TritonBF16Error(
+                    'streamed BF16 Triton preparation failed'
+                ) from exc
         if not isinstance(projected, PreparedBF16QKV):
             raise TritonBF16Error('BF16 Triton requires chunked BF16 Q/K/V')
         prepared = self.prepare(
@@ -370,7 +518,41 @@ class TritonBF16Backend:
         )
         return prepared
 
+    def execute_projected(self, module, prepared):
+        from .triton_bf16_streamed import (
+            PreparedStreamedTritonBF16,
+            execute_streamed_triton_bf16,
+        )
+
+        if isinstance(prepared, PreparedStreamedTritonBF16):
+            try:
+                result = execute_streamed_triton_bf16(
+                    module,
+                    self,
+                    prepared,
+                )
+                if not self._streamed_q_announced:
+                    self._streamed_q_announced = True
+                    logging.info(
+                        '[H3 Optimizations] streamed BF16 Triton ran: '
+                        'global K/V, bounded Q/output, chunk_rows=%d',
+                        int(prepared.metadata['query_chunk_rows']),
+                    )
+                return result
+            except Exception as exc:
+                prepared.release()
+                raise TritonBF16Error(
+                    'streamed BF16 Triton execution failed'
+                ) from exc
+        return None
+
     def execute(self, prepared):
+        from .triton_bf16_streamed import PreparedStreamedTritonBF16
+
+        if isinstance(prepared, PreparedStreamedTritonBF16):
+            raise TritonBF16Error(
+                'streamed BF16 Triton must execute through execute_projected'
+            )
         try:
             return _launch(prepared)
         except Exception as exc:
@@ -391,8 +573,11 @@ class TritonBF16Backend:
             'probability_value_path': 'bf16_x_bf16_fp32',
             'route_format': 'dense_implicit_plus_sparse_absolute_int32',
             'chunked_qkv': self.projector is not None,
-            'streamed_qkv': bool(
-                getattr(self.projector, 'streamed_qkv', False)
+            'streamed_q': bool(getattr(self.projector, 'streamed_q', False)),
+            'qkv_lifetime': (
+                'global_bf16_kv_bounded_q'
+                if getattr(self.projector, 'streamed_q', False)
+                else 'global_bf16_qkv'
             ),
             'approximate': True,
         }
@@ -405,5 +590,6 @@ __all__ = [
     'TritonBF16Spec',
     '_compact_route',
     '_launch',
+    '_launch_streamed_chunk',
     'preflight_triton_bf16',
 ]

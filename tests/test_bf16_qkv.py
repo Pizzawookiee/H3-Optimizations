@@ -30,6 +30,7 @@ from h3_optimizations.plan import (  # noqa: E402
     MemoryRequest,
 )
 from h3_optimizations.attention_forward import (  # noqa: E402
+    _finish_projected,
     _legacy_attention,
     finish_qkv_projection,
     make_forward,
@@ -53,6 +54,9 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_STANDARD,
     QKV_STREAMED_BF16_KITCHEN,
     resolve_qkv_provider,
+)
+from h3_optimizations.qkv.projectors import (  # noqa: E402
+    TritonSparseQKVProjector,
 )
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -132,18 +136,59 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         self.assertEqual(projector.chunk_rows, 4096)
         self.assertEqual(
             projector.installation_signature,
-            ('chunked_bf16_qkv', 4096, False, False),
+            ('chunked_bf16_qkv', 4096, False, False, False),
         )
         forced = ChunkedBF16QKVProjector(force_weights_bf16=True)
         self.assertEqual(
             forced.installation_signature,
-            ('chunked_bf16_qkv', 4096, True, False),
+            ('chunked_bf16_qkv', 4096, True, False, False),
         )
         quantized = ChunkedBF16QKVProjector(force_weights_fp8=True)
         self.assertEqual(
             quantized.installation_signature,
-            ('chunked_bf16_qkv', 4096, False, True),
+            ('chunked_bf16_qkv', 4096, False, True, False),
         )
+
+        int8 = ChunkedBF16QKVProjector(force_weights_int8=True)
+        self.assertEqual(
+            int8.installation_signature,
+            ('chunked_bf16_qkv', 4096, False, False, True),
+        )
+
+    def test_triton_force_int8_keeps_named_streamed_projector(self):
+        projector = TritonSparseQKVProjector(force_weights_int8=True)
+        self.assertFalse(projector.streamed_qkv)
+        self.assertTrue(projector.streamed_q)
+        self.assertTrue(projector._implementation.force_weights_int8)
+
+    def test_direct_streamed_backend_uses_lazy_out_projection(self):
+        expected = torch.empty((4, 8), dtype=torch.bfloat16)
+        source = torch.empty((4, 8), dtype=torch.bfloat16)
+        out_projection = SimpleNamespace(
+            linear=mock.Mock(return_value=expected),
+        )
+        module = SimpleNamespace(
+            out_proj=mock.Mock(side_effect=AssertionError('BF16 out_proj ran')),
+        )
+
+        class Backend:
+            name = 'direct'
+
+            @staticmethod
+            def execute_projected(execution_module, _prepared):
+                return execution_module.out_proj(source)
+
+        self.assertIs(
+            _finish_projected(
+                module,
+                Backend(),
+                object(),
+                out_projection,
+            ),
+            expected,
+        )
+        out_projection.linear.assert_called_once_with(source)
+        module.out_proj.assert_not_called()
 
     def test_chunk_rows_must_be_positive(self):
         for value in (0, -1, -4096):

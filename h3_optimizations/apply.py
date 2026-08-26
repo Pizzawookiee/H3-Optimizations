@@ -59,6 +59,7 @@ from .plan import (
     ATTENTION_EXISTING,
     DENSITY_FIXED,
     FUSED_QKV_AUTO,
+    FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     H3OptimizationPlan,
@@ -84,7 +85,11 @@ from .qkv.providers import (
     QKV_BF16_CHUNKED,
     QKV_DENSE_CONVROT_INT8,
     QKV_FORCE_BF16_CHUNKED,
-    QKV_FORCE_QUANT_CHUNKED,
+    QKV_FORCE_BF16_STREAMED_KITCHEN,
+    QKV_FORCE_CONVROT_INT8_CHUNKED,
+    QKV_FORCE_CONVROT_INT8_KITCHEN,
+    QKV_FORCE_CONVROT_INT8_TRITON,
+    QKV_FORCE_FP8_CHUNKED,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
@@ -119,7 +124,8 @@ SPARSE_EXECUTION_BACKENDS = (
 _BOUNDED_QKV_PROVIDERS = (
     QKV_BF16_CHUNKED,
     QKV_FORCE_BF16_CHUNKED,
-    QKV_FORCE_QUANT_CHUNKED,
+    QKV_FORCE_CONVROT_INT8_CHUNKED,
+    QKV_FORCE_FP8_CHUNKED,
 )
 
 
@@ -127,14 +133,27 @@ def _bounded_qkv_projector(qkv):
     return ChunkedBF16QKVProjector(
         chunk_rows=4096,
         force_weights_bf16=qkv.provider_id == QKV_FORCE_BF16_CHUNKED,
-        force_weights_fp8=qkv.provider_id == QKV_FORCE_QUANT_CHUNKED,
+        force_weights_fp8=qkv.provider_id == QKV_FORCE_FP8_CHUNKED,
+        force_weights_int8=(
+            qkv.provider_id == QKV_FORCE_CONVROT_INT8_CHUNKED
+        ),
     )
 
 def _frost_qkv_projector(qkv):
     return FrostBF16QKVProjector(
         chunk_rows=4096,
         force_weights_bf16=qkv.provider_id == QKV_FORCE_BF16_CHUNKED,
-        force_weights_fp8=qkv.provider_id == QKV_FORCE_QUANT_CHUNKED,
+        force_weights_fp8=qkv.provider_id == QKV_FORCE_FP8_CHUNKED,
+        force_weights_int8=(
+            qkv.provider_id == QKV_FORCE_CONVROT_INT8_CHUNKED
+        ),
+    )
+
+
+def _force_out_proj_int8(plan, inventory):
+    return bool(
+        _qkv_request(plan) == FUSED_QKV_FORCE_QUANT
+        and getattr(inventory, 'out_proj_plain_float', False)
     )
 
 
@@ -259,6 +278,8 @@ def describe_memory_options(attention):
         installed.append('streamed_out')
     if getattr(projector, 'strided_qk_input', False):
         installed.append('strided_qk')
+    if getattr(projector, 'streamed_q', False):
+        installed.append('streamed_q')
     score_chunk = getattr(
         getattr(backend, 'router', None), 'score_chunk_tiles', None
     )
@@ -333,6 +354,8 @@ def _resolve_dense(plan, model, inventory, environment=None):
     elif qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
         QKV_DENSE_FP8_CHUNKED,
+        QKV_FORCE_CONVROT_INT8_KITCHEN,
+        QKV_FORCE_BF16_STREAMED_KITCHEN,
     ):
         backend = ChunkedKitchenAttentionBackend()
         # The chunk quantizer is handed the same strided Q/K views here as on
@@ -340,7 +363,13 @@ def _resolve_dense(plan, model, inventory, environment=None):
         # The sequence-major output layout is deliberately not enabled on this
         # path: it was measured on the sparse route only.
         projector = ChunkedKitchenQKVProjector(
+            force_weights_bf16=(
+                qkv.provider_id == QKV_FORCE_BF16_STREAMED_KITCHEN
+            ),
             fp8_projection=qkv.provider_id == QKV_DENSE_FP8_CHUNKED,
+            convrot_int8_projection=(
+                qkv.provider_id == QKV_FORCE_CONVROT_INT8_KITCHEN
+            ),
             strided_qk_input=True,
         )
     return (
@@ -389,7 +418,14 @@ def _resolve_sparse(plan, environment, inventory):
     elif qkv.provider_id == QKV_SPARSE_FP8_CHUNKED:
         from .attention.sparse.fp8_qkv import FP8SparseQKVProjector
 
-        projector = FP8SparseQKVProjector(kernel_spec, chunk_rows=4096)
+        projector = FP8SparseQKVProjector(
+            kernel_spec,
+            required=(
+                _qkv_request(plan) == FUSED_QKV_FORCE_QUANT
+                and inventory.qkv_plain_float
+            ),
+            chunk_rows=4096,
+        )
     backend = HybridSparseBackend(
         config,
         kernel_spec=kernel_spec,
@@ -513,13 +549,37 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
         mode=MODE_SAGE128,
         **_sparse_config_kwargs(plan),
     )
+    stream_native_bf16 = bool(
+        qkv.provider_id in (
+            QKV_BF16_CHUNKED,
+            QKV_FORCE_BF16_CHUNKED,
+            QKV_TRITON_SPARSE_CHUNKED,
+        )
+        and getattr(inventory, 'qkv_plain_float', False)
+        and _native_bf16_qkv(inventory)
+    )
     projector = None
-    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
-        projector = _bounded_qkv_projector(qkv)
-    elif qkv.provider_id == QKV_TRITON_SPARSE_CHUNKED:
+    if stream_native_bf16:
         from .qkv.projectors import TritonSparseQKVProjector
 
-        projector = TritonSparseQKVProjector(chunk_rows=4096)
+        projector = TritonSparseQKVProjector(
+            chunk_rows=4096,
+            stream_native_bf16=True,
+        )
+    elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+        projector = _bounded_qkv_projector(qkv)
+    elif qkv.provider_id in (
+        QKV_TRITON_SPARSE_CHUNKED,
+        QKV_FORCE_CONVROT_INT8_TRITON,
+    ):
+        from .qkv.projectors import TritonSparseQKVProjector
+
+        projector = TritonSparseQKVProjector(
+            chunk_rows=4096,
+            force_weights_int8=(
+                qkv.provider_id == QKV_FORCE_CONVROT_INT8_TRITON
+            ),
+        )
     backend = TritonSparseBackend(
         config,
         spec=spec,
@@ -565,6 +625,8 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
     use_projected = qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
         QKV_STREAMED_BF16_KITCHEN,
+        QKV_FORCE_CONVROT_INT8_KITCHEN,
+        QKV_FORCE_BF16_STREAMED_KITCHEN,
     )
     config = HybridSparseConfig(
         mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
@@ -574,11 +636,17 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         projector = _bounded_qkv_projector(qkv)
     elif use_projected:
         projector = ChunkedKitchenQKVProjector(
+            force_weights_bf16=(
+                qkv.provider_id == QKV_FORCE_BF16_STREAMED_KITCHEN
+            ),
             routing_summaries=True,
             q_tile=KITCHEN_Q_TILE,
             kv_tile=KITCHEN_KV_TILE,
             strided_qk_input=True,
             stream_output=True,
+            convrot_int8_projection=(
+                qkv.provider_id == QKV_FORCE_CONVROT_INT8_KITCHEN
+            ),
         )
     else:
         projector = None
@@ -733,6 +801,7 @@ def _ensure_sparse_runtime(model_patcher):
 def _inventory_status(inventory):
     return {
         'qkv': list(inventory.labels('qkv')),
+        'out_proj': list(inventory.labels('out_proj')),
         'fc1': list(inventory.labels('fc1')),
         'fc2': list(inventory.labels('fc2')),
     }
@@ -804,8 +873,14 @@ def _status(
                     QKV_DENSE_KITCHEN_CHUNKED,
                     QKV_DENSE_FP8_CHUNKED,
                     QKV_STREAMED_BF16_KITCHEN,
+                    QKV_FORCE_CONVROT_INT8_KITCHEN,
+                    QKV_FORCE_BF16_STREAMED_KITCHEN,
                 )
                 else None
+            ),
+            'out_proj_runtime_convrot_int8': _force_out_proj_int8(
+                plan,
+                inventory,
             ),
         },
         'mlp': {
@@ -855,6 +930,11 @@ def apply_plan(model, plan: H3OptimizationPlan):
 
     patched = model.clone()
     attention_blocks = 0
+    out_proj_kwargs = (
+        {'force_out_proj_int8': True}
+        if _force_out_proj_int8(plan, inventory)
+        else {}
+    )
     sparse_execution_selected = attention.backend_kind in SPARSE_EXECUTION_BACKENDS
     flex_dense_fallback = (
         attention.backend_kind == ATTENTION_FP8_FLEX
@@ -868,12 +948,14 @@ def apply_plan(model, plan: H3OptimizationPlan):
                 attention.backend,
                 projector=attention.projector,
                 backend_fallback_to_dense=flex_dense_fallback,
+                **out_proj_kwargs,
             )
         else:
             _backend, attention_blocks = configure_backend(
                 patched,
                 attention.backend,
                 projector=attention.projector,
+                **out_proj_kwargs,
             )
         if flex_dense_fallback and attention.dense_resolution is not None:
             install_dense_attention(patched, attention.dense_resolution)
@@ -882,7 +964,10 @@ def apply_plan(model, plan: H3OptimizationPlan):
             QKV_DENSE_CONVROT_INT8,
             QKV_BF16_CHUNKED,
             QKV_FORCE_BF16_CHUNKED,
-            QKV_FORCE_QUANT_CHUNKED,
+            QKV_FORCE_CONVROT_INT8_CHUNKED,
+            QKV_FORCE_CONVROT_INT8_KITCHEN,
+            QKV_FORCE_BF16_STREAMED_KITCHEN,
+            QKV_FORCE_FP8_CHUNKED,
             QKV_DENSE_KITCHEN_CHUNKED,
             QKV_DENSE_FP8_CHUNKED,
         ):
@@ -891,6 +976,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
                 attention.backend,
                 projector=attention.projector,
                 projector_fallback_to_original=True,
+                **out_proj_kwargs,
             )
         install_dense_attention(patched, attention.dense_resolution)
 
@@ -923,13 +1009,20 @@ def apply_plan(model, plan: H3OptimizationPlan):
     _warn_about_slow_paths(attention, qkv)
     qkv_labels = inventory.labels('qkv')
     logging.info(
-        '%s armed: attention=%s qkv="%s" qkv_route=%s qkv_weights=%s qkv_layers=%d mlp=%s memory=%s device=%s',
+        '%s armed: attention=%s qkv="%s" qkv_route=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s memory=%s device=%s',
         LOG_PREFIX,
         attention.selected,
         format_qkv_execution(options[STATUS_KEY]),
         qkv.provider_id,
         ','.join(sorted(set(qkv_labels))) or 'unknown',
         len(qkv_labels),
+        (
+            'runtime_convrot_int8'
+            if options[STATUS_KEY]['fused_qkv'][
+                'out_proj_runtime_convrot_int8'
+            ]
+            else 'checkpoint_native'
+        ),
         mlp.provider_id,
         describe_memory_options(attention),
         environment.device_name,

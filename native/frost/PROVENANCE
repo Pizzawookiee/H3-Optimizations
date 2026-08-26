@@ -1,5 +1,5 @@
 Artifact: h3_frost_bf16_sm89.cubin
-SHA256: a6056f00245c01720214e56894a86656a58b87811c849cef61605c888f8a0af5
+SHA256: 4be095512e6a117634a3c0dddac9cedeab2722543ea2f37537b6602dd5002cd3
 Upstream: NVIDIA/cudnn-frontend
 Upstream commit: ae8705effeea3804585b6aca554beaca1a76a3da
 Upstream source: python/cudnn/sdpa/fwd/kernels/prefill_f16_sm80.py
@@ -7,7 +7,7 @@ Upstream license: Apache-2.0
 H3 patch: frost_h3.patch
 Target: sm_89
 Input/output dtype: BF16
-Geometry: 64 query rows x 64 key/value rows, 42 heads, head dimension 128
+Geometry: 64 query rows x 64 key/value rows, 56 heads, head dimension 128
 Launch: 128 threads, 65536 bytes dynamic shared memory
 Static resources: 255 registers/thread, 0 stack, 0 local memory
 Route: absolute int32 LUT plus int32 valid counts

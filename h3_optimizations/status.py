@@ -68,11 +68,23 @@ def format_qkv_execution(status):
         'chunked_kitchen_qkv',
         'streamed_bf16_kitchen_qkv',
         'chunked_fp8_kitchen_qkv',
+        'force_convrot_int8_kitchen_qkv',
+        'force_bf16_streamed_kitchen_qkv',
     ):
         projection = (
             'FP8 projection -> %d-row BF16 chunks' % chunk_rows
             if provider == 'chunked_fp8_kitchen_qkv'
-            else '%d-row BF16 chunks' % chunk_rows
+            else (
+                'runtime ConvRot-256 INT8 projection -> %d-row BF16 chunks'
+                % chunk_rows
+                if provider == 'force_convrot_int8_kitchen_qkv'
+                else (
+                    'forced BF16 projection -> %d-row BF16 chunks'
+                    % chunk_rows
+                    if provider == 'force_bf16_streamed_kitchen_qkv'
+                    else '%d-row BF16 chunks' % chunk_rows
+                )
+            )
         )
         text = '%s -> %s -> Kitchen INT8 carrier' % (
             weights,
@@ -85,6 +97,12 @@ def format_qkv_execution(status):
 
     if provider in ('chunked_bf16_qkv', 'force_bf16_qkv'):
         prefix = 'forced BF16 projection' if provider == 'force_bf16_qkv' else 'BF16 projection'
+        if projector == 'chunked_triton_sparse_qkv':
+            return '%s -> %s; retained BF16 K/V + %d-row BF16 Q slabs -> Triton' % (
+                weights,
+                prefix,
+                chunk_rows,
+            )
         if projector == 'streamed_dense_bf16_qkv':
             return '%s -> %s in %d-row chunks; full BF16 K/V; Q and output streamed' % (
                 weights,
@@ -97,8 +115,13 @@ def format_qkv_execution(status):
             chunk_rows,
         )
 
-    if provider == 'force_quant_qkv':
+    if provider == 'force_fp8_qkv':
         return '%s -> forced FP8 projection in %d-row chunks -> full BF16 Q/K/V' % (
+            weights,
+            chunk_rows,
+        )
+    if provider == 'force_convrot_int8_qkv':
+        return '%s -> runtime ConvRot-256 INT8 projection in %d-row chunks -> full BF16 Q/K/V' % (
             weights,
             chunk_rows,
         )
@@ -110,7 +133,17 @@ def format_qkv_execution(status):
             chunk_rows,
         )
     if provider == 'chunked_triton_bf16_sparse':
+        if projector == 'chunked_triton_sparse_qkv':
+            return '%s -> retained BF16 K/V + %d-row BF16 Q slabs -> Triton' % (
+                weights,
+                chunk_rows,
+            )
         return '%s -> %d-row projection -> Triton BF16 carrier' % (
+            weights,
+            chunk_rows,
+        )
+    if provider == 'force_convrot_int8_triton_qkv':
+        return '%s -> runtime ConvRot-256 INT8 projection -> retained BF16 K/V + %d-row BF16 Q slabs -> Triton' % (
             weights,
             chunk_rows,
         )
@@ -140,6 +173,8 @@ def format_memory_status(model):
         'QKV: %s' % format_qkv_execution(status),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
+    if qkv.get('out_proj_runtime_convrot_int8'):
+        lines.insert(2, 'Attention output: runtime ConvRot-256 INT8')
     if final_layer.get('chunked'):
         lines.append(
             'FinalLayer: chunked (%d-row chunks)'
@@ -152,7 +187,10 @@ def format_memory_status(model):
         'off',
         'preserve_upstream_mlp',
     ):
-        lines[2] += ' (%d-row chunks)' % int(chunk_rows)
+        mlp_index = next(
+            index for index, line in enumerate(lines) if line.startswith('MLP:')
+        )
+        lines[mlp_index] += ' (%d-row chunks)' % int(chunk_rows)
     return '\n'.join(lines)
 
 
@@ -217,11 +255,14 @@ def format_sparse_status(model):
         'convrot_int8_sparse_sage',
         'chunked_fp8_sparse_sage',
         'chunked_triton_bf16_sparse',
+        'force_convrot_int8_triton_qkv',
     ):
         lines[qkv_index] += ' (%d-row chunks)' % int(
             qkv.get('chunk_rows') or 4096
         )
     lines[qkv_index] = _mark_runtime_fallback(qkv, lines[qkv_index])
+    if qkv.get('out_proj_runtime_convrot_int8'):
+        lines.insert(qkv_index + 1, 'Attention output: runtime ConvRot-256 INT8')
 
     early_steps = sparse.get('early_steps')
     if early_steps is None:

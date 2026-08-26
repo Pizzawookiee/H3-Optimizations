@@ -59,7 +59,7 @@ class NativeShippingTests(unittest.TestCase):
             self.assertTrue((frost / name).is_file(), name)
         provenance = (frost / 'PROVENANCE').read_text(encoding='utf-8')
         self.assertIn('ae8705effeea3804585b6aca554beaca1a76a3da', provenance)
-        self.assertIn('a6056f00245c01720214e56894a86656a58b87811c849cef61605c888f8a0af5', provenance)
+        self.assertIn('4be095512e6a117634a3c0dddac9cedeab2722543ea2f37537b6602dd5002cd3', provenance)
 
     def test_native_availability_requires_selftest(self):
         with (

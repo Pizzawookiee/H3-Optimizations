@@ -12,6 +12,21 @@ from .ordering_probe import has_ordering_observer, observe_attention
 DENSE_KITCHEN_PREQUANTIZED = 'comfy_kitchen_int8_prequantized'
 
 
+class _AttentionOutProjectionProxy:
+    def __init__(self, module, out_proj):
+        self._module = module
+        self.out_proj = out_proj
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+def _project_attention_output(module, out, out_projection):
+    if out_projection is None:
+        return module.out_proj(out)
+    return out_projection.linear(out)
+
+
 def finish_qkv_projection(module, projected, rope_freqs):
     seq = projected.shape[0]
     inner = module.heads * module.head_dim
@@ -127,13 +142,21 @@ def flatten_attention_output(module, out, source):
     )
 
 
-def _finish_projected(module, backend, prepared):
+def _finish_projected(module, backend, prepared, out_projection=None):
     # A streamed backend may own the full attention -> out_proj lifetime and
     # return the final hidden-size tensor directly. This is deliberately
     # opt-in so Kitchen, Triton, BF16 and legacy projected contracts stay put.
     execute_projected = getattr(backend, 'execute_projected', None)
     if execute_projected is not None:
-        direct = execute_projected(module, prepared)
+        execution_module = (
+            module
+            if out_projection is None
+            else _AttentionOutProjectionProxy(
+                module,
+                out_projection.linear,
+            )
+        )
+        direct = execute_projected(execution_module, prepared)
         if direct is not None:
             if direct.ndim != 2:
                 raise RuntimeError(
@@ -162,7 +185,11 @@ def _finish_projected(module, backend, prepared):
             )
         release()
     with diagnostics.stage('attention_out'):
-        return module.out_proj(out.squeeze(0))
+        return _project_attention_output(
+            module,
+            out.squeeze(0),
+            out_projection,
+        )
 
 
 def _finish_bf16_projected(
@@ -172,6 +199,7 @@ def _finish_bf16_projected(
     *,
     layer_index,
     transformer_options,
+    out_projection=None,
 ):
     """Consume chunked/native BF16 QKV without running QKV projection again."""
     q, k, v = projected.q, projected.k, projected.v
@@ -210,7 +238,11 @@ def _finish_bf16_projected(
     out = flatten_attention_output(module, raw, source)
     del raw
     with diagnostics.stage('attention_out'):
-        return module.out_proj(out.squeeze(0))
+        return _project_attention_output(
+            module,
+            out.squeeze(0),
+            out_projection,
+        )
 
 
 def _finish_streamed_dense_bf16_projected(
@@ -218,6 +250,7 @@ def _finish_streamed_dense_bf16_projected(
     projected,
     *,
     transformer_options,
+    out_projection=None,
 ):
     """Consume Q slabs against complete BF16 K/V and project each output slab."""
     output = projected.x
@@ -237,7 +270,13 @@ def _finish_streamed_dense_bf16_projected(
             )
             del raw
             with diagnostics.stage('attention_out'):
-                output[start:end].copy_(module.out_proj(out.squeeze(0)))
+                output[start:end].copy_(
+                    _project_attention_output(
+                        module,
+                        out.squeeze(0),
+                        out_projection,
+                    )
+                )
             del q, out
         return output
     finally:
@@ -252,6 +291,7 @@ def make_forward(
     projector=None,
     fallback_forward=None,
     backend_fallback_to_dense=False,
+    force_out_proj_int8=False,
 ):
     if backend is not None and attention is not None:
         raise ValueError('pass either backend or attention, not both')
@@ -262,10 +302,27 @@ def make_forward(
         bind_projector(module)
 
     def forward(x, rope_freqs=None, transformer_options=None):
-        with diagnostics.stage('attention_total'):
-            return _forward(x, rope_freqs, transformer_options)
+        if force_out_proj_int8:
+            from .qkv.int8 import LazyConvRotINT8Linear
 
-    def _forward(x, rope_freqs, transformer_options):
+        out_projection = (
+            LazyConvRotINT8Linear(module.out_proj)
+            if force_out_proj_int8
+            else None
+        )
+        try:
+            with diagnostics.stage('attention_total'):
+                return _forward(
+                    x,
+                    rope_freqs,
+                    transformer_options,
+                    out_projection,
+                )
+        finally:
+            if out_projection is not None:
+                out_projection.release()
+
+    def _forward(x, rope_freqs, transformer_options, out_projection):
         transformer_options = (
             transformer_options if transformer_options is not None else {}
         )
@@ -290,6 +347,7 @@ def make_forward(
                         module,
                         projected,
                         transformer_options=transformer_options,
+                        out_projection=out_projection,
                     )
 
                 if isinstance(projected, PreparedBF16QKV):
@@ -299,6 +357,7 @@ def make_forward(
                         projected,
                         layer_index=layer_index,
                         transformer_options=transformer_options,
+                        out_projection=out_projection,
                     )
                 prepared = backend.prepare_projected(
                     projected,
@@ -307,7 +366,12 @@ def make_forward(
                 )
                 del projected
                 try:
-                    return _finish_projected(module, backend, prepared)
+                    return _finish_projected(
+                        module,
+                        backend,
+                        prepared,
+                        out_projection,
+                    )
                 finally:
                     del prepared
             if fallback_forward is not None:
@@ -379,10 +443,17 @@ def make_forward(
             del out_hnd
 
         with diagnostics.stage('attention_out'):
-            return module.out_proj(out.squeeze(0))
+            return _project_attention_output(
+                module,
+                out.squeeze(0),
+                out_projection,
+            )
 
     forward._h3_optimizations_attention = True
     forward._h3_optimizations_layer_index = int(layer_index)
     forward._h3_optimizations_backend = getattr(backend, 'name', None)
     forward._h3_optimizations_projector = getattr(projector, 'name', None)
+    forward._h3_optimizations_force_out_proj_int8 = bool(
+        force_out_proj_int8
+    )
     return forward

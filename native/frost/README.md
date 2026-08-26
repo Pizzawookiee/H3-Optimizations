@@ -5,7 +5,7 @@ This directory contains the packaged CUDA cubin used by the explicit
 of NVIDIA's Apache-2.0 `prefill_f16_sm80.py` FROST template, not a wheel-provided
 kernel.
 
-The specialization accepts BF16 H3 Q/K/V tensors in `[1, 42, S, 128]`, a
+The specialization accepts BF16 H3 Q/K/V tensors in `[1, 56, S, 128]`, a
 full-width absolute int32 block route with int32 row counts, and writes
 sequence-major BF16 output. Query and KV tiles are both 64 tokens.
 Only SM89 is accepted by runtime preflight.

@@ -16,6 +16,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     MLP_CONVROT_INT8_TWO_SLICE,
     MLP_FLOAT_CHUNKED,
     MLP_FP8_CHUNKED,
+    MLP_RUNTIME_CONVROT_INT8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
     MLP_W4A8_CHUNKED,
     QKV_BF16_CHUNKED,
@@ -66,7 +67,10 @@ def linear(weight, bias=None):
 
 def block(weight):
     return SimpleNamespace(
-        attn=SimpleNamespace(qkv_proj=linear(weight)),
+        attn=SimpleNamespace(
+            qkv_proj=linear(weight),
+            out_proj=linear(weight),
+        ),
         mlp=SimpleNamespace(
             fc1=linear(weight),
             fc2=linear(weight),
@@ -127,6 +131,8 @@ class ProviderTests(unittest.TestCase):
 
     def test_compatible_convrot_selects_specialized_providers(self):
         inventory = inspect_h3_linears([block(self.convrot), block(self.convrot)])
+        self.assertTrue(inventory.out_proj_convrot_int8_256)
+        self.assertFalse(inventory.out_proj_plain_float)
         dense = resolve_qkv_provider(
             inventory,
             request='auto',
@@ -244,6 +250,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_bf16_uses_float_chunking_without_fp8_hardware(self):
         inventory = inspect_h3_linears([block(self.plain)])
+        self.assertTrue(inventory.out_proj_plain_float)
         mlp = resolve_mlp_provider(
             inventory,
             request='auto',
@@ -257,20 +264,30 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(mlp.provider_id, MLP_FLOAT_CHUNKED)
         self.assertEqual(mlp.activation_mode, 'mlp_chunked_bf16')
 
-    def test_force_quant_converts_plain_mlp_and_requires_fp8(self):
+    def test_force_quant_converts_plain_mlp_to_runtime_convrot_int8(self):
         inventory = inspect_h3_linears([block(self.plain)])
         mlp = resolve_mlp_provider(
             inventory,
             request=MLP_MEMORY_FORCE_QUANT,
             fp8_available=True,
         )
-        self.assertEqual(mlp.provider_id, MLP_FP8_CHUNKED)
-        with self.assertRaisesRegex(RuntimeError, 'accelerated FP8'):
-            resolve_mlp_provider(
-                inventory,
-                request=MLP_MEMORY_FORCE_QUANT,
-                fp8_available=False,
-            )
+        self.assertEqual(
+            mlp.provider_id,
+            MLP_RUNTIME_CONVROT_INT8_CHUNKED,
+        )
+        self.assertEqual(
+            mlp.activation_mode,
+            'mlp_chunked_convrot_int8_runtime',
+        )
+        without_fp8 = resolve_mlp_provider(
+            inventory,
+            request=MLP_MEMORY_FORCE_QUANT,
+            fp8_available=False,
+        )
+        self.assertEqual(
+            without_fp8.provider_id,
+            MLP_RUNTIME_CONVROT_INT8_CHUNKED,
+        )
 
     def test_nvfp4_memory_preserves_upstream(self):
         inventory = inspect_h3_linears([block(self.nvfp4)])

@@ -116,6 +116,7 @@ class H3LinearInventory:
     qkv: tuple[LinearWeightFormat, ...]
     fc1: tuple[LinearWeightFormat, ...]
     fc2: tuple[LinearWeightFormat, ...]
+    out_proj: tuple[LinearWeightFormat, ...] = ()
 
     @property
     def qkv_convrot_int8_256(self):
@@ -132,6 +133,18 @@ class H3LinearInventory:
     @property
     def qkv_plain_float(self):
         return bool(self.qkv) and all(item.plain_float for item in self.qkv)
+
+    @property
+    def out_proj_convrot_int8_256(self):
+        return bool(self.out_proj) and all(
+            item.convrot_int8_256 for item in self.out_proj
+        )
+
+    @property
+    def out_proj_plain_float(self):
+        return bool(self.out_proj) and all(
+            item.plain_float for item in self.out_proj
+        )
 
     @property
     def mlp_convrot_int8_256(self):
@@ -241,6 +254,7 @@ def describe_linear(module):
 
 def inspect_h3_linears(blocks):
     qkv = []
+    out_proj = []
     fc1 = []
     fc2 = []
     for index, block in enumerate(tuple(blocks)):
@@ -249,14 +263,25 @@ def inspect_h3_linears(blocks):
         if attn is None or mlp is None:
             raise ValueError("H3 block %d is missing attention or MLP" % index)
         qkv_proj = getattr(attn, "qkv_proj", None)
+        attention_out = getattr(attn, "out_proj", None)
         first = getattr(mlp, "fc1", None)
         second = getattr(mlp, "fc2", None)
-        if qkv_proj is None or first is None or second is None:
-            raise ValueError("H3 block %d is missing qkv_proj/fc1/fc2" % index)
+        if (
+            qkv_proj is None
+            or attention_out is None
+            or first is None
+            or second is None
+        ):
+            raise ValueError(
+                "H3 block %d is missing qkv_proj/out_proj/fc1/fc2" % index
+            )
         qkv.append(describe_linear(qkv_proj))
+        out_proj.append(describe_linear(attention_out))
         fc1.append(describe_linear(first))
         fc2.append(describe_linear(second))
-    return H3LinearInventory(tuple(qkv), tuple(fc1), tuple(fc2))
+    return H3LinearInventory(
+        tuple(qkv), tuple(fc1), tuple(fc2), tuple(out_proj)
+    )
 
 
 _WEIGHT_FORMAT_MESSAGES = (

@@ -23,6 +23,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 import h3_optimizations.kitchen_qkv as kitchen_qkv  # noqa: E402
+import h3_optimizations.apply_policy as apply_policy  # noqa: E402
 import h3_optimizations.qkv.chunked as chunked_qkv  # noqa: E402
 from h3_optimizations.attention_forward import make_forward  # noqa: E402
 from h3_optimizations.attention.sparse.config import (  # noqa: E402
@@ -180,6 +181,32 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
         )
         self.assertIsNone(prepared.q_summary)
         self.assertIsNone(prepared.k_summary)
+
+    def test_policy_fp8_auto_binding_does_not_override_forced_bf16(self):
+        projector = apply_policy.PolicyChunkedKitchenQKVProjector(
+            force_weights_bf16=True,
+        )
+        expected = object()
+        with mock.patch.object(
+            apply_policy,
+            'describe_linear',
+            return_value=SimpleNamespace(fp8=True),
+        ), mock.patch.object(
+            apply_policy._BASE_KITCHEN_PROJECTOR,
+            'try_project',
+            autospec=True,
+            return_value=expected,
+        ) as base_try:
+            actual = projector.try_project(
+                SimpleNamespace(qkv_proj=object()),
+                object(),
+                None,
+                layer_index=0,
+                transformer_options={},
+            )
+
+        self.assertIs(actual, expected)
+        self.assertIs(base_try.call_args.args[0], projector)
 
     def test_sparse_producer_retains_only_tile_summaries(self):
         fake = FakeKitchen()
@@ -492,8 +519,137 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             )
 
         self.assertIs(actual, expected)
+        self.assertFalse(run.call_args.kwargs['force_weights_bf16'])
         self.assertFalse(run.call_args.kwargs['fp8_projection'])
         self.assertEqual(fake.spec_requests[-1]['cta_k'], 64)
+
+    def test_forced_bf16_projector_streams_quantized_source_into_kitchen(self):
+        fake = FakeKitchen()
+        module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=4)
+        x = SimpleNamespace(
+            ndim=2,
+            is_cuda=True,
+            shape=(8, 8),
+            dtype=torch.bfloat16,
+            device=torch.device('cuda:0'),
+        )
+        projector = kitchen_qkv.ChunkedKitchenQKVProjector(
+            force_weights_bf16=True,
+            routing_summaries=True,
+            q_tile=64,
+            kv_tile=64,
+        )
+        expected = object()
+        with mock.patch.object(
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
+        ), mock.patch.object(
+            kitchen_qkv.comfy.model_management,
+            'in_training',
+            False,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'describe_linear',
+            return_value=SimpleNamespace(
+                fp8=False,
+                plain_float=False,
+                convrot_int8_256=True,
+                w4a8=False,
+            ),
+        ), mock.patch.object(
+            kitchen_qkv,
+            'run_chunked_kitchen_qkv',
+            return_value=expected,
+        ) as run:
+            actual = projector.try_project(
+                module,
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+            )
+
+        self.assertIs(actual, expected)
+        self.assertTrue(run.call_args.kwargs['force_weights_bf16'])
+        self.assertFalse(run.call_args.kwargs['fp8_projection'])
+        self.assertFalse(run.call_args.kwargs['convrot_int8_projection'])
+
+    def test_forced_bf16_run_materializes_binding_once_for_all_chunks(self):
+        fake = FakeKitchen()
+        module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=4)
+        x = torch.arange(10, dtype=torch.bfloat16).unsqueeze(1).expand(10, 6)
+        binding = SimpleNamespace(entered=False, exited=False)
+
+        def project_rows(_x, _rope, rows):
+            base = rows.to(torch.bfloat16).view(1, 1, -1, 1)
+            q = base.expand(1, 2, -1, 4).clone()
+            return q, q + 100, q + 200
+
+        def project_hnd(_x, _rope, start, end):
+            rows = torch.arange(start, end, dtype=torch.bfloat16).view(1, 1, -1, 1)
+            q = rows.expand(1, 2, -1, 4).clone()
+            return q, q + 100, q + 200
+
+        binding.project_rows = project_rows
+        binding.project_hnd = project_hnd
+
+        class Binding:
+            def __init__(self, _module, _sample, *, allow_quantized_source=False):
+                self.allow_quantized_source = allow_quantized_source
+
+            def __enter__(self):
+                binding.entered = True
+                binding.allow_quantized_source = self.allow_quantized_source
+                return self
+
+            def __exit__(self, *_args):
+                binding.exited = True
+                return False
+
+            def project_rows(self, *args):
+                return binding.project_rows(*args)
+
+            def project_hnd(self, *args):
+                return binding.project_hnd(*args)
+
+        with mock.patch.object(
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=fake,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'describe_linear',
+            return_value=SimpleNamespace(
+                plain_float=False,
+                convrot_int8_256=True,
+                w4a8=False,
+                fp8=False,
+            ),
+        ), mock.patch.object(
+            kitchen_qkv,
+            'HeldBF16QKV',
+            Binding,
+        ):
+            prepared = kitchen_qkv.run_chunked_kitchen_qkv(
+                module,
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+                spec=fake.int8_attention_producer_spec(),
+                chunk_rows=4,
+                force_weights_bf16=True,
+            )
+
+        self.assertTrue(binding.entered)
+        self.assertTrue(binding.exited)
+        self.assertTrue(binding.allow_quantized_source)
+        self.assertEqual(prepared.carrier, 'carrier')
+        self.assertEqual(
+            [entry[:2] for entry in fake.qk_chunks],
+            [(0, 0), (4, 4), (8, 8)],
+        )
 
     def test_runtime_capability_decline_returns_to_upstream_forward(self):
         fake = FakeKitchen()

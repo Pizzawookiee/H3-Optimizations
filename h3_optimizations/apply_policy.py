@@ -44,7 +44,11 @@ class PolicyChunkedKitchenQKVProjector(_BASE_KITCHEN_PROJECTOR):
         transformer_options,
     ):
         actual = describe_linear(module.qkv_proj)
-        if actual.fp8 and not self.fp8_projection:
+        if actual.fp8 and not (
+            self.force_weights_bf16
+            or self.fp8_projection
+            or self.convrot_int8_projection
+        ):
             delegate = _BASE_KITCHEN_PROJECTOR(
                 chunk_rows=self.chunk_rows,
                 fp8_projection=True,

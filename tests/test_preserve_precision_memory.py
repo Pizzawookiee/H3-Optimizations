@@ -47,7 +47,10 @@ def linear(weight):
 
 def block(weight):
     return SimpleNamespace(
-        attn=SimpleNamespace(qkv_proj=linear(weight)),
+        attn=SimpleNamespace(
+            qkv_proj=linear(weight),
+            out_proj=linear(weight),
+        ),
         mlp=SimpleNamespace(fc1=linear(weight), fc2=linear(weight)),
     )
 

@@ -89,6 +89,19 @@ class QKVStatusReadabilityTests(unittest.TestCase):
 
         self.assertIn('Sparse fallback: Kitchen INT8 unavailable: synthetic', text)
 
+    def test_sparse_preview_reports_runtime_int8_output_projection(self):
+        self.status['fused_qkv']['out_proj_runtime_convrot_int8'] = True
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: self.status},
+            }
+        )
+
+        self.assertIn(
+            'Attention output: runtime ConvRot-256 INT8',
+            format_sparse_status(model),
+        )
+
     def test_standard_path_keeps_the_fallback_reason(self):
         status = {
             'fused_qkv': {
@@ -103,11 +116,48 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             'BF16 weights -> standard QKV path (Kitchen producer unavailable)',
         )
 
+    def test_force_quant_triton_reports_the_actual_retained_carrier(self):
+        status = {
+            'fused_qkv': {
+                'provider': 'force_convrot_int8_triton_qkv',
+                'chunk_rows': 4096,
+            },
+            'weight_formats': {'qkv': ['Parameter:torch.bfloat16']},
+        }
+        self.assertEqual(
+            format_qkv_execution(status),
+            (
+                'BF16 weights -> runtime ConvRot-256 INT8 projection -> '
+                'retained BF16 K/V + 4096-row BF16 Q slabs -> Triton'
+            ),
+        )
+
+    def test_native_bf16_triton_reports_the_actual_retained_carrier(self):
+        status = {
+            'fused_qkv': {
+                'provider': 'force_bf16_qkv',
+                'projector': 'chunked_triton_sparse_qkv',
+                'chunk_rows': 4096,
+            },
+            'weight_formats': {'qkv': ['Parameter:torch.bfloat16']},
+        }
+        self.assertEqual(
+            format_qkv_execution(status),
+            (
+                'BF16 weights -> forced BF16 projection; retained BF16 K/V + '
+                '4096-row BF16 Q slabs -> Triton'
+            ),
+        )
+
     def test_every_public_route_has_a_readable_description(self):
         expected = {
             'chunked_bf16_qkv': 'full BF16 Q/K/V',
             'force_bf16_qkv': 'forced BF16 projection',
-            'force_quant_qkv': 'forced FP8 projection',
+            'force_bf16_streamed_kitchen_qkv': 'forced BF16 projection',
+            'force_fp8_qkv': 'forced FP8 projection',
+            'force_convrot_int8_qkv': 'runtime ConvRot-256 INT8 projection',
+            'force_convrot_int8_kitchen_qkv': 'runtime ConvRot-256 INT8 projection',
+            'force_convrot_int8_triton_qkv': 'runtime ConvRot-256 INT8 projection',
             'convrot_int8_dense_sage': 'dense Sage carrier',
             'chunked_kitchen_qkv': 'Kitchen INT8 carrier',
             'streamed_bf16_kitchen_qkv': 'Kitchen INT8 carrier',

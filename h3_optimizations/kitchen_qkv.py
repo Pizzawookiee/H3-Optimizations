@@ -15,6 +15,7 @@ from .qkv.bf16 import HeldBF16QKV
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
 from .qkv.fp8 import FP8BindingError, HeldFP8QKV
+from .qkv.int8 import ConvRotINT8BindingError, HeldConvRotINT8QKV
 from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 
 
@@ -154,7 +155,9 @@ def run_chunked_kitchen_qkv(
     transformer_options,
     spec,
     chunk_rows=CHUNK_ROWS,
+    force_weights_bf16=False,
     fp8_projection=False,
+    convrot_int8_projection=False,
     routing_summaries=False,
     routing_q_tile=None,
     routing_kv_tile=None,
@@ -173,7 +176,21 @@ def run_chunked_kitchen_qkv(
     held = None
     try:
         fmt = describe_linear(module.qkv_proj)
-        if fp8_projection:
+        if force_weights_bf16:
+            held = HeldBF16QKV(
+                module,
+                x[:1],
+                allow_quantized_source=True,
+            )
+            held.__enter__()
+        elif convrot_int8_projection:
+            held = HeldConvRotINT8QKV(
+                module,
+                x[:1],
+                allow_float_conversion=getattr(fmt, 'plain_float', False),
+            )
+            held.__enter__()
+        elif fp8_projection:
             held = HeldFP8QKV(
                 module,
                 x[:1],
@@ -259,7 +276,9 @@ class ChunkedKitchenQKVProjector:
     def __init__(
         self,
         chunk_rows=CHUNK_ROWS,
+        force_weights_bf16=False,
         fp8_projection=False,
+        convrot_int8_projection=False,
         routing_summaries=False,
         q_tile=None,
         kv_tile=None,
@@ -267,7 +286,19 @@ class ChunkedKitchenQKVProjector:
         stream_output=False,
     ):
         self.chunk_rows = int(chunk_rows)
+        self.force_weights_bf16 = bool(force_weights_bf16)
         self.fp8_projection = bool(fp8_projection)
+        self.convrot_int8_projection = bool(convrot_int8_projection)
+        if sum(
+            (
+                self.force_weights_bf16,
+                self.fp8_projection,
+                self.convrot_int8_projection,
+            )
+        ) > 1:
+            raise ValueError(
+                'Kitchen QKV projection cannot force more than one weight format'
+            )
         self.routing_summaries = bool(routing_summaries)
         self.q_tile = None if q_tile is None else int(q_tile)
         self.kv_tile = None if kv_tile is None else int(kv_tile)
@@ -283,7 +314,9 @@ class ChunkedKitchenQKVProjector:
         return (
             self.name,
             self.chunk_rows,
+            self.force_weights_bf16,
             self.fp8_projection,
+            self.convrot_int8_projection,
             self.routing_summaries,
             self.q_tile,
             self.kv_tile,
@@ -305,15 +338,29 @@ class ChunkedKitchenQKVProjector:
             return None
         fmt = describe_linear(module.qkv_proj)
         native_bf16 = _native_bf16_format(fmt)
-        format_ok = (
-            getattr(fmt, 'fp8', False) or getattr(fmt, 'plain_float', False)
-            if self.fp8_projection
-            else (
+        if self.force_weights_bf16:
+            format_ok = bool(
+                getattr(fmt, 'plain_float', False)
+                or getattr(fmt, 'convrot_int8_256', False)
+                or getattr(fmt, 'w4a8', False)
+                or getattr(fmt, 'fp8', False)
+            )
+        elif self.convrot_int8_projection:
+            format_ok = bool(
+                getattr(fmt, 'convrot_int8_256', False)
+                or getattr(fmt, 'plain_float', False)
+            )
+        elif self.fp8_projection:
+            format_ok = bool(
+                getattr(fmt, 'fp8', False)
+                or getattr(fmt, 'plain_float', False)
+            )
+        else:
+            format_ok = bool(
                 getattr(fmt, 'convrot_int8_256', False)
                 or getattr(fmt, 'w4a8', False)
                 or native_bf16
             )
-        )
         owns_dense_h3 = (
             (transformer_options or {}).get(H3_ATTENTION_BACKEND_KEY)
             == DENSE_KITCHEN_BACKEND
@@ -357,7 +404,9 @@ class ChunkedKitchenQKVProjector:
                     transformer_options=transformer_options,
                     spec=spec,
                     chunk_rows=self.chunk_rows,
+                    force_weights_bf16=self.force_weights_bf16,
                     fp8_projection=self.fp8_projection,
+                    convrot_int8_projection=self.convrot_int8_projection,
                     routing_summaries=self.routing_summaries,
                     routing_q_tile=self.q_tile,
                     routing_kv_tile=self.kv_tile,
@@ -368,11 +417,14 @@ class ChunkedKitchenQKVProjector:
                 return projected
         except (
             FP8BindingError,
+            ConvRotINT8BindingError,
             W4A8BindingError,
             RuntimeError,
             TypeError,
             ValueError,
         ):
+            if self.force_weights_bf16 or self.convrot_int8_projection:
+                raise
             if (
                 not self.fp8_projection
                 and not getattr(fmt, 'w4a8', False)

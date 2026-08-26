@@ -27,6 +27,7 @@ from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
 )
 from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_EXISTING,
+    FUSED_QKV_FORCE_BF16,
     FUSED_QKV_OFF,
     H3OptimizationPlan,
     MemoryRequest,
@@ -42,8 +43,12 @@ from h3_optimizations.plan import (  # noqa: E402
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
     MLPProviderResolution,
+    QKV_FORCE_BF16_STREAMED_KITCHEN,
     QKVProviderResolution,
     QKV_STREAMED_BF16_KITCHEN,
+)
+from h3_optimizations.qkv.policy import (  # noqa: E402
+    resolve_qkv_provider as resolve_policy_qkv_provider,
 )
 from h3_optimizations.status import format_sparse_status  # noqa: E402
 
@@ -349,6 +354,57 @@ class SparseBackendSelectionTests(unittest.TestCase):
             (64, 64),
         )
         self.assertTrue(attention.projector.strided_qk_input)
+        self.assertTrue(attention.projector.stream_output)
+        self.assertTrue(attention.backend.stream_output)
+
+    def test_forced_bf16_sparse_kitchen_streams_projected_chunks(self):
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_FORCE_BF16,
+            ),
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN),
+        )
+        inventory = SimpleNamespace(
+            qkv=(object(),),
+            qkv_convrot_int8_256=False,
+            qkv_w4a8=False,
+            qkv_fp8=False,
+            qkv_plain_float=True,
+            homogeneous=lambda name: name == 'qkv',
+            labels=lambda _name: ('Parameter:torch.bfloat16',),
+        )
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(8, 9),
+            device_index=0,
+        )
+
+        with mock.patch.object(
+            apply_module,
+            'preflight_sparse_kitchen',
+            return_value=SimpleNamespace(__version__='test'),
+        ), mock.patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=True,
+        ), mock.patch.object(
+            apply_module,
+            'resolve_qkv_provider',
+            resolve_policy_qkv_provider,
+        ):
+            attention, qkv = apply_module._resolve_kitchen_sparse(
+                plan,
+                environment,
+                inventory,
+            )
+
+        self.assertEqual(
+            qkv.provider_id,
+            QKV_FORCE_BF16_STREAMED_KITCHEN,
+        )
+        self.assertTrue(attention.projector.force_weights_bf16)
+        self.assertTrue(attention.projector.routing_summaries)
         self.assertTrue(attention.projector.stream_output)
         self.assertTrue(attention.backend.stream_output)
 

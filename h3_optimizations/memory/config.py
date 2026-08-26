@@ -5,8 +5,15 @@ from dataclasses import dataclass
 MODE_BF16 = 'mlp_chunked_bf16'
 MODE_NATIVE = 'mlp_chunked_native'
 MODE_FP8 = 'mlp_chunked_fp8'
+MODE_CONVROT_INT8_RUNTIME = 'mlp_chunked_convrot_int8_runtime'
 MODE_CONVROT_2SLICE = 'mlp_chunked_convrot_2slice'
-IMPLEMENTED_MODES = (MODE_BF16, MODE_NATIVE, MODE_FP8, MODE_CONVROT_2SLICE)
+IMPLEMENTED_MODES = (
+    MODE_BF16,
+    MODE_NATIVE,
+    MODE_FP8,
+    MODE_CONVROT_INT8_RUNTIME,
+    MODE_CONVROT_2SLICE,
+)
 DEFAULT_MODE = MODE_NATIVE
 
 MIN_CHUNK_ROWS = 256
@@ -59,6 +66,10 @@ class ActivationMemoryConfig:
     @property
     def convrot_2slice(self):
         return self.mode == MODE_CONVROT_2SLICE
+
+    @property
+    def runtime_convrot_int8(self):
+        return self.mode == MODE_CONVROT_INT8_RUNTIME
 
     @property
     def signature(self):

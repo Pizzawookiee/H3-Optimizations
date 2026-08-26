@@ -11,15 +11,17 @@ control.
 - H3 Memory Optimization selects the resolved dense H3 attention path and
   applies compatible memory/execution providers. ConvRot INT8 QKV can project
   in 4K token chunks directly into Comfy Kitchen carriers. Native FP8 uses held
-  chunked FP8 execution, and ordinary BF16/FP16 QKV/MLP weights may be converted
-  to FP8 E4M3 when accelerated FP8 is available. FinalLayer norm, modulation,
+  chunked FP8 execution, while Force quant converts floating H3 QKV, attention
+  output, and MLP weights to execution-scoped ConvRot-256 INT8. FinalLayer norm, modulation,
   and FP32 output projection also run in bounded token chunks using the same
   activation chunk-row setting. The advanced precision selector offers four
   policies: `Auto` chooses the best compatible path and may use FP8 conversion
   as a fallback; `BF16` materializes supported weights for BF16 execution;
   `Preserve native` never introduces a new weight conversion; and `Force quant`
-  requires floating weights to use FP8 E4M3 while retaining supported native
-  quantized checkpoint formats. With sparse Kitchen,
+  retains supported native quantized checkpoint formats. With BF16 Triton,
+  native BF16 QKV and Force quant both retain global BF16 K/V, stream bounded
+  BF16 Q and attention output slabs, and write output projection directly into
+  the disposable block input. With sparse Kitchen,
   checkpoint-native ConvRot INT8 QKV streams BF16 projection, norm, and RoPE
   chunks into the routed INT8 carrier instead of materializing full-sequence
   BF16 Q/K/V. With existing dense attention, checkpoint-native BF16 keeps full
@@ -205,7 +207,8 @@ compatible Sparse Sage package and then the package BF16 Triton sparse backend
 on NVIDIA compute capability 8.0 or newer. Triton consumes the same route and
 streams 4K projection chunks from supported BF16, ConvRot-256, W4A8, and FP8
 checkpoints into its final BF16 HND carrier without materializing a full fused
-QKV projection. The package-owned BF16 Triton and
+projection temporary. Native BF16 QKV additionally avoids retaining full Q and
+full attention output tensors. The package-owned BF16 Triton and
 FlexAttention fallbacks both use 64Q x 64KV routing, matching the native Kitchen
 default. If Triton is unavailable, FlexAttention is next. On supported NVIDIA
 runtimes, Flex stores Q/K/V as

@@ -234,7 +234,7 @@ class H3MemoryOptimization(io.ComfyNode):
                         'conversion as a fallback. BF16 materializes supported weights '
                         'as BF16. Preserve native never introduces a new conversion. '
                         'Force quant keeps supported quantized checkpoints native and '
-                        'requires floating weights to use FP8 E4M3.'
+                        'converts floating H3 linears to execution-scoped ConvRot-256 INT8.'
                     ),
                 ),
                 io.Combo.Input(

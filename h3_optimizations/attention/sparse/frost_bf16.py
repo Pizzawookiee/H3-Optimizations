@@ -26,8 +26,9 @@ from .triton_route import TritonRouteError
 
 Q_TILE = 64
 KV_TILE = 64
-HEADS = 42
+HEADS = 56
 HEAD_DIM = 128
+_ARTIFACT_GPU_VALIDATED = False
 
 
 class FrostBF16Error(RuntimeError):
@@ -72,6 +73,10 @@ def preflight_frost_bf16(
     capability_getter,
     driver_probe=driver_available,
 ):
+    if not _ARTIFACT_GPU_VALIDATED:
+        raise FrostBF16Error(
+            'the corrected 56-head FROST BF16 artifact is disabled pending GPU parity validation'
+        )
     if not bool(cuda_available()):
         raise FrostBF16Error('FROST BF16 requires NVIDIA CUDA')
     capability = tuple(capability_getter())
@@ -141,9 +146,10 @@ class FrostBF16Executor:
         expected = (1, self.spec.heads, self.spec.head_dim)
         if (int(q.shape[0]), int(q.shape[1]), int(q.shape[3])) != expected:
             raise FrostBF16Error(
-                'FROST BF16 requires [1,%d,S,%d] Q/K/V' % (
+                'FROST BF16 requires [1,%d,S,%d] Q/K/V, got %s' % (
                     self.spec.heads,
                     self.spec.head_dim,
+                    tuple(int(value) for value in q.shape),
                 )
             )
         if q.device != k.device or q.device != v.device:

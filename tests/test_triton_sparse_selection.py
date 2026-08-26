@@ -28,14 +28,20 @@ from h3_optimizations.attention.sparse import (  # noqa: E402
     TritonSparseSpec,
 )
 from h3_optimizations.plan import (  # noqa: E402
+    FUSED_QKV_FORCE_BF16,
+    FUSED_QKV_FORCE_QUANT,
     H3OptimizationPlan,
     MemoryRequest,
     SparseRequest,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
+    QKV_FORCE_CONVROT_INT8_TRITON,
     QKV_STANDARD,
     QKV_TRITON_SPARSE_CHUNKED,
     QKVProviderResolution,
+)
+from h3_optimizations.qkv.policy import (  # noqa: E402
+    resolve_qkv_provider as resolve_policy_qkv_provider,
 )
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -58,6 +64,22 @@ def inventory(convrot=True):
         qkv_plain_float=False,
         homogeneous=lambda name: name == 'qkv',
         labels=lambda _name: ('TensorWiseINT8Layout+convrot256',),
+    )
+
+
+def bf16_inventory():
+    item = SimpleNamespace(
+        plain_float=True,
+        logical_dtype='torch.bfloat16',
+    )
+    return SimpleNamespace(
+        qkv=(item,),
+        qkv_convrot_int8_256=False,
+        qkv_w4a8=False,
+        qkv_fp8=False,
+        qkv_plain_float=True,
+        homogeneous=lambda name: name == 'qkv',
+        labels=lambda _name: ('Parameter:torch.bfloat16',),
     )
 
 
@@ -101,6 +123,96 @@ class TritonSparseSelectionTests(unittest.TestCase):
         self.assertEqual(attention.projector.name, 'chunked_triton_sparse_qkv')
         self.assertEqual(attention.projector.chunk_rows, 4096)
         self.assertIs(attention.backend.projector, attention.projector)
+
+    def test_force_quant_bf16_checkpoint_selects_low_vram_query_stream(self):
+        forced_plan = H3OptimizationPlan(
+            memory=MemoryRequest(fused_qkv=FUSED_QKV_FORCE_QUANT),
+            sparse=SparseRequest(),
+        )
+        plain = SimpleNamespace(
+            qkv=(object(),),
+            qkv_convrot_int8_256=False,
+            qkv_w4a8=False,
+            qkv_fp8=False,
+            qkv_plain_float=True,
+            homogeneous=lambda name: name == 'qkv',
+            labels=lambda _name: ('Parameter:torch.bfloat16',),
+        )
+        with mock.patch.object(
+            apply_module,
+            'preflight_triton_sparse',
+            return_value=TritonSparseSpec(),
+        ), mock.patch.object(
+            apply_module,
+            'resolve_qkv_provider',
+            resolve_policy_qkv_provider,
+        ):
+            attention, qkv = apply_module._resolve_triton_sparse(
+                forced_plan,
+                environment(),
+                plain,
+                None,
+            )
+
+        self.assertEqual(qkv.provider_id, QKV_FORCE_CONVROT_INT8_TRITON)
+        self.assertTrue(attention.projector.streamed_q)
+        self.assertFalse(attention.projector.streamed_qkv)
+        self.assertEqual(
+            apply_module.describe_memory_options(attention),
+            'streamed_q',
+        )
+
+    def test_native_bf16_checkpoint_selects_low_vram_query_stream(self):
+        with mock.patch.object(
+            apply_module,
+            'preflight_triton_sparse',
+            return_value=TritonSparseSpec(),
+        ), mock.patch.object(
+            apply_module,
+            'resolve_qkv_provider',
+            resolve_policy_qkv_provider,
+        ):
+            attention, qkv = apply_module._resolve_triton_sparse(
+                plan(),
+                environment(),
+                bf16_inventory(),
+                None,
+            )
+
+        self.assertEqual(qkv.provider_id, QKV_TRITON_SPARSE_CHUNKED)
+        self.assertTrue(qkv.fused)
+        self.assertTrue(attention.projector.stream_native_bf16)
+        self.assertTrue(attention.projector.streamed_q)
+        self.assertEqual(
+            apply_module.describe_memory_options(attention),
+            'streamed_q',
+        )
+
+    def test_explicit_bf16_qkv_selects_low_vram_query_stream(self):
+        bf16_plan = H3OptimizationPlan(
+            memory=MemoryRequest(fused_qkv=FUSED_QKV_FORCE_BF16),
+            sparse=SparseRequest(),
+        )
+        with mock.patch.object(
+            apply_module,
+            'preflight_triton_sparse',
+            return_value=TritonSparseSpec(),
+        ), mock.patch.object(
+            apply_module,
+            'resolve_qkv_provider',
+            resolve_policy_qkv_provider,
+        ):
+            attention, qkv = apply_module._resolve_triton_sparse(
+                bf16_plan,
+                environment(),
+                bf16_inventory(),
+                None,
+            )
+
+        self.assertEqual(qkv.provider_id, 'force_bf16_qkv')
+        self.assertTrue(qkv.fused)
+        self.assertTrue(attention.projector.stream_native_bf16)
+        self.assertTrue(attention.projector.streamed_q)
 
     def test_triton_is_tried_before_flex(self):
         dense_attention = apply_module.ResolvedAttention(

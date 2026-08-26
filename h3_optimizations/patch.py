@@ -95,6 +95,7 @@ def configure_backend(
     *,
     projector_fallback_to_original=False,
     backend_fallback_to_dense=False,
+    force_out_proj_int8=False,
 ):
     '''Install or replace the package-owned H3 attention transaction.'''
 
@@ -109,6 +110,7 @@ def configure_backend(
         installation_signature(projector),
         bool(projector_fallback_to_original),
         bool(backend_fallback_to_dense),
+        bool(force_out_proj_int8),
     )
     owned = [
         index
@@ -161,6 +163,7 @@ def configure_backend(
                 else None
             ),
             backend_fallback_to_dense=backend_fallback_to_dense,
+            force_out_proj_int8=force_out_proj_int8,
         )
         setattr(forward, OWNER_MARKER, True)
         setattr(forward, SIGNATURE_MARKER, desired)

@@ -23,6 +23,7 @@ from .. import diagnostics
 from ..attention_forward import finish_qkv_projection, project_qkv, to_hnd
 from .fp8 import HeldFP8QKV
 from .formats import describe_linear
+from .int8 import HeldConvRotINT8QKV
 
 
 CHUNK_ROWS = 4096
@@ -238,12 +239,22 @@ class ChunkedBF16QKVProjector:
         *,
         force_weights_bf16=False,
         force_weights_fp8=False,
+        force_weights_int8=False,
     ):
         self.chunk_rows = int(chunk_rows)
         self.force_weights_bf16 = bool(force_weights_bf16)
         self.force_weights_fp8 = bool(force_weights_fp8)
-        if self.force_weights_bf16 and self.force_weights_fp8:
-            raise ValueError('QKV weights cannot be forced to both BF16 and FP8')
+        self.force_weights_int8 = bool(force_weights_int8)
+        if sum(
+            (
+                self.force_weights_bf16,
+                self.force_weights_fp8,
+                self.force_weights_int8,
+            )
+        ) > 1:
+            raise ValueError(
+                'QKV weights cannot be forced to more than one execution dtype'
+            )
         if self.chunk_rows <= 0:
             raise ValueError('chunk_rows must be positive')
 
@@ -254,6 +265,7 @@ class ChunkedBF16QKVProjector:
             self.chunk_rows,
             self.force_weights_bf16,
             self.force_weights_fp8,
+            self.force_weights_int8,
         )
 
     def _validate(self, module, x, rope_freqs, *, allow_cpu=False):
@@ -292,7 +304,13 @@ class ChunkedBF16QKVProjector:
             raise TypeError('consume_chunk must be callable')
         sequence = int(x.shape[0])
 
-        if self.force_weights_fp8:
+        if self.force_weights_int8:
+            held = HeldConvRotINT8QKV(
+                module,
+                x[:1],
+                allow_float_conversion=True,
+            )
+        elif self.force_weights_fp8:
             held = HeldFP8QKV(
                 module,
                 x[:1],
@@ -353,7 +371,11 @@ class ChunkedBF16QKVProjector:
         try:
             return self.project(module, x, rope_freqs)
         except BF16QKVBindingError:
-            if self.force_weights_bf16 or self.force_weights_fp8:
+            if (
+                self.force_weights_bf16
+                or self.force_weights_fp8
+                or self.force_weights_int8
+            ):
                 raise
             return None
 
