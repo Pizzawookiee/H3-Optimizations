@@ -8,7 +8,6 @@ ignored by execution. Appended authoritative controls own current behavior.
 from comfy_api.latest import io, ui
 
 from .apply_policy import apply_plan
-from .dense_resolver import has_explicit_dense_attention
 from .node_constants import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
 from .plan import (
     ATTENTION_AUTO,
@@ -84,7 +83,6 @@ def _memory_request_for_modes(
     chunk_rows,
     precision_mode,
     qkv_streaming_mode,
-    explicit_attention_selected=False,
 ):
     # fused_qkv is a serialized compatibility tombstone. QKV streaming is the
     # authoritative public policy now; keeping the argument preserves old
@@ -93,18 +91,15 @@ def _memory_request_for_modes(
     precision_mode = _normalize_precision_mode(precision_mode)
     streaming = _qkv_streaming_request(qkv_streaming_mode)
 
-    # Off preserves the current attention backend. With conversion allowed it
-    # may still use bounded QKV projection; it only forbids a streamed carrier
-    # from claiming attention. Auto claims unselected dense attention to obtain
-    # a streamed producer and yields to an explicit selector. Forced explicitly
-    # authorizes the Kitchen dense path.
+    # Off and Auto preserve the current dense attention backend. Auto adds a
+    # compatible streamed QKV carrier around that consumer; Forced explicitly
+    # authorizes the private Kitchen dense path.
     # An H3 Sparse request remains separately authoritative through the shared
     # order-independent optimization plan.
     attention = (
-        ATTENTION_EXISTING
-        if streaming == QKV_STREAMING_OFF
-        or (streaming == QKV_STREAMING_AUTO and explicit_attention_selected)
-        else ATTENTION_AUTO
+        ATTENTION_AUTO
+        if streaming == QKV_STREAMING_FORCED
+        else ATTENTION_EXISTING
     )
 
     qkv_requests = {
@@ -244,12 +239,12 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=QKV_STREAMING_MODE_AUTO,
                     advanced=True,
                     tooltip=(
-                        'Off disables streamed carriers and preserves existing '
-                        'attention. The selected precision policy still controls '
-                        'bounded or native fused QKV projection. '
-                        'Auto prefers BF16 Q/K/V chunk streaming and only claims dense '
-                        'Kitchen when a compatible streamed producer is available; it '
-                        'preserves explicit attention selectors. Forced explicitly '
+                        'Off prevents this node from replacing existing dense '
+                        'attention and disables QKV streaming, including carriers '
+                        'requested by H3 Sparse Attention. '
+                        'Auto preserves Sage, Comfy Kitchen, or ComfyUI\'s normal '
+                        'attention selection and adds a compatible bounded carrier. '
+                        'Forced explicitly '
                         'allows this node to replace dense attention with full-density '
                         'Kitchen. H3 Sparse Attention remains authoritative.'
                     ),
@@ -277,7 +272,6 @@ class H3MemoryOptimization(io.ComfyNode):
                 chunk_rows=chunk_rows,
                 precision_mode=precision_mode,
                 qkv_streaming_mode=qkv_streaming_mode,
-                explicit_attention_selected=has_explicit_dense_attention(model),
             )
         )
         patched = apply_plan(model, plan)

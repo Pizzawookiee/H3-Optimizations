@@ -22,9 +22,9 @@ from h3_optimizations.attention.sparse.frost_bf16 import (
     preflight_frost_bf16,
 )
 from h3_optimizations.attention.sparse import frost_loader
-from h3_optimizations.attention.sparse import frost_bf16
 from h3_optimizations.attention.sparse.frost_route import (
     build_full_absolute_route,
+    build_full_absolute_route_from_summaries,
 )
 from h3_optimizations.attention.sparse.router import SparseTileRouter
 
@@ -57,27 +57,17 @@ class FrostBF16Tests(unittest.TestCase):
         self.assertIn('ptrbf16', symbol)
 
     def test_preflight_is_explicitly_sm89(self):
-        with mock.patch.object(frost_bf16, '_ARTIFACT_GPU_VALIDATED', True):
-            spec = preflight_frost_bf16(
-                cuda_available=lambda: True,
-                capability_getter=lambda: (8, 9),
-                driver_probe=lambda: True,
-            )
+        spec = preflight_frost_bf16(
+            cuda_available=lambda: True,
+            capability_getter=lambda: (8, 9),
+            driver_probe=lambda: True,
+        )
         self.assertEqual(spec.signature, ('frost_bf16_sm89', 1, 64, 64, 56, 128))
 
-        with mock.patch.object(frost_bf16, '_ARTIFACT_GPU_VALIDATED', True):
-            with self.assertRaisesRegex(FrostBF16Error, 'compiled for SM89'):
-                preflight_frost_bf16(
-                    cuda_available=lambda: True,
-                    capability_getter=lambda: (8, 6),
-                    driver_probe=lambda: True,
-                )
-
-    def test_preflight_disables_unvalidated_artifact(self):
-        with self.assertRaisesRegex(FrostBF16Error, 'disabled pending GPU parity'):
+        with self.assertRaisesRegex(FrostBF16Error, 'compiled for SM89'):
             preflight_frost_bf16(
                 cuda_available=lambda: True,
-                capability_getter=lambda: (8, 9),
+                capability_getter=lambda: (8, 6),
                 driver_probe=lambda: True,
             )
 
@@ -119,6 +109,26 @@ class FrostBF16Tests(unittest.TestCase):
         self.assertTrue(torch.equal(route[0, 0, 0], expected))
         self.assertTrue(torch.all(counts == route.shape[-1]))
         self.assertEqual(metadata.sparse_q_tiles, 0)
+
+    def test_summary_route_matches_full_qk_route(self):
+        torch.manual_seed(31)
+        packed = layout()
+        router = SparseTileRouter(q_tile=64, kv_tile=64)
+        q = torch.randn(1, 2, packed.seq_len, 16)
+        k = torch.randn_like(q)
+
+        expected = build_full_absolute_route(router, q, k, packed, 0.3)
+        actual = build_full_absolute_route_from_summaries(
+            router,
+            router._mean_pool(q, router.q_tile),
+            router._mean_pool(k, router.kv_tile),
+            packed,
+            0.3,
+        )
+
+        self.assertEqual(actual[2], expected[2])
+        self.assertTrue(torch.equal(actual[0], expected[0]))
+        self.assertTrue(torch.equal(actual[1], expected[1]))
 
     def test_executor_preserves_strided_hnd_inputs_and_writes_nhd(self):
         sequence = 129
@@ -179,6 +189,32 @@ class FrostBF16Tests(unittest.TestCase):
                 q, q, q, route, counts, layer_index=0, metadata={}
             )
 
+    def test_executor_accepts_bounded_q_with_global_kv(self):
+        q_sequence = 65
+        kv_sequence = 129
+        q = torch.empty(
+            1, q_sequence, 56, 128, dtype=torch.bfloat16
+        ).permute(0, 2, 1, 3)
+        k, v = (
+            torch.empty(
+                1, kv_sequence, 56, 128, dtype=torch.bfloat16
+            ).permute(0, 2, 1, 3)
+            for _ in range(2)
+        )
+        route = torch.zeros(1, 56, 2, 3, dtype=torch.int32)
+        counts = torch.ones(1, 56, 2, dtype=torch.int32)
+        executor = FrostBF16Executor(
+            launcher=lambda *_args, **_kwargs: None,
+            allow_cpu_for_tests=True,
+        )
+
+        prepared = executor.prepare(
+            q, k, v, route, counts, layer_index=0, metadata={}
+        )
+
+        self.assertEqual(tuple(prepared.output.shape), (1, 56, q_sequence, 128))
+        self.assertEqual(int(prepared.k.shape[-2]), kv_sequence)
+
     def test_executor_rejects_contiguous_hnd_storage(self):
         executor = FrostBF16Executor(allow_cpu_for_tests=True)
         q = torch.empty(1, 56, 129, 128, dtype=torch.bfloat16)
@@ -207,16 +243,20 @@ class FrostBF16Tests(unittest.TestCase):
                 ]
                 return 0
 
-        sequence = 129
-        q, k, v = (
-            torch.empty(1, sequence, 56, 128, dtype=torch.bfloat16).permute(
-                0, 2, 1, 3
-            )
-            for _ in range(3)
+        sequence_q = 65
+        sequence_kv = 129
+        q = torch.empty(
+            1, sequence_q, 56, 128, dtype=torch.bfloat16
+        ).permute(0, 2, 1, 3)
+        k, v = (
+            torch.empty(
+                1, sequence_kv, 56, 128, dtype=torch.bfloat16
+            ).permute(0, 2, 1, 3)
+            for _ in range(2)
         )
-        output = torch.empty(1, sequence, 56, 128, dtype=torch.bfloat16)
-        route = torch.zeros(1, 56, 3, 3, dtype=torch.int32)
-        counts = torch.ones(1, 56, 3, dtype=torch.int32)
+        output = torch.empty(1, sequence_q, 56, 128, dtype=torch.bfloat16)
+        route = torch.zeros(1, 56, 2, 3, dtype=torch.int32)
+        counts = torch.ones(1, 56, 2, dtype=torch.int32)
         driver = Driver()
 
         with mock.patch.object(
@@ -231,14 +271,14 @@ class FrostBF16Tests(unittest.TestCase):
             )
 
         launch = decoded['launch']
-        self.assertEqual(launch[1:7], (3, 56, 1, frost_loader.THREADS, 1, 1))
+        self.assertEqual(launch[1:7], (2, 56, 1, frost_loader.THREADS, 1, 1))
         self.assertEqual(launch[7], 64 * 1024)
         self.assertEqual(launch[8].value, 99)
         params = decoded['params']
         self.assertEqual(params[6:13], [0] * 7)
-        self.assertEqual(params[13:16], [3, 3, 3])
+        self.assertEqual(params[13:16], [2, 3, 3])
         self.assertAlmostEqual(params[16], 0.125)
-        self.assertEqual(params[17:21], [sequence, sequence, 128, 0])
+        self.assertEqual(params[17:21], [sequence_q, sequence_kv, 128, 0])
         self.assertAlmostEqual(params[21], math.sqrt(128), places=6)
 
 

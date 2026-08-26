@@ -23,8 +23,10 @@ comfy.options.enable_args_parsing()
 
 import h3_optimizations.apply as apply_module  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
+    FUSED_QKV_OFF,
     H3OptimizationPlan,
     MemoryRequest,
+    QKV_STREAMING_OFF,
     SparseRequest,
     STATUS_KEY,
     read_plan,
@@ -78,6 +80,13 @@ def apply_in_order(base, first_request, second_request):
 
 
 class ApplyCompositionTests(unittest.TestCase):
+    def test_streaming_off_disables_qkv_carriers_with_sparse_present(self):
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(qkv_streaming=QKV_STREAMING_OFF),
+            sparse=SparseRequest(),
+        )
+        self.assertEqual(apply_module._qkv_request(plan), FUSED_QKV_OFF)
+
     def test_both_node_orders_resolve_identically(self):
         memory = MemoryRequest()
         sparse = SparseRequest(
@@ -128,6 +137,10 @@ class ApplyCompositionTests(unittest.TestCase):
         ), mock.patch.object(
             apply_module,
             '_resolve_dense',
+            side_effect=resolve,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
             side_effect=resolve,
         ), mock.patch.object(
             apply_module,
@@ -224,6 +237,12 @@ class ApplyCompositionTests(unittest.TestCase):
             return_value=(dense, qkv),
         ), mock.patch.object(
             apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError(
+                'Kitchen sparse attention is unavailable'
+            ),
+        ), mock.patch.object(
+            apply_module,
             '_resolve_sparse',
             side_effect=apply_module.SparseSageError(
                 'requires NVIDIA CUDA'
@@ -301,6 +320,12 @@ class ApplyCompositionTests(unittest.TestCase):
             apply_module,
             '_resolve_dense',
             return_value=(dense, qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=apply_module.SparseKitchenError(
+                'Kitchen sparse attention is unavailable'
+            ),
         ), mock.patch.object(
             apply_module,
             '_resolve_sparse',

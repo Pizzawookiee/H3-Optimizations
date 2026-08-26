@@ -117,6 +117,22 @@ def _stream_triton(inventory, *, backend_kind, triton_available):
     )
 
 
+def _stream_frost(inventory, *, backend_kind):
+    if (
+        backend_kind != 'frost_bf16_sm89'
+        or _native_stream_format(inventory) is None
+    ):
+        return None
+    return base.QKVProviderResolution(
+        base.QKV_FROST_STREAMED,
+        True,
+        (
+            'checkpoint-native %s weights retain global sequence-major BF16 '
+            'K/V and stream bounded BF16 Q/output through FROST'
+        ) % _native_stream_format(inventory),
+    )
+
+
 def _native_bounded_fallback(
     inventory,
     *,
@@ -168,13 +184,21 @@ def _native_bounded_fallback(
 
     fmt = _native_stream_format(inventory)
     if fmt is not None:
+        reason = (
+            'checkpoint-native %s QKV retains complete BF16 K/V and streams '
+            'bounded BF16 Q/output through the selected Comfy attention consumer'
+            % fmt
+            if backend_kind == 'existing'
+            else (
+                'checkpoint-native %s QKV projects in bounded token chunks and '
+                'materializes complete BF16 Q/K/V for the selected attention consumer'
+                % fmt
+            )
+        )
         return base.QKVProviderResolution(
             base.QKV_BF16_CHUNKED,
             False,
-            (
-                'checkpoint-native %s QKV projects in bounded token chunks and '
-                'materializes complete BF16 Q/K/V for the selected attention consumer'
-            ) % fmt,
+            reason,
         )
 
     labels = ', '.join(sorted(set(inventory.labels('qkv'))))
@@ -203,13 +227,42 @@ def resolve_qkv_provider(
     if not inventory.homogeneous('qkv'):
         return base._required_or_standard(request, 'H3 QKV layers use mixed weight formats')
     if backend_kind == DENSE_SAGE_SM89:
-        return base.resolve_qkv_provider(
-            inventory,
-            request=request,
-            backend_kind=backend_kind,
-            triton_available=triton_available,
-            memory_optimize=memory_optimize,
-            fp8_available=fp8_available,
+        if not triton_available:
+            return base._required_or_standard(
+                request,
+                'the direct SageAttention Q/K carrier producer requires Triton',
+            )
+        fmt = _native_stream_format(inventory)
+        if fmt is None:
+            return base._required_or_standard(
+                request,
+                'selected SageAttention has no direct carrier producer for the checkpoint QKV format',
+            )
+        if inventory.qkv_fp8 and not fp8_available:
+            return base._required_or_standard(
+                request,
+                'checkpoint-native FP8 direct SageAttention projection is unavailable',
+            )
+        if request == FUSED_QKV_FORCE_BF16:
+            provider = base.QKV_FORCE_BF16_CHUNKED
+            source = 'BF16-materialized'
+        elif request == FUSED_QKV_FORCE_QUANT and inventory.qkv_plain_float:
+            provider = base.QKV_FORCE_CONVROT_INT8_CHUNKED
+            source = 'runtime ConvRot-256 INT8'
+        else:
+            provider = (
+                base.QKV_DENSE_CONVROT_INT8
+                if inventory.qkv_convrot_int8_256
+                else base.QKV_BF16_CHUNKED
+            )
+            source = 'checkpoint-native %s' % fmt
+        return base.QKVProviderResolution(
+            provider,
+            True,
+            (
+                '%s QKV projects in bounded slabs directly into the selected '
+                'SageAttention native Q/K carrier'
+            ) % source,
         )
     if (
         request == FUSED_QKV_FORCE_BF16
@@ -240,23 +293,47 @@ def resolve_qkv_provider(
             raise RuntimeError(
                 'BF16 mode cannot materialize the checkpoint QKV format as BF16'
             )
+        if backend_kind == 'frost_bf16_sm89':
+            return base.QKVProviderResolution(
+                base.QKV_FORCE_BF16_CHUNKED,
+                True,
+                (
+                    'QKV weights are materialized as BF16 in bounded slabs; '
+                    'FROST retains global sequence-major K/V and streams bounded Q'
+                ),
+            )
         if (
-            backend_kind == 'triton_sparse_bf16'
+            backend_kind == 'sparse_sage'
             and triton_available
-            and base._qkv_is_native_bf16(inventory)
+            and base._sparse_contract_ok(sparse_spec)
         ):
             return base.QKVProviderResolution(
                 base.QKV_FORCE_BF16_CHUNKED,
                 True,
                 (
-                    'native BF16 QKV retains complete K/V and streams bounded '
-                    'BF16 Q slabs into Triton without weight conversion'
+                    'QKV weights are materialized as BF16 in bounded slabs; '
+                    'Sparse Sage retains global K/V and streams bounded Q'
                 ),
             )
+        if backend_kind == 'triton_sparse_bf16' and triton_available:
+            return base.QKVProviderResolution(
+                base.QKV_FORCE_BF16_CHUNKED,
+                True,
+                (
+                    'QKV weights are materialized as BF16 in bounded slabs; '
+                    'Triton retains global K/V and streams bounded Q'
+                ),
+            )
+        reason = (
+            'QKV weights are materialized as BF16 while the selected Comfy '
+            'attention retains complete K/V and streams bounded Q/output'
+            if backend_kind == 'existing'
+            else 'QKV weights are materialized as BF16 for bounded BF16 projection'
+        )
         return base.QKVProviderResolution(
             base.QKV_FORCE_BF16_CHUNKED,
             False,
-            'QKV weights are materialized as BF16 for bounded BF16 projection',
+            reason,
         )
     if request == FUSED_QKV_FORCE_QUANT and inventory.qkv_plain_float:
         if backend_kind in _KITCHEN_CARRIER_CONSUMERS:
@@ -291,6 +368,15 @@ def resolve_qkv_provider(
                     'ConvRot-256 INT8 and streamed as BF16 Q/K/V into Triton'
                 ),
             )
+        if backend_kind == 'frost_bf16_sm89':
+            return base.QKVProviderResolution(
+                base.QKV_FORCE_CONVROT_INT8_FROST,
+                True,
+                (
+                    'floating QKV weights are converted to execution-scoped '
+                    'ConvRot-256 INT8 and streamed as BF16 Q/K/V into FROST'
+                ),
+            )
         if backend_kind == 'flex_attention_fp8':
             if not fp8_available:
                 raise RuntimeError(
@@ -301,13 +387,20 @@ def resolve_qkv_provider(
                 False,
                 'floating QKV weights are forced to FP8 E4M3 for FP8 FlexAttention',
             )
+        reason = (
+            'floating QKV weights are converted to execution-scoped ConvRot-256 '
+            'INT8 while the selected Comfy attention retains complete BF16 K/V '
+            'and streams bounded BF16 Q/output'
+            if backend_kind == 'existing'
+            else (
+                'floating QKV weights are converted to execution-scoped '
+                'ConvRot-256 INT8 and projected as bounded BF16 Q/K/V'
+            )
+        )
         return base.QKVProviderResolution(
             base.QKV_FORCE_CONVROT_INT8_CHUNKED,
             False,
-            (
-                'floating QKV weights are converted to execution-scoped '
-                'ConvRot-256 INT8 and projected as bounded BF16 Q/K/V'
-            ),
+            reason,
         )
 
     streamed = _stream_kitchen(
@@ -330,6 +423,12 @@ def resolve_qkv_provider(
         inventory,
         backend_kind=backend_kind,
         triton_available=triton_available,
+    )
+    if streamed is not None:
+        return streamed
+    streamed = _stream_frost(
+        inventory,
+        backend_kind=backend_kind,
     )
     if streamed is not None:
         return streamed

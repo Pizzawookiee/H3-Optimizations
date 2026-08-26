@@ -138,6 +138,7 @@ class QKVStatusReadabilityTests(unittest.TestCase):
                 'provider': 'force_bf16_qkv',
                 'projector': 'chunked_triton_sparse_qkv',
                 'chunk_rows': 4096,
+                'streamed_q': True,
             },
             'weight_formats': {'qkv': ['Parameter:torch.bfloat16']},
         }
@@ -148,6 +149,18 @@ class QKVStatusReadabilityTests(unittest.TestCase):
                 '4096-row BF16 Q slabs -> Triton'
             ),
         )
+
+    def test_projector_name_does_not_claim_streaming_without_capability(self):
+        status = {
+            'fused_qkv': {
+                'provider': 'force_bf16_qkv',
+                'projector': 'chunked_triton_sparse_qkv',
+                'chunk_rows': 4096,
+                'streamed_q': False,
+            },
+            'weight_formats': {'qkv': ['Parameter:torch.bfloat16']},
+        }
+        self.assertIn('full BF16 Q/K/V', format_qkv_execution(status))
 
     def test_every_public_route_has_a_readable_description(self):
         expected = {

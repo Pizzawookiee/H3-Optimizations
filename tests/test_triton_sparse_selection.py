@@ -211,7 +211,7 @@ class TritonSparseSelectionTests(unittest.TestCase):
 
         self.assertEqual(qkv.provider_id, 'force_bf16_qkv')
         self.assertTrue(qkv.fused)
-        self.assertTrue(attention.projector.stream_native_bf16)
+        self.assertEqual(attention.projector.projection_mode, 'force_bf16')
         self.assertTrue(attention.projector.streamed_q)
 
     def test_triton_is_tried_before_flex(self):

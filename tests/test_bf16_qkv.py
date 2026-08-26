@@ -44,7 +44,6 @@ from h3_optimizations.qkv.bf16 import (  # noqa: E402
     BF16QKVBindingError,
     CHUNK_ROWS,
     ChunkedBF16QKVProjector,
-    FrostBF16QKVProjector,
     PreparedBF16QKV,
     StreamedDenseBF16QKVProjector,
 )
@@ -202,32 +201,6 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         self.assertEqual(prepared.sequence, 17)
         self.assertEqual(prepared.heads, 56)
         self.assertEqual(prepared.head_dim, 128)
-
-    def test_frost_projector_returns_hnd_views_over_sequence_major_storage(self):
-        projector = FrostBF16QKVProjector(chunk_rows=3)
-        module = SimpleNamespace(heads=2, head_dim=4)
-        x = torch.empty((5, 8), dtype=torch.bfloat16)
-
-        def stream(_module, _x, _rope, consume):
-            for start, end in ((0, 3), (3, 5)):
-                chunk = torch.full(
-                    (1, 2, end - start, 4),
-                    start + 1,
-                    dtype=torch.bfloat16,
-                )
-                consume(start, end, chunk, chunk, chunk)
-
-        with mock.patch.object(projector, '_validate'), mock.patch.object(
-            projector, 'stream', side_effect=stream
-        ):
-            prepared = projector.project(module, x, None)
-
-        expected_stride = (5 * 2 * 4, 4, 2 * 4, 1)
-        for tensor in (prepared.q, prepared.k, prepared.v):
-            self.assertEqual(tensor.stride(), expected_stride)
-            self.assertFalse(tensor.is_contiguous())
-            self.assertTrue(torch.all(tensor[:, :, :3] == 1))
-            self.assertTrue(torch.all(tensor[:, :, 3:] == 4))
 
     def test_cpu_activation_is_rejected_before_weight_acquisition(self):
         projector = ChunkedBF16QKVProjector()
@@ -444,6 +417,104 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         self.assertIs(actual, actual_buffer)
         self.assertEqual(calls, [(3, 7, 7), (3, 7, 7), (1, 7, 7)])
         torch.testing.assert_close(actual, expected)
+
+    def test_dense_streaming_reaches_external_attention_override(self):
+        module = self._module()
+        source = torch.randn((7, 8), dtype=torch.bfloat16)
+        projector = StreamedDenseBF16QKVProjector(
+            chunk_rows=3,
+            allow_cpu_for_tests=True,
+        )
+        calls = []
+
+        def external_sage(_original, q, k, v, _heads, **_kwargs):
+            calls.append((int(q.shape[2]), int(k.shape[2]), int(v.shape[2])))
+            return q
+
+        forward = make_forward(
+            module,
+            0,
+            backend=ChunkedKitchenAttentionBackend(),
+            projector=projector,
+        )
+        output = source.clone()
+        with mock.patch.object(
+            bf16_module,
+            'HeldBF16QKV',
+            self._fake_held(),
+        ):
+            actual = forward(
+                output,
+                transformer_options={
+                    'optimized_attention_override': external_sage,
+                },
+            )
+
+        self.assertIs(actual, output)
+        self.assertEqual(calls, [(3, 7, 7), (3, 7, 7), (1, 7, 7)])
+
+    def test_dense_native_quantized_source_never_retains_full_q(self):
+        module = self._module()
+        source = torch.randn((7, 8), dtype=torch.bfloat16)
+
+        class FullProjectionOnlyHeld:
+            def __init__(self):
+                self.calls = []
+                self.released = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                self.released = True
+                return False
+
+            def project_hnd(self, x, _rope, start, end):
+                self.calls.append((start, end))
+                rows = end - start
+                values = x[start:end].view(rows, 2, 4).transpose(0, 1).unsqueeze(0)
+                return values, values + 1, values + 2
+
+        held = FullProjectionOnlyHeld()
+        projector = StreamedDenseBF16QKVProjector(
+            chunk_rows=3,
+            allow_cpu_for_tests=True,
+        )
+        quantized_format = SimpleNamespace(
+            plain_float=False,
+            convrot_int8_256=False,
+            w4a8=False,
+            fp8=True,
+            logical_dtype='float8_e4m3fn',
+            label='FP8',
+        )
+        with mock.patch.object(
+            projector,
+            '_validate',
+            return_value=quantized_format,
+        ), mock.patch(
+            'h3_optimizations.qkv.streamed.create_held_qkv',
+            return_value=held,
+        ) as factory:
+            prepared = projector.project(module, source, None)
+            q_chunks = list(prepared.stream_q())
+
+        factory.assert_called_once()
+        factory_args = factory.call_args.args
+        self.assertIs(factory_args[0], module)
+        self.assertIs(factory_args[1]._base, source)
+        self.assertEqual(factory_args[2], 'native')
+        self.assertFalse(hasattr(prepared, 'q'))
+        self.assertEqual(
+            [(start, end) for start, end, _q in q_chunks],
+            [(0, 3), (3, 6), (6, 7)],
+        )
+        self.assertEqual(
+            held.calls,
+            [(0, 3), (3, 6), (6, 7), (0, 3), (3, 6), (6, 7)],
+        )
+        prepared.release()
+        self.assertTrue(held.released)
 
     def test_preserve_precision_has_an_internal_bf16_qkv_request(self):
         request = MemoryRequest(

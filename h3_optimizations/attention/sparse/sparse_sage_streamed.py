@@ -10,11 +10,12 @@ Sparge path that remain useful and have a clean lifetime contract:
 * project the bounded attention output immediately and reuse the attention
   input tensor for the final hidden-size result.
 
-The ConvRot Q weight is acquired and released independently for every Q chunk.
-It is never held across a Sparge launch or ``out_proj`` acquisition.  This is
-slightly less clever than the original PR #13 implementation, but avoids the
-reusable Comfy cast-buffer aliasing hazard that made that implementation unsafe
-on offloaded/low-VRAM models.
+The source QKV weight is acquired and released independently for every Q chunk.
+It is never held across a Sparge launch or ``out_proj`` acquisition. Native
+ConvRot keeps its direct INT8 Q-only path; the other supported checkpoint and
+forced-precision modes produce only one bounded BF16 Q slab. This avoids the
+reusable Comfy cast-buffer aliasing hazard that made the original PR #13 path
+unsafe on offloaded/low-VRAM models.
 """
 
 from __future__ import annotations
@@ -25,7 +26,12 @@ import math
 import torch
 
 from ... import diagnostics
-from ...qkv.chunked import project_chunk_hnd
+from ...qkv.formats import describe_linear
+from ...qkv.streamed import (
+    PROJECTION_NATIVE,
+    create_held_qkv,
+    project_q_hnd,
+)
 from . import fused_qkv as _fused_qkv_mod
 from .chunked_qkv import pack_sparse_qk_chunk_into
 from .config import resolve_video_budget
@@ -56,6 +62,7 @@ class StreamedSparseSageQKV:
     layer_index: int
     project_chunk_rows: int
     query_chunk_rows: int
+    projection_mode: str
 
 
 @dataclass
@@ -187,8 +194,10 @@ def _assemble_streamed_sparse_qkv(
     spec,
     project_chunk_rows,
     query_chunk_rows,
+    projection_mode=PROJECTION_NATIVE,
     packer=pack_sparse_qk_chunk_into,
-    project_chunk=project_chunk_hnd,
+    project_chunk=None,
+    held_factory=create_held_qkv,
 ):
     """Produce global K/V and routing summaries without a global Q carrier."""
     mismatch = sparse_fused_qkv_contract_mismatch(spec)
@@ -244,18 +253,30 @@ def _assemble_streamed_sparse_qkv(
         (1, heads, max_q_blocks, head_dim), dtype=x.dtype, device=x.device
     )
 
+    held = None
+    if project_chunk is None:
+        held = held_factory(module, x[:1], projection_mode)
+        held.__enter__()
     try:
         for start in range(0, sequence, project_chunk_rows):
             end = min(start + project_chunk_rows, sequence)
             rows = end - start
             local_q_blocks = (rows + int(spec.q_tile) - 1) // int(spec.q_tile)
-            q, k, chunk_v = project_chunk(
-                module,
-                x,
-                rope_freqs,
-                start,
-                end,
-            )
+            if held is None:
+                q, k, chunk_v = project_chunk(
+                    module,
+                    x,
+                    rope_freqs,
+                    start,
+                    end,
+                )
+            else:
+                q, k, chunk_v = held.project_hnd(
+                    x,
+                    rope_freqs,
+                    start,
+                    end,
+                )
             try:
                 if rows == max_rows:
                     q_local = q_int8_scratch
@@ -307,6 +328,8 @@ def _assemble_streamed_sparse_qkv(
             finally:
                 del q, k, chunk_v
     finally:
+        if held is not None:
+            held.__exit__(None, None, None)
         del q_int8_scratch, q_scale_scratch, q_summary_scratch
 
     return StreamedSparseSageQKV(
@@ -325,6 +348,7 @@ def _assemble_streamed_sparse_qkv(
         layer_index=int(layer_index),
         project_chunk_rows=project_chunk_rows,
         query_chunk_rows=query_chunk_rows,
+        projection_mode=projection_mode,
     )
 
 
@@ -337,6 +361,7 @@ def run_streamed_sparse_qkv(
     spec,
     project_chunk_rows=DEFAULT_PROJECT_CHUNK_ROWS,
     query_chunk_rows=DEFAULT_QUERY_CHUNK_ROWS,
+    projection_mode=PROJECTION_NATIVE,
 ):
     import comfy.model_management
 
@@ -360,6 +385,7 @@ def run_streamed_sparse_qkv(
         spec=spec,
         project_chunk_rows=project_chunk_rows,
         query_chunk_rows=query_chunk_rows,
+        projection_mode=projection_mode,
     )
 
 
@@ -374,8 +400,10 @@ class StreamedSparseSageQKVProjector:
         *,
         project_chunk_rows=DEFAULT_PROJECT_CHUNK_ROWS,
         query_chunk_rows=DEFAULT_QUERY_CHUNK_ROWS,
+        projection_mode=PROJECTION_NATIVE,
     ):
         self.spec = spec
+        self.projection_mode = projection_mode
         self.chunk_rows = _validate_chunk_rows(
             project_chunk_rows,
             spec.q_tile,
@@ -396,6 +424,7 @@ class StreamedSparseSageQKVProjector:
             self.qk_format,
             self.chunk_rows,
             self.query_chunk_rows,
+            self.projection_mode,
             self.spec.signature,
         )
 
@@ -417,6 +446,7 @@ class StreamedSparseSageQKVProjector:
             spec=self.spec,
             project_chunk_rows=self.chunk_rows,
             query_chunk_rows=self.query_chunk_rows,
+            projection_mode=self.projection_mode,
         )
 
 
@@ -752,6 +782,65 @@ def _run_fused_q_only_into(
         )
 
 
+def _project_streamed_q_into(
+    projected,
+    row_start,
+    row_end,
+    q_int8,
+    q_scale,
+    q_summary_scratch,
+    *,
+    block_size,
+    held_factory=create_held_qkv,
+    packer=pack_sparse_qk_chunk_into,
+):
+    """Project and pack one Q slab without retaining its weight binding."""
+    actual = describe_linear(projected.module.qkv_proj)
+    if projected.projection_mode == PROJECTION_NATIVE and actual.convrot_int8_256:
+        chunk_rope = (
+            None
+            if projected.rope_freqs is None
+            else projected.rope_freqs[:, row_start:row_end]
+        )
+        _run_fused_q_only_into(
+            projected.module,
+            projected.x[row_start:row_end],
+            chunk_rope,
+            q_int8,
+            q_scale,
+            q_summary_scratch,
+        )
+        return
+
+    held = held_factory(
+        projected.module,
+        projected.x[row_start:row_start + 1],
+        projected.projection_mode,
+    )
+    held.__enter__()
+    try:
+        q = project_q_hnd(
+            held,
+            projected.x,
+            projected.rope_freqs,
+            row_start,
+            row_end,
+        )
+        try:
+            packer(
+                q,
+                q_int8,
+                q_scale,
+                q_summary_scratch,
+                row_start=0,
+                block_size=block_size,
+            )
+        finally:
+            del q
+    finally:
+        held.__exit__(None, None, None)
+
+
 def execute_streamed_sparse_sage(module, backend, prepared):
     if not isinstance(prepared, PreparedStreamedSparseSage):
         return None
@@ -841,18 +930,14 @@ def execute_streamed_sparse_sage(module, backend, prepared):
                     device=result.device,
                 )
 
-            chunk_rope = (
-                None
-                if projected.rope_freqs is None
-                else projected.rope_freqs[:, row_start:row_end]
-            )
-            _run_fused_q_only_into(
-                projected.module,
-                result[row_start:row_end],
-                chunk_rope,
+            _project_streamed_q_into(
+                projected,
+                row_start,
+                row_end,
                 q_int8,
                 q_scale,
                 q_summary_scratch,
+                block_size=q_tile,
             )
 
             with diagnostics.stage("sparse_attention_kernel"):

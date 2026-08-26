@@ -65,6 +65,19 @@ class FakeHeld:
         return False
 
 
+class FullQKVOnlyHeld(FakeHeld):
+    project_q_hnd = None
+
+
+class ReusableBufferHeld(FakeHeld):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.binding = SimpleNamespace(handle=object())
+
+    def __enter__(self):
+        return self
+
+
 class OutProjectionProxy:
     def __init__(self, module, out_proj):
         self._module = module
@@ -119,6 +132,50 @@ class StreamedTritonBF16Tests(unittest.TestCase):
         self.assertFalse(held.released)
         projected.release()
         self.assertTrue(held.released)
+
+    def test_source_without_q_only_projection_still_returns_bounded_q(self):
+        held = FullQKVOnlyHeld(self.heads)
+        projected = _assemble_streamed_triton_qkv(
+            self.module,
+            self.x,
+            None,
+            held,
+            layer_index=3,
+            chunk_rows=64,
+            projection_mode='native',
+        )
+
+        q = projected.project_q(64, 128)
+
+        self.assertEqual(tuple(q.shape), (1, self.heads, 64, 128))
+        self.assertEqual(held.full_calls[-1], (64, 128))
+        self.assertEqual(projected.projection_mode, 'native')
+        projected.release()
+
+    def test_reusable_cast_buffer_is_not_held_across_attention(self):
+        first_pass = ReusableBufferHeld(self.heads)
+        projected = _assemble_streamed_triton_qkv(
+            self.module,
+            self.x,
+            None,
+            first_pass,
+            layer_index=3,
+            chunk_rows=64,
+        )
+        self.assertTrue(first_pass.released)
+        self.assertIsNone(projected.held)
+
+        query_binding = FakeHeld(self.heads)
+        query_binding.__enter__ = lambda: query_binding
+        with mock.patch(
+            'h3_optimizations.attention.sparse.triton_bf16_streamed.create_held_qkv',
+            return_value=query_binding,
+        ):
+            projected.project_q(0, 64)
+
+        self.assertEqual(query_binding.q_calls, [(0, 64)])
+        self.assertTrue(query_binding.released)
+        projected.release()
 
     def test_prepare_keeps_only_the_compact_absolute_route(self):
         held = FakeHeld(self.heads)

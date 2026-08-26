@@ -56,6 +56,7 @@ def format_qkv_execution(status):
     qkv = status.get('fused_qkv') or {}
     provider = qkv.get('provider') or 'standard_h3_qkv'
     projector = qkv.get('projector')
+    streamed_q = bool(qkv.get('streamed_q'))
     weights = _qkv_weights_text(status)
     chunk_rows = int(qkv.get('chunk_rows') or 4096)
 
@@ -97,7 +98,7 @@ def format_qkv_execution(status):
 
     if provider in ('chunked_bf16_qkv', 'force_bf16_qkv'):
         prefix = 'forced BF16 projection' if provider == 'force_bf16_qkv' else 'BF16 projection'
-        if projector == 'chunked_triton_sparse_qkv':
+        if streamed_q and projector == 'chunked_triton_sparse_qkv':
             return '%s -> %s; retained BF16 K/V + %d-row BF16 Q slabs -> Triton' % (
                 weights,
                 prefix,
@@ -109,6 +110,24 @@ def format_qkv_execution(status):
                 prefix,
                 chunk_rows,
             )
+        if projector == 'chunked_kitchen_dense_sage_qkv':
+            return '%s -> %s in %d-row chunks -> dense Sage Q/K carrier; V retained in BF16' % (
+                weights,
+                prefix,
+                chunk_rows,
+            )
+        if streamed_q and projector == 'chunked_sparse_sage_qkv':
+            return '%s -> %s; retained Sparse Sage K/V + %d-row BF16 Q slabs' % (
+                weights,
+                prefix,
+                chunk_rows,
+            )
+        if streamed_q and projector == 'streamed_frost_bf16_qkv':
+            return '%s -> %s; retained sequence-major BF16 K/V + %d-row BF16 Q/output slabs -> FROST' % (
+                weights,
+                prefix,
+                chunk_rows,
+            )
         return '%s -> %s in %d-row chunks -> full BF16 Q/K/V' % (
             weights,
             prefix,
@@ -116,11 +135,21 @@ def format_qkv_execution(status):
         )
 
     if provider == 'force_fp8_qkv':
+        if streamed_q:
+            return '%s -> forced FP8 projection; retained Sparse Sage K/V + %d-row BF16 Q slabs' % (
+                weights,
+                chunk_rows,
+            )
         return '%s -> forced FP8 projection in %d-row chunks -> full BF16 Q/K/V' % (
             weights,
             chunk_rows,
         )
     if provider == 'force_convrot_int8_qkv':
+        if projector == 'chunked_kitchen_dense_sage_qkv':
+            return '%s -> runtime ConvRot-256 INT8 projection in %d-row chunks -> dense Sage Q/K carrier; V retained in BF16' % (
+                weights,
+                chunk_rows,
+            )
         return '%s -> runtime ConvRot-256 INT8 projection in %d-row chunks -> full BF16 Q/K/V' % (
             weights,
             chunk_rows,
@@ -128,12 +157,17 @@ def format_qkv_execution(status):
     if provider == 'convrot_int8_dense_sage':
         return '%s -> dense Sage carrier; V retained in BF16' % weights
     if provider in ('convrot_int8_sparse_sage', 'chunked_fp8_sparse_sage'):
-        return '%s -> %d-row projection -> Sparse Sage carrier; V retained in BF16' % (
+        lifetime = (
+            'retained Sparse Sage K/V + %d-row BF16 Q slabs'
+            if streamed_q
+            else '%d-row projection -> Sparse Sage carrier; V retained in BF16'
+        )
+        return ('%s -> ' + lifetime) % (
             weights,
             chunk_rows,
         )
     if provider == 'chunked_triton_bf16_sparse':
-        if projector == 'chunked_triton_sparse_qkv':
+        if streamed_q:
             return '%s -> retained BF16 K/V + %d-row BF16 Q slabs -> Triton' % (
                 weights,
                 chunk_rows,
@@ -144,6 +178,16 @@ def format_qkv_execution(status):
         )
     if provider == 'force_convrot_int8_triton_qkv':
         return '%s -> runtime ConvRot-256 INT8 projection -> retained BF16 K/V + %d-row BF16 Q slabs -> Triton' % (
+            weights,
+            chunk_rows,
+        )
+    if provider == 'streamed_frost_bf16_qkv':
+        return '%s -> retained sequence-major BF16 K/V + %d-row BF16 Q/output slabs -> FROST' % (
+            weights,
+            chunk_rows,
+        )
+    if provider == 'force_convrot_int8_frost_qkv':
+        return '%s -> runtime ConvRot-256 INT8 projection -> retained sequence-major BF16 K/V + %d-row BF16 Q/output slabs -> FROST' % (
             weights,
             chunk_rows,
         )

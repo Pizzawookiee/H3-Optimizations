@@ -8,8 +8,10 @@ control.
 
 ## Nodes
 
-- H3 Memory Optimization selects the resolved dense H3 attention path and
-  applies compatible memory/execution providers. ConvRot INT8 QKV can project
+- H3 Memory Optimization preserves the dense attention selected by ComfyUI and
+  applies compatible memory/execution providers around it. This includes an
+  external Sage selector, an external Comfy Kitchen selector, and ComfyUI's
+  normal attention backend. ConvRot INT8 QKV can project
   in 4K token chunks directly into Comfy Kitchen carriers. Native FP8 uses held
   chunked FP8 execution, while Force quant converts floating H3 QKV, attention
   output, and MLP weights to execution-scoped ConvRot-256 INT8. FinalLayer norm, modulation,
@@ -24,11 +26,16 @@ control.
   the disposable block input. With sparse Kitchen,
   checkpoint-native ConvRot INT8 QKV streams BF16 projection, norm, and RoPE
   chunks into the routed INT8 carrier instead of materializing full-sequence
-  BF16 Q/K/V. With existing dense attention, checkpoint-native BF16 keeps full
-  BF16 K/V, streams BF16 Q through the selected Comfy attention backend, and
-  writes each output-projection chunk into the disposable block input. Other
-  dense QKV stays on the upstream Comfy path, while MLP auto keeps BF16/FP16
-  weights floating and still uses bounded token chunking.
+  BF16 Q/K/V. A compatible selected SageAttention SM89 consumer uses bounded
+  source projection directly into Sage's per-thread INT8 Q/K carrier for BF16,
+  ConvRot-256 INT8, W4A8, and FP8 checkpoints. Other Sage configurations and
+  ordinary Comfy attention retain full BF16 K/V, stream bounded BF16 Q through
+  the unchanged consumer, and write each output-projection chunk into the
+  disposable block input. An external Comfy Kitchen selection instead uses its
+  streamed INT8 carrier for all four formats. `Off` leaves QKV projection and
+  attention entirely upstream; `Forced` may replace dense attention with the
+  private full-density Kitchen path. MLP auto keeps BF16/FP16 weights floating
+  and still uses bounded token chunking.
   Checkpoint-native ConvRot, FP8, and W4A8
   remain native where a compatible bounded MLP provider exists; unsupported
   quantized formats preserve upstream Comfy execution. `Auto` is the default.
@@ -66,15 +73,16 @@ control.
   Sparse Sage, BF16 Triton, and FP8 FlexAttention. Kitchen INT8 is the default
   and uses the shipped native 64Q x 64KV path. FROST BF16 is an explicit
   SM89-only 64Q x 64KV backend. It uses the packaged cubin compiled by this
-  project from NVIDIA's open Apache-2.0 FROST SM80 template, consumes BF16
-  Q/K/V directly, and writes sequence-major BF16 output. The package-owned
-  BF16 Triton and FP8 FlexAttention fallbacks use the same 64Q x 64KV routing
-  geometry; Sparse Sage follows its installed kernel ABI. FlexAttention uses
-  FP8 carriers on supported NVIDIA runtimes and native BF16/FP16 Q/K/V through
-  Triton on ROCm. Explicit backend selections are hard requirements and error
-  if unavailable; bypass the node to force dense attention. Legacy saved
-  backend values remain accepted for workflow compatibility but are not shown
-  in the dropdown.
+  project from NVIDIA's open Apache-2.0 FROST SM80 template. BF16,
+  ConvRot-256 INT8, W4A8, and FP8 checkpoints project into global
+  sequence-major BF16 K/V plus bounded BF16 Q/output slabs; no full BF16 Q
+  carrier is retained. The package-owned BF16 Triton and FP8 FlexAttention
+  fallbacks use the same 64Q x 64KV routing geometry; Sparse Sage follows its
+  installed kernel ABI. FlexAttention uses FP8 carriers on supported NVIDIA
+  runtimes and native BF16/FP16 Q/K/V through Triton on ROCm. Explicit backend
+  selections are hard requirements and error if unavailable; bypass the node
+  to force dense attention. Legacy saved backend values remain accepted for
+  workflow compatibility but are not shown in the dropdown.
 
 > **Sparse attention changes model computation. It is not free acceleration.**
 > Lower Video KV budgets retain fewer target-video attention connections and can

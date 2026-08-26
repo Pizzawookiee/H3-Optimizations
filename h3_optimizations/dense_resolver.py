@@ -39,19 +39,23 @@ def preserve_dense_attention(reason):
     return _existing_resolution(ATTENTION_EXISTING, reason)
 
 
-def command_line_sage_selected(model_patcher):
+def sage_attention_selected(model_patcher):
     options = (
         getattr(model_patcher, 'model_options', {})
         .get('transformer_options', {})
         or {}
     )
     if 'optimized_attention_override' in options:
-        return False
+        backend = get_attention_function(ATTENTION_SAGE, None)
+        return _override_wraps_backend(
+            options.get('optimized_attention_override'),
+            backend,
+        )
     return bool(comfy.model_management.sage_attention_enabled())
 
 
-def resolve_command_line_sage_fused_attention(model_patcher, environment):
-    if not command_line_sage_selected(model_patcher):
+def resolve_sage_fused_attention(model_patcher, environment):
+    if not sage_attention_selected(model_patcher):
         return None
     if tuple(getattr(environment, 'capability', ()) or ()) != (8, 9):
         return DenseResolution(
@@ -78,7 +82,7 @@ def resolve_command_line_sage_fused_attention(model_patcher, environment):
         ATTENTION_SAGE,
         ATTENTION_SAGE,
         backend,
-        'command-line Sage with native ConvRot fused-QKV support',
+        'selected SageAttention with direct native-carrier QKV support',
         ATTENTION_SAGE_SM89,
     )
 
@@ -130,21 +134,28 @@ def is_comfy_kitchen_dense_attention(transformer_options):
     return _override_wraps_backend(override, backend)
 
 
-def has_explicit_dense_attention(model_patcher):
-    '''Return true for an incompatible user/upstream dense attention override.
-
-    Comfy's own Kitchen selector is deliberately compatible: the H3 memory
-    node upgrades that route to the package-owned streamed Kitchen producer and
-    consumer rather than treating it as a conflicting attention choice.
-    '''
+def resolve_current_dense_attention(model_patcher, environment):
+    """Preserve Comfy's selected backend while recognizing external Kitchen."""
     options = (
         getattr(model_patcher, 'model_options', {})
         .get('transformer_options', {})
         or {}
     )
-    if 'optimized_attention_override' not in options:
-        return False
-    return not is_comfy_kitchen_dense_attention(options)
+    if is_comfy_kitchen_dense_attention(options):
+        return DenseResolution(
+            ATTENTION_EXISTING,
+            ATTENTION_COMFY_KITCHEN_INT8,
+            None,
+            'preserved the external Comfy Kitchen attention selection',
+            ATTENTION_COMFY_KITCHEN_INT8,
+        )
+    sage = resolve_sage_fused_attention(model_patcher, environment)
+    if sage is not None:
+        return sage
+    return _existing_resolution(
+        ATTENTION_EXISTING,
+        'preserved ComfyUI\'s current dense attention selection',
+    )
 
 
 def resolve_dense_attention(model_patcher):

@@ -28,7 +28,6 @@ from .dense_fused_qkv_kernel import (
     dense_fused_qkv_tensor_core,
 )
 from .attention.triton_i64 import per_thread_int8_i64
-from .qkv.chunked import project_chunk_hnd
 
 CHUNK_ROWS = 4096
 
@@ -235,12 +234,15 @@ class DenseFusedQKVProjector:
         *,
         quantizer=None,
         project_chunk=None,
+        projection_mode="native",
         allow_cpu_for_tests=False,
     ):
         self.chunk_rows = int(chunk_rows)
         self.quantizer = quantizer or per_thread_int8_i64
-        self.project_chunk = project_chunk or project_chunk_hnd
+        self.project_chunk = project_chunk
+        self.projection_mode = projection_mode
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
+        self.consumer_native_carrier = True
         if self.chunk_rows <= 0 or self.chunk_rows % Q_TILE:
             raise ValueError("dense Sage QKV chunk rows must be divisible by 128")
 
@@ -258,6 +260,7 @@ class DenseFusedQKVProjector:
             self.name,
             self.qk_format,
             self.chunk_rows,
+            self.projection_mode,
             identity(self.quantizer),
             identity(self.project_chunk),
         )
@@ -289,32 +292,50 @@ class DenseFusedQKVProjector:
         q_scale_start = 0
         k_scale_start = 0
 
-        for start in range(0, sequence, self.chunk_rows):
-            stop = min(start + self.chunk_rows, sequence)
-            q_chunk, k_chunk, v_chunk = self.project_chunk(
-                module, x, rope_freqs, start, stop
-            )
-            chunk_q, chunk_q_scale, chunk_k, chunk_k_scale = self.quantizer(
-                q_chunk,
-                k_chunk,
-                None,
-                BLKQ=Q_TILE,
-                WARPQ=32,
-                BLKK=K_TILE,
-                WARPK=64,
-                tensor_layout="HND",
-            )
-            q_int8[:, :, start:stop, :].copy_(chunk_q)
-            k_int8[:, :, start:stop, :].copy_(chunk_k)
-            v[:, :, start:stop, :].copy_(v_chunk)
-            q_scale_stop = q_scale_start + int(chunk_q_scale.shape[-1])
-            k_scale_stop = k_scale_start + int(chunk_k_scale.shape[-1])
-            q_scale[:, :, q_scale_start:q_scale_stop].copy_(chunk_q_scale)
-            k_scale[:, :, k_scale_start:k_scale_stop].copy_(chunk_k_scale)
-            q_scale_start = q_scale_stop
-            k_scale_start = k_scale_stop
-            del q_chunk, k_chunk, v_chunk, chunk_q, chunk_k
-            del chunk_q_scale, chunk_k_scale
+        held = None
+        if self.project_chunk is None:
+            from .qkv.streamed import create_held_qkv
+
+            held = create_held_qkv(module, x[:1], self.projection_mode)
+            held.__enter__()
+        try:
+            for start in range(0, sequence, self.chunk_rows):
+                stop = min(start + self.chunk_rows, sequence)
+                if held is None:
+                    q_chunk, k_chunk, v_chunk = self.project_chunk(
+                        module, x, rope_freqs, start, stop
+                    )
+                else:
+                    q_chunk, k_chunk, v_chunk = held.project_hnd(
+                        x,
+                        rope_freqs,
+                        start,
+                        stop,
+                    )
+                chunk_q, chunk_q_scale, chunk_k, chunk_k_scale = self.quantizer(
+                    q_chunk,
+                    k_chunk,
+                    None,
+                    BLKQ=Q_TILE,
+                    WARPQ=32,
+                    BLKK=K_TILE,
+                    WARPK=64,
+                    tensor_layout="HND",
+                )
+                q_int8[:, :, start:stop, :].copy_(chunk_q)
+                k_int8[:, :, start:stop, :].copy_(chunk_k)
+                v[:, :, start:stop, :].copy_(v_chunk)
+                q_scale_stop = q_scale_start + int(chunk_q_scale.shape[-1])
+                k_scale_stop = k_scale_start + int(chunk_k_scale.shape[-1])
+                q_scale[:, :, q_scale_start:q_scale_stop].copy_(chunk_q_scale)
+                k_scale[:, :, k_scale_start:k_scale_stop].copy_(chunk_k_scale)
+                q_scale_start = q_scale_stop
+                k_scale_start = k_scale_stop
+                del q_chunk, k_chunk, v_chunk, chunk_q, chunk_k
+                del chunk_q_scale, chunk_k_scale
+        finally:
+            if held is not None:
+                held.__exit__(None, None, None)
 
         if q_scale_start != q_scales or k_scale_start != k_scales:
             raise DenseFusedQKVError("chunked dense Sage Q/K scale layout is invalid")

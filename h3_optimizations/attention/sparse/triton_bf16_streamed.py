@@ -10,8 +10,12 @@ import torch
 import comfy.model_management
 
 from ... import diagnostics
-from ...qkv.bf16 import HeldBF16QKV
-from ...qkv.int8 import HeldConvRotINT8QKV
+from ...qkv.streamed import (
+    PROJECTION_FORCE_INT8,
+    PROJECTION_NATIVE,
+    create_held_qkv,
+    project_q_hnd,
+)
 from .config import resolve_video_budget
 from .router import SparseRouterError
 from .triton_route import TritonRouteError, build_compact_absolute_route
@@ -38,16 +42,33 @@ class StreamedTritonBF16QKV:
     head_dim: int
     layer_index: int
     chunk_rows: int
+    projection_mode: str = PROJECTION_NATIVE
 
     def project_q(self, start, end):
-        if self.held is None:
-            raise RuntimeError("streamed Triton QKV binding was released")
-        return self.held.project_q_hnd(
-            self.x,
-            self.rope_freqs,
-            int(start),
-            int(end),
+        if self.held is not None:
+            return project_q_hnd(
+                self.held,
+                self.x,
+                self.rope_freqs,
+                int(start),
+                int(end),
+            )
+        held = create_held_qkv(
+            self.module,
+            self.x[int(start):int(start) + 1],
+            self.projection_mode,
         )
+        held.__enter__()
+        try:
+            return project_q_hnd(
+                held,
+                self.x,
+                self.rope_freqs,
+                int(start),
+                int(end),
+            )
+        finally:
+            held.__exit__(None, None, None)
 
     def release_weight(self):
         held, self.held = self.held, None
@@ -102,6 +123,11 @@ def _tile_mean(x, tile):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
 
 
+def _uses_reusable_cast_buffer(held):
+    binding = getattr(held, "binding", held)
+    return getattr(binding, "handle", None) is not None
+
+
 def _assemble_streamed_triton_qkv(
     module,
     x,
@@ -110,6 +136,7 @@ def _assemble_streamed_triton_qkv(
     *,
     layer_index,
     chunk_rows,
+    projection_mode=PROJECTION_NATIVE,
 ):
     chunk_rows = _validate_chunk_rows(chunk_rows)
     sequence = int(x.shape[0])
@@ -159,7 +186,7 @@ def _assemble_streamed_triton_qkv(
                 del q_mean, k_mean
             finally:
                 del q_chunk, k_chunk, v_chunk
-        return StreamedTritonBF16QKV(
+        projected = StreamedTritonBF16QKV(
             module=module,
             x=x,
             rope_freqs=rope_freqs,
@@ -173,7 +200,11 @@ def _assemble_streamed_triton_qkv(
             head_dim=head_dim,
             layer_index=int(layer_index),
             chunk_rows=chunk_rows,
+            projection_mode=projection_mode,
         )
+        if _uses_reusable_cast_buffer(held):
+            projected.release_weight()
+        return projected
     except Exception:
         held.__exit__(None, None, None)
         raise
@@ -208,24 +239,13 @@ def run_streamed_triton_qkv(
 ):
     _validate_streamed_input(x, rope_freqs)
 
-    held = HeldConvRotINT8QKV(
-        module,
-        x[:1],
-        allow_float_conversion=True,
-    )
-    held.__enter__()
-    if not held.binding.converted_from_float:
-        held.__exit__(None, None, None)
-        raise RuntimeError(
-            "streamed Triton runtime INT8 requires floating QKV weights"
-        )
-    return _assemble_streamed_triton_qkv(
+    return run_streamed_source_triton_qkv(
         module,
         x,
         rope_freqs,
-        held,
         layer_index=layer_index,
         chunk_rows=chunk_rows,
+        projection_mode=PROJECTION_FORCE_INT8,
     )
 
 
@@ -237,9 +257,28 @@ def run_streamed_bf16_triton_qkv(
     layer_index,
     chunk_rows,
 ):
+    return run_streamed_source_triton_qkv(
+        module,
+        x,
+        rope_freqs,
+        layer_index=layer_index,
+        chunk_rows=chunk_rows,
+        projection_mode=PROJECTION_NATIVE,
+    )
+
+
+def run_streamed_source_triton_qkv(
+    module,
+    x,
+    rope_freqs,
+    *,
+    layer_index,
+    chunk_rows,
+    projection_mode=PROJECTION_NATIVE,
+):
     _validate_streamed_input(x, rope_freqs)
 
-    held = HeldBF16QKV(module, x[:1])
+    held = create_held_qkv(module, x[:1], projection_mode)
     held.__enter__()
     return _assemble_streamed_triton_qkv(
         module,
@@ -248,6 +287,7 @@ def run_streamed_bf16_triton_qkv(
         held,
         layer_index=layer_index,
         chunk_rows=chunk_rows,
+        projection_mode=projection_mode,
     )
 
 
@@ -370,5 +410,6 @@ __all__ = [
     "execute_streamed_triton_bf16",
     "prepare_streamed_triton_bf16",
     "run_streamed_bf16_triton_qkv",
+    "run_streamed_source_triton_qkv",
     "run_streamed_triton_qkv",
 ]

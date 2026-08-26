@@ -6,6 +6,7 @@ from .formats import (
     describe_linear,
     is_fused_weight_format_error,
 )
+from .streamed import PROJECTION_NATIVE
 
 
 def _unsupported(required, message):
@@ -46,6 +47,7 @@ class SparseFusedQKVProjector:
         required=False,
         chunk_rows=4096,
         query_chunk_rows=4096,
+        projection_mode="native",
     ):
         from ..attention.sparse.sparse_sage_streamed import (
             StreamedSparseSageQKVProjector as Implementation,
@@ -54,10 +56,12 @@ class SparseFusedQKVProjector:
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
         self.query_chunk_rows = int(query_chunk_rows)
+        self.projection_mode = projection_mode
         self._implementation = Implementation(
             spec,
             project_chunk_rows=self.chunk_rows,
             query_chunk_rows=self.query_chunk_rows,
+            projection_mode=self.projection_mode,
         )
 
     @property
@@ -66,6 +70,7 @@ class SparseFusedQKVProjector:
             self.name,
             self.qk_format,
             bool(self.required),
+            self.projection_mode,
             self._implementation.installation_signature,
         )
 
@@ -112,18 +117,38 @@ class TritonSparseQKVProjector:
         v_scale_group_size=None,
         force_weights_int8=False,
         stream_native_bf16=False,
+        projection_mode=None,
     ):
         from .bf16 import ChunkedBF16QKVProjector
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
+        self._legacy_force_weights_int8 = bool(force_weights_int8)
+        self._legacy_stream_native_bf16 = bool(stream_native_bf16)
         self.force_weights_int8 = bool(force_weights_int8)
         self.stream_native_bf16 = bool(stream_native_bf16)
         if self.force_weights_int8 and self.stream_native_bf16:
             raise ValueError(
                 "Triton QKV cannot force INT8 and preserve native BF16 weights"
             )
-        self.streamed_q = self.force_weights_int8 or self.stream_native_bf16
+        if projection_mode is not None and (
+            self.force_weights_int8 or self.stream_native_bf16
+        ):
+            raise ValueError(
+                "projection_mode cannot be combined with legacy Triton stream flags"
+            )
+        if self.force_weights_int8:
+            projection_mode = "force_int8"
+        elif self.stream_native_bf16:
+            projection_mode = "native"
+        self.projection_mode = projection_mode
+        self.force_weights_int8 = (
+            self.force_weights_int8 or self.projection_mode == "force_int8"
+        )
+        self.stream_native_bf16 = (
+            self.stream_native_bf16 or self.projection_mode == "native"
+        )
+        self.streamed_q = self.projection_mode is not None
         if v_scale_group_size is not None:
             raise ValueError(
                 'BF16 Triton does not use an INT8 V scale group'
@@ -144,7 +169,7 @@ class TritonSparseQKVProjector:
             self.qk_format,
             self.v_format,
             bool(self.required),
-            bool(self.stream_native_bf16),
+            self.projection_mode,
             self._implementation.installation_signature,
         )
 
@@ -167,6 +192,7 @@ class TritonSparseQKVProjector:
                 return _unsupported(self.required, str(exc))
             raise
 
+
     def try_project(
         self,
         module,
@@ -182,7 +208,7 @@ class TritonSparseQKVProjector:
                 self.required,
                 "QKV format is %s" % actual.label,
             )
-        if self.force_weights_int8:
+        if self._legacy_force_weights_int8:
             if not actual.plain_float:
                 return _unsupported(
                     self.required,
@@ -199,7 +225,7 @@ class TritonSparseQKVProjector:
                 layer_index=layer_index,
                 chunk_rows=self.chunk_rows,
             )
-        if self.stream_native_bf16:
+        if self._legacy_stream_native_bf16:
             dtype = str(getattr(actual, "logical_dtype", "")).lower()
             if not actual.plain_float or not (
                 "bfloat16" in dtype or "bf16" in dtype
@@ -219,6 +245,19 @@ class TritonSparseQKVProjector:
                 layer_index=layer_index,
                 chunk_rows=self.chunk_rows,
             )
+        if self.projection_mode is not None:
+            from ..attention.sparse.triton_bf16_streamed import (
+                run_streamed_source_triton_qkv,
+            )
+
+            return run_streamed_source_triton_qkv(
+                module,
+                x,
+                rope_freqs,
+                layer_index=layer_index,
+                chunk_rows=self.chunk_rows,
+                projection_mode=self.projection_mode,
+            )
         try:
             projected = self._implementation.try_project(
                 module,
@@ -236,4 +275,72 @@ class TritonSparseQKVProjector:
         except Exception as exc:
             if is_fused_weight_format_error(exc):
                 return _unsupported(self.required, str(exc))
+            raise
+
+
+class FrostStreamedQKVProjector:
+    '''Stream bounded BF16 Q against global sequence-major BF16 K/V.'''
+
+    name = 'streamed_frost_bf16_qkv'
+    qk_format = 'bf16_sequence_major'
+    streamed_q = True
+    streamed_qkv = False
+
+    def __init__(
+        self,
+        spec,
+        *,
+        required=False,
+        chunk_rows=4096,
+        projection_mode=PROJECTION_NATIVE,
+    ):
+        self.spec = spec
+        self.required = bool(required)
+        self.chunk_rows = int(chunk_rows)
+        self.projection_mode = projection_mode
+
+    @property
+    def installation_signature(self):
+        return (
+            self.name,
+            self.qk_format,
+            bool(self.required),
+            self.chunk_rows,
+            self.projection_mode,
+            self.spec.signature,
+        )
+
+    def try_project(
+        self,
+        module,
+        x,
+        rope_freqs,
+        *,
+        layer_index,
+        transformer_options,
+    ):
+        del transformer_options
+        actual = describe_linear(module.qkv_proj)
+        if not _bf16_streamable(actual):
+            return _unsupported(
+                self.required,
+                'QKV format is %s' % actual.label,
+            )
+        from ..attention.sparse.frost_bf16_streamed import (
+            _assemble_streamed_frost_qkv,
+        )
+
+        try:
+            return _assemble_streamed_frost_qkv(
+                module,
+                x,
+                rope_freqs,
+                spec=self.spec,
+                layer_index=layer_index,
+                chunk_rows=self.chunk_rows,
+                projection_mode=self.projection_mode,
+            )
+        except Exception as error:
+            if is_fused_weight_format_error(error):
+                return _unsupported(self.required, str(error))
             raise

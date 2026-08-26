@@ -173,7 +173,8 @@ def _kernel_params(values):
 def launch(q, k, v, output, route, counts, *, scale_log2, stream):
     driver = load_driver()
     _module, function = _load_function(driver)
-    sequence = int(q.shape[-2])
+    sequence_q = int(q.shape[-2])
+    sequence_kv = int(k.shape[-2])
     q_tiles = int(route.shape[-2])
     kv_tiles = int(route.shape[-1])
     values = [
@@ -188,8 +189,8 @@ def launch(q, k, v, output, route, counts, *, scale_log2, stream):
         ctypes.c_uint32(kv_tiles),
         ctypes.c_uint32(kv_tiles),
         ctypes.c_float(float(scale_log2)),
-        ctypes.c_uint32(sequence),
-        ctypes.c_uint32(sequence),
+        ctypes.c_uint32(sequence_q),
+        ctypes.c_uint32(sequence_kv),
         ctypes.c_uint32(int(q.shape[-1])),
         ctypes.c_uint32(0),
         ctypes.c_float(math.sqrt(int(q.shape[-1]))),

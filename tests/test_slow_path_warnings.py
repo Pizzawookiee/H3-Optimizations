@@ -57,7 +57,7 @@ def test_sparse_fallback_to_triton_is_loud(caplog):
     )
     assert len(messages) == 1
     assert "FELL BACK" in messages[0]
-    assert "half the speed" in messages[0]
+    assert "slower than Kitchen INT8" in messages[0]
     assert "no compiled kernel" in messages[0]
 
 
@@ -70,7 +70,7 @@ def test_sparse_fallback_to_flex_is_loud(caplog):
         QKVProviderResolution(QKV_DENSE_KITCHEN_CHUNKED, False, "fine"),
     )
     assert len(messages) == 1
-    assert "far slower" in messages[0]
+    assert "slower than Kitchen INT8" in messages[0]
 
 
 def test_kitchen_sparse_fallback_is_loud(caplog):
@@ -134,6 +134,34 @@ def test_deliberately_choosing_a_slower_backend_is_silent(caplog):
         QKVProviderResolution(QKV_DENSE_KITCHEN_CHUNKED, False, "fine"),
     )
     assert messages == []
+
+
+def test_deliberately_choosing_frost_is_silent(caplog):
+    messages = _warnings(
+        caplog,
+        _attention(
+            apply_module.ATTENTION_FROST_BF16,
+            apply_module.ATTENTION_FROST_BF16,
+            reason='explicit FROST selection',
+        ),
+        QKVProviderResolution(QKV_DENSE_KITCHEN_CHUNKED, False, 'fine'),
+    )
+    assert messages == []
+
+
+def test_unmeasured_fallback_does_not_claim_a_speed_penalty(caplog):
+    messages = _warnings(
+        caplog,
+        _attention(
+            apply_module.ATTENTION_SPARSE,
+            'future_sparse_backend',
+            reason='preferred backend unavailable',
+        ),
+        QKVProviderResolution(QKV_DENSE_KITCHEN_CHUNKED, False, 'fine'),
+    )
+    assert len(messages) == 1
+    assert 'FELL BACK' in messages[0]
+    assert 'slower' not in messages[0]
 
 
 def test_standard_qkv_for_an_unrelated_reason_is_silent(caplog):

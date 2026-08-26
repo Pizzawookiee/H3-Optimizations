@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 
 import torch
@@ -28,7 +29,6 @@ Q_TILE = 64
 KV_TILE = 64
 HEADS = 56
 HEAD_DIM = 128
-_ARTIFACT_GPU_VALIDATED = False
 
 
 class FrostBF16Error(RuntimeError):
@@ -73,10 +73,6 @@ def preflight_frost_bf16(
     capability_getter,
     driver_probe=driver_available,
 ):
-    if not _ARTIFACT_GPU_VALIDATED:
-        raise FrostBF16Error(
-            'the corrected 56-head FROST BF16 artifact is disabled pending GPU parity validation'
-        )
     if not bool(cuda_available()):
         raise FrostBF16Error('FROST BF16 requires NVIDIA CUDA')
     capability = tuple(capability_getter())
@@ -137,28 +133,31 @@ class FrostBF16Executor:
     def prepare(self, q, k, v, route, counts, *, layer_index, metadata):
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise FrostBF16Error('FROST BF16 expects rank-4 HND Q/K/V')
-        if q.shape != k.shape or q.shape != v.shape:
-            raise FrostBF16Error('FROST BF16 requires equal Q/K/V shapes')
+        if k.shape != v.shape:
+            raise FrostBF16Error('FROST BF16 requires equal K/V shapes')
         if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
             raise FrostBF16Error('FROST BF16 requires BF16 Q/K/V')
         if not self.allow_cpu_for_tests and not (q.is_cuda and k.is_cuda and v.is_cuda):
             raise FrostBF16Error('FROST BF16 requires CUDA Q/K/V')
         expected = (1, self.spec.heads, self.spec.head_dim)
-        if (int(q.shape[0]), int(q.shape[1]), int(q.shape[3])) != expected:
-            raise FrostBF16Error(
-                'FROST BF16 requires [1,%d,S,%d] Q/K/V, got %s' % (
-                    self.spec.heads,
-                    self.spec.head_dim,
-                    tuple(int(value) for value in q.shape),
+        for name, tensor in (('Q', q), ('K', k), ('V', v)):
+            if (int(tensor.shape[0]), int(tensor.shape[1]), int(tensor.shape[3])) != expected:
+                raise FrostBF16Error(
+                    'FROST BF16 requires [1,%d,S,%d] %s, got %s' % (
+                        self.spec.heads,
+                        self.spec.head_dim,
+                        name,
+                        tuple(int(value) for value in tensor.shape),
+                    )
                 )
-            )
         if q.device != k.device or q.device != v.device:
             raise FrostBF16Error('FROST BF16 Q/K/V devices differ')
         for name, tensor in (('Q', q), ('K', k), ('V', v)):
             _check_sequence_major(name, tensor)
-        sequence = int(q.shape[-2])
-        q_tiles = (sequence + self.spec.q_tile - 1) // self.spec.q_tile
-        kv_tiles = (sequence + self.spec.kv_tile - 1) // self.spec.kv_tile
+        sequence_q = int(q.shape[-2])
+        sequence_kv = int(k.shape[-2])
+        q_tiles = (sequence_q + self.spec.q_tile - 1) // self.spec.q_tile
+        kv_tiles = (sequence_kv + self.spec.kv_tile - 1) // self.spec.kv_tile
         if tuple(route.shape) != (1, self.spec.heads, q_tiles, kv_tiles):
             raise FrostBF16Error('FROST route shape does not match Q/K/V')
         if tuple(counts.shape) != (1, self.spec.heads, q_tiles):
@@ -172,7 +171,7 @@ class FrostBF16Executor:
         if route.device != q.device or counts.device != q.device:
             raise FrostBF16Error('FROST route and Q/K/V devices differ')
         storage = torch.empty(
-            (1, sequence, self.spec.heads, self.spec.head_dim),
+            (1, sequence_q, self.spec.heads, self.spec.head_dim),
             dtype=torch.bfloat16,
             device=q.device,
         )
@@ -234,6 +233,7 @@ class FrostBF16Backend:
             allow_cpu_for_tests=allow_cpu_for_tests,
         )
         self.projector = projector
+        self._streamed_q_announced = False
         if (self.router.q_tile, self.router.kv_tile) != (
             self.spec.q_tile,
             self.spec.kv_tile,
@@ -298,7 +298,64 @@ class FrostBF16Backend:
         )
 
     def execute(self, prepared):
+        from .frost_bf16_streamed import PreparedStreamedFrostBF16
+
+        if isinstance(prepared, PreparedStreamedFrostBF16):
+            raise FrostBF16Error(
+                'streamed FROST BF16 must execute through execute_projected'
+            )
         return self.executor.execute(prepared)
+
+    def prepare_projected(
+        self,
+        projected,
+        *,
+        layer_index,
+        transformer_options,
+    ):
+        from .frost_bf16_streamed import (
+            StreamedFrostBF16QKV,
+            prepare_streamed_frost_bf16,
+        )
+
+        if not isinstance(projected, StreamedFrostBF16QKV):
+            raise FrostBF16Error('FROST BF16 requires streamed BF16 QKV')
+        try:
+            return prepare_streamed_frost_bf16(
+                self,
+                projected,
+                layer_index=layer_index,
+                transformer_options=transformer_options,
+            )
+        except Exception as error:
+            projected.release()
+            raise FrostBF16Error(
+                'streamed FROST BF16 preparation failed'
+            ) from error
+
+    def execute_projected(self, module, prepared):
+        from .frost_bf16_streamed import (
+            PreparedStreamedFrostBF16,
+            execute_streamed_frost_bf16,
+        )
+
+        if not isinstance(prepared, PreparedStreamedFrostBF16):
+            return None
+        try:
+            result = execute_streamed_frost_bf16(module, self, prepared)
+            if not self._streamed_q_announced:
+                self._streamed_q_announced = True
+                logging.info(
+                    '[H3 Optimizations] streamed FROST BF16 ran: '
+                    'global sequence-major K/V, bounded Q/output, chunk_rows=%d',
+                    int(prepared.metadata['query_chunk_rows']),
+                )
+            return result
+        except Exception as error:
+            prepared.release()
+            raise FrostBF16Error(
+                'streamed FROST BF16 execution failed'
+            ) from error
 
     def as_status(self):
         return {
@@ -314,5 +371,11 @@ class FrostBF16Backend:
             'approximate': True,
             'fused_qkv': self.projector is not None,
             'qkv_projector': getattr(self.projector, 'name', None),
+            'streamed_q': bool(getattr(self.projector, 'streamed_q', False)),
+            'qkv_lifetime': (
+                'global_sequence_major_bf16_kv_bounded_q'
+                if getattr(self.projector, 'streamed_q', False)
+                else 'global_sequence_major_bf16_qkv'
+            ),
             'frost_abi': self.spec.abi,
         }

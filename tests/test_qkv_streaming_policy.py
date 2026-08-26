@@ -25,6 +25,7 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_FORCE_BF16_CHUNKED,
     QKV_FORCE_BF16_STREAMED_KITCHEN,
+    QKV_FORCE_CONVROT_INT8_CHUNKED,
     QKV_FORCE_CONVROT_INT8_KITCHEN,
     QKV_FORCE_CONVROT_INT8_TRITON,
     QKV_SPARSE_CONVROT_INT8,
@@ -187,7 +188,7 @@ class QKVStreamingPolicyTests(unittest.TestCase):
                 self.assertEqual(resolved.provider_id, QKV_TRITON_SPARSE_CHUNKED)
                 self.assertIn('BF16 Q/K/V chunks', resolved.reason)
 
-    def test_generic_attention_uses_bounded_projection_for_all_streamable_formats(self):
+    def test_generic_attention_streams_q_for_all_streamable_formats(self):
         for weight in (self.bf16, self.convrot, self.w4a8, self.fp8):
             with self.subTest(layout=weight._layout_cls):
                 resolved = resolve_qkv_provider(
@@ -199,8 +200,35 @@ class QKVStreamingPolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(resolved.provider_id, QKV_BF16_CHUNKED)
                 self.assertFalse(resolved.fused)
-                self.assertIn('bounded token chunks', resolved.reason)
-                self.assertIn('complete BF16 Q/K/V', resolved.reason)
+                self.assertIn('complete BF16 K/V', resolved.reason)
+                self.assertIn('bounded BF16 Q/output', resolved.reason)
+
+    def test_generic_attention_streams_every_declared_precision_matrix_cell(self):
+        requests = (
+            FUSED_QKV_AUTO,
+            FUSED_QKV_FORCE_BF16,
+            FUSED_QKV_PRESERVE_BF16,
+            FUSED_QKV_FORCE_QUANT,
+        )
+        weights = (self.bf16, self.convrot, self.w4a8, self.fp8)
+        for request in requests:
+            for weight in weights:
+                with self.subTest(request=request, layout=weight._layout_cls):
+                    resolved = resolve_qkv_provider(
+                        inventory(weight),
+                        request=request,
+                        backend_kind='existing',
+                        memory_optimize=True,
+                        fp8_available=True,
+                    )
+                    expected = QKV_BF16_CHUNKED
+                    if request == FUSED_QKV_FORCE_BF16:
+                        expected = QKV_FORCE_BF16_CHUNKED
+                    elif request == FUSED_QKV_FORCE_QUANT and weight is self.bf16:
+                        expected = QKV_FORCE_CONVROT_INT8_CHUNKED
+                    self.assertEqual(resolved.provider_id, expected)
+                    self.assertFalse(resolved.fused)
+                    self.assertIn('bounded', resolved.reason)
 
     def test_allow_fp8_still_uses_bounded_native_projection_before_conversion(self):
         for weight in (self.bf16, self.convrot, self.w4a8, self.fp8):
@@ -233,6 +261,32 @@ class QKVStreamingPolicyTests(unittest.TestCase):
                 self.assertIn('materialized as BF16', resolved.reason)
                 self.assertIn('streamed directly', resolved.reason)
 
+    def test_external_kitchen_streams_every_declared_precision_matrix_cell(self):
+        requests = (
+            FUSED_QKV_AUTO,
+            FUSED_QKV_FORCE_BF16,
+            FUSED_QKV_PRESERVE_BF16,
+            FUSED_QKV_FORCE_QUANT,
+        )
+        weights = (self.bf16, self.convrot, self.w4a8, self.fp8)
+        for request in requests:
+            for weight in weights:
+                with self.subTest(request=request, layout=weight._layout_cls):
+                    resolved = resolve_qkv_provider(
+                        inventory(weight),
+                        request=request,
+                        backend_kind='comfy_kitchen_int8',
+                        kitchen_producer_available=True,
+                        memory_optimize=True,
+                        fp8_available=True,
+                    )
+                    expected = QKV_DENSE_KITCHEN_CHUNKED
+                    if request == FUSED_QKV_FORCE_BF16:
+                        expected = QKV_FORCE_BF16_STREAMED_KITCHEN
+                    elif request == FUSED_QKV_FORCE_QUANT and weight is self.bf16:
+                        expected = QKV_FORCE_CONVROT_INT8_KITCHEN
+                    self.assertEqual(resolved.provider_id, expected)
+
     def test_bf16_mode_materializes_full_qkv_without_kitchen_producer(self):
         resolved = resolve_qkv_provider(
             inventory(self.bf16),
@@ -243,17 +297,24 @@ class QKVStreamingPolicyTests(unittest.TestCase):
         self.assertEqual(resolved.provider_id, QKV_FORCE_BF16_CHUNKED)
         self.assertFalse(resolved.fused)
 
-    def test_bf16_mode_streams_native_bf16_q_into_triton(self):
-        resolved = resolve_qkv_provider(
-            inventory(self.bf16),
-            request=FUSED_QKV_FORCE_BF16,
-            backend_kind='triton_sparse_bf16',
-            triton_available=True,
-        )
-        self.assertEqual(resolved.provider_id, QKV_FORCE_BF16_CHUNKED)
-        self.assertTrue(resolved.fused)
-        self.assertIn('retains complete K/V', resolved.reason)
-        self.assertIn('bounded BF16 Q slabs', resolved.reason)
+    def test_bf16_mode_streams_all_supported_sources_into_sparse_consumers(self):
+        for weight in (self.bf16, self.convrot, self.w4a8, self.fp8):
+            for backend_kind in ('sparse_sage', 'triton_sparse_bf16'):
+                with self.subTest(layout=weight._layout_cls, backend=backend_kind):
+                    resolved = resolve_qkv_provider(
+                        inventory(weight),
+                        request=FUSED_QKV_FORCE_BF16,
+                        backend_kind=backend_kind,
+                        triton_available=True,
+                        sparse_spec=sparse_spec(),
+                    )
+                    self.assertEqual(
+                        resolved.provider_id,
+                        QKV_FORCE_BF16_CHUNKED,
+                    )
+                    self.assertTrue(resolved.fused)
+                    self.assertIn('bounded slabs', resolved.reason)
+                    self.assertIn('bounded Q', resolved.reason)
 
     def test_force_quant_converts_plain_qkv_before_native_streaming(self):
         resolved = resolve_qkv_provider(
@@ -332,6 +393,63 @@ class QKVStreamingPolicyTests(unittest.TestCase):
         )
         self.assertEqual(resolved.provider_id, QKV_DENSE_CONVROT_INT8)
         self.assertTrue(resolved.fused)
+
+    def test_known_dense_sage_uses_direct_carriers_for_the_declared_matrix(self):
+        requests = (
+            FUSED_QKV_AUTO,
+            FUSED_QKV_FORCE_BF16,
+            FUSED_QKV_PRESERVE_BF16,
+            FUSED_QKV_FORCE_QUANT,
+        )
+        weights = (self.bf16, self.convrot, self.w4a8, self.fp8)
+        for request in requests:
+            for weight in weights:
+                with self.subTest(request=request, layout=weight._layout_cls):
+                    resolved = resolve_qkv_provider(
+                        inventory(weight),
+                        request=request,
+                        backend_kind='dense_sage_sm89',
+                        triton_available=True,
+                        memory_optimize=True,
+                        fp8_available=True,
+                    )
+                    expected = QKV_BF16_CHUNKED
+                    if request == FUSED_QKV_FORCE_BF16:
+                        expected = QKV_FORCE_BF16_CHUNKED
+                    elif request == FUSED_QKV_FORCE_QUANT and weight is self.bf16:
+                        expected = QKV_FORCE_CONVROT_INT8_CHUNKED
+                    elif weight is self.convrot:
+                        expected = QKV_DENSE_CONVROT_INT8
+                    self.assertEqual(resolved.provider_id, expected)
+                    self.assertTrue(resolved.fused)
+                    self.assertIn('SageAttention native Q/K carrier', resolved.reason)
+
+    def test_dense_sage_direct_carrier_requires_triton(self):
+        resolved = resolve_qkv_provider(
+            inventory(self.bf16),
+            request=FUSED_QKV_AUTO,
+            backend_kind='dense_sage_sm89',
+            triton_available=False,
+            memory_optimize=True,
+        )
+
+        self.assertEqual(resolved.provider_id, QKV_STANDARD)
+        self.assertFalse(resolved.fused)
+        self.assertIn('requires Triton', resolved.reason)
+
+    def test_dense_sage_native_fp8_requires_accelerated_projection(self):
+        resolved = resolve_qkv_provider(
+            inventory(self.fp8),
+            request=FUSED_QKV_AUTO,
+            backend_kind='dense_sage_sm89',
+            triton_available=True,
+            memory_optimize=True,
+            fp8_available=False,
+        )
+
+        self.assertEqual(resolved.provider_id, QKV_STANDARD)
+        self.assertFalse(resolved.fused)
+        self.assertIn('FP8', resolved.reason)
 
     def test_required_does_not_accept_nonfused_bounded_fallback(self):
         with self.assertRaisesRegex(RuntimeError, 'required fused QKV'):

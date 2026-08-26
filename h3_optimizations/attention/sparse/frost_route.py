@@ -22,6 +22,22 @@ def build_full_absolute_route(
         k_summary = router._mean_pool(k, router.kv_tile)
     except Exception as error:
         raise TritonRouteError('FROST route mean pooling failed: %s' % error) from error
+    return build_full_absolute_route_from_summaries(
+        router,
+        q_summary,
+        k_summary,
+        layout,
+        video_budget,
+    )
+
+
+def build_full_absolute_route_from_summaries(
+    router,
+    q_summary,
+    k_summary,
+    layout,
+    video_budget,
+):
     compact, metadata = build_compact_absolute_route(
         router,
         q_summary,
@@ -30,11 +46,11 @@ def build_full_absolute_route(
         video_budget,
     )
     geometry = router.geometry(layout)
-    batch, heads = q.shape[:2]
+    batch, heads = q_summary.shape[:2]
     dense = torch.arange(
         geometry.kv_tiles,
         dtype=torch.int32,
-        device=q.device,
+        device=q_summary.device,
     )
     route = dense.view(1, 1, 1, -1).expand(
         batch,
@@ -46,7 +62,7 @@ def build_full_absolute_route(
         (batch, heads, geometry.q_tiles),
         geometry.kv_tiles,
         dtype=torch.int32,
-        device=q.device,
+        device=q_summary.device,
     )
     if compact.numel():
         start = geometry.pure_video_q_start

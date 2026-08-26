@@ -5,10 +5,11 @@ This directory contains the packaged CUDA cubin used by the explicit
 of NVIDIA's Apache-2.0 `prefill_f16_sm80.py` FROST template, not a wheel-provided
 kernel.
 
-The specialization accepts BF16 H3 Q/K/V tensors in `[1, 56, S, 128]`, a
-full-width absolute int32 block route with int32 row counts, and writes
-sequence-major BF16 output. Query and KV tiles are both 64 tokens.
-Only SM89 is accepted by runtime preflight.
+The specialization accepts BF16 H3 Q in `[1, 56, SQ, 128]`, BF16 K/V in
+`[1, 56, SKV, 128]`, a full-width absolute int32 block route with int32 row
+counts, and writes sequence-major BF16 output. `SQ` and `SKV` may differ, so a
+bounded Q slab can attend the global K/V carrier. Query and KV tiles are both
+64 tokens. Only SM89 is accepted by runtime preflight.
 
 ## Rebuild
 
@@ -36,3 +37,11 @@ head_dim, band, inverse_softmax_scale`.
 The routed derivative drains each matching K/V tile into shared memory before
 computing it. NVIDIA's original cross-iteration prefetch assumes a contiguous
 KV range and is not used by this sparse specialization.
+
+## Validation
+
+The packaged 56-head artifact passed CUDA Driver parity on an RTX 4070 / SM89
+for Q lengths 64, 65, and 129 against 193-row K/V, using both dense and
+noncontiguous absolute routes. Relative L2 error was at most 0.00258 and all
+outputs were finite. The streamed consumer also passed a three-slab
+`64 + 64 + 1` execution against global 129-row K/V with relative L2 0.00258.

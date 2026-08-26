@@ -22,9 +22,6 @@ comfy.options.enable_args_parsing()
 
 from comfy.model_patcher import ModelPatcher  # noqa: E402
 import h3_optimizations.apply as apply_module  # noqa: E402
-from h3_optimizations.dense_resolver import (  # noqa: E402
-    has_explicit_dense_attention,
-)
 from h3_optimizations.memory_migration_node import (  # noqa: E402
     PRECISION_MODE_PRESERVE,
     QKV_STREAMING_MODE_AUTO,
@@ -80,22 +77,14 @@ class ComfyKitchenSelectorStreamingTests(unittest.TestCase):
         model = FakePatcher()
         model.set_model_optimized_attention(kitchen_attention)
 
-        with patch(
-            'h3_optimizations.dense_resolver.get_attention_function',
-            return_value=kitchen_attention,
-        ):
-            explicit = has_explicit_dense_attention(model)
-
-        self.assertFalse(explicit)
         request = _memory_request_for_modes(
             fused_qkv='auto',
             mlp_memory='auto',
             chunk_rows=4096,
             precision_mode=PRECISION_MODE_PRESERVE,
             qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
-            explicit_attention_selected=explicit,
         )
-        self.assertEqual(request.attention, ATTENTION_AUTO)
+        self.assertEqual(request.attention, ATTENTION_EXISTING)
 
         plan = H3OptimizationPlan().with_memory(request)
         with patch(
@@ -118,28 +107,32 @@ class ComfyKitchenSelectorStreamingTests(unittest.TestCase):
             attention.backend.name,
             'comfy_kitchen_int8_prequantized',
         )
-        self.assertIn('upgraded an explicit Comfy Kitchen', attention.reason)
+        self.assertIn('preserved the external Comfy Kitchen', attention.reason)
 
-    def test_non_kitchen_explicit_selector_still_blocks_streaming_auto(self):
+    def test_non_kitchen_explicit_selector_gets_generic_streaming(self):
         model = FakePatcher()
         model.set_model_optimized_attention(pytorch_attention)
-
-        with patch(
-            'h3_optimizations.dense_resolver.get_attention_function',
-            return_value=kitchen_attention,
-        ):
-            explicit = has_explicit_dense_attention(model)
-
-        self.assertTrue(explicit)
         request = _memory_request_for_modes(
             fused_qkv='auto',
             mlp_memory='auto',
             chunk_rows=4096,
             precision_mode=PRECISION_MODE_PRESERVE,
             qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
-            explicit_attention_selected=explicit,
         )
         self.assertEqual(request.attention, ATTENTION_EXISTING)
+        plan = H3OptimizationPlan().with_memory(request)
+        with patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=True,
+        ):
+            attention, _qkv = apply_module._resolve_dense(
+                plan,
+                model,
+                convrot_inventory(),
+            )
+        self.assertEqual(attention.selected, ATTENTION_EXISTING)
+        self.assertEqual(attention.projector.name, 'streamed_dense_bf16_qkv')
 
 
 if __name__ == '__main__':

@@ -40,7 +40,7 @@ from .attention.sparse.kitchen_sparse import (
 from .dense_resolver import (
     install_dense_attention,
     preserve_dense_attention,
-    resolve_command_line_sage_fused_attention,
+    resolve_current_dense_attention,
     resolve_dense_attention,
 )
 from .environment import RuntimeEnvironment
@@ -61,7 +61,6 @@ from .plan import (
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
-    FUSED_QKV_PRESERVE_BF16,
     H3OptimizationPlan,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
@@ -75,10 +74,15 @@ from .plan import (
 )
 from .qkv.bf16 import (
     ChunkedBF16QKVProjector,
-    FrostBF16QKVProjector,
     StreamedDenseBF16QKVProjector,
 )
 from .qkv.formats import inspect_h3_linears
+from .qkv.streamed import (
+    PROJECTION_FORCE_BF16,
+    PROJECTION_FORCE_FP8,
+    PROJECTION_FORCE_INT8,
+    PROJECTION_NATIVE,
+)
 from .qkv.providers import (
     MLP_OFF,
     MLP_PRESERVE_UPSTREAM,
@@ -87,9 +91,11 @@ from .qkv.providers import (
     QKV_FORCE_BF16_CHUNKED,
     QKV_FORCE_BF16_STREAMED_KITCHEN,
     QKV_FORCE_CONVROT_INT8_CHUNKED,
+    QKV_FORCE_CONVROT_INT8_FROST,
     QKV_FORCE_CONVROT_INT8_KITCHEN,
     QKV_FORCE_CONVROT_INT8_TRITON,
     QKV_FORCE_FP8_CHUNKED,
+    QKV_FROST_STREAMED,
     QKV_DENSE_FP8_CHUNKED,
     QKV_DENSE_KITCHEN_CHUNKED,
     QKV_SPARSE_CONVROT_INT8,
@@ -139,14 +145,14 @@ def _bounded_qkv_projector(qkv):
         ),
     )
 
-def _frost_qkv_projector(qkv):
-    return FrostBF16QKVProjector(
+def _frost_qkv_projector(qkv, inventory, spec):
+    from .qkv.projectors import FrostStreamedQKVProjector
+
+    return FrostStreamedQKVProjector(
+        spec,
+        required=bool(qkv.fused),
         chunk_rows=4096,
-        force_weights_bf16=qkv.provider_id == QKV_FORCE_BF16_CHUNKED,
-        force_weights_fp8=qkv.provider_id == QKV_FORCE_FP8_CHUNKED,
-        force_weights_int8=(
-            qkv.provider_id == QKV_FORCE_CONVROT_INT8_CHUNKED
-        ),
+        projection_mode=_streamed_projection_mode(qkv, inventory),
     )
 
 
@@ -157,14 +163,21 @@ def _force_out_proj_int8(plan, inventory):
     )
 
 
-def _native_bf16_qkv(inventory):
-    if not inventory.qkv:
-        return False
-    for item in inventory.qkv:
-        dtype = str(item.logical_dtype).lower()
-        if not item.plain_float or not ('bfloat16' in dtype or 'bf16' in dtype):
-            return False
-    return True
+def _streamed_projection_mode(qkv, inventory):
+    if qkv.provider_id == QKV_FORCE_BF16_CHUNKED:
+        return PROJECTION_FORCE_BF16
+    if qkv.provider_id in (
+        QKV_FORCE_CONVROT_INT8_CHUNKED,
+        QKV_FORCE_CONVROT_INT8_FROST,
+        QKV_FORCE_CONVROT_INT8_TRITON,
+    ):
+        return PROJECTION_FORCE_INT8
+    if (
+        qkv.provider_id == QKV_SPARSE_FP8_CHUNKED
+        and getattr(inventory, 'qkv_plain_float', False)
+    ):
+        return PROJECTION_FORCE_FP8
+    return PROJECTION_NATIVE
 
 @dataclass(frozen=True)
 class ResolvedAttention:
@@ -177,12 +190,11 @@ class ResolvedAttention:
     dense_resolution: object | None = None
 
 
-# Backends that are materially slower than the one that was asked for. A
-# fallback here is not a detail: it roughly halves attention throughput, and it
-# used to be visible only to someone who went looking at the status output.
+# Fallbacks with a measured performance penalty relative to Kitchen INT8.
+# Unlisted fallbacks remain visible without making an unsupported speed claim.
 _SLOW_SPARSE_FALLBACKS = {
-    ATTENTION_TRITON_SPARSE: 'BF16 Triton sparse is slower than the native sparse kernel',
-    ATTENTION_FP8_FLEX: 'FP8 FlexAttention is far slower than the native sparse kernel',
+    ATTENTION_TRITON_SPARSE: 'BF16 Triton attention is slower than Kitchen INT8 in measured H3 runs',
+    ATTENTION_FP8_FLEX: 'FP8 FlexAttention is slower than Kitchen INT8 in measured H3 runs',
 }
 
 
@@ -195,19 +207,27 @@ def _warn_about_slow_paths(attention, qkv):
     requested_sparse = attention.requested in (
         ATTENTION_SPARSE,
         ATTENTION_KITCHEN_SPARSE,
+        ATTENTION_FROST_BF16,
+        ATTENTION_TRITON_SPARSE,
+        ATTENTION_FP8_FLEX,
     )
     if requested_sparse and attention.selected != attention.requested:
-        cost = _SLOW_SPARSE_FALLBACKS.get(
-            attention.selected,
-            'this path is substantially slower than the native sparse kernel',
-        )
-        logging.warning(
-            '%s SPARSE ATTENTION FELL BACK to %s. %s. Reason: %s',
-            LOG_PREFIX,
-            attention.selected,
-            cost,
-            attention.reason or 'unknown',
-        )
+        cost = _SLOW_SPARSE_FALLBACKS.get(attention.selected)
+        if cost is None:
+            logging.warning(
+                '%s SPARSE ATTENTION FELL BACK to %s. Reason: %s',
+                LOG_PREFIX,
+                attention.selected,
+                attention.reason or 'unknown',
+            )
+        else:
+            logging.warning(
+                '%s SPARSE ATTENTION FELL BACK to %s. %s. Reason: %s',
+                LOG_PREFIX,
+                attention.selected,
+                cost,
+                attention.reason or 'unknown',
+            )
 
     # The chunked Comfy Kitchen QKV producer is the fast QKV path. When its
     # Kitchen-side API is missing the pack silently projects the slow way,
@@ -223,6 +243,8 @@ def _warn_about_slow_paths(attention, qkv):
 
 def _qkv_request(plan):
     if plan.memory is not None:
+        if plan.memory.qkv_streaming == QKV_STREAMING_OFF:
+            return FUSED_QKV_OFF
         return plan.memory.fused_qkv
     if plan.sparse is not None:
         return FUSED_QKV_AUTO
@@ -280,6 +302,8 @@ def describe_memory_options(attention):
         installed.append('strided_qk')
     if getattr(projector, 'streamed_q', False):
         installed.append('streamed_q')
+    if getattr(projector, 'consumer_native_carrier', False):
+        installed.append('consumer_native_carrier')
     score_chunk = getattr(
         getattr(backend, 'router', None), 'score_chunk_tiles', None
     )
@@ -290,24 +314,11 @@ def describe_memory_options(attention):
 
 def _resolve_dense(plan, model, inventory, environment=None):
     memory = plan.memory
-    native_fused_sage = (
-        resolve_command_line_sage_fused_attention(model, environment)
-        if (
-            memory is not None
-            and memory.qkv_streaming == QKV_STREAMING_OFF
-            and memory.fused_qkv in (
-                FUSED_QKV_AUTO,
-                FUSED_QKV_PRESERVE_BF16,
-            )
-            and inventory.qkv_convrot_int8_256
-        )
-        else None
-    )
-    dense = native_fused_sage or (
+    dense = (
         preserve_dense_attention('no memory optimization requested')
         if memory is None
         else (
-            preserve_dense_attention('existing dense attention was requested')
+            resolve_current_dense_attention(model, environment)
             if memory.attention == ATTENTION_EXISTING
             else resolve_dense_attention(model)
         )
@@ -328,29 +339,27 @@ def _resolve_dense(plan, model, inventory, environment=None):
     )
     backend = None
     projector = None
-    if qkv.provider_id == QKV_DENSE_CONVROT_INT8:
+    if (
+        dense.backend_kind == 'dense_sage_sm89'
+        and qkv.provider_id != QKV_STANDARD
+    ):
         from .dense_backend import ProjectedSM89SageBackend
         from .dense_fused_qkv import DenseFusedQKVProjector
 
         backend = ProjectedSM89SageBackend(dense.backend)
-        projector = DenseFusedQKVProjector(chunk_rows=memory.chunk_rows)
-    elif (
-        qkv.provider_id == QKV_BF16_CHUNKED
-        and _native_bf16_qkv(inventory)
-    ):
-        # Native BF16 dense attention keeps complete K/V, then feeds bounded Q
-        # slabs to the selected Comfy attention backend and projects each
-        # output slab directly into the disposable block input.
+        projector = DenseFusedQKVProjector(
+            chunk_rows=memory.chunk_rows,
+            projection_mode=_streamed_projection_mode(qkv, inventory),
+        )
+    elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+        # Preserve the selected dense attention while retaining complete BF16
+        # K/V, consuming bounded source-aware Q slabs, and writing each output
+        # projection slab into the disposable block input.
         backend = ChunkedKitchenAttentionBackend()
         projector = StreamedDenseBF16QKVProjector(
             chunk_rows=memory.chunk_rows,
+            projection_mode=_streamed_projection_mode(qkv, inventory),
         )
-    elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
-        # Reuse the package-owned attention-forward slot without changing the
-        # selected dense attention. attention_forward recognizes the BF16
-        # payload and delegates it to the existing Comfy/upstream backend.
-        backend = ChunkedKitchenAttentionBackend()
-        projector = _bounded_qkv_projector(qkv)
     elif qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
         QKV_DENSE_FP8_CHUNKED,
@@ -401,6 +410,7 @@ def _resolve_sparse(plan, environment, inventory):
         fp8_available=_fp8_execution_available(environment),
     )
     use_projected = qkv.provider_id in (
+        QKV_FORCE_BF16_CHUNKED,
         QKV_SPARSE_CONVROT_INT8,
         QKV_SPARSE_FP8_CHUNKED,
     )
@@ -409,23 +419,21 @@ def _resolve_sparse(plan, environment, inventory):
         **_sparse_config_kwargs(plan),
     )
     projector = None
-    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
-        projector = _bounded_qkv_projector(qkv)
-    elif qkv.provider_id == QKV_SPARSE_CONVROT_INT8:
+    if qkv.provider_id in (
+        QKV_FORCE_BF16_CHUNKED,
+        QKV_SPARSE_CONVROT_INT8,
+        QKV_SPARSE_FP8_CHUNKED,
+    ):
         from .qkv.projectors import SparseFusedQKVProjector
 
-        projector = SparseFusedQKVProjector(kernel_spec, chunk_rows=4096)
-    elif qkv.provider_id == QKV_SPARSE_FP8_CHUNKED:
-        from .attention.sparse.fp8_qkv import FP8SparseQKVProjector
-
-        projector = FP8SparseQKVProjector(
+        projector = SparseFusedQKVProjector(
             kernel_spec,
-            required=(
-                _qkv_request(plan) == FUSED_QKV_FORCE_QUANT
-                and inventory.qkv_plain_float
-            ),
+            required=bool(qkv.fused),
             chunk_rows=4096,
+            projection_mode=_streamed_projection_mode(qkv, inventory),
         )
+    elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+        projector = _bounded_qkv_projector(qkv)
     backend = HybridSparseBackend(
         config,
         kernel_spec=kernel_spec,
@@ -456,11 +464,13 @@ def _resolve_frost_bf16(plan, environment, inventory):
         memory_optimize=plan.memory is not None,
         fp8_available=_fp8_execution_available(environment),
     )
-    projector = (
-        _frost_qkv_projector(qkv)
-        if qkv.provider_id in _BOUNDED_QKV_PROVIDERS
-        else None
-    )
+    projector = None
+    if qkv.provider_id in (
+        QKV_FROST_STREAMED,
+        QKV_FORCE_BF16_CHUNKED,
+        QKV_FORCE_CONVROT_INT8_FROST,
+    ):
+        projector = _frost_qkv_projector(qkv, inventory, spec)
     config = HybridSparseConfig(
         mode=MODE_SAGE128,
         **_sparse_config_kwargs(plan),
@@ -472,7 +482,7 @@ def _resolve_frost_bf16(plan, environment, inventory):
     )
     return (
         ResolvedAttention(
-            requested=ATTENTION_SPARSE,
+            requested=ATTENTION_FROST_BF16,
             selected=ATTENTION_FROST_BF16,
             backend=backend,
             reason='explicit FROST BF16 SM89 64Q x 64KV sparse attention',
@@ -520,7 +530,11 @@ def _resolve_fp8_flex(
         dense_resolution = dense_attention.dense_resolution
     return (
         ResolvedAttention(
-            requested=ATTENTION_SPARSE,
+            requested=(
+                ATTENTION_FP8_FLEX
+                if fallback_reason is None
+                else ATTENTION_SPARSE
+            ),
             selected=ATTENTION_FP8_FLEX,
             backend=backend,
             reason=reason,
@@ -549,37 +563,22 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
         mode=MODE_SAGE128,
         **_sparse_config_kwargs(plan),
     )
-    stream_native_bf16 = bool(
-        qkv.provider_id in (
-            QKV_BF16_CHUNKED,
-            QKV_FORCE_BF16_CHUNKED,
-            QKV_TRITON_SPARSE_CHUNKED,
-        )
-        and getattr(inventory, 'qkv_plain_float', False)
-        and _native_bf16_qkv(inventory)
-    )
     projector = None
-    if stream_native_bf16:
-        from .qkv.projectors import TritonSparseQKVProjector
-
-        projector = TritonSparseQKVProjector(
-            chunk_rows=4096,
-            stream_native_bf16=True,
-        )
-    elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
-        projector = _bounded_qkv_projector(qkv)
-    elif qkv.provider_id in (
+    if qkv.provider_id in (
+        QKV_BF16_CHUNKED,
+        QKV_FORCE_BF16_CHUNKED,
         QKV_TRITON_SPARSE_CHUNKED,
         QKV_FORCE_CONVROT_INT8_TRITON,
     ):
         from .qkv.projectors import TritonSparseQKVProjector
 
         projector = TritonSparseQKVProjector(
+            required=bool(qkv.fused),
             chunk_rows=4096,
-            force_weights_int8=(
-                qkv.provider_id == QKV_FORCE_CONVROT_INT8_TRITON
-            ),
+            projection_mode=_streamed_projection_mode(qkv, inventory),
         )
+    elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+        projector = _bounded_qkv_projector(qkv)
     backend = TritonSparseBackend(
         config,
         spec=spec,
@@ -593,7 +592,11 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
     )
     return (
         ResolvedAttention(
-            requested=ATTENTION_SPARSE,
+            requested=(
+                ATTENTION_TRITON_SPARSE
+                if fallback_reason is None
+                else ATTENTION_SPARSE
+            ),
             selected=ATTENTION_TRITON_SPARSE,
             backend=backend,
             reason=reason,
@@ -860,6 +863,9 @@ def _status(
             'reason': qkv.reason,
             'projector': getattr(attention.projector, 'name', None),
             'chunk_rows': getattr(attention.projector, 'chunk_rows', None),
+            'streamed_q': bool(
+                getattr(attention.projector, 'streamed_q', False)
+            ),
             'strided_qk_input': getattr(
                 attention.projector, 'strided_qk_input', None
             ),

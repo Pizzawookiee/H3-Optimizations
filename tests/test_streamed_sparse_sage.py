@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 
@@ -151,6 +152,67 @@ class StreamedSparseSageTests(unittest.TestCase):
         self.assertEqual(projector.chunk_rows, 4096)
         self.assertEqual(projector.query_chunk_rows, 4096)
         self.assertTrue(projector.streamed_q)
+
+    def test_generic_source_projects_and_releases_one_bounded_q_slab(self):
+        calls = []
+
+        class FullQKVHeld:
+            def __enter__(self):
+                calls.append('enter')
+                return self
+
+            def __exit__(self, *_args):
+                calls.append('exit')
+
+            def project_hnd(self, x, _rope, start, end):
+                calls.append(('project', start, end))
+                rows = end - start
+                q = (
+                    x[start:end]
+                    .reshape(rows, 2, 128)
+                    .transpose(0, 1)
+                    .unsqueeze(0)
+                    .contiguous()
+                )
+                return q, q + 1, q + 2
+
+        x = torch.arange(64 * 256, dtype=torch.float32).reshape(64, 256)
+        projected = SimpleNamespace(
+            module=SimpleNamespace(qkv_proj=object()),
+            x=x,
+            rope_freqs=None,
+            projection_mode='native',
+        )
+        q_int8 = torch.empty((1, 2, 64, 128), dtype=torch.int8)
+        q_scale = torch.empty((1, 2, 1), dtype=torch.float32)
+        q_summary = torch.empty((1, 2, 1, 128), dtype=torch.float32)
+
+        def factory(_module, _sample, mode):
+            calls.append(('factory', mode))
+            return FullQKVHeld()
+
+        with mock.patch.object(
+            streamed,
+            'describe_linear',
+            return_value=SimpleNamespace(convrot_int8_256=False),
+        ):
+            streamed._project_streamed_q_into(
+                projected,
+                0,
+                64,
+                q_int8,
+                q_scale,
+                q_summary,
+                block_size=128,
+                held_factory=factory,
+                packer=cpu_packer,
+            )
+
+        self.assertEqual(
+            calls,
+            [('factory', 'native'), 'enter', ('project', 0, 64), 'exit'],
+        )
+        self.assertEqual(tuple(q_int8.shape), (1, 2, 64, 128))
 
 
 if __name__ == '__main__':

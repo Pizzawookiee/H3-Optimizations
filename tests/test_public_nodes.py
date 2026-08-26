@@ -90,40 +90,25 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(_qkv_streaming_request(QKV_STREAMING_MODE_AUTO), QKV_STREAMING_AUTO)
         self.assertEqual(_qkv_streaming_request(QKV_STREAMING_MODE_FORCED), QKV_STREAMING_FORCED)
 
-    def test_streaming_auto_claims_unselected_attention(self):
+    def test_streaming_auto_preserves_current_attention(self):
         request = _memory_request_for_modes(
             fused_qkv='auto',
             mlp_memory='auto',
             chunk_rows=2048,
             precision_mode=PRECISION_MODE_PRESERVE_NATIVE,
             qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
-            explicit_attention_selected=False,
-        )
-        self.assertEqual(request.attention, ATTENTION_AUTO)
-        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
-        self.assertEqual(request.qkv_streaming, QKV_STREAMING_AUTO)
-
-    def test_streaming_auto_yields_to_explicit_attention(self):
-        request = _memory_request_for_modes(
-            fused_qkv='auto',
-            mlp_memory='auto',
-            chunk_rows=2048,
-            precision_mode=PRECISION_MODE_PRESERVE_NATIVE,
-            qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
-            explicit_attention_selected=True,
         )
         self.assertEqual(request.attention, ATTENTION_EXISTING)
         self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_AUTO)
 
-    def test_streaming_forced_claims_attention_even_when_explicit(self):
+    def test_streaming_forced_claims_attention(self):
         request = _memory_request_for_modes(
             fused_qkv='auto',
             mlp_memory='auto',
             chunk_rows=2048,
             precision_mode=PRECISION_MODE_PRESERVE_NATIVE,
             qkv_streaming_mode=QKV_STREAMING_MODE_FORCED,
-            explicit_attention_selected=True,
         )
         self.assertEqual(request.attention, ATTENTION_AUTO)
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_FORCED)
@@ -169,7 +154,7 @@ class PublicNodeTests(unittest.TestCase):
                     values,
                 )
 
-    def test_streaming_off_allows_bounded_qkv_when_precision_is_not_preserved(self):
+    def test_streaming_off_remains_authoritative_over_precision_policy(self):
         request = _memory_request_for_modes(
             fused_qkv='auto',
             mlp_memory='auto',

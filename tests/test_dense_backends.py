@@ -177,6 +177,63 @@ class DenseBackendTests(unittest.TestCase):
         self.assertTrue(torch.all(prepared.v[:, :, 256:] == 23))
         self.assertEqual(prepared.layer_index, 7)
 
+    def test_dense_sage_projector_holds_source_binding_into_native_carrier(self):
+        class HeldQKV:
+            def __init__(self):
+                self.calls = []
+                self.released = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                self.released = True
+                return False
+
+            def project_hnd(self, _x, _rope, start, stop):
+                self.calls.append((start, stop))
+                shape = (1, 2, stop - start, 128)
+                value = torch.zeros(shape, dtype=torch.bfloat16)
+                return value, value, value
+
+        def quantizer(q, k, _km, **_kwargs):
+            length = int(q.shape[2])
+            return (
+                torch.zeros_like(q, dtype=torch.int8),
+                torch.ones((1, 2, ((length + 127) // 128) * 32)),
+                torch.zeros_like(k, dtype=torch.int8),
+                torch.ones((1, 2, ((length + 63) // 64) * 4)),
+            )
+
+        held = HeldQKV()
+        projector = DenseFusedQKVProjector(
+            chunk_rows=128,
+            quantizer=quantizer,
+            projection_mode='force_bf16',
+            allow_cpu_for_tests=True,
+        )
+        module = type('Attention', (), {'heads': 2, 'head_dim': 128})()
+        source = torch.empty((257, 4), dtype=torch.bfloat16)
+        with mock.patch(
+            'h3_optimizations.qkv.streamed.create_held_qkv',
+            return_value=held,
+        ) as factory:
+            prepared = projector.project(
+                module,
+                source,
+                None,
+                layer_index=7,
+                transformer_options={},
+            )
+
+        factory.assert_called_once()
+        self.assertIs(factory.call_args.args[0], module)
+        self.assertIs(factory.call_args.args[1]._base, source)
+        self.assertEqual(factory.call_args.args[2], 'force_bf16')
+        self.assertEqual(held.calls, [(0, 128), (128, 256), (256, 257)])
+        self.assertTrue(held.released)
+        self.assertEqual(prepared.qk_format, 'sage_per_thread_int8')
+
     def test_sm89_resolves_extension_alias_used_by_public_dispatcher(self):
         kernel = FakeKernel(expected_granularity=3)
         extension = type('WheelExtension', (), {

@@ -60,15 +60,19 @@ class PreparedStreamedDenseBF16QKV:
     rope_freqs: torch.Tensor | None
     held: object
     chunk_rows: int
+    projection_mode: str
 
     @property
     def sequence(self):
         return int(self.k.shape[-2])
 
     def stream_q(self):
+        from .streamed import project_q_hnd
+
         for start in range(0, self.sequence, self.chunk_rows):
             end = min(start + self.chunk_rows, self.sequence)
-            yield start, end, self.held.project_q_hnd(
+            yield start, end, project_q_hnd(
+                self.held,
                 self.x, self.rope_freqs, start, end
             )
 
@@ -380,49 +384,26 @@ class ChunkedBF16QKVProjector:
             return None
 
 
-class FrostBF16QKVProjector(ChunkedBF16QKVProjector):
-    """Produce HND views over FROST's native sequence-major storage."""
-
-    name = 'frost_bf16_qkv'
-
-    def project(self, module, x, rope_freqs):
-        self._validate(module, x, rope_freqs)
-        sequence = int(x.shape[0])
-        storage_shape = (
-            1,
-            sequence,
-            int(module.heads),
-            int(module.head_dim),
-        )
-        q_storage = torch.empty(storage_shape, dtype=torch.bfloat16, device=x.device)
-        k_storage = torch.empty(storage_shape, dtype=torch.bfloat16, device=x.device)
-        v_storage = torch.empty(storage_shape, dtype=torch.bfloat16, device=x.device)
-        q_full, k_full, v_full = (
-            tensor.permute(0, 2, 1, 3)
-            for tensor in (q_storage, k_storage, v_storage)
-        )
-
-        def consume(start, end, q, k, v):
-            q_full[:, :, start:end, :].copy_(q)
-            k_full[:, :, start:end, :].copy_(k)
-            v_full[:, :, start:end, :].copy_(v)
-
-        self.stream(module, x, rope_freqs, consume)
-        return PreparedBF16QKV(q=q_full, k=k_full, v=v_full)
-
-
 class StreamedDenseBF16QKVProjector(ChunkedBF16QKVProjector):
-    """Keep full BF16 K/V while projecting and consuming Q in bounded slabs."""
+    """Keep full BF16 K/V while consuming source-aware Q in bounded slabs."""
 
     name = 'streamed_dense_bf16_qkv'
 
-    def __init__(self, chunk_rows=CHUNK_ROWS, *, allow_cpu_for_tests=False):
+    def __init__(
+        self,
+        chunk_rows=CHUNK_ROWS,
+        *,
+        projection_mode="native",
+        allow_cpu_for_tests=False,
+    ):
         super().__init__(chunk_rows)
+        self.projection_mode = projection_mode
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
+        self.streamed_q = True
 
     @property
     def installation_signature(self):
-        return (self.name, self.chunk_rows)
+        return (self.name, self.chunk_rows, self.projection_mode)
 
     def _validate(self, module, x, rope_freqs):
         fmt = super()._validate(
@@ -437,25 +418,81 @@ class StreamedDenseBF16QKVProjector(ChunkedBF16QKVProjector):
             raise BF16QKVBindingError(
                 'streamed dense BF16 QKV requires apply_rope_split_half1_'
             )
+        from .streamed import (
+            PROJECTION_FORCE_BF16,
+            PROJECTION_FORCE_FP8,
+            PROJECTION_FORCE_INT8,
+            PROJECTION_MODES,
+            PROJECTION_NATIVE,
+        )
+
+        if self.projection_mode not in PROJECTION_MODES:
+            raise ValueError(
+                'unknown streamed dense QKV projection mode %r'
+                % self.projection_mode
+            )
         dtype = str(getattr(fmt, 'logical_dtype', '')).lower()
-        if not fmt.plain_float or not ('bfloat16' in dtype or 'bf16' in dtype):
+        native_supported = bool(
+            fmt.convrot_int8_256
+            or fmt.w4a8
+            or fmt.fp8
+            or (
+                fmt.plain_float
+                and ('bfloat16' in dtype or 'bf16' in dtype)
+            )
+        )
+        if self.projection_mode == PROJECTION_NATIVE and not native_supported:
             raise BF16QKVBindingError(
-                'streamed dense BF16 QKV requires native BF16 weights'
+                'streamed dense QKV does not support native %s weights'
+                % fmt.label
+            )
+        if self.projection_mode in (
+            PROJECTION_FORCE_FP8,
+            PROJECTION_FORCE_INT8,
+        ) and not fmt.plain_float:
+            raise BF16QKVBindingError(
+                '%s streamed dense QKV requires floating source weights'
+                % self.projection_mode
+            )
+        if self.projection_mode == PROJECTION_FORCE_BF16 and not _streamable_format(fmt):
+            raise BF16QKVBindingError(
+                'BF16 streamed dense QKV does not support %s' % fmt.label
             )
         return fmt
 
     def project(self, module, x, rope_freqs):
-        self._validate(module, x, rope_freqs)
+        fmt = self._validate(module, x, rope_freqs)
+        from .streamed import PROJECTION_NATIVE, create_held_qkv
+
         sequence = int(x.shape[0])
         shape = (1, int(module.heads), sequence, int(module.head_dim))
         k_full = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
         v_full = torch.empty(shape, dtype=torch.bfloat16, device=x.device)
-        held = HeldBF16QKV(module, x[:1])
+        dtype = str(getattr(fmt, 'logical_dtype', '')).lower()
+        held = (
+            HeldBF16QKV(module, x[:1])
+            if (
+                self.projection_mode == PROJECTION_NATIVE
+                and fmt.plain_float
+                and ('bfloat16' in dtype or 'bf16' in dtype)
+            )
+            else create_held_qkv(module, x[:1], self.projection_mode)
+        )
         held.__enter__()
         try:
             for start in range(0, sequence, self.chunk_rows):
                 end = min(start + self.chunk_rows, sequence)
-                k, v = held.project_kv_hnd(x, rope_freqs, start, end)
+                project_kv = getattr(held, 'project_kv_hnd', None)
+                if callable(project_kv):
+                    k, v = project_kv(x, rope_freqs, start, end)
+                else:
+                    q, k, v = held.project_hnd(
+                        x,
+                        rope_freqs,
+                        start,
+                        end,
+                    )
+                    del q
                 k_full[:, :, start:end, :].copy_(k)
                 v_full[:, :, start:end, :].copy_(v)
                 del k, v
@@ -466,6 +503,7 @@ class StreamedDenseBF16QKVProjector(ChunkedBF16QKVProjector):
                 rope_freqs=rope_freqs,
                 held=held,
                 chunk_rows=self.chunk_rows,
+                projection_mode=self.projection_mode,
             )
         except Exception:
             held.__exit__(None, None, None)

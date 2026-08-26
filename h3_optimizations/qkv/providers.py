@@ -25,6 +25,7 @@ QKV_FORCE_QUANT_CHUNKED = QKV_FORCE_FP8_CHUNKED
 QKV_FORCE_CONVROT_INT8_CHUNKED = 'force_convrot_int8_qkv'
 QKV_FORCE_CONVROT_INT8_KITCHEN = 'force_convrot_int8_kitchen_qkv'
 QKV_FORCE_CONVROT_INT8_TRITON = 'force_convrot_int8_triton_qkv'
+QKV_FORCE_CONVROT_INT8_FROST = 'force_convrot_int8_frost_qkv'
 QKV_DENSE_CONVROT_INT8 = 'convrot_int8_dense_sage'
 QKV_DENSE_KITCHEN_CHUNKED = 'chunked_kitchen_qkv'
 QKV_STREAMED_BF16_KITCHEN = 'streamed_bf16_kitchen_qkv'
@@ -35,6 +36,7 @@ QKV_SPARSE_FP8_CHUNKED = 'chunked_fp8_sparse_sage'
 QKV_SPARSE_W4A8_CHUNKED = QKV_SPARSE_FP8_CHUNKED
 QKV_TRITON_SPARSE_CHUNKED = 'chunked_triton_bf16_sparse'
 QKV_TRITON_W4A8_CHUNKED = QKV_TRITON_SPARSE_CHUNKED
+QKV_FROST_STREAMED = 'streamed_frost_bf16_qkv'
 
 MLP_OFF = 'off'
 MLP_PRESERVE_UPSTREAM = 'preserve_upstream_mlp'
