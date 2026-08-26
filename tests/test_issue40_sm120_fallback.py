@@ -29,41 +29,33 @@ sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 class Issue40SM120FallbackTests(unittest.TestCase):
-    def test_sm120_selects_static_loop_triton_backend(self):
+    def test_sm120_selects_portable_bf16_triton_backend(self):
         sentinel = object()
         with mock.patch.object(
-            triton_sparse.torch.cuda,
-            'get_device_capability',
-            return_value=(12, 0),
-        ), mock.patch.object(
             triton_sparse,
-            'SM120TritonKitchenBackend',
+            'TritonBF16Backend',
             return_value=sentinel,
         ) as backend:
             actual = triton_sparse.TritonSparseBackend('config', projector='p')
         self.assertIs(actual, sentinel)
         backend.assert_called_once_with('config', projector='p')
 
-    def test_non_sm120_keeps_normal_kitchen_parity_backend(self):
+    def test_sm89_uses_the_same_portable_bf16_backend(self):
         sentinel = object()
         with mock.patch.object(
-            triton_sparse.torch.cuda,
-            'get_device_capability',
-            return_value=(8, 9),
-        ), mock.patch.object(
             triton_sparse,
-            'TritonKitchenBackend',
+            'TritonBF16Backend',
             return_value=sentinel,
         ) as backend:
             actual = triton_sparse.TritonSparseBackend('config', projector='p')
         self.assertIs(actual, sentinel)
         backend.assert_called_once_with('config', projector='p')
 
-    def test_triton_preflight_keeps_legacy_capability_contract(self):
+    def test_triton_preflight_uses_bf16_capability_contract(self):
         sentinel = object()
         with mock.patch.object(
-            triton_sparse._legacy,
-            'preflight_triton_sparse',
+            triton_sparse,
+            'preflight_triton_bf16',
             return_value=sentinel,
         ):
             actual = triton_sparse.preflight_triton_sparse(

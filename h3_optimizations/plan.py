@@ -61,7 +61,8 @@ MLP_MEMORY_REQUESTS = (
 
 SPARSE_BACKEND_AUTO = 'auto'
 SPARSE_BACKEND_SAGE = 'Sparse Sage'
-SPARSE_BACKEND_TRITON = 'INT8 Triton'
+SPARSE_BACKEND_TRITON = 'BF16 Triton'
+SPARSE_BACKEND_TRITON_LEGACY = 'INT8 Triton'
 SPARSE_BACKEND_FLEX = 'FP8 FlexAttention'
 SPARSE_BACKEND_FROST = 'FROST BF16 (SM89)'
 SPARSE_BACKEND_KITCHEN = 'Kitchen INT8'
@@ -89,6 +90,7 @@ SPARSE_BACKEND_REQUESTS = (
 SPARSE_BACKEND_COMPAT_REQUESTS = (
     *SPARSE_BACKEND_REQUESTS,
     SPARSE_BACKEND_KITCHEN_LEGACY,
+    SPARSE_BACKEND_TRITON_LEGACY,
 )
 SPARSE_BACKEND_PUBLIC_REQUESTS = (
     SPARSE_BACKEND_KITCHEN,
@@ -236,6 +238,8 @@ class SparseRequest:
         _validate_sparse_budget('video_budget', self.video_budget)
         if self.backend == SPARSE_BACKEND_KITCHEN_LEGACY:
             object.__setattr__(self, 'backend', SPARSE_BACKEND_KITCHEN)
+        if self.backend == SPARSE_BACKEND_TRITON_LEGACY:
+            object.__setattr__(self, 'backend', SPARSE_BACKEND_TRITON)
         if self.backend not in SPARSE_BACKEND_REQUESTS:
             raise ValueError('unknown sparse backend request %r' % self.backend)
         if self.routing_mode not in ROUTING_MODES:

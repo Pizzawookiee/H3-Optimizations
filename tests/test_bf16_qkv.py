@@ -413,7 +413,7 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         backend_kinds = (
             'existing',
             'sparse_sage',
-            'triton_sparse_int8',
+            'triton_sparse_bf16',
             'flex_attention_fp8',
         )
         for backend_kind in backend_kinds:

@@ -4,7 +4,7 @@ The Triton kernel and launch ladder are copied unchanged from:
 
     PlagueKind/ComfyUI-PlagueKind-Nodes
     ComfyUI-H3-SLA-Attention/sla/kernel.py
-    commit 6ca3037bd16dc143b6d461c67c87a28ca8074063
+    commit a05db58981fec697bd3644229b215ee04c126ea7
 
 Copyright (c) 2026 PlagueKind, distributed under the MIT License. The source
 declares that its forward kernel is vendored and reduced from LightX2V's
@@ -28,7 +28,7 @@ from h3_optimizations.attention.sparse.router import SparseTileRouter
 from h3_optimizations.runtime.context import get_runtime_snapshot
 
 
-PLAGUEKIND_SOURCE_COMMIT = '6ca3037bd16dc143b6d461c67c87a28ca8074063'
+PLAGUEKIND_SOURCE_COMMIT = 'a05db58981fec697bd3644229b215ee04c126ea7'
 
 
 @triton.jit

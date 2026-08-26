@@ -22,7 +22,7 @@ import torch  # noqa: E402
 from h3_optimizations.attention.sparse.triton_qkv import (  # noqa: E402
     pack_float_qkv,
 )
-from h3_optimizations.attention.sparse.triton_sparse import (  # noqa: E402
+from h3_optimizations.attention.sparse.triton_sparse_fast import (  # noqa: E402
     TritonSparseBackend,
     TritonSparseError,
     TritonSparseExecutor,

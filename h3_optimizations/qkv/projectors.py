@@ -99,16 +99,11 @@ class SparseFusedQKVProjector:
 
 
 class TritonSparseQKVProjector:
-    """Produce the exact Kitchen carrier consumed by the Triton fallback.
-
-    The old fallback had its own coarse block-INT8 carrier. 64x64 numerical
-    parity requires that projection/quantization stop being backend-specific,
-    so this compatibility wrapper keeps the existing provider ID and public
-    projector name while delegating to the Kitchen producer.
-    """
+    """Stream bounded projection chunks into the final BF16 HND carrier."""
 
     name = "chunked_triton_sparse_qkv"
-    qk_format = "kitchen_per_thread_int8"
+    qk_format = "bf16_hnd"
+    streamed_qkv = True
 
     def __init__(
         self,
@@ -116,29 +111,21 @@ class TritonSparseQKVProjector:
         chunk_rows=4096,
         v_scale_group_size=None,
     ):
-        from ..attention.sparse.triton_qkv import normalize_v_scale_group_size
-        from ..kitchen_qkv import ChunkedKitchenQKVProjector
+        from .bf16 import ChunkedBF16QKVProjector
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
-        requested_group = normalize_v_scale_group_size(v_scale_group_size)
-        if requested_group != 1:
+        if v_scale_group_size is not None:
             raise ValueError(
-                'Kitchen-parity Triton uses Kitchen per-channel V scaling; '
-                'H3_TRITON_V_SCALE_GROUP must be 1'
+                'BF16 Triton does not use an INT8 V scale group'
             )
-        self.v_scale_group_size = 1
-        self._implementation = ChunkedKitchenQKVProjector(
-            chunk_rows=self.chunk_rows,
-            routing_summaries=True,
-            q_tile=64,
-            kv_tile=64,
-            strided_qk_input=True,
+        self._implementation = ChunkedBF16QKVProjector(
+            chunk_rows=self.chunk_rows
         )
 
     @property
     def v_format(self):
-        return "kitchen_per_channel_permuted_int8"
+        return "bf16_hnd"
 
     @property
     def installation_signature(self):
@@ -146,10 +133,28 @@ class TritonSparseQKVProjector:
             self.name,
             self.qk_format,
             self.v_format,
-            self.v_scale_group_size,
             bool(self.required),
             self._implementation.installation_signature,
         )
+
+    def stream(self, module, x, rope_freqs, consume_chunk):
+        actual = describe_linear(module.qkv_proj)
+        if not _bf16_streamable(actual):
+            return _unsupported(
+                self.required,
+                "QKV format is %s" % actual.label,
+            )
+        try:
+            return self._implementation.stream(
+                module,
+                x,
+                rope_freqs,
+                consume_chunk,
+            )
+        except Exception as exc:
+            if is_fused_weight_format_error(exc):
+                return _unsupported(self.required, str(exc))
+            raise
 
     def try_project(
         self,
@@ -177,7 +182,7 @@ class TritonSparseQKVProjector:
             if projected is None:
                 return _unsupported(
                     self.required,
-                    "Kitchen INT8 producer is unavailable at runtime",
+                    "bounded BF16 QKV projection is unavailable at runtime",
                 )
             return projected
         except Exception as exc:

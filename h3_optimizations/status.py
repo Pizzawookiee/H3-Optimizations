@@ -181,8 +181,8 @@ def format_sparse_status(model):
     reason = str(attention.get('reason') or '').strip()
     if selected == 'sparse_sage':
         attention_line = 'Attention: Sparse Sage'
-    elif selected == 'triton_sparse_int8':
-        attention_line = 'Attention: INT8 Triton Sparse'
+    elif selected == 'triton_sparse_bf16':
+        attention_line = 'Attention: BF16 Triton Sparse'
     elif selected == 'flex_attention_fp8':
         attention_line = 'Attention: FP8 FlexAttention'
     elif selected == 'frost_bf16_sm89':
@@ -228,6 +228,14 @@ def format_sparse_status(model):
     qkv_index = next(
         index for index, line in enumerate(lines) if line.startswith('QKV:')
     )
+    if qkv.get('provider') in (
+        'convrot_int8_sparse_sage',
+        'chunked_fp8_sparse_sage',
+        'chunked_triton_bf16_sparse',
+    ):
+        lines[qkv_index] += ' (%d-row chunks)' % int(
+            qkv.get('chunk_rows') or 4096
+        )
     lines[qkv_index] = _mark_runtime_fallback(qkv, lines[qkv_index])
 
     early_steps = sparse.get('early_steps')

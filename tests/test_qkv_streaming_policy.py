@@ -174,7 +174,7 @@ class QKVStreamingPolicyTests(unittest.TestCase):
                 resolved = resolve_qkv_provider(
                     inventory(weight),
                     request=FUSED_QKV_PRESERVE_BF16,
-                    backend_kind='triton_sparse_int8',
+                    backend_kind='triton_sparse_bf16',
                     triton_available=True,
                     fp8_available=True,
                 )

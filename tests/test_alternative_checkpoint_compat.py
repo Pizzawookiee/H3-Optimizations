@@ -165,7 +165,7 @@ class AlternativeCheckpointCompatibilityTests(unittest.TestCase):
         triton = resolve_qkv_provider(
             inventory,
             request='auto',
-            backend_kind='triton_sparse_int8',
+            backend_kind='triton_sparse_bf16',
             triton_available=True,
             memory_optimize=False,
             fp8_available=False,

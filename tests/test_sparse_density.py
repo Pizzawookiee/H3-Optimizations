@@ -218,7 +218,7 @@ def test_advanced_node_schema_and_request():
             'Kitchen INT8',
             'FROST BF16 (SM89)',
             'Sparse Sage',
-            'INT8 Triton',
+            'BF16 Triton',
             'FP8 FlexAttention',
         ],
         'advanced backend selector exposes the supported sparse backends',
@@ -251,14 +251,14 @@ def test_advanced_node_schema_and_request():
             early_kv=0.6,
             late_steps=4,
             late_kv=0.7,
-            backend='INT8 Triton',
+            backend='BF16 Triton',
             routing_mode='Fresh random (test)',
             routing_seed=1234,
         )
     request = apply.call_args.args[1].sparse
     check(
         result.args[0] is patched
-        and request.backend == 'INT8 Triton'
+        and request.backend == 'BF16 Triton'
         and request.video_budget == 0.3
         and request.early_steps == 3
         and request.early_kv == 0.6
