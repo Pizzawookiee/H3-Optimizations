@@ -83,7 +83,7 @@ class TritonBF16Tests(unittest.TestCase):
             plain_float=True,
         )
         with mock.patch.object(projector_module, 'describe_linear', return_value=fmt):
-            self.assertTrue(projector.stream(module, 'x', 'rope', consume))
+            self.assertIsNone(projector.stream(module, 'x', 'rope', consume))
         projector._implementation.stream.assert_called_once_with(
             module, 'x', 'rope', consume
         )
@@ -124,6 +124,17 @@ class TritonBF16Tests(unittest.TestCase):
         self.assertLess(kernel.index('v = tl.load('), kernel.index('tile_max ='))
         self.assertIn('tl.dot(probability.to(v.dtype), v)', kernel)
         self.assertNotIn('int8', kernel.lower())
+
+    def test_kernel_supports_strided_hnd_without_full_contiguous_copies(self):
+        source = (
+            PACK / 'h3_optimizations' / 'attention' / 'sparse' / 'triton_bf16.py'
+        ).read_text(encoding='utf-8')
+        self.assertIn('stride_qh: tl.constexpr', source)
+        self.assertIn('stride_kn: tl.constexpr', source)
+        self.assertIn('stride_vn: tl.constexpr', source)
+        self.assertNotIn('prepared.q.contiguous()', source)
+        self.assertNotIn('prepared.k.contiguous()', source)
+        self.assertNotIn('prepared.v.contiguous()', source)
 
 
 if __name__ == '__main__':

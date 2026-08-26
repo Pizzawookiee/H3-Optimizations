@@ -90,8 +90,8 @@ def _validate_qkv(q, k, v):
         raise TritonBF16Error('BF16 Triton requires BF16 Q/K/V')
     if q.device != k.device or q.device != v.device or not q.is_cuda:
         raise TritonBF16Error('BF16 Triton requires CUDA Q/K/V on one device')
-    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-        raise TritonBF16Error('BF16 Triton requires contiguous HND Q/K/V')
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise TritonBF16Error('BF16 Triton requires contiguous head dimensions')
 
 
 def _compact_route(lut, valid, metadata):
@@ -139,6 +139,12 @@ if TRITON_AVAILABLE:
         sequence,
         Q_BLOCK_START,
         Q_BLOCK_COUNT,
+        stride_qh: tl.constexpr,
+        stride_qn: tl.constexpr,
+        stride_kh: tl.constexpr,
+        stride_kn: tl.constexpr,
+        stride_vh: tl.constexpr,
+        stride_vn: tl.constexpr,
         N_SELECTED: tl.constexpr,
         USE_ROUTE: tl.constexpr,
         softmax_scale: tl.constexpr,
@@ -154,10 +160,8 @@ if TRITON_AVAILABLE:
         kv_rows = tl.arange(0, KV_TILE_)
         dims = tl.arange(0, D)
         q_mask = q_rows < sequence
-        hnd_base = bh * sequence * D
-
         q = tl.load(
-            Q + hnd_base + q_rows[:, None] * D + dims[None, :],
+            Q + bh * stride_qh + q_rows[:, None] * stride_qn + dims[None, :],
             mask=q_mask[:, None],
             other=0.0,
         )
@@ -177,14 +181,14 @@ if TRITON_AVAILABLE:
             k_rows = key_block * KV_TILE_ + kv_rows
             k_mask = k_rows < sequence
             k = tl.load(
-                K + hnd_base + k_rows[None, :] * D + dims[:, None],
+                K + bh * stride_kh + k_rows[None, :] * stride_kn + dims[:, None],
                 mask=k_mask[None, :],
                 other=0.0,
             )
             logits = tl.dot(q, k) * (softmax_scale * 1.4426950408889634)
             logits = tl.where(k_mask[None, :], logits, -float('inf'))
             v = tl.load(
-                V + hnd_base + k_rows[:, None] * D + dims[None, :],
+                V + bh * stride_vh + k_rows[:, None] * stride_vn + dims[None, :],
                 mask=k_mask[:, None],
                 other=0.0,
             )
@@ -201,7 +205,7 @@ if TRITON_AVAILABLE:
             row_max = new_row_max
 
         tl.store(
-            O + hnd_base + q_rows[:, None] * D + dims[None, :],
+            O + (bh * sequence + q_rows[:, None]) * D + dims[None, :],
             (output / row_sum[:, None]).to(O.type.element_ty),
             mask=q_mask[:, None],
         )
@@ -229,7 +233,11 @@ def _launch(prepared):
     ):
         raise TritonBF16Error('prepared BF16 Triton sparse LUT is invalid')
 
-    output = torch.empty_like(prepared.q)
+    output = torch.empty(
+        prepared.q.shape,
+        dtype=prepared.q.dtype,
+        device=prepared.q.device,
+    )
 
     def launch_group(q_start, q_count, selected, use_route):
         if not q_count:
@@ -243,6 +251,12 @@ def _launch(prepared):
             sequence,
             q_start,
             q_count,
+            stride_qh=prepared.q.stride(1),
+            stride_qn=prepared.q.stride(2),
+            stride_kh=prepared.k.stride(1),
+            stride_kn=prepared.k.stride(2),
+            stride_vh=prepared.v.stride(1),
+            stride_vn=prepared.v.stride(2),
             N_SELECTED=selected,
             USE_ROUTE=use_route,
             softmax_scale=HEAD_DIM**-0.5,

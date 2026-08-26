@@ -145,13 +145,12 @@ class TritonSparseQKVProjector:
                 "QKV format is %s" % actual.label,
             )
         try:
-            self._implementation.stream(
+            return self._implementation.stream(
                 module,
                 x,
                 rope_freqs,
                 consume_chunk,
             )
-            return True
         except Exception as exc:
             if is_fused_weight_format_error(exc):
                 return _unsupported(self.required, str(exc))

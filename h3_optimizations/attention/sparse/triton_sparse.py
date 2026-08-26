@@ -32,7 +32,6 @@ TritonSparseBackend.name = TritonBF16Backend.name
 
 def preflight_triton_sparse(**kwargs):
     '''Validate the portable BF16 Triton fallback.'''
-    kwargs.pop('v_scale_group_size', None)
     return preflight_triton_bf16(**kwargs)
 
 
