@@ -1,4 +1,4 @@
-'''Compact fixed-density routes for the INT8 Triton sparse backend.'''
+'''Compact fixed-density routes for the BF16 Triton sparse backend.'''
 
 import torch
 

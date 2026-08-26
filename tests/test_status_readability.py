@@ -55,6 +55,40 @@ class QKVStatusReadabilityTests(unittest.TestCase):
         )
         self.assertNotIn('streamed_bf16_kitchen_qkv', text)
 
+    def test_auto_kitchen_success_is_not_labeled_as_fallback(self):
+        status = dict(self.status)
+        status['attention'] = {
+            'selected': 'sparse_kitchen_int8',
+            'reason': 'native Kitchen INT8 64Q x 64KV sparse attention',
+        }
+        status['sparse'] = {'backend': 'auto', 'video_budget': 0.3}
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: status},
+            }
+        )
+
+        text = format_sparse_status(model)
+
+        self.assertNotIn('Sparse fallback:', text)
+
+    def test_auto_sparse_sage_is_labeled_as_fallback(self):
+        status = dict(self.status)
+        status['attention'] = {
+            'selected': 'sparse_sage',
+            'reason': 'Kitchen INT8 unavailable: synthetic',
+        }
+        status['sparse'] = {'backend': 'auto', 'video_budget': 0.3}
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: status},
+            }
+        )
+
+        text = format_sparse_status(model)
+
+        self.assertIn('Sparse fallback: Kitchen INT8 unavailable: synthetic', text)
+
     def test_standard_path_keeps_the_fallback_reason(self):
         status = {
             'fused_qkv': {

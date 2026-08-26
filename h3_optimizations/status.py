@@ -197,7 +197,7 @@ def format_sparse_status(model):
     ]
     if backend_request != SPARSE_BACKEND_AUTO:
         lines.insert(1, 'Requested sparse backend: %s' % backend_request)
-    elif selected != 'sparse_sage' and reason:
+    elif selected != 'sparse_kitchen_int8' and reason:
         lines.insert(1, 'Sparse fallback: %s' % reason)
     layer_budgets = sparse.get('layer_video_budgets')
     if layer_budgets:
