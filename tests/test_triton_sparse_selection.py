@@ -1,4 +1,4 @@
-'''CPU-only selection contract for the INT8 Triton sparse fallback.'''
+'''CPU-only selection contract for the BF16 Triton sparse fallback.'''
 
 import os
 from pathlib import Path
@@ -83,7 +83,7 @@ class TritonSparseSelectionTests(unittest.TestCase):
             apply_module,
             'TritonSparseBackend',
             side_effect=lambda config, **kwargs: SimpleNamespace(
-                name='triton_sparse_int8',
+                name='triton_sparse_bf16',
                 config=config,
                 **kwargs,
             ),
@@ -97,7 +97,7 @@ class TritonSparseSelectionTests(unittest.TestCase):
 
         self.assertEqual(qkv.provider_id, QKV_TRITON_SPARSE_CHUNKED)
         self.assertTrue(qkv.fused)
-        self.assertEqual(attention.selected, 'triton_sparse_int8')
+        self.assertEqual(attention.selected, 'triton_sparse_bf16')
         self.assertEqual(attention.projector.name, 'chunked_triton_sparse_qkv')
         self.assertEqual(attention.projector.chunk_rows, 4096)
         self.assertIs(attention.backend.projector, attention.projector)
@@ -117,10 +117,10 @@ class TritonSparseSelectionTests(unittest.TestCase):
         )
         triton_attention = apply_module.ResolvedAttention(
             requested='sparse_sage',
-            selected='triton_sparse_int8',
+            selected='triton_sparse_bf16',
             backend=object(),
             reason='triton',
-            backend_kind='triton_sparse_int8',
+            backend_kind='triton_sparse_bf16',
         )
         triton_qkv = QKVProviderResolution(
             QKV_STANDARD,
@@ -152,7 +152,7 @@ class TritonSparseSelectionTests(unittest.TestCase):
                 plan(), object(), inventory(), environment()
             )
 
-        self.assertEqual(attention.selected, 'triton_sparse_int8')
+        self.assertEqual(attention.selected, 'triton_sparse_bf16')
         triton.assert_called_once()
         flex.assert_not_called()
 
@@ -246,7 +246,7 @@ class TritonSparseSelectionTests(unittest.TestCase):
 
         self.assertEqual(attention.selected, 'existing')
         self.assertIs(qkv, dense_qkv)
-        self.assertIn('INT8 Triton unavailable', attention.reason)
+        self.assertIn('BF16 Triton unavailable', attention.reason)
         self.assertIn('FP8 FlexAttention unavailable', attention.reason)
 
 

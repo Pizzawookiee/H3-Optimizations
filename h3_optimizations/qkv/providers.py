@@ -28,7 +28,7 @@ QKV_DENSE_W4A8_CHUNKED = QKV_DENSE_KITCHEN_CHUNKED
 QKV_SPARSE_CONVROT_INT8 = 'convrot_int8_sparse_sage'
 QKV_SPARSE_FP8_CHUNKED = 'chunked_fp8_sparse_sage'
 QKV_SPARSE_W4A8_CHUNKED = QKV_SPARSE_FP8_CHUNKED
-QKV_TRITON_SPARSE_CHUNKED = 'chunked_triton_int8_sparse'
+QKV_TRITON_SPARSE_CHUNKED = 'chunked_triton_bf16_sparse'
 QKV_TRITON_W4A8_CHUNKED = QKV_TRITON_SPARSE_CHUNKED
 
 MLP_OFF = 'off'
@@ -149,7 +149,7 @@ def _resolve_preserve_precision_qkv(
     consumers = {
         'existing',
         'sparse_sage',
-        'triton_sparse_int8',
+        'triton_sparse_bf16',
         'flex_attention_fp8',
     }
     if backend_kind not in consumers:
@@ -259,13 +259,13 @@ def resolve_qkv_provider(
                 True,
                 'checkpoint-native W4A8 QKV is projected in bounded token chunks into Sparse Sage carriers',
             )
-        if backend_kind == 'triton_sparse_int8':
+        if backend_kind == 'triton_sparse_bf16':
             if not triton_available:
                 return _required_or_standard(request, 'Triton is unavailable')
             return QKVProviderResolution(
                 QKV_TRITON_W4A8_CHUNKED,
                 True,
-                'checkpoint-native W4A8 QKV is projected in bounded token chunks into Triton sparse carriers',
+                'checkpoint-native W4A8 QKV is projected in bounded BF16 chunks into the Triton sparse carrier',
             )
 
     fp8_memory_candidate = (
@@ -327,13 +327,13 @@ def resolve_qkv_provider(
             True,
             '4K ConvRot QKV chunks into routed Comfy Kitchen INT8 carriers',
         )
-    if backend_kind == 'triton_sparse_int8':
+    if backend_kind == 'triton_sparse_bf16':
         if not triton_available:
             return _required_or_standard(request, 'Triton is unavailable')
         return QKVProviderResolution(
             QKV_TRITON_SPARSE_CHUNKED,
             True,
-            '4K ConvRot QKV chunks into Triton INT8 sparse carriers',
+            '4K ConvRot QKV chunks into the Triton BF16 sparse carrier',
         )
     if backend_kind == 'sparse_sage':
         if not triton_available:

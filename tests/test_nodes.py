@@ -142,7 +142,7 @@ class NodeTests(unittest.TestCase):
             [
                 'Kitchen INT8',
                 'Sparse Sage',
-                'INT8 Triton',
+                'BF16 Triton',
                 'FP8 FlexAttention',
             ],
         )

@@ -130,7 +130,7 @@ class SparseSelectionTests(unittest.TestCase):
             apply_module,
             'TritonSparseBackend',
             side_effect=lambda config, **kwargs: SimpleNamespace(
-                name='triton_sparse_int8',
+                name='triton_sparse_bf16',
                 config=config,
                 **kwargs,
             ),
@@ -143,7 +143,7 @@ class SparseSelectionTests(unittest.TestCase):
             )
 
         self.assertEqual(qkv.provider_id, QKV_TRITON_SPARSE_CHUNKED)
-        self.assertEqual(attention.selected, 'triton_sparse_int8')
+        self.assertEqual(attention.selected, 'triton_sparse_bf16')
         self.assertEqual(attention.projector.name, 'chunked_triton_sparse_qkv')
         self.assertEqual(attention.projector.chunk_rows, 4096)
         self.assertIs(attention.backend.projector, attention.projector)

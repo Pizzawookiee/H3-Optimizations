@@ -102,7 +102,7 @@ def _stream_sparse_sage(
 
 def _stream_triton(inventory, *, backend_kind, triton_available):
     if (
-        backend_kind != 'triton_sparse_int8'
+        backend_kind != 'triton_sparse_bf16'
         or _native_stream_format(inventory) is None
         or not triton_available
     ):
@@ -112,7 +112,7 @@ def _stream_triton(inventory, *, backend_kind, triton_available):
         True,
         (
             'checkpoint-native %s weights project into bounded BF16 Q/K/V '
-            'chunks for the Triton sparse carrier'
+            'chunks streamed into the final Triton BF16 sparse carrier'
         ) % _native_stream_format(inventory),
     )
 
@@ -133,7 +133,7 @@ def _native_bounded_fallback(
                 True,
                 'checkpoint-native ConvRot QKV uses its native Sparse Sage provider',
             )
-        if backend_kind == 'triton_sparse_int8' and triton_available:
+        if backend_kind == 'triton_sparse_bf16' and triton_available:
             return base.QKVProviderResolution(
                 base.QKV_TRITON_SPARSE_CHUNKED,
                 True,
@@ -147,7 +147,7 @@ def _native_bounded_fallback(
                 True,
                 'checkpoint-native W4A8 QKV uses its native Sparse Sage provider',
             )
-        if backend_kind == 'triton_sparse_int8' and triton_available:
+        if backend_kind == 'triton_sparse_bf16' and triton_available:
             return base.QKVProviderResolution(
                 base.QKV_TRITON_W4A8_CHUNKED,
                 True,

@@ -106,7 +106,7 @@ from .runtime.context import (
 
 LOG_PREFIX = '[H3 Optimizations]'
 ATTENTION_SPARSE = 'sparse_sage'
-ATTENTION_TRITON_SPARSE = 'triton_sparse_int8'
+ATTENTION_TRITON_SPARSE = 'triton_sparse_bf16'
 ATTENTION_FP8_FLEX = 'flex_attention_fp8'
 ATTENTION_KITCHEN_SPARSE = 'sparse_kitchen_int8'
 ATTENTION_NATIVE_128X64 = 'native_int8_128x64'
@@ -159,7 +159,7 @@ class ResolvedAttention:
 # fallback here is not a detail: it roughly halves attention throughput, and it
 # used to be visible only to someone who went looking at the status output.
 _SLOW_SPARSE_FALLBACKS = {
-    ATTENTION_TRITON_SPARSE: 'INT8 Triton sparse is roughly half the speed of the native sparse kernel',
+    ATTENTION_TRITON_SPARSE: 'BF16 Triton sparse is slower than the native sparse kernel',
     ATTENTION_FP8_FLEX: 'FP8 FlexAttention is far slower than the native sparse kernel',
 }
 
@@ -476,9 +476,9 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
         projector=projector,
     )
     reason = (
-        'explicit INT8 Triton 64Q x 64KV sparse attention selection'
+        'explicit BF16 Triton 64Q x 64KV sparse attention selection'
         if fallback_reason is None
-        else '%s; using INT8 Triton 64Q x 64KV sparse attention'
+        else '%s; using BF16 Triton 64Q x 64KV sparse attention'
         % fallback_reason
     )
     return (
@@ -804,7 +804,7 @@ def _resolve_attention(plan, model, inventory, environment):
                 )
             except TritonSparseError as triton_exc:
                 fallback_reason = (
-                    '%s; INT8 Triton unavailable: %s'
+                    '%s; BF16 Triton unavailable: %s'
                     % (fallback_reason, triton_exc)
                 )
                 try:

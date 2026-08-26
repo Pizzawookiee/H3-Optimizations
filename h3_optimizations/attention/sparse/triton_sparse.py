@@ -1,53 +1,44 @@
-'''Stable public surface for the INT8 Triton sparse backend.
+'''Stable public surface for the BF16 Triton sparse backend.
 
-The production backend consumes the exact Kitchen carrier and mirrors the
-Kitchen pure-INT8 probability/value math at 64Q x 64KV. The old carrier,
-executor, and spec remain importable so existing tests/benchmarks and saved
-integrations keep their low-level ABI.
+The production backend keeps projected Q/K/V in BF16 and uses ordinary BF16
+tensor-core dots with FP32 online-softmax state at 64Q x 64KV. The old INT8
+carrier, executor, and spec remain importable for low-level compatibility.
 '''
 
-import torch
-
-from . import triton_sparse_fast as _legacy
 from .triton_sparse_fast import (  # legacy low-level compatibility
     PreparedTritonSparse,
     PreparedTritonHybrid,
     TritonSparseExecutor,
     TritonSparseSpec,
 )
-from .triton_kitchen import (
-    PreparedTritonKitchen,
-    TritonKitchenBackend,
-    TritonKitchenError,
+from .triton_bf16 import (
+    PreparedTritonBF16,
+    TritonBF16Backend,
+    TritonBF16Error,
+    preflight_triton_bf16,
 )
-from .triton_kitchen_sm120 import SM120TritonKitchenBackend
 
 
-TritonSparseError = TritonKitchenError
+TritonSparseError = TritonBF16Error
 
 
 def TritonSparseBackend(config=None, **kwargs):
-    '''Construct the Kitchen-parity backend appropriate for this CUDA target.'''
-    capability = tuple(int(value) for value in torch.cuda.get_device_capability())
-    backend = (
-        SM120TritonKitchenBackend
-        if capability == (12, 0)
-        else TritonKitchenBackend
-    )
-    return backend(config, **kwargs)
+    '''Construct the portable BF16 Triton backend.'''
+    return TritonBF16Backend(config, **kwargs)
+
+
+TritonSparseBackend.name = TritonBF16Backend.name
 
 
 def preflight_triton_sparse(**kwargs):
-    '''Keep the historical spec ABI while translating preflight errors uniformly.'''
-    try:
-        return _legacy.preflight_triton_sparse(**kwargs)
-    except _legacy.TritonSparseError as exc:
-        raise TritonKitchenError(str(exc)) from exc
+    '''Validate the portable BF16 Triton fallback.'''
+    kwargs.pop('v_scale_group_size', None)
+    return preflight_triton_bf16(**kwargs)
 
 
 __all__ = [
     'PreparedTritonHybrid',
-    'PreparedTritonKitchen',
+    'PreparedTritonBF16',
     'PreparedTritonSparse',
     'TritonSparseBackend',
     'TritonSparseError',

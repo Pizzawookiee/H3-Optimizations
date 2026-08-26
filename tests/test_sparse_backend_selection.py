@@ -588,7 +588,7 @@ class SparseBackendSelectionTests(unittest.TestCase):
             }
         )
         text = format_sparse_status(model)
-        self.assertIn('Requested sparse backend: INT8 Triton', text)
+        self.assertIn('Requested sparse backend: BF16 Triton', text)
         self.assertNotIn('Sparse fallback:', text)
 
 

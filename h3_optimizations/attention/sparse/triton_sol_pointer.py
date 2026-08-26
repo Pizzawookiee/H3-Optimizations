@@ -1,9 +1,8 @@
 '''Minimal Sol-shaped Triton attention over the Kitchen INT8 carrier.
 
-This experiment deliberately answers one narrow question: can Triton execute a
-single 64-query x one-head x full-D128 program efficiently on the Kitchen
-carrier? It is full-route only, has no router, and is not selected by the
-production backend.
+Each program owns one 64-query x one-head x full-D128 tile. Dense query tiles
+walk KV implicitly; sparse query tiles consume a compact absolute route. This
+module remains a benchmark control and is not selected by production.
 
 The program shape follows Sol-Attn's non-TMA pointer reference. Kitchen's Q/K
 scale layouts, U8 probability rounding, signed-dot correction, permuted V
@@ -44,10 +43,16 @@ class TritonSolPointerError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass
 class PreparedSolKitchenCarrier:
     carrier: object
     v_sum: torch.Tensor
+    sparse_lut: torch.Tensor
+    dense_q_tiles: int
+    sparse_q_tiles: int
+    sparse_selected: int
+    layer_index: int = -1
+    metadata: dict | None = None
 
 
 def kernel_contract():
@@ -57,7 +62,7 @@ def kernel_contract():
         'kv_tile': KV_TILE,
         'head_dim': HEAD_DIM,
         'program': 'one_64q_tile_x_one_head_x_full_d128',
-        'route': 'full_absolute_compile_time',
+        'route': 'dense_implicit_plus_sparse_absolute',
         'v_sum': 'precomputed_once_per_carrier_kv_tile',
         'autotune': SOL_POINTER_CONFIGS,
         'production_backend': False,
@@ -136,9 +141,12 @@ if TRITON_AVAILABLE:
         except TypeError:  # older Triton without persistent autotune cache
             return triton.autotune(configs=configs, key=key)
 
-    @_autotune(_CONFIGS, key=['KV_BLOCKS', 'OUTPUT_BF16'])
+    @_autotune(
+        _CONFIGS,
+        key=['KV_BLOCKS', 'N_SELECTED', 'USE_ROUTE', 'OUTPUT_BF16'],
+    )
     @triton.jit
-    def _sol_kitchen_full_kernel(
+    def _sol_kitchen_kernel(
         Q,
         K,
         V,
@@ -146,10 +154,15 @@ if TRITON_AVAILABLE:
         K_SCALE,
         V_SCALE,
         V_SUM,
+        LUT,
         O,
         sequence,
         padded_sequence,
+        Q_BLOCK_START,
+        Q_BLOCK_COUNT,
         KV_BLOCKS: tl.constexpr,
+        N_SELECTED: tl.constexpr,
+        USE_ROUTE: tl.constexpr,
         softmax_scale: tl.constexpr,
         Q_TILE_: tl.constexpr,
         KV_TILE_: tl.constexpr,
@@ -160,7 +173,8 @@ if TRITON_AVAILABLE:
     ):
         # Sol pointer shape: one value tile, one Q block, one batch/head.
         _value_tile = tl.program_id(0)
-        q_block = tl.program_id(1)
+        local_q_block = tl.program_id(1)
+        q_block = Q_BLOCK_START + local_q_block
         bh = tl.program_id(2)
 
         q_rows = q_block * Q_TILE_ + tl.arange(0, Q_TILE_)
@@ -187,9 +201,15 @@ if TRITON_AVAILABLE:
         output = tl.zeros((Q_TILE_, D), dtype=tl.float32)
         k_scale_count = KV_BLOCKS * 4
 
-        # Full route only. The absolute KV block is the compile-time loop index;
-        # there is no LUT load or loop-carried delta dependency.
-        for key_block in tl.range(0, KV_BLOCKS):
+        for route_position in tl.range(0, N_SELECTED):
+            if USE_ROUTE:
+                route_offset = (
+                    (bh * Q_BLOCK_COUNT + local_q_block) * N_SELECTED
+                    + route_position
+                )
+                key_block = tl.load(LUT + route_offset)
+            else:
+                key_block = route_position
             k_positions = key_block * KV_TILE_ + kv_rows
             k_valid = k_positions < sequence
             k = tl.load(
@@ -210,6 +230,15 @@ if TRITON_AVAILABLE:
                 * LOG2E_
             )
             logits = tl.where(k_valid[None, :], logits, -float('inf'))
+            v_positions = _v_perm16(k_positions)
+            v = tl.load(
+                V
+                + (bh * D + dims[None, :]) * padded_sequence
+                + v_positions[:, None],
+            ).to(tl.int8)
+            v_sum = tl.load(
+                V_SUM + (bh * KV_BLOCKS + key_block) * D + dims
+            ).to(tl.int32)
 
             tile_max = tl.max(logits, axis=1)
             tile_row_max = tile_max - S_U8_OFFSET_
@@ -223,15 +252,6 @@ if TRITON_AVAILABLE:
             p_code = tl.minimum(tl.maximum(p_code, 0), 255)
             p_signed = (p_code - 128).to(tl.int8)
 
-            v_positions = _v_perm16(k_positions)
-            v = tl.load(
-                V
-                + (bh * D + dims[None, :]) * padded_sequence
-                + v_positions[:, None],
-            ).to(tl.int8)
-            v_sum = tl.load(
-                V_SUM + (bh * KV_BLOCKS + key_block) * D + dims
-            ).to(tl.int32)
             pv_i32 = tl.dot(p_signed, v, out_dtype=tl.int32)
             pv_i32 += 128 * v_sum[None, :]
 
@@ -250,13 +270,11 @@ if TRITON_AVAILABLE:
         )
 
 
-def prepare_carrier(carrier):
-    '''Precompute the per-KV-tile signed V sums used by logical U8 P x S8 V.'''
+def _prepare_v_sum(carrier, heads, kv_blocks, padded):
     if not TRITON_AVAILABLE:
-        raise TritonSolPointerError('Sol-shaped Kitchen experiment requires Triton')
-    carrier, _sequence, heads, _q_blocks, kv_blocks, padded = _shape(carrier)
+        raise TritonSolPointerError('Sol-shaped Kitchen backend requires Triton')
     if not carrier.q.is_cuda:
-        raise TritonSolPointerError('Sol-shaped Kitchen experiment requires CUDA')
+        raise TritonSolPointerError('Sol-shaped Kitchen backend requires CUDA')
     v_sum = torch.empty(
         (heads, kv_blocks, HEAD_DIM),
         dtype=torch.int32,
@@ -272,13 +290,94 @@ def prepare_carrier(carrier):
         num_warps=4,
         num_stages=1,
     )
-    return PreparedSolKitchenCarrier(carrier=carrier, v_sum=v_sum)
+    return v_sum
+
+
+def _compact_route(lut, valid, metadata):
+    if lut.ndim != 4 or valid.ndim != 3:
+        raise TritonSolPointerError('Sol-shaped Kitchen route ranks are invalid')
+    if lut.dtype != torch.int32 or valid.dtype != torch.int32:
+        raise TritonSolPointerError('Sol-shaped Kitchen route must be INT32')
+    if not lut.is_contiguous() or not valid.is_contiguous():
+        raise TritonSolPointerError('Sol-shaped Kitchen route must be contiguous')
+    batch, heads, q_tiles, kv_tiles = (int(value) for value in lut.shape)
+    if tuple(valid.shape) != (batch, heads, q_tiles):
+        raise TritonSolPointerError('Sol-shaped Kitchen route shapes differ')
+    dense_q_tiles = int(metadata['dense_q_tiles'])
+    sparse_q_tiles = int(metadata['sparse_q_tiles'])
+    if dense_q_tiles + sparse_q_tiles != q_tiles:
+        raise TritonSolPointerError('Sol-shaped Kitchen Q route geometry differs')
+    if sparse_q_tiles:
+        pure_video_kv_tiles = int(metadata['pure_video_kv_tiles'])
+        retained_video_kv_tiles = int(metadata['retained_video_kv_tiles'])
+        sparse_selected = (
+            kv_tiles - pure_video_kv_tiles + retained_video_kv_tiles
+        )
+        if not 0 < sparse_selected < kv_tiles:
+            raise TritonSolPointerError('Sol-shaped Kitchen sparse route is invalid')
+        sparse_delta = lut[
+            ...,
+            dense_q_tiles:dense_q_tiles + sparse_q_tiles,
+            :sparse_selected,
+        ]
+        sparse_lut = torch.cumsum(
+            sparse_delta, dim=-1, dtype=torch.int32
+        ).contiguous()
+    else:
+        sparse_selected = 0
+        sparse_lut = lut.new_empty((batch, heads, 0, 0))
+    return sparse_lut, dense_q_tiles, sparse_q_tiles, sparse_selected
+
+
+def prepare_carrier(carrier):
+    '''Prepare a full-route Kitchen carrier for direct benchmarks.'''
+    carrier, _sequence, heads, q_blocks, kv_blocks, padded = _shape(carrier)
+    v_sum = _prepare_v_sum(carrier, heads, kv_blocks, padded)
+    return PreparedSolKitchenCarrier(
+        carrier=carrier,
+        v_sum=v_sum,
+        sparse_lut=torch.empty(
+            (1, heads, 0, 0), dtype=torch.int32, device=carrier.q.device
+        ),
+        dense_q_tiles=q_blocks,
+        sparse_q_tiles=0,
+        sparse_selected=0,
+        metadata={'route_format': 'implicit_full'},
+    )
+
+
+def prepare_routed_carrier(carrier, lut, valid, *, layer_index, metadata):
+    '''Prepare dense and compact sparse launch groups from a delta route.'''
+    carrier, _sequence, heads, _q_blocks, kv_blocks, padded = _shape(carrier)
+    if lut.device != carrier.q.device or valid.device != carrier.q.device:
+        raise TritonSolPointerError('Sol-shaped Kitchen route device differs')
+    sparse_lut, dense_q_tiles, sparse_q_tiles, sparse_selected = _compact_route(
+        lut, valid, metadata
+    )
+    route_metadata = dict(metadata)
+    route_metadata.update(
+        {
+            'sparse_backend': 'triton_sol_pointer_int8',
+            'route_format': 'dense_implicit_plus_sparse_absolute_int32',
+            'program_shape': 'one_64q_tile_x_one_head_x_full_d128',
+        }
+    )
+    return PreparedSolKitchenCarrier(
+        carrier=carrier,
+        v_sum=_prepare_v_sum(carrier, heads, kv_blocks, padded),
+        sparse_lut=sparse_lut,
+        dense_q_tiles=dense_q_tiles,
+        sparse_q_tiles=sparse_q_tiles,
+        sparse_selected=sparse_selected,
+        layer_index=int(layer_index),
+        metadata=route_metadata,
+    )
 
 
 def launch_prepared(prepared):
-    '''Execute the full-route pointer kernel from a prepared Kitchen carrier.'''
+    '''Execute the dense and sparse pointer launch groups.'''
     if not TRITON_AVAILABLE:
-        raise TritonSolPointerError('Sol-shaped Kitchen experiment requires Triton')
+        raise TritonSolPointerError('Sol-shaped Kitchen backend requires Triton')
     if not isinstance(prepared, PreparedSolKitchenCarrier):
         raise TritonSolPointerError('invalid Sol-shaped Kitchen payload')
     carrier, sequence, heads, q_blocks, kv_blocks, padded = _shape(
@@ -295,32 +394,64 @@ def launch_prepared(prepared):
     if prepared.v_sum.device != carrier.q.device:
         raise TritonSolPointerError('V sum and Kitchen carrier devices differ')
     if not carrier.q.is_cuda:
-        raise TritonSolPointerError('Sol-shaped Kitchen experiment requires CUDA')
+        raise TritonSolPointerError('Sol-shaped Kitchen backend requires CUDA')
+    if prepared.dense_q_tiles + prepared.sparse_q_tiles != q_blocks:
+        raise TritonSolPointerError('prepared Sol-shaped Q geometry differs')
+    expected_sparse_lut = (
+        1,
+        heads,
+        prepared.sparse_q_tiles,
+        prepared.sparse_selected,
+    )
+    if tuple(prepared.sparse_lut.shape) != expected_sparse_lut:
+        raise TritonSolPointerError('prepared Sol-shaped sparse LUT shape differs')
+    if (
+        prepared.sparse_lut.dtype != torch.int32
+        or not prepared.sparse_lut.is_contiguous()
+        or prepared.sparse_lut.device != carrier.q.device
+    ):
+        raise TritonSolPointerError('prepared Sol-shaped sparse LUT is invalid')
 
     output = torch.empty(
         (1, heads, sequence, HEAD_DIM),
         dtype=carrier.input_dtype,
         device=carrier.q.device,
     )
-    _sol_kitchen_full_kernel[(1, q_blocks, heads)](
-        carrier.q,
-        carrier.k,
-        carrier.v,
-        carrier.q_scale,
-        carrier.k_scale,
-        carrier.v_scale,
-        prepared.v_sum,
-        output,
-        sequence,
-        padded,
-        KV_BLOCKS=kv_blocks,
-        softmax_scale=float(carrier.attention_scale),
-        Q_TILE_=Q_TILE,
-        KV_TILE_=KV_TILE,
-        D=HEAD_DIM,
-        LOG2E_=LOG2E,
-        S_U8_OFFSET_=S_U8_OFFSET,
-        OUTPUT_BF16=carrier.input_dtype == torch.bfloat16,
+    def launch_group(q_start, q_count, selected, use_route):
+        if not q_count:
+            return
+        _sol_kitchen_kernel[(1, q_count, heads)](
+            carrier.q,
+            carrier.k,
+            carrier.v,
+            carrier.q_scale,
+            carrier.k_scale,
+            carrier.v_scale,
+            prepared.v_sum,
+            prepared.sparse_lut,
+            output,
+            sequence,
+            padded,
+            q_start,
+            q_count,
+            KV_BLOCKS=kv_blocks,
+            N_SELECTED=selected,
+            USE_ROUTE=use_route,
+            softmax_scale=float(carrier.attention_scale),
+            Q_TILE_=Q_TILE,
+            KV_TILE_=KV_TILE,
+            D=HEAD_DIM,
+            LOG2E_=LOG2E,
+            S_U8_OFFSET_=S_U8_OFFSET,
+            OUTPUT_BF16=carrier.input_dtype == torch.bfloat16,
+        )
+
+    launch_group(0, prepared.dense_q_tiles, kv_blocks, False)
+    launch_group(
+        prepared.dense_q_tiles,
+        prepared.sparse_q_tiles,
+        prepared.sparse_selected,
+        True,
     )
     return output
 
@@ -335,8 +466,10 @@ __all__ = [
     'SOL_POINTER_CONFIGS',
     'TRITON_AVAILABLE',
     'TritonSolPointerError',
+    '_compact_route',
     'kernel_contract',
     'launch_full_route',
     'launch_prepared',
     'prepare_carrier',
+    'prepare_routed_carrier',
 ]

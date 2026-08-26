@@ -94,8 +94,8 @@ def format_sparse_status(model):
     reason = str(attention.get('reason') or '').strip()
     if selected == 'sparse_sage':
         attention_line = 'Attention: Sparse Sage'
-    elif selected == 'triton_sparse_int8':
-        attention_line = 'Attention: INT8 Triton Sparse'
+    elif selected == 'triton_sparse_bf16':
+        attention_line = 'Attention: BF16 Triton Sparse'
     elif selected == 'flex_attention_fp8':
         attention_line = 'Attention: FP8 FlexAttention'
     else:
@@ -128,7 +128,7 @@ def format_sparse_status(model):
     if qkv.get('provider') in (
         'convrot_int8_sparse_sage',
         'chunked_fp8_sparse_sage',
-        'chunked_triton_int8_sparse',
+        'chunked_triton_bf16_sparse',
     ):
         qkv_index = next(
             index for index, line in enumerate(lines) if line.startswith('QKV:')

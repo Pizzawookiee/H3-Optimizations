@@ -6,7 +6,8 @@ the comparison focused on attention execution:
 * native Kitchen dense attention;
 * native Kitchen 64Q x 64KV attention on the same full route;
 * PR #41's Kitchen-parity Triton kernel on an explicit full route;
-* the experimental one-program-per-64Q Sol-shaped pointer kernel.
+* the experimental one-program-per-64Q Sol-shaped pointer kernel;
+* all four launch geometries of PlagueKind's BF16 SLA Triton kernel.
 
 By default only the small numerical gate runs. Pass ``--benchmark`` to add the
 larger timing case. No model or ComfyUI server is involved.
@@ -33,7 +34,19 @@ ARM_ORDER = (
     'kitchen_64x64_full',
     'pr41_triton',
     'sol_pointer',
+    'sol_bf16_hnd_64x64',
+    'production_bf16_64x64',
+    'plaguekind_64x64',
+    'plaguekind_64x128',
+    'plaguekind_128x64',
+    'plaguekind_128x128',
 )
+PLAGUEKIND_GEOMETRIES = {
+    'plaguekind_64x64': (64, 64),
+    'plaguekind_64x128': (64, 128),
+    'plaguekind_128x64': (128, 64),
+    'plaguekind_128x128': (128, 128),
+}
 
 
 def parse_args(argv=None):
@@ -84,6 +97,82 @@ def dense_delta_route(torch, sequence, heads, device):
     return lut, valid
 
 
+def dense_absolute_route(torch, sequence, heads, q_tile, kv_tile, device):
+    q_tiles = (int(sequence) + int(q_tile) - 1) // int(q_tile)
+    kv_tiles = (int(sequence) + int(kv_tile) - 1) // int(kv_tile)
+    lut = torch.arange(kv_tiles, dtype=torch.int32, device=device)
+    lut = lut.reshape(1, 1, 1, kv_tiles).expand(
+        1, int(heads), q_tiles, kv_tiles
+    ).contiguous()
+    return lut, kv_tiles
+
+
+def mixed_delta_route(torch, sequence, heads, device):
+    q_tiles = (int(sequence) + 63) // 64
+    kv_tiles = (int(sequence) + 63) // 64
+    if q_tiles < 2 or kv_tiles < 3:
+        raise ValueError('mixed route needs at least two Q and three KV tiles')
+    retained = max(1, (kv_tiles - 1) // 2)
+    selected = 1 + retained
+    absolute = torch.cat(
+        (
+            torch.zeros((1,), dtype=torch.int32, device=device),
+            torch.linspace(
+                1,
+                kv_tiles - 1,
+                retained,
+                dtype=torch.float32,
+                device=device,
+            ).round().to(torch.int32),
+        )
+    ).unique(sorted=True)
+    selected = int(absolute.numel())
+    delta = torch.cat((absolute[:1], absolute[1:] - absolute[:-1]))
+    lut, valid = dense_delta_route(torch, sequence, heads, device)
+    lut[..., 1:, :].zero_()
+    lut[..., 1:, :selected] = delta.reshape(1, 1, 1, selected)
+    valid[..., 1:] = selected
+    metadata = {
+        'dense_q_tiles': 1,
+        'sparse_q_tiles': q_tiles - 1,
+        'pure_video_kv_tiles': kv_tiles - 1,
+        'retained_video_kv_tiles': selected - 1,
+    }
+    return lut, valid, metadata
+
+
+def prepare_production_bf16(
+    torch, triton_bf16, q, k, v, lut=None, valid=None, metadata=None
+):
+    sequence = int(q.shape[-2])
+    heads = int(q.shape[1])
+    q_tiles = (sequence + 63) // 64
+    if lut is None:
+        sparse_lut = torch.empty(
+            (1, heads, 0, 0), dtype=torch.int32, device=q.device
+        )
+        dense_q_tiles = q_tiles
+        sparse_q_tiles = 0
+        sparse_selected = 0
+        route_metadata = {'route_format': 'implicit_full'}
+    else:
+        sparse_lut, dense_q_tiles, sparse_q_tiles, sparse_selected = (
+            triton_bf16._compact_route(lut, valid, metadata)
+        )
+        route_metadata = dict(metadata)
+    return triton_bf16.PreparedTritonBF16(
+        q=q,
+        k=k,
+        v=v,
+        sparse_lut=sparse_lut,
+        dense_q_tiles=dense_q_tiles,
+        sparse_q_tiles=sparse_q_tiles,
+        sparse_selected=sparse_selected,
+        layer_index=0,
+        metadata=route_metadata,
+    )
+
+
 def tensor_metrics(torch, actual, expected):
     delta = actual.float() - expected.float()
     denominator = expected.float().square().mean().sqrt().clamp_min(1.0e-12)
@@ -97,7 +186,16 @@ def tensor_metrics(torch, actual, expected):
     }
 
 
-def make_carrier(torch, native, sequence, heads, seed, device):
+def dense_fp32_reference(torch, q, k, v):
+    q_cpu = q.float().cpu()
+    k_cpu = k.float().cpu()
+    v_cpu = v.float().cpu()
+    logits = torch.matmul(q_cpu, k_cpu.transpose(-1, -2)) * (128**-0.5)
+    output = torch.matmul(torch.softmax(logits, dim=-1), v_cpu)
+    return output.to(dtype=q.dtype, device=q.device)
+
+
+def make_inputs(torch, native, sequence, heads, seed, device):
     generator = torch.Generator(device=device).manual_seed(int(seed))
 
     def sample():
@@ -108,13 +206,40 @@ def make_carrier(torch, native, sequence, heads, seed, device):
             generator=generator,
         )
 
-    return native.prequantize_int8_attention(
-        sample(), sample(), sample(), cta_k=64
-    )
+    q, k, v = sample(), sample(), sample()
+    carrier = native.prequantize_int8_attention(q, k, v, cta_k=64)
+    return q, k, v, carrier
 
 
-def numerical_gate(torch, native, pr41_launch, sol, args, device):
-    carrier = make_carrier(
+def plaguekind_inputs(q, k, v):
+    return tuple(value.transpose(1, 2).contiguous() for value in (q, k, v))
+
+
+def plaguekind_routes(torch, sequence, heads, device):
+    return {
+        name: dense_absolute_route(
+            torch, sequence, heads, q_tile, kv_tile, device
+        )
+        for name, (q_tile, kv_tile) in PLAGUEKIND_GEOMETRIES.items()
+    }
+
+
+def plaguekind_arms(plaguekind, q, k, v, routes):
+    arms = {}
+    for name, (q_tile, kv_tile) in PLAGUEKIND_GEOMETRIES.items():
+        lut, topk = routes[name]
+        arms[name] = lambda lut=lut, topk=topk, q_tile=q_tile, kv_tile=kv_tile: (
+            plaguekind.block_sparse_attention(
+                q, k, v, lut, topk, q_tile, kv_tile
+            )
+        )
+    return arms
+
+
+def numerical_gate(
+    torch, native, pr41_launch, sol, triton_bf16, bf16_control, plaguekind, args, device
+):
+    q, k, v, carrier = make_inputs(
         torch,
         native,
         args.parity_sequence,
@@ -133,6 +258,14 @@ def numerical_gate(torch, native, pr41_launch, sol, args, device):
         encoding='delta',
     )
     prepared = sol.prepare_carrier(carrier)
+    production_bf16 = prepare_production_bf16(torch, triton_bf16, q, k, v)
+    q_blhd, k_blhd, v_blhd = plaguekind_inputs(q, k, v)
+    plague_routes = plaguekind_routes(
+        torch, args.parity_sequence, args.heads, device
+    )
+    plague_arms = plaguekind_arms(
+        plaguekind, q_blhd, k_blhd, v_blhd, plague_routes
+    )
     outputs = {
         'kitchen_dense': native.int8_attention_from_prequantized(carrier),
         'kitchen_64x64_full': (
@@ -140,14 +273,91 @@ def numerical_gate(torch, native, pr41_launch, sol, args, device):
         ),
         'pr41_triton': pr41_launch(carrier, lut, valid),
         'sol_pointer': sol.launch_prepared(prepared),
+        'sol_bf16_hnd_64x64': bf16_control.launch(q, k, v),
+        'production_bf16_64x64': triton_bf16._launch(production_bf16),
     }
+    outputs.update(
+        (name, function().transpose(1, 2))
+        for name, function in plague_arms.items()
+    )
     torch.cuda.synchronize(device)
-    reference = outputs['kitchen_64x64_full']
-    result = {
-        name: tensor_metrics(torch, value, reference)
-        for name, value in outputs.items()
+    references = {
+        'kitchen_64x64_full': outputs['kitchen_64x64_full'],
+        'dense_fp32_softmax_bf16_output': dense_fp32_reference(torch, q, k, v),
     }
-    del outputs, reference, prepared, carrier, lut, valid
+    result = {
+        reference_name: {
+            name: tensor_metrics(torch, value, reference)
+            for name, value in outputs.items()
+        }
+        for reference_name, reference in references.items()
+    }
+    sparse_lut, sparse_valid, sparse_metadata = mixed_delta_route(
+        torch, args.parity_sequence, args.heads, device
+    )
+    sparse_pr41 = pr41_launch(carrier, sparse_lut, sparse_valid)
+    sparse_prepared = sol.prepare_routed_carrier(
+        carrier,
+        sparse_lut,
+        sparse_valid,
+        layer_index=0,
+        metadata=sparse_metadata,
+    )
+    sparse_sol = sol.launch_prepared(sparse_prepared)
+    sparse_bf16_prepared = prepare_production_bf16(
+        torch,
+        triton_bf16,
+        q,
+        k,
+        v,
+        sparse_lut,
+        sparse_valid,
+        sparse_metadata,
+    )
+    sparse_bf16 = triton_bf16._launch(sparse_bf16_prepared)
+    absolute = torch.cumsum(sparse_lut, dim=-1, dtype=torch.int32)
+    dense_q_tiles = int(sparse_metadata['dense_q_tiles'])
+    sparse_selected = int(sparse_bf16_prepared.sparse_selected)
+    dense_rows = dense_q_tiles * 64
+    sparse_bf16_reference = torch.empty_like(q_blhd)
+    plaguekind._block_sparse_attention_into(
+        q_blhd[:, :dense_rows],
+        k_blhd,
+        v_blhd,
+        absolute[..., :dense_q_tiles, :],
+        absolute.shape[-1],
+        64,
+        64,
+        sparse_bf16_reference[:, :dense_rows],
+    )
+    plaguekind._block_sparse_attention_into(
+        q_blhd[:, dense_rows:],
+        k_blhd,
+        v_blhd,
+        absolute[..., dense_q_tiles:, :sparse_selected].contiguous(),
+        sparse_selected,
+        64,
+        64,
+        sparse_bf16_reference[:, dense_rows:],
+    )
+    sparse_bf16_reference = sparse_bf16_reference.transpose(1, 2)
+    torch.cuda.synchronize(device)
+    result['mixed_sparse_route_against_pr41'] = {
+        'pr41_triton': tensor_metrics(torch, sparse_pr41, sparse_pr41),
+        'sol_pointer': tensor_metrics(torch, sparse_sol, sparse_pr41),
+    }
+    result['production_bf16_mixed_route_against_plaguekind_64x64'] = {
+        'production_bf16_64x64': tensor_metrics(
+            torch, sparse_bf16, sparse_bf16_reference
+        ),
+        'plaguekind_64x64': tensor_metrics(
+            torch, sparse_bf16_reference, sparse_bf16_reference
+        ),
+    }
+    del outputs, references, prepared, carrier, lut, valid
+    del q, k, v, q_blhd, k_blhd, v_blhd, plague_routes, plague_arms
+    del production_bf16, sparse_lut, sparse_valid, sparse_prepared, sparse_pr41, sparse_sol
+    del sparse_bf16_prepared, sparse_bf16, sparse_bf16_reference, absolute
     return result
 
 
@@ -161,8 +371,10 @@ def elapsed_ms(torch, function, device):
     return float(start.elapsed_time(stop)), value
 
 
-def benchmark(torch, native, pr41_launch, sol, args, device):
-    carrier = make_carrier(
+def benchmark(
+    torch, native, pr41_launch, sol, triton_bf16, bf16_control, plaguekind, args, device
+):
+    q, k, v, carrier = make_inputs(
         torch,
         native,
         args.benchmark_sequence,
@@ -181,6 +393,11 @@ def benchmark(torch, native, pr41_launch, sol, args, device):
         encoding='delta',
     )
     prepared = sol.prepare_carrier(carrier)
+    production_bf16 = prepare_production_bf16(torch, triton_bf16, q, k, v)
+    q_blhd, k_blhd, v_blhd = plaguekind_inputs(q, k, v)
+    plague_routes = plaguekind_routes(
+        torch, args.benchmark_sequence, args.heads, device
+    )
     arms = {
         'kitchen_dense': lambda: native.int8_attention_from_prequantized(carrier),
         'kitchen_64x64_full': lambda: (
@@ -188,7 +405,14 @@ def benchmark(torch, native, pr41_launch, sol, args, device):
         ),
         'pr41_triton': lambda: pr41_launch(carrier, lut, valid),
         'sol_pointer': lambda: sol.launch_prepared(prepared),
+        'sol_bf16_hnd_64x64': lambda: bf16_control.launch(q, k, v),
+        'production_bf16_64x64': lambda: triton_bf16._launch(production_bf16),
     }
+    arms.update(
+        plaguekind_arms(
+            plaguekind, q_blhd, k_blhd, v_blhd, plague_routes
+        )
+    )
 
     for _ in range(args.warmup):
         for name in ARM_ORDER:
@@ -247,6 +471,7 @@ def benchmark(torch, native, pr41_launch, sol, args, device):
         },
     }
     del prepared, carrier, lut, valid
+    del q, k, v, q_blhd, k_blhd, v_blhd, plague_routes
     return result
 
 
@@ -267,11 +492,14 @@ def main(argv=None):
     import torch
 
     from h3_optimizations.attention.sparse import triton_sol_pointer as sol
+    from h3_optimizations.attention.sparse import triton_bf16
     from h3_optimizations.attention.sparse.triton_kitchen import (
         _launch as pr41_launch,
     )
     from h3_optimizations.native import carrier_selftest
     from h3_optimizations.native import int8_attention as native
+    import sol_bf16_control as bf16_control
+    import plaguekind_sla as plaguekind
 
     if not torch.cuda.is_available():
         raise SystemExit('CUDA is required')
@@ -286,17 +514,35 @@ def main(argv=None):
     if not native.int8_attention_is_available(device):
         raise SystemExit('native Kitchen 64x64 sparse attention is unavailable')
 
-    parity = numerical_gate(torch, native, pr41_launch, sol, args, device)
-    failed = [name for name, metrics in parity.items() if not metrics['exact']]
+    parity = numerical_gate(
+        torch, native, pr41_launch, sol, triton_bf16, bf16_control, plaguekind, args, device
+    )
+    kitchen_parity = parity['kitchen_64x64_full']
+    failed = [
+        name
+        for name in ('pr41_triton', 'sol_pointer')
+        if not kitchen_parity[name]['exact']
+    ]
     timings = (
-        benchmark(torch, native, pr41_launch, sol, args, device)
+        benchmark(
+            torch,
+            native,
+            pr41_launch,
+            sol,
+            triton_bf16,
+            bf16_control,
+            plaguekind,
+            args,
+            device,
+        )
         if args.benchmark and (not failed or args.benchmark_inexact)
         else None
     )
     result = {
         'boundary': (
-            'attention execution from one identical, already-prequantized '
-            'Kitchen carrier; QKV projection and routing are excluded'
+            'attention execution from identical source BF16 Q/K/V; Kitchen '
+            'carrier preparation, PlagueKind BLHD packing, QKV projection, '
+            'and routing are excluded'
         ),
         'source': {
             'path': str(PACK),
@@ -309,6 +555,16 @@ def main(argv=None):
             'capability': list(capability),
         },
         'contract': sol.kernel_contract(),
+        'bf16_control': bf16_control.contract(),
+        'plaguekind': {
+            'source_commit': plaguekind.PLAGUEKIND_SOURCE_COMMIT,
+            'math': 'BF16 QK and BF16 P-by-V with FP32 online softmax',
+            'route': 'full absolute fixed-topk',
+            'geometries': {
+                name: {'q_tile': geometry[0], 'kv_tile': geometry[1]}
+                for name, geometry in PLAGUEKIND_GEOMETRIES.items()
+            },
+        },
         'parity_shape': {
             'batch': 1,
             'heads': args.heads,
@@ -316,7 +572,7 @@ def main(argv=None):
             'head_dim': 128,
             'dtype': 'bfloat16',
         },
-        'parity_against_kitchen': parity,
+        'numerics_against': parity,
         'parity_passed': not failed,
         'timing_shape': (
             {

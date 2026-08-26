@@ -29,41 +29,33 @@ sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 class Issue40SM120FallbackTests(unittest.TestCase):
-    def test_sm120_selects_static_loop_triton_backend(self):
+    def test_sm120_selects_portable_bf16_triton_backend(self):
         sentinel = object()
         with mock.patch.object(
-            triton_sparse.torch.cuda,
-            'get_device_capability',
-            return_value=(12, 0),
-        ), mock.patch.object(
             triton_sparse,
-            'SM120TritonKitchenBackend',
+            'TritonBF16Backend',
             return_value=sentinel,
         ) as backend:
             actual = triton_sparse.TritonSparseBackend('config', projector='p')
         self.assertIs(actual, sentinel)
         backend.assert_called_once_with('config', projector='p')
 
-    def test_non_sm120_keeps_normal_kitchen_parity_backend(self):
+    def test_sm89_uses_the_same_portable_bf16_backend(self):
         sentinel = object()
         with mock.patch.object(
-            triton_sparse.torch.cuda,
-            'get_device_capability',
-            return_value=(8, 9),
-        ), mock.patch.object(
             triton_sparse,
-            'TritonKitchenBackend',
+            'TritonBF16Backend',
             return_value=sentinel,
         ) as backend:
             actual = triton_sparse.TritonSparseBackend('config', projector='p')
         self.assertIs(actual, sentinel)
         backend.assert_called_once_with('config', projector='p')
 
-    def test_triton_preflight_keeps_legacy_capability_contract(self):
+    def test_triton_preflight_uses_bf16_capability_contract(self):
         sentinel = object()
         with mock.patch.object(
-            triton_sparse._legacy,
-            'preflight_triton_sparse',
+            triton_sparse,
+            'preflight_triton_bf16',
             return_value=sentinel,
         ):
             actual = triton_sparse.preflight_triton_sparse(
@@ -84,13 +76,18 @@ class Issue40SM120FallbackTests(unittest.TestCase):
             [(0, 3, 11), (3, 5, 6)],
         )
 
-    def test_healthy_64x64_geometry_survives_unrelated_global_failure(self):
+    def test_healthy_geometries_ignore_global_and_bit_identity_failures(self):
         detail = {
             'dense_int8_passed': True,
-            'full_route_bit_identical': {
+            'full_route_passed': {
                 '128x128': False,
                 '128x64': True,
                 '64x64': True,
+            },
+            'full_route_bit_identical': {
+                '128x128': False,
+                '128x64': False,
+                '64x64': False,
             },
         }
         with mock.patch.object(selftest, '_load_result', return_value=(False, detail)):
@@ -101,7 +98,7 @@ class Issue40SM120FallbackTests(unittest.TestCase):
     def test_geometry_is_rejected_when_common_dense_carrier_gate_fails(self):
         detail = {
             'dense_int8_passed': False,
-            'full_route_bit_identical': {'64x64': True},
+            'full_route_passed': {'64x64': True},
         }
         with mock.patch.object(selftest, '_load_result', return_value=(False, detail)):
             self.assertFalse(selftest.sparse_geometry_check(64, 64, 'cuda'))
@@ -109,7 +106,7 @@ class Issue40SM120FallbackTests(unittest.TestCase):
     def test_lse_probe_is_not_part_of_normal_kitchen_gate(self):
         detail = {
             'dense_int8_passed': True,
-            'full_route_bit_identical': {'64x64': True},
+            'full_route_passed': {'64x64': True},
         }
         with mock.patch.object(selftest, '_load_result', return_value=(True, detail)):
             self.assertTrue(selftest.sparse_geometry_check(64, 64, 'cuda'))

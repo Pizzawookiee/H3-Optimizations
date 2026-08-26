@@ -57,9 +57,9 @@ control.
   steps; Early steps/Early KV and Late steps/Late KV independently control the
   edges. The defaults are two early steps at 50 percent KV and two late steps at
   50 percent KV. If the two windows overlap, the denser of the two requested
-  edge budgets is used. The backend choices are Kitchen INT8, Sparse Sage, INT8
+  edge budgets is used. The backend choices are Kitchen INT8, Sparse Sage, BF16
   Triton, and FP8 FlexAttention. Kitchen INT8 is the default and uses the shipped
-  native 64Q x 64KV path. The package-owned INT8 Triton and FP8 FlexAttention
+  native 64Q x 64KV path. The package-owned BF16 Triton and FP8 FlexAttention
   fallbacks use the same 64Q x 64KV routing geometry; Sparse Sage follows its
   installed kernel ABI. Explicit backend selections are hard requirements and
   error if unavailable; bypass the node to force dense attention.
@@ -91,7 +91,7 @@ The production nodes are order-independent. Unsupported model families pass
 through unchanged. Auto modes retain the existing implementation when a
 specialized provider cannot satisfy its complete format and runtime contract.
 The standard H3 Sparse Attention node uses the shipped native Kitchen backend
-when its per-GPU self-test passes, then Sparse Sage, INT8 Triton, FlexAttention,
+when its per-GPU self-test passes, then Sparse Sage, BF16 Triton, FlexAttention,
 and the resolved dense H3 path. The Advanced node instead uses the backend
 selected in its production dropdown, with Kitchen INT8 as its default. Explicit
 advanced early/middle/late budgets are preserved across all sparse backends.
@@ -201,10 +201,11 @@ retain their complete format and runtime gates.
 
 Missing dense capabilities return to upstream H3 QKV and normal Comfy
 attention. If native Kitchen is unavailable, `auto` tries an existing
-compatible Sparse Sage package and then the package INT8 Triton sparse backend
-on NVIDIA compute capability 8.0 or newer. Triton consumes the same route and,
-for compatible ConvRot-256 TensorWise INT8 checkpoints, uses 4K QKV chunks to
-produce its INT8 carriers directly. The package-owned INT8 Triton and
+compatible Sparse Sage package and then the package BF16 Triton sparse backend
+on NVIDIA compute capability 8.0 or newer. Triton consumes the same route and
+streams 4K projection chunks from supported BF16, ConvRot-256, W4A8, and FP8
+checkpoints into its final BF16 HND carrier without materializing a full fused
+QKV projection. The package-owned BF16 Triton and
 FlexAttention fallbacks both use 64Q x 64KV routing, matching the native Kitchen
 default. If Triton is unavailable, FlexAttention is next. On supported NVIDIA
 runtimes, Flex stores Q/K/V as
@@ -234,7 +235,7 @@ without changing the already selected attention backend.
 - NVIDIA SM80 or newer for the shipped native Kitchen default
 - NVIDIA SM80 or newer with Triton for the next local sparse fallback
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the NVIDIA Flex
-  fallback when INT8 Triton is unavailable
+  fallback when BF16 Triton is unavailable
 - A ROCm-capable PyTorch build with FlexAttention/Triton for the AMD sparse Flex
   fallback; incompatible ROCm stacks fall back to dense on first validation
 - NVIDIA CUDA SM80, SM86, SM87, SM89, SM90, or SM120 for Sparse Sage

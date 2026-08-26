@@ -540,7 +540,7 @@ class H3SparseAttention(io.ComfyNode):
                 'no percentage is lossless for every prompt. Text, reference '
                 'conditioning, audio, non-video queries, and mixed boundary tiles '
                 'remain dense. Backend auto prefers native Kitchen INT8, then '
-                'Sparse Sage, INT8 Triton, FP8 FlexAttention, and finally the '
+                'Sparse Sage, BF16 Triton, FP8 FlexAttention, and finally the '
                 'resolved dense attention path.'
             ),
             search_aliases=[
@@ -622,7 +622,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 'Lower budgets are faster but can change the generated result, and '
                 'the quality cost depends on the prompt and where attention is '
                 'removed in the denoising schedule. Kitchen INT8 64x64 is the '
-                'default; Sparse Sage, INT8 Triton, and FP8 FlexAttention are '
+                'default; Sparse Sage, BF16 Triton, and FP8 FlexAttention are '
                 'available as explicit alternatives.'
             ),
             search_aliases=[
@@ -689,7 +689,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     default=SPARSE_BACKEND_KITCHEN,
                     tooltip=(
                         'Kitchen INT8 uses the shipped native 64Q x 64KV path. '
-                        'INT8 Triton and FP8 FlexAttention use the same 64Q x '
+                        'BF16 Triton and FP8 FlexAttention use the same 64Q x '
                         '64KV routing geometry. Sparse Sage uses its installed '
                         'kernel geometry. Each alternative is selected explicitly. '
                         'Explicit backend choices fail if that backend is '

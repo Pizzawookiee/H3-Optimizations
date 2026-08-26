@@ -305,7 +305,7 @@ class ApplyCompositionTests(unittest.TestCase):
             apply_module,
             '_resolve_triton_sparse',
             side_effect=apply_module.TritonSparseError(
-                'INT8 Triton is unavailable'
+                'BF16 Triton is unavailable'
             ),
         ), mock.patch.object(
             apply_module,

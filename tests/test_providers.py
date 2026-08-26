@@ -160,7 +160,7 @@ class ProviderTests(unittest.TestCase):
         triton_sparse = resolve_qkv_provider(
             inventory,
             request='auto',
-            backend_kind='triton_sparse_int8',
+            backend_kind='triton_sparse_bf16',
             triton_available=True,
         )
         self.assertEqual(triton_sparse.provider_id, QKV_TRITON_SPARSE_CHUNKED)
@@ -227,7 +227,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_preserve_bf16_keeps_full_bf16_for_noncarrier_consumers(self):
         inventory = inspect_h3_linears([block(self.plain)])
-        for backend_kind in ('existing', 'sparse_sage', 'triton_sparse_int8'):
+        for backend_kind in ('existing', 'sparse_sage', 'triton_sparse_bf16'):
             with self.subTest(backend_kind=backend_kind):
                 qkv = resolve_qkv_provider(
                     inventory,
