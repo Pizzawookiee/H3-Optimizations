@@ -84,13 +84,18 @@ class Issue40SM120FallbackTests(unittest.TestCase):
             [(0, 3, 11), (3, 5, 6)],
         )
 
-    def test_healthy_64x64_geometry_survives_unrelated_global_failure(self):
+    def test_healthy_geometries_ignore_global_and_bit_identity_failures(self):
         detail = {
             'dense_int8_passed': True,
-            'full_route_bit_identical': {
+            'full_route_passed': {
                 '128x128': False,
                 '128x64': True,
                 '64x64': True,
+            },
+            'full_route_bit_identical': {
+                '128x128': False,
+                '128x64': False,
+                '64x64': False,
             },
         }
         with mock.patch.object(selftest, '_load_result', return_value=(False, detail)):
@@ -101,7 +106,7 @@ class Issue40SM120FallbackTests(unittest.TestCase):
     def test_geometry_is_rejected_when_common_dense_carrier_gate_fails(self):
         detail = {
             'dense_int8_passed': False,
-            'full_route_bit_identical': {'64x64': True},
+            'full_route_passed': {'64x64': True},
         }
         with mock.patch.object(selftest, '_load_result', return_value=(False, detail)):
             self.assertFalse(selftest.sparse_geometry_check(64, 64, 'cuda'))
@@ -109,7 +114,7 @@ class Issue40SM120FallbackTests(unittest.TestCase):
     def test_lse_probe_is_not_part_of_normal_kitchen_gate(self):
         detail = {
             'dense_int8_passed': True,
-            'full_route_bit_identical': {'64x64': True},
+            'full_route_passed': {'64x64': True},
         }
         with mock.patch.object(selftest, '_load_result', return_value=(True, detail)):
             self.assertTrue(selftest.sparse_geometry_check(64, 64, 'cuda'))

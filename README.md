@@ -171,7 +171,9 @@ When the native backend is first resolved, the local binary is loaded, its ABI
 is checked, and a cached per-GPU self-test is run. Nothing is downloaded,
 compiled, or installed during startup. If the binary is missing, cannot load,
 or fails the self-test, the nodes still load and `auto` uses the remaining
-fallback chain.
+fallback chain. Each sparse geometry is gated independently on finite output,
+relative L2 below 0.002, and max absolute error below 0.01 against matched dense
+Kitchen. Exact bit identity is retained as diagnostic information only.
 
 The shipped CUDA targets are SM80, SM89, and SM120 on Windows, with SM90a also
 included on Linux. Sparse Sage remains an optional explicit backend and an
