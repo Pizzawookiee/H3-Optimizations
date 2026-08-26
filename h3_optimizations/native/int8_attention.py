@@ -140,6 +140,88 @@ class BlockSparseRoute:
         )
 
 
+def _coarsen_64q_route_to_128q(route, kv_tiles):
+    """Union pairs of 64Q routes into a valid 128Q x 64KV route.
+
+    This is a safety fallback, not the normal router. It preserves every KV tile
+    selected by either 64-row half, so it can only become denser when two query
+    tiles disagree. CTA_K remains 64, which means the already-produced Kitchen
+    carrier is directly reusable without requantizing Q/K/V.
+    """
+    if (int(route.q_tile), int(route.kv_tile)) != (64, 64):
+        raise ValueError('only 64Q x 64KV routes can be coarsened to 128Q x 64KV')
+    absolute = route.to_absolute()
+    indices = absolute.indices.to(torch.int64)
+    counts = absolute.counts.to(torch.int64)
+    if indices.ndim != 4 or counts.shape != indices.shape[:-1]:
+        raise ValueError('sparse route has invalid shapes')
+    kv_tiles = int(kv_tiles)
+    if kv_tiles <= 0:
+        raise ValueError('kv_tiles must be positive')
+
+    batch, heads, old_q_tiles, slots = indices.shape
+    new_q_tiles = (old_q_tiles + 1) // 2
+    positions = torch.arange(slots, device=indices.device)
+    live = positions.view(1, 1, 1, -1) < counts.unsqueeze(-1)
+    if bool(((indices < 0) & live).any()) or bool(((indices >= kv_tiles) & live).any()):
+        raise ValueError('sparse route contains an out-of-range KV tile')
+
+    old_q = torch.arange(old_q_tiles, device=indices.device).view(1, 1, -1, 1)
+    new_q = old_q // 2
+    safe_indices = torch.where(live, indices, torch.zeros_like(indices))
+    linear = new_q * kv_tiles + safe_indices
+
+    selected_flat = torch.zeros(
+        batch,
+        heads,
+        new_q_tiles * kv_tiles,
+        dtype=torch.int32,
+        device=indices.device,
+    )
+    selected_flat.scatter_add_(
+        -1,
+        linear.expand(batch, heads, -1, -1).reshape(batch, heads, -1),
+        live.to(torch.int32).reshape(batch, heads, -1),
+    )
+    selected = selected_flat.reshape(batch, heads, new_q_tiles, kv_tiles) > 0
+    new_counts = selected.sum(dim=-1, dtype=torch.int32).contiguous()
+    candidates = torch.arange(kv_tiles, dtype=torch.int32, device=indices.device)
+    packed = torch.where(
+        selected,
+        candidates.view(1, 1, 1, -1),
+        torch.full((), kv_tiles, dtype=torch.int32, device=indices.device),
+    ).sort(dim=-1).values.contiguous()
+    return BlockSparseRoute(
+        indices=packed,
+        counts=new_counts,
+        q_tile=128,
+        kv_tile=64,
+        encoding='absolute',
+    )
+
+
+def _runtime_sparse_route(quantized, route, *, validate_geometry):
+    """Choose a geometry proven on this GPU, keeping Kitchen ahead of Triton."""
+    if not validate_geometry:
+        return route
+    from . import selftest
+
+    device = quantized.q.device
+    q_tile, kv_tile = int(route.q_tile), int(route.kv_tile)
+    if selftest.sparse_geometry_check(q_tile, kv_tile, device):
+        return route
+    if (q_tile, kv_tile) == (64, 64) and selftest.sparse_geometry_check(
+        128, 64, device
+    ):
+        kv_tiles = (int(quantized.k.shape[-2]) + 63) // 64
+        return _coarsen_64q_route_to_128q(route, kv_tiles)
+    raise RuntimeError(
+        'native sparse geometry %dQ x %dKV failed its device self-test and no '
+        'carrier-compatible Kitchen fallback geometry is available'
+        % (q_tile, kv_tile)
+    )
+
+
 def _check_quantize_qk(*arguments):
     loader.check(loader.load().h3_int8_quantize_qk(*arguments), 'quantize_qk')
 
@@ -377,10 +459,17 @@ def int8_attention_from_prequantized(quantized, *, output_layout=OUTPUT_HND):
 
 
 def block_sparse_int8_attention_from_prequantized(
-    quantized, route, *, output_layout=OUTPUT_HND
+    quantized,
+    route,
+    *,
+    output_layout=OUTPUT_HND,
+    validate_geometry=True,
 ):
     """INT8 attention over the KV tiles the route selects."""
     library = loader.load()
+    route = _runtime_sparse_route(
+        quantized, route, validate_geometry=validate_geometry
+    )
     kernel_route = _validate_sparse_route(quantized, route)
 
     output, output_dtype, geometry, strides = _attention_geometry(
@@ -403,9 +492,16 @@ def block_sparse_int8_attention_from_prequantized(
 
 
 def block_sparse_int8_attention_with_lse_from_prequantized(
-    quantized, route, *, output_layout=OUTPUT_HND
+    quantized,
+    route,
+    *,
+    output_layout=OUTPUT_HND,
+    validate_geometry=True,
 ):
     """INT8 sparse attention plus the per-row base-2 softmax normalizer."""
+    route = _runtime_sparse_route(
+        quantized, route, validate_geometry=validate_geometry
+    )
     kernel_route = _validate_sparse_route(quantized, route)
 
     output, output_dtype, geometry, strides = _attention_geometry(

@@ -104,7 +104,6 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
                 return False
 
         return FakeHeld
-
     def test_existing_attention_is_requested_to_return_hnd(self):
         calls = []
 

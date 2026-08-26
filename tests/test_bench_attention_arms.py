@@ -396,3 +396,59 @@ class ResetSemanticsTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SageLaunchFlagTests(unittest.IsolatedAsyncioTestCase):
+    '''The Sage arms come from a launch flag, so the benchmark must verify it.
+
+    Neither Sage row puts an attention node in the graph. On a server started
+    without --use-sage-attention they would silently measure the default
+    backend and still be reported as SageAttention.
+    '''
+
+    class Session:
+        def __init__(self, argv, status=200):
+            self.argv = argv
+            self.status = status
+            self.requested = []
+
+        def get(self, url):
+            self.requested.append(url)
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def json(self):
+            return {'system': {'argv': self.argv}}
+
+    async def test_missing_flag_is_refused(self):
+        session = self.Session(['main.py', '--port', '8189'])
+        with self.assertRaises(bench.BenchError) as caught:
+            await bench.require_command_line_sage(
+                session, 'http://stub', ['kitchen', 'sage']
+            )
+        self.assertIn('--use-sage-attention', str(caught.exception))
+
+    async def test_present_flag_passes(self):
+        session = self.Session(['main.py', '--use-sage-attention'])
+        await bench.require_command_line_sage(
+            session, 'http://stub', ['sage', 'sage_memory']
+        )
+
+    async def test_no_sage_arms_skips_the_check_entirely(self):
+        session = self.Session([])
+        await bench.require_command_line_sage(
+            session, 'http://stub', ['kitchen', 'h3opt']
+        )
+        self.assertEqual(session.requested, [])
+
+    async def test_unreadable_system_stats_is_refused(self):
+        session = self.Session([], status=503)
+        with self.assertRaises(bench.BenchError):
+            await bench.require_command_line_sage(
+                session, 'http://stub', ['sage']
+            )

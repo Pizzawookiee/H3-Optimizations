@@ -1,35 +1,57 @@
-'''Stable public surface for the optimized INT8 Triton sparse backend.'''
+'''Stable public surface for the INT8 Triton sparse backend.
 
-from . import triton_sparse_fast as _impl
-from .triton_compact import (
-    backend_prepare as _backend_prepare,
-    backend_prepare_projected as _backend_prepare_projected,
-    executor_prepare_compact as _executor_prepare_compact,
-    executor_prepare_projected_compact as _executor_prepare_projected_compact,
+The production backend consumes the exact Kitchen carrier and mirrors the
+Kitchen pure-INT8 probability/value math at 64Q x 64KV. The old carrier,
+executor, and spec remain importable so existing tests/benchmarks and saved
+integrations keep their low-level ABI.
+'''
+
+import torch
+
+from . import triton_sparse_fast as _legacy
+from .triton_sparse_fast import (  # legacy low-level compatibility
+    PreparedTritonSparse,
+    PreparedTritonHybrid,
+    TritonSparseExecutor,
+    TritonSparseSpec,
 )
-from .triton_sparse_kernels import launch_int8_sparse as _fast_launch
-
-# Keep the public backend surface stable while replacing the expensive pieces:
-# the attention launcher and Sparge-format route preparation.
-_impl._launch_int8_sparse = _fast_launch
-_impl.TritonSparseExecutor.prepare_compact = _executor_prepare_compact
-_impl.TritonSparseExecutor.prepare_projected_compact = (
-    _executor_prepare_projected_compact
+from .triton_kitchen import (
+    PreparedTritonKitchen,
+    TritonKitchenBackend,
+    TritonKitchenError,
 )
-_impl.TritonSparseBackend.prepare = _backend_prepare
-_impl.TritonSparseBackend.prepare_projected = _backend_prepare_projected
-
-_original_as_status = _impl.TritonSparseBackend.as_status
+from .triton_kitchen_sm120 import SM120TritonKitchenBackend
 
 
-def _optimized_as_status(self):
-    status = _original_as_status(self)
-    status['autotune_block_m'] = [16, 32, 64]
-    status['autotune_warps'] = [4, 8]
-    status['route_format'] = 'absolute_compact_int32_direct'
-    return status
+TritonSparseError = TritonKitchenError
 
 
-_impl.TritonSparseBackend.as_status = _optimized_as_status
+def TritonSparseBackend(config=None, **kwargs):
+    '''Construct the Kitchen-parity backend appropriate for this CUDA target.'''
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability())
+    backend = (
+        SM120TritonKitchenBackend
+        if capability == (12, 0)
+        else TritonKitchenBackend
+    )
+    return backend(config, **kwargs)
 
-from .triton_sparse_fast import *  # noqa: E402,F401,F403
+
+def preflight_triton_sparse(**kwargs):
+    '''Keep the historical spec ABI while translating preflight errors uniformly.'''
+    try:
+        return _legacy.preflight_triton_sparse(**kwargs)
+    except _legacy.TritonSparseError as exc:
+        raise TritonKitchenError(str(exc)) from exc
+
+
+__all__ = [
+    'PreparedTritonHybrid',
+    'PreparedTritonKitchen',
+    'PreparedTritonSparse',
+    'TritonSparseBackend',
+    'TritonSparseError',
+    'TritonSparseExecutor',
+    'TritonSparseSpec',
+    'preflight_triton_sparse',
+]

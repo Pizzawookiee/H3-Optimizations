@@ -485,6 +485,31 @@ def step_durations(boundaries, warmup):
     return deltas[warmup:], deltas
 
 
+async def require_command_line_sage(session, server, arms):
+    '''Refuse to run the Sage arms unless the server actually selected Sage.
+
+    Both Sage rows rely on ComfyUI's --use-sage-attention rather than a node in
+    the graph, so on a server without it they would silently measure whatever
+    the default attention is and still be labelled SageAttention.
+    '''
+    if not any(arm in ('sage', 'sage_memory') for arm in arms):
+        return
+    async with session.get('%s/api/system_stats' % server) as response:
+        if response.status != 200:
+            raise BenchError(
+                'cannot verify --use-sage-attention: /api/system_stats '
+                'returned %d' % response.status
+            )
+        payload = await response.json()
+    argv = (payload.get('system') or {}).get('argv') or []
+    if '--use-sage-attention' not in argv:
+        raise BenchError(
+            'the sage and sage_memory arms require a server started with '
+            '--use-sage-attention; restart ComfyUI with that flag or drop '
+            'those arms'
+        )
+
+
 async def reset_between_arms(session, server, unload_models):
     '''Release model weights between arms without forcing a text re-encode.'''
     if not unload_models:
@@ -719,6 +744,8 @@ async def run_matrix(args):
                 file=sys.stderr,
             )
             return records
+
+        await require_command_line_sage(session, args.server, args.arm_list)
 
         if args.prime:
             prime_arm, prime_label = args.arm_list[0], args.workload_list[0]

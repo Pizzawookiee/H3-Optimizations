@@ -153,7 +153,6 @@ def _bounded_qkv_projector(qkv):
         force_weights_fp8=qkv.provider_id == QKV_FORCE_QUANT_CHUNKED,
     )
 
-
 def _frost_qkv_projector(qkv):
     return FrostBF16QKVProjector(
         chunk_rows=4096,
@@ -170,7 +169,6 @@ def _native_bf16_qkv(inventory):
         if not item.plain_float or not ('bfloat16' in dtype or 'bf16' in dtype):
             return False
     return True
-
 
 @dataclass(frozen=True)
 class ResolvedAttention:

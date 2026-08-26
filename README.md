@@ -68,11 +68,13 @@ control.
   sequence-major BF16 output.
   FlexAttention uses FP8 carriers on
   supported NVIDIA runtimes and native BF16/FP16 Q/K/V through Triton on ROCm.
+  The package-owned INT8 Triton and FP8 FlexAttention fallbacks use the same
+  64Q x 64KV routing geometry; Sparse Sage follows its installed kernel ABI.
   Explicit backend selections are hard requirements and error if unavailable;
   bypass the node to force dense attention. Legacy saved backend values remain
   accepted for workflow compatibility but are not shown in the dropdown.
 
-The production native backend and the explicit quality arms execute 64Q x
+Benchmark-only native geometry and quality arms execute 64Q x
 64KV, 128Q x 128KV, or 128Q x 64KV routed geometry through the native INT8
 kernel. They reuse the same
 chunked Kitchen Q128 quantization carrier; the 64Q kernel consumes each 64-row
@@ -86,7 +88,9 @@ percent FL2VA baker and robot stress cases, 64Q x 64KV was dramatically more
 robust than either larger geometry. The earlier INT8-derived Sol residual did
 not visibly improve 128Q x 64KV or 64Q x 64KV and added sampler time, so `auto`
 uses hard 64Q x 64KV and never selects Sol. The explicit Sol choices run the
-new BF16 residual for quality evaluation.
+new BF16 residual for quality evaluation. These geometry and Sol controls remain available to
+repository benchmarks and saved workflows but are not shown in the production
+node selector.
 
 > **Sparse attention changes model computation. It is not free acceleration.**
 > Lower Video KV budgets retain fewer target-video attention connections and can
@@ -100,129 +104,71 @@ The production nodes are grouped under H3-Optimizations > Model Patches.
 The production nodes are order-independent. Unsupported model families pass
 through unchanged. Auto modes retain the existing implementation when a
 specialized provider cannot satisfy its complete format and runtime contract.
-A saved workflow containing either H3 Sparse Attention node first uses the
-shipped native Kitchen backend when its per-GPU self-test passes. An existing
-compatible Sparse Sage installation is next, followed by INT8 Triton,
-FlexAttention, and the resolved dense H3 path. The selected fallback and reason
-appear in the node status text. Explicit advanced early/middle/late budgets are
-preserved across all sparse backends.
-
-## Performance
-
-The table below is a representative end-to-end sampler sweep comparing dense
-Comfy attention against the optimization pack at two video lengths. Times are
-median sampler-step times from the sweep. The 20-step columns are simple
-projections from the measured step time, so they are useful for scale but are
-not separate wall-clock measurements. These measurements predate the 64Q x
-64KV production default and do not measure its current performance.
-
-The 5-second VRAM measurements are deliberately omitted. That workload had
-enough free memory that allocation/offload behavior was demand-driven and
-run-order sensitive, making those peaks misleading. The 10-second workload put
-the card under genuine memory pressure, so its peak figures are the useful
-comparison from this sweep.
-
-| configuration | 5s step | 5s 20-step | 10s step | 10s 20-step | 10s peak VRAM |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Comfy Kitchen INT8 dense (no pack) | 27.4 s | ~9m08s | 85.1 s | ~28m22s | 11800 MiB |
-| SageAttention dense (no pack) | 27.5 s | ~9m09s | out of memory | - | - |
-| H3 Memory Optimization | 25.5 s | ~8m29s | 75.1 s | ~25m02s | 9121 MiB |
-| H3 Memory Optimization + H3 Sparse Attention (KV 100%) | 25.3 s | ~8m26s | 75.9 s | ~25m18s | 8763 MiB |
-| **H3 Memory Optimization + H3 Sparse Attention (KV 30%, default)** | **15.7 s** | **~5m13s** | **39.2 s** | **~13m04s** | **9425 MiB** |
-
-Against public dense Comfy Kitchen attention, the default 30 percent sparse
-configuration measured **1.75x faster at 5 seconds** and **2.17x faster at 10
-seconds**. The advantage increased with sequence length in this sweep rather
-than remaining a fixed multiplier.
-
-### Where the measured speedup comes from
-
-The same sweep was arranged as an attribution ladder so each major change could
-be measured independently:
-
-| change | 5s | 10s |
-| --- | ---: | ---: |
-| chunked QKV and bounded MLP | +7.5% | +13.3% |
-| public dense Kitchen to the native Kitchen INT8 kernel | +0.7% | -1.0% |
-| video KV density 100% to 30% | +61.5% | +93.7% |
-
-Sparsity is the dominant acceleration. Chunked QKV and bounded MLP provide a
-smaller but real gain. The native Kitchen kernel at 100 percent KV density is
-approximately performance-neutral against ComfyUI's public dense Kitchen path
-in this measurement; its main value here is providing the execution path that
-can consume the sparse route efficiently.
-
-Sparse attention is therefore not free speed. `KV` density is a
-quality/prompt-adherence budget as well as a performance setting, and its
-visible effect depends on the prompt and on where in the diffusion schedule the
-removed attention occurs. Some prompts tolerate very low budgets while others
-require substantially more. The default is intended as a practical
-speed/quality tradeoff, not a claim that 30 percent density is lossless.
-
-These numbers are measurements from one test setup, not universal performance
-claims. GPU architecture, checkpoint format, sequence length, ComfyUI version,
-and backend availability can all change the result.
+The standard H3 Sparse Attention node uses the shipped native Kitchen backend
+when its per-GPU self-test passes, then Sparse Sage, INT8 Triton, FlexAttention,
+and the resolved dense H3 path. The Advanced node instead uses the backend
+selected in its production dropdown, with Kitchen INT8 as its default. Explicit
+advanced early/middle/late budgets are preserved across all sparse backends.
 
 ## Performance
 
 MiniMax H3 text-to-video at 1376x768 (1.0 MP, 16:9) on an RTX 4070 12 GB,
-`res_multistep`/`simple`, measured end to end through a real sampler. Times are
-the median of three sampler steps after a discarded warmup step; the 20-step
-column extrapolates from that median.
+`res_multistep`/`simple`, measured end to end through a real sampler. Each cell
+executes five sampler steps and reports the median of the four step times after
+the first; step 1 carries model initialization and is excluded. The 20-step
+columns are projections from that median, not separate wall-clock runs.
 
-| configuration | 5s step | 5s 20-step | 10s step | 10s 20-step | 10s peak VRAM |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Comfy Kitchen INT8 dense (no pack) | 27.4 s | ~9m08s | 85.1 s | ~28m22s | 11800 MiB |
-| SageAttention dense (no pack) | 27.5 s | ~9m09s | out of memory | — | — |
-| H3 Memory Optimization | 25.5 s | ~8m29s | 75.1 s | ~25m02s | 9121 MiB |
-| H3 Memory Optimization + H3 Sparse Attention (KV 100%) | 25.3 s | ~8m26s | 75.9 s | ~25m18s | 8763 MiB |
-| **H3 Memory Optimization + H3 Sparse Attention (KV 30%, default)** | **15.7 s** | **~5m13s** | **39.2 s** | **~13m04s** | **9425 MiB** |
+| configuration | 5s step | 5s 20-step | 5s peak VRAM | 10s step | 10s 20-step | 10s peak VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Comfy Kitchen INT8 dense | 26.7 s | ~8m55s | 7513 MiB | 72.2 s | ~24m05s | 11729 MiB |
+| SageAttention dense | 26.5 s | ~8m50s | 7754 MiB | out of memory | - | - |
+| SageAttention + H3 Memory Optimization | 26.2 s | ~8m44s | 5901 MiB | 76.1 s | ~25m22s | 9047 MiB |
+| H3 Memory Optimization + Sparse Attention (KV 100%) | 28.9 s | ~9m39s | 5355 MiB | 86.3 s | ~28m45s | 7315 MiB |
+| **H3 Memory Optimization + Sparse Attention (KV 30%, default)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
 
-Against Comfy Kitchen INT8 dense, the default configuration is **1.75x faster at
-5s and 2.17x at 10s**. The advantage grows with sequence length, so a single
-speedup number understates it on long clips and overstates it on short ones.
+Against dense Comfy Kitchen attention, the default configuration measured
+**1.57x faster at 5 seconds and 1.69x at 10 seconds**, using 2.2 GB less VRAM at
+5 seconds and 4.4 GB less at 10 seconds. The advantage grows with sequence
+length, so a single speedup figure understates long clips and overstates short
+ones.
 
-The three pack rows form an observed ladder. The last two steps change one
-thing; the first combines chunked QKV and bounded MLP:
+Each row differs from the one above it by one change, so the result can be
+attributed rather than merely observed:
 
-| step | 5s | 10s |
+| change | 5s speed | 5s VRAM |
 | --- | ---: | ---: |
-| chunked QKV and bounded MLP | +7.5% | +13.3% |
-| public dense Kitchen to the native Kitchen INT8 kernel | +0.7% | -1.0% |
-| video KV density 100% to 30% | +61.5% | +93.7% |
+| Comfy Kitchen dense to dense SageAttention | 1.01x | +241 MiB |
+| add chunked QKV, MLP and FinalLayer | 1.01x | -1853 MiB |
+| add streamed QKV and the native 64Q x 64KV kernel | 0.91x | -546 MiB |
+| reduce video KV density to 30 percent | 1.70x | -60 MiB |
 
-Chunked QKV is a memory optimization, not a compute-speed optimization. The
-observed QKV timing difference comes from Comfy Kitchen selecting CUTLASS config
-13 for the full large-sequence projection while 4K chunks select the faster
-config 0; forcing config 0 on the full projection accounts for that QKV speed
-change. A future dispatcher fix may therefore remove the timing difference,
-while the lower peak memory from chunking remains. The first row must not be
-read as QKV-only speed attribution.
+Two things are worth reading off that table. The memory optimizations are
+effectively free: roughly 1.8 GB at 5 seconds and 2.7 GB at 10 seconds at no
+measurable time cost, and they are what allows SageAttention to complete the
+10-second workload at all, where it otherwise runs out of memory. The native
+kernel is not itself faster than dense attention at equal density; it is what
+makes the density reduction possible, and sparsity is where the speed comes
+from.
 
-Sparsity is nearly all of it. The native kernel is not itself faster than
-ComfyUI's public dense `comfy_kitchen_int8` at equal density -- it is what makes
-the density reduction possible, and at 10s it is marginally slower at full
-density. Anyone weighing the pack for its kernel alone should read that row.
-
-VRAM is reported for 10s only, and deliberately. At 5s the card has enough
-headroom that physical VRAM is demand-driven: DynamicVRAM expands into whatever
-is free, so the peaks there measure available memory rather than what a
-configuration needs, and comparing them is misleading. At 10s the card is under
-real pressure and the figures separate: Comfy Kitchen dense reaches 11800 of
-12282 MiB, the pack configurations sit between 8763 and 9425 MiB, and
-SageAttention cannot complete the run at all.
-
-These are physical whole-GPU peaks from `nvidia-smi`, not allocator high-water
-marks, so they answer "does this fit on the card" rather than "how much did the
-allocator hold". The allocator-level figures elsewhere in this README are
-measured separately and are not comparable to these.
+The measurements were taken with the NVIDIA driver's CUDA sysmem fallback
+disabled, so exceeding VRAM fails instead of silently paging to system memory.
+With fallback enabled, the 10-second Comfy Kitchen and SageAttention rows page
+rather than fail, which on this card cost roughly a further 2x in step time.
+Treat 10-second timings as plus or minus 10 percent: arms running near the
+12282 MiB limit vary noticeably between sessions. The 5-second column and all
+VRAM figures are stable.
 
 Reproduce with `benchmarks/bench_attention_arms.py`, which drives a running
 ComfyUI server over its prompt API. Install and enable the sibling
 `ComfyUI-H3-Extended` pack, which owns the benchmark-only control nodes. The
-SageAttention row additionally requires a `sageattention` package and a server
-started with `--use-sage-attention`; it is measured here as plain dense
-SageAttention, not Sparge/`spas_sage_attn`.
+benchmark pins every arm's ConvRot QKV to Comfy Kitchen
+CUTLASS config 0 and AIMDO residency to 0 blocks, so dispatcher and
+weight-residency behavior cannot differ between arms. The SageAttention rows
+require a server started with `--use-sage-attention`, and the benchmark refuses
+to run them otherwise; they measure plain dense SageAttention, not
+Sparge/`spas_sage_attn`. Peak VRAM is whole-GPU driver-level usage from
+`nvidia-smi`, so it answers whether a run fits on the card rather than what the
+allocator held.
 
 ## Install
 

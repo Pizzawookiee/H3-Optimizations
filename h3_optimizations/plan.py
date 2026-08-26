@@ -71,7 +71,7 @@ SPARSE_BACKEND_NATIVE_64X64 = 'Native INT8 64x64'
 SPARSE_BACKEND_SOL_64X64 = 'Native INT8 64x64 + Sol residual 64x64'
 SPARSE_BACKEND_NATIVE_HARD = 'Native INT8 128x128 hard control'
 SPARSE_BACKEND_SOL = 'Native INT8 128x128 + Sol residual 64x64'
-_SPARSE_BACKEND_KITCHEN_LEGACY = 'Kitchen INT8 (experimental)'
+SPARSE_BACKEND_KITCHEN_LEGACY = 'Kitchen INT8 (experimental)'
 SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_SAGE,
@@ -85,6 +85,17 @@ SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_SOL_64X64,
     SPARSE_BACKEND_NATIVE_HARD,
     SPARSE_BACKEND_SOL,
+)
+SPARSE_BACKEND_COMPAT_REQUESTS = (
+    *SPARSE_BACKEND_REQUESTS,
+    SPARSE_BACKEND_KITCHEN_LEGACY,
+)
+SPARSE_BACKEND_PUBLIC_REQUESTS = (
+    SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_FROST,
+    SPARSE_BACKEND_SAGE,
+    SPARSE_BACKEND_TRITON,
+    SPARSE_BACKEND_FLEX,
 )
 
 MIN_CHUNK_ROWS = 256
@@ -213,7 +224,7 @@ class SparseRequest:
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
-        if self.backend == _SPARSE_BACKEND_KITCHEN_LEGACY:
+        if self.backend == SPARSE_BACKEND_KITCHEN_LEGACY:
             object.__setattr__(self, 'backend', SPARSE_BACKEND_KITCHEN)
         if self.backend not in SPARSE_BACKEND_REQUESTS:
             raise ValueError('unknown sparse backend request %r' % self.backend)

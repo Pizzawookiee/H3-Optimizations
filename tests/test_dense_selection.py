@@ -304,7 +304,6 @@ class DenseSelectionTests(unittest.TestCase):
 
         self.assertEqual(qkv.provider_id, QKV_BF16_CHUNKED)
         self.assertEqual(attention.projector.name, 'chunked_bf16_qkv')
-
     def test_streaming_off_preserve_native_uses_fused_dense_sage(self):
         model = FakePatcher()
         plan = H3OptimizationPlan().with_memory(

@@ -147,11 +147,10 @@ class NodeTests(unittest.TestCase):
                 'FP8 FlexAttention',
             ],
         )
-        self.assertIn('hard requirements', advanced.description)
-        self.assertIn('Kitchen INT8 (64Q x 64KV)', advanced.description)
+        self.assertIn('Kitchen INT8 64x64 is the default', advanced.description)
         self.assertIn('Bypass this node', backend.tooltip)
         self.assertIn(
-            'INT8 Triton and FP8 FlexAttention also use 64Q x 64KV',
+            'INT8 Triton and FP8 FlexAttention use the same 64Q x 64KV',
             backend.tooltip,
         )
         self.assertIn('FROST BF16 uses 64Q x 64KV', backend.tooltip)
@@ -162,8 +161,13 @@ class NodeTests(unittest.TestCase):
                 'Native INT8 128x128 + Sol residual 64x64'
             )
         )
+        self.assertTrue(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8 (experimental)'
+            )
+        )
         self.assertIsInstance(
-            H3SparseAttentionAdvanced.validate_inputs('unknown backend'),
+            H3SparseAttentionAdvanced.validate_inputs('not a backend'),
             str,
         )
         self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.3)

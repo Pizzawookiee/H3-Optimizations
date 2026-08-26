@@ -33,12 +33,9 @@ from .plan import (
     MLP_MEMORY_AUTO,
     MLP_MEMORY_OFF,
     MLP_MEMORY_PRESERVE,
-    SPARSE_BACKEND_AUTO,
-    SPARSE_BACKEND_FLEX,
-    SPARSE_BACKEND_FROST,
+    SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN,
-    SPARSE_BACKEND_SAGE,
-    SPARSE_BACKEND_TRITON,
+    SPARSE_BACKEND_PUBLIC_REQUESTS,
     MemoryRequest,
     SparseRequest,
     parse_layer_video_budgets,
@@ -51,15 +48,6 @@ from .status import (
 
 DEFAULT_CHUNK_ROWS = 4096
 NODE_CATEGORY = 'H3-Optimizations/Model Patches'
-ADVANCED_SPARSE_BACKEND_OPTIONS = (
-    SPARSE_BACKEND_KITCHEN,
-    SPARSE_BACKEND_FROST,
-    SPARSE_BACKEND_SAGE,
-    SPARSE_BACKEND_TRITON,
-    SPARSE_BACKEND_FLEX,
-)
-
-
 def _video_budget_input():
     return io.Float.Input(
         'video_budget',
@@ -631,8 +619,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 'and Late KV override the first and last configured step counts. '
                 'Lower budgets are faster but can change the generated result, and '
                 'the quality cost depends on the prompt and where attention is '
-                'removed in the denoising schedule. Kitchen INT8 (64Q x 64KV) is '
-                'the default. Backend selections are hard requirements.'
+                'removed in the denoising schedule. Kitchen INT8 64x64 is the '
+                'default; FROST BF16, Sparse Sage, INT8 Triton, and FP8 '
+                'FlexAttention are available as explicit alternatives.'
             ),
             search_aliases=[
                 'H3 sparse advanced',
@@ -694,17 +683,17 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 io.Combo.Input(
                     'backend',
                     display_name='Sparse backend',
-                    options=list(ADVANCED_SPARSE_BACKEND_OPTIONS),
+                    options=list(SPARSE_BACKEND_PUBLIC_REQUESTS),
                     default=SPARSE_BACKEND_KITCHEN,
                     tooltip=(
+                        'Kitchen INT8 uses the shipped native 64Q x 64KV path. '
+                        'FROST BF16 uses 64Q x 64KV routing and is available '
+                        'only on SM89. '
+                        'INT8 Triton and FP8 FlexAttention use the same 64Q x '
+                        '64KV routing geometry. Sparse Sage uses its installed '
+                        'kernel geometry. Each alternative is selected explicitly. '
                         'Explicit backend choices fail if that backend is '
                         'unavailable and do not switch to another backend. '
-                        'Kitchen INT8 is the default and uses the native 64Q x '
-                        '64KV block-sparse kernel. It '
-                        'consumes compatible chunked Kitchen QKV carriers '
-                        'directly. FROST BF16 uses 64Q x 64KV routing and is '
-                        'available only on SM89. INT8 Triton and FP8 FlexAttention also use '
-                        '64Q x 64KV routing. '
                         'Bypass this node to force dense attention.'
                     ),
                 ),
@@ -741,11 +730,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
 
     @classmethod
     def validate_inputs(cls, backend):
-        try:
-            SparseRequest(backend=backend)
-        except ValueError as exc:
-            return str(exc)
-        return True
+        if backend in SPARSE_BACKEND_COMPAT_REQUESTS:
+            return True
+        return 'unknown sparse backend %r' % backend
 
 
 class H3MLPStage0(io.ComfyNode):
