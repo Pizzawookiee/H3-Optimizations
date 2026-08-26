@@ -157,7 +157,7 @@ class NodeTests(unittest.TestCase):
         self.assertIn('Kitchen INT8 64x64 is the default', advanced.description)
         self.assertIn('Bypass this node', backend.tooltip)
         self.assertIn(
-            'INT8 Triton and FP8 FlexAttention use the same 64Q x 64KV',
+            'BF16 Triton and FP8 FlexAttention use the same 64Q x 64KV',
             backend.tooltip,
         )
         self.assertIn('FROST BF16 uses 64Q x 64KV', backend.tooltip)
