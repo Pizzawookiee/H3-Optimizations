@@ -6,14 +6,17 @@ than something anyone checked, so check it here once and cache the verdict.
 
 The dense CTA_K=64 carrier path is the common producer gate. Sparse geometries
 are validated independently: production Kitchen is usable when either 64x64 or
-its carrier-compatible 128x64 fallback passes. The legacy 128x128/LSE path is
-validated only when an LSE-dependent experimental backend explicitly asks for
-it, so it cannot disable normal Kitchen.
+its carrier-compatible 128x64 fallback is finite and numerically close to the
+matched dense Kitchen output. Exact equality remains diagnostic because
+harmless BF16 reduction-order differences may vary across GPU architectures.
+The legacy 128x128/LSE path is validated only when an LSE-dependent
+experimental backend explicitly asks for it, so it cannot disable normal
+Kitchen.
 
 Blackwell deliberately uses different probability math for short CTA_K=64
-dense rows. Sparse kernels use the fused path. Geometry parity therefore runs
+dense rows. Sparse kernels use the fused path. Geometry comparison therefore runs
 with K > 512 so dense and sparse exercise the same probability implementation;
-otherwise a healthy SM120 64KV kernel fails a meaningless bit-identity check.
+otherwise a healthy SM120 64KV kernel fails a meaningless comparison.
 """
 
 from __future__ import annotations
@@ -38,11 +41,11 @@ _lse_results = {}
 
 # Bump whenever the meaning of a cached pass/fail changes without changing the
 # native binary build ID. Otherwise an old failure can survive a Python-only fix.
-_SELFTEST_REVISION = 'v6'
+_SELFTEST_REVISION = 'v7'
 
 # K > 512 is intentional. Blackwell's dense CTA_K=64 launcher chooses a
 # lower-pressure probability path at K <= 512 while sparse always uses fused
-# probability math. At 640 rows parity compares like with like on SM120.
+# probability math. At 640 rows the outputs compare like with like on SM120.
 _BATCH, _HEADS, _Q_LEN, _KV_LEN, _HEAD_DIM = 1, 4, 640, 640, 128
 
 # Keep this local to the native startup layer: importing the high-level sparse
@@ -53,6 +56,10 @@ _PRODUCTION_GEOMETRIES = ((64, 64), (128, 64))
 # Healthy INT8 error is ~0.016 relative L2; the mildest corruption injected in
 # testing produced 0.42. This sits between, well clear of both.
 _INT8_TOLERANCE = 0.15
+# Focused corruption tests accept a local BF16 ULP while rejecting distributed
+# drift, a localized 0.02 error, and non-finite output.
+_SPARSE_REL_L2_TOLERANCE = 0.002
+_SPARSE_MAX_ABS_TOLERANCE = 0.01
 
 
 def _geometry_key(q_tile, kv_tile):
@@ -62,6 +69,29 @@ def _geometry_key(q_tile, kv_tile):
 def _relative_l2(actual, expected):
     error = (actual.float() - expected.float()).norm()
     return (error / expected.float().norm().clamp_min(1e-12)).item()
+
+
+def _sparse_output_health(actual, expected):
+    finite = bool(torch.isfinite(actual).all() and torch.isfinite(expected).all())
+    if not finite:
+        return False, {
+            'finite': False,
+            'rel_l2': None,
+            'max_abs': None,
+            'passed': False,
+        }
+    relative_l2 = _relative_l2(actual, expected)
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    passed = bool(
+        relative_l2 < _SPARSE_REL_L2_TOLERANCE
+        and max_abs < _SPARSE_MAX_ABS_TOLERANCE
+    )
+    return passed, {
+        'finite': True,
+        'rel_l2': round(relative_l2, 6),
+        'max_abs': round(max_abs, 6),
+        'passed': passed,
+    }
 
 
 def _carrier_lse_reference(carrier):
@@ -164,6 +194,8 @@ def run(device=None, *, verbose=False):
         carriers = {}
         dense_by_kv = {}
         parity = {}
+        geometry_health = {}
+        geometry_passed = {}
         for q_tile, kv_tile in _SPARSE_PARITY_GEOMETRIES:
             key = _geometry_key(q_tile, kv_tile)
             try:
@@ -185,15 +217,21 @@ def run(device=None, *, verbose=False):
                 )
                 torch.cuda.synchronize(device)
                 parity[key] = torch.equal(routed, dense_by_kv[kv_tile])
+                geometry_passed[key], geometry_health[key] = (
+                    _sparse_output_health(routed, dense_by_kv[kv_tile])
+                )
             except Exception as error:  # geometry-local rejection when possible
                 parity[key] = False
+                geometry_passed[key] = False
                 detail.setdefault('geometry_errors', {})[key] = (
                     '%s: %s' % (type(error).__name__, error)
                 )
         detail['full_route_bit_identical'] = parity
+        detail['full_route_numerical_health'] = geometry_health
+        detail['full_route_passed'] = geometry_passed
 
         production_sparse_ok = any(
-            bool(parity.get(_geometry_key(*geometry), False))
+            bool(geometry_passed.get(_geometry_key(*geometry), False))
             for geometry in _PRODUCTION_GEOMETRIES
         )
         detail['production_sparse_passed'] = bool(production_sparse_ok)
@@ -208,7 +246,9 @@ def run(device=None, *, verbose=False):
     if verbose:
         print('  dense INT8 vs FP32 SDPA : rel_l2 %.6f (tolerance %s) %s'
               % (int8_error, _INT8_TOLERANCE, 'ok' if dense_ok else 'FAIL'))
-        print('  100%% route vs dense     : %s'
+        print('  100%% route health       : %s'
+              % ', '.join('%s=%s' % item for item in geometry_health.items()))
+        print('  bit-identical diagnostic: %s'
               % ', '.join('%s=%s' % item for item in parity.items()))
         print('  production 64KV sparse  : %s'
               % ('ok' if production_sparse_ok else 'FAIL'))
@@ -290,7 +330,7 @@ def _load_result(device=None, *, force=False):
         else:
             failed = [
                 geometry for geometry, ok
-                in detail.get('full_route_bit_identical', {}).items()
+                in detail.get('full_route_passed', {}).items()
                 if not ok
             ]
             if failed:
@@ -308,15 +348,15 @@ def check(device=None, *, force=False):
 
 
 def sparse_geometry_check(q_tile, kv_tile, device=None, *, force=False):
-    """Whether one shipped sparse geometry passed its full-route parity test."""
+    """Whether one shipped sparse geometry passed its numerical health test."""
     geometry = (int(q_tile), int(kv_tile))
     if geometry not in _SPARSE_PARITY_GEOMETRIES:
         return False
     _passed, detail = _load_result(device, force=force)
     if not bool(detail.get('dense_int8_passed', False)):
         return False
-    parity = detail.get('full_route_bit_identical', {})
-    return bool(parity.get(_geometry_key(*geometry), False))
+    geometry_passed = detail.get('full_route_passed', {})
+    return bool(geometry_passed.get(_geometry_key(*geometry), False))
 
 
 def sparse_lse_check(device=None, *, force=False):
