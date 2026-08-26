@@ -31,7 +31,6 @@ from h3_optimizations.plan import (  # noqa: E402
     H3OptimizationPlan,
     MemoryRequest,
     PLAN_KEY,
-    ROUTING_RANDOM_FIXED,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_FROST,
@@ -247,8 +246,6 @@ class SparseBackendSelectionTests(unittest.TestCase):
         plan = H3OptimizationPlan(
             sparse=SparseRequest(
                 backend=SPARSE_BACKEND_KITCHEN,
-                routing_mode=ROUTING_RANDOM_FIXED,
-                routing_seed=1234,
             )
         )
         inventory = SimpleNamespace(
@@ -288,11 +285,6 @@ class SparseBackendSelectionTests(unittest.TestCase):
         self.assertTrue(attention.projector.stream_output)
         self.assertTrue(attention.backend.stream_output)
         self.assertIs(attention.backend.projector, attention.projector)
-        self.assertEqual(
-            attention.backend.router.routing_mode,
-            ROUTING_RANDOM_FIXED,
-        )
-        self.assertEqual(attention.backend.router.routing_seed, 1234)
         self.assertEqual(
             (attention.projector.q_tile, attention.projector.kv_tile),
             (64, 64),

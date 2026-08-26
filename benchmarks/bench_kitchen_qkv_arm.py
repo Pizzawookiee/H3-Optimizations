@@ -274,7 +274,6 @@ def main(argv=None):
     from h3_optimizations.qkv.formats import describe_linear
     from h3_optimizations.qkv.chunked import project_chunk_hnd
     from h3_optimizations.runtime.context import RUNTIME_KEY, RuntimeSnapshot
-    from h3_optimizations.mlp_sharing.route import router_kwargs
 
     if not torch.cuda.is_available():
         raise SystemExit('CUDA is required')
@@ -451,7 +450,6 @@ def main(argv=None):
                         projected.k_summary,
                         snapshot.layout,
                         budget,
-                        **router_kwargs(transformer_options, layer_index),
                     )
                 except SparseRouterError as exc:
                     raise SparseKitchenError(

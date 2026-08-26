@@ -20,9 +20,6 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations.attention.sparse import triton_sparse  # noqa: E402
-from h3_optimizations.attention.sparse.triton_kitchen_sm120 import (  # noqa: E402
-    _route_groups,
-)
 from h3_optimizations.native import selftest  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -63,18 +60,6 @@ class Issue40SM120FallbackTests(unittest.TestCase):
                 capability_getter=lambda: (12, 0),
             )
         self.assertIs(actual, sentinel)
-
-    def test_sm120_route_groups_restore_fixed_dense_and_sparse_counts(self):
-        metadata = {
-            'dense_q_tiles': 3,
-            'sparse_q_tiles': 5,
-            'pure_video_kv_tiles': 7,
-            'retained_video_kv_tiles': 2,
-        }
-        self.assertEqual(
-            _route_groups(metadata, q_tiles=8, kv_blocks=11),
-            [(0, 3, 11), (3, 5, 6)],
-        )
 
     def test_healthy_geometries_ignore_global_and_bit_identity_failures(self):
         detail = {

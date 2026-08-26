@@ -16,7 +16,6 @@ from .sparse_sage import (
     SparseSageExecutor,
     load_sparse_sage_spec,
 )
-from ...mlp_sharing.route import router_kwargs as _route_kwargs
 
 
 @dataclass
@@ -169,7 +168,6 @@ class HybridSparseBackend:
                 k,
                 snapshot.layout,
                 video_budget,
-                **_route_kwargs(transformer_options, layer_index),
             )
         except SparseRouterError as exc:
             raise SparseSageError('sparse routing failed: %s' % exc) from exc
@@ -230,7 +228,6 @@ class HybridSparseBackend:
                     projected.k_summary,
                     snapshot.layout,
                     video_budget,
-                    **_route_kwargs(transformer_options, layer_index),
                 )
             )
         except SparseRouterError as exc:

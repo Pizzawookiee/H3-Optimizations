@@ -25,7 +25,6 @@ class QKVStatusReadabilityTests(unittest.TestCase):
                 'provider': 'streamed_bf16_kitchen_qkv',
                 'projector': 'chunked_kitchen_qkv',
                 'chunk_rows': 4096,
-                'v_mode': 'retain',
                 'output_streamed': True,
             },
             'weight_formats': {'qkv': ['Parameter:torch.bfloat16'] * 50},
@@ -37,7 +36,7 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             format_qkv_execution(self.status),
             (
                 'BF16 weights -> 4096-row BF16 chunks -> Kitchen INT8 carrier; '
-                'V retained in BF16; output streamed'
+                'output streamed'
             ),
         )
 
@@ -55,21 +54,6 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             text,
         )
         self.assertNotIn('streamed_bf16_kitchen_qkv', text)
-
-    def test_sparse_preview_identifies_random_test_routing(self):
-        self.status['sparse'].update(
-            routing_mode='Fixed random (test)',
-            routing_seed=1234,
-        )
-        model = SimpleNamespace(
-            model_options={
-                'transformer_options': {STATUS_KEY: self.status},
-            }
-        )
-
-        text = format_sparse_status(model)
-
-        self.assertIn('Routing test: Fixed random (test) (seed 1234)', text)
 
     def test_standard_path_keeps_the_fallback_reason(self):
         status = {
@@ -96,7 +80,7 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             'chunked_fp8_kitchen_qkv': 'FP8 projection',
             'convrot_int8_sparse_sage': 'Sparse Sage carrier',
             'chunked_fp8_sparse_sage': 'Sparse Sage carrier',
-            'chunked_triton_int8_sparse': 'Triton INT8 carrier',
+            'chunked_triton_bf16_sparse': 'Triton BF16 carrier',
         }
         for provider, phrase in expected.items():
             with self.subTest(provider=provider):

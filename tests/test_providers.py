@@ -206,12 +206,6 @@ class ProviderTests(unittest.TestCase):
         consumers = (
             'comfy_kitchen_int8',
             'sparse_kitchen_int8',
-            'native_int8_128x64',
-            'native_int8_128x64_sol_residual_64x64',
-            'native_int8_64x64',
-            'native_int8_64x64_sol_residual_64x64',
-            'native_int8_128x128_hard_control',
-            'native_int8_128x128_sol_residual_64x64',
         )
         for backend_kind in consumers:
             with self.subTest(backend_kind=backend_kind):

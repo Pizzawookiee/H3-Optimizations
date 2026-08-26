@@ -1,25 +1,20 @@
 '''Stable public surface for the BF16 Triton sparse backend.
 
 The production backend keeps projected Q/K/V in BF16 and uses ordinary BF16
-tensor-core dots with FP32 online-softmax state at 64Q x 64KV. The old INT8
-carrier, executor, and spec remain importable for low-level compatibility.
+tensor-core dots with FP32 online-softmax state at 64Q x 64KV.
 '''
 
-from .triton_sparse_fast import (  # legacy low-level compatibility
-    PreparedTritonSparse,
-    PreparedTritonHybrid,
-    TritonSparseExecutor,
-    TritonSparseSpec,
-)
 from .triton_bf16 import (
     PreparedTritonBF16,
     TritonBF16Backend,
     TritonBF16Error,
+    TritonBF16Spec,
     preflight_triton_bf16,
 )
 
 
 TritonSparseError = TritonBF16Error
+TritonSparseSpec = TritonBF16Spec
 
 
 def TritonSparseBackend(config=None, **kwargs):
@@ -36,12 +31,9 @@ def preflight_triton_sparse(**kwargs):
 
 
 __all__ = [
-    'PreparedTritonHybrid',
     'PreparedTritonBF16',
-    'PreparedTritonSparse',
     'TritonSparseBackend',
     'TritonSparseError',
-    'TritonSparseExecutor',
     'TritonSparseSpec',
     'preflight_triton_sparse',
 ]

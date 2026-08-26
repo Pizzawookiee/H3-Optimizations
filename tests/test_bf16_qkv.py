@@ -485,39 +485,5 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         )
         self.assertIn('projector=attention.projector', text)
 
-    def test_native_sol_architecture_reuses_the_kitchen_int8_provider(self):
-        inventory = FakeInventory()
-        inventory.qkv_convrot_int8_256 = True
-        for request in (FUSED_QKV_AUTO, FUSED_QKV_PRESERVE_BF16):
-            for backend_kind in (
-                'native_int8_128x64',
-                'native_int8_128x64_sol_residual_64x64',
-                'native_int8_64x64',
-                'native_int8_64x64_sol_residual_64x64',
-                'native_int8_128x128_hard_control',
-                'native_int8_128x128_sol_residual_64x64',
-            ):
-                with self.subTest(request=request, backend_kind=backend_kind):
-                    resolved = resolve_qkv_provider(
-                        inventory,
-                        request=request,
-                        backend_kind=backend_kind,
-                        kitchen_producer_available=True,
-                    )
-                    self.assertEqual(
-                        resolved.provider_id,
-                        QKV_DENSE_KITCHEN_CHUNKED,
-                    )
-                    self.assertTrue(resolved.fused)
-                    self.assertIn('ConvRot-256 INT8', resolved.reason)
-
-        disabled = resolve_qkv_provider(
-            inventory,
-            request=FUSED_QKV_OFF,
-            backend_kind='native_int8_128x128_sol_residual_64x64',
-        )
-        self.assertEqual(disabled.provider_id, QKV_STANDARD)
-
-
 if __name__ == '__main__':
     unittest.main()

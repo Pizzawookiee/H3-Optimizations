@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import torch
 
-from ...mlp_sharing.route import router_kwargs as _route_kwargs
 from ...qkv.bf16 import PreparedBF16QKV
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
@@ -329,7 +328,6 @@ class TritonBF16Backend:
                 k,
                 snapshot.layout,
                 budget,
-                **_route_kwargs(transformer_options, layer_index),
             )
         except SparseRouterError as exc:
             raise TritonBF16Error('BF16 Triton routing failed: %s' % exc) from exc

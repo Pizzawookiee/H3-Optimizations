@@ -18,7 +18,6 @@ from .. import AttentionBackendUnavailable
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
-from ...mlp_sharing.route import router_kwargs as _route_kwargs
 
 
 CHUNK_ROWS = 4096
@@ -367,7 +366,6 @@ class FP8FlexBackend:
                 k,
                 snapshot.layout,
                 video_budget,
-                **_route_kwargs(transformer_options, layer_index),
             )
         except SparseRouterError as exc:
             raise FP8FlexError('sparse routing failed: %s' % exc) from exc

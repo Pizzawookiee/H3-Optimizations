@@ -44,12 +44,6 @@ MLP_CONVROT_INT8_TWO_SLICE = 'convrot_int8_two_slice'
 _BF16_KITCHEN_CARRIER_CONSUMERS = {
     'comfy_kitchen_int8',
     'sparse_kitchen_int8',
-    'native_int8_128x64',
-    'native_int8_128x64_sol_residual_64x64',
-    'native_int8_64x64',
-    'native_int8_64x64_sol_residual_64x64',
-    'native_int8_128x128_hard_control',
-    'native_int8_128x128_sol_residual_64x64',
 }
 
 
@@ -199,27 +193,6 @@ def resolve_qkv_provider(
             QKV_DENSE_CONVROT_INT8,
             True,
             'native ConvRot-256 INT8 QKV projects directly into dense Sage carriers',
-        )
-    if (
-        inventory.qkv_convrot_int8_256
-        and backend_kind in (
-            'native_int8_128x64',
-            'native_int8_128x64_sol_residual_64x64',
-            'native_int8_64x64',
-            'native_int8_64x64_sol_residual_64x64',
-            'native_int8_128x128_hard_control',
-            'native_int8_128x128_sol_residual_64x64',
-        )
-    ):
-        if not kitchen_producer_available:
-            return _required_or_standard(
-                request,
-                'the native INT8 sparse architecture needs the Kitchen QKV producer',
-            )
-        return QKVProviderResolution(
-            QKV_DENSE_KITCHEN_CHUNKED,
-            True,
-            'checkpoint-native ConvRot-256 INT8 QKV uses 4K projection chunks into one shared Kitchen INT8 carrier for exact and residual attention',
         )
     if request == FUSED_QKV_PRESERVE_BF16:
         return _resolve_preserve_precision_qkv(

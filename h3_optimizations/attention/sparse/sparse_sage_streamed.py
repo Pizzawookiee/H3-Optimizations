@@ -25,7 +25,6 @@ import math
 import torch
 
 from ... import diagnostics
-from ...mlp_sharing.route import router_kwargs as _route_kwargs
 from ...qkv.chunked import project_chunk_hnd
 from . import fused_qkv as _fused_qkv_mod
 from .chunked_qkv import pack_sparse_qk_chunk_into
@@ -427,8 +426,6 @@ def _prepare_streamed_route_plan(
     k_summary,
     layout,
     video_budget,
-    *,
-    sink=None,
 ):
     """Keep exact current Top-K selection, but not the full Sparge LUT."""
     if q_summary.ndim != 4 or k_summary.ndim != 4:
@@ -458,7 +455,6 @@ def _prepare_streamed_route_plan(
     metadata = router._metadata(geometry, video_budget, retained)
     if retained == geometry.pure_video_kv_tiles:
         indices = None
-        router._notify(sink, geometry, None)
     else:
         # Deliberately use the existing selector as one full-M matmul.  Changing
         # GEMM M can alter floating accumulation enough to flip near-tied Top-K
@@ -468,7 +464,6 @@ def _prepare_streamed_route_plan(
             k_summary[..., geometry.pure_video_kv_start:, :],
             retained,
         )
-        router._notify(sink, geometry, indices)
     return (
         StreamedRoutePlan(
             geometry=geometry,
@@ -553,14 +548,12 @@ def prepare_streamed_sparse_sage(
     )
     try:
         with diagnostics.stage("sparse_route"):
-            kwargs = _route_kwargs(transformer_options, layer_index)
             route_plan, mask_metadata = _prepare_streamed_route_plan(
                 backend.router,
                 projected.q_summary,
                 projected.k_summary,
                 snapshot.layout,
                 video_budget,
-                **kwargs,
             )
     except SparseRouterError as exc:
         raise SparseSageError("sparse routing failed: %s" % exc) from exc

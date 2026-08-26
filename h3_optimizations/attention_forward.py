@@ -327,7 +327,6 @@ def make_forward(
                 k,
                 v,
             )
-
         if backend is None:
             out = _legacy_attention(
                 module,

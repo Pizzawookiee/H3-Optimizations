@@ -26,7 +26,6 @@ from ... import diagnostics
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
-from ...mlp_sharing.route import router_kwargs as _route_kwargs
 from ...kitchen_qkv import PreparedChunkedKitchenQKV
 
 
@@ -409,7 +408,6 @@ class SparseKitchenBackend:
                     k,
                     snapshot.layout,
                     video_budget,
-                    **_route_kwargs(transformer_options, layer_index),
                 )
         except SparseRouterError as exc:
             raise SparseKitchenError('sparse routing failed: %s' % exc) from exc
@@ -466,7 +464,6 @@ class SparseKitchenBackend:
                         projected.k_summary,
                         snapshot.layout,
                         video_budget,
-                        **_route_kwargs(transformer_options, layer_index),
                     )
                 )
         except SparseRouterError as exc:

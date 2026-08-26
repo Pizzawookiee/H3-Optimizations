@@ -20,9 +20,6 @@ from .linear import (
     module_swiglu_fc2,
     swiglu_eager,
 )
-from .observer import get_mlp_observer, notify_exact_mlp, notify_mlp_block_end
-from .sharing import get_mlp_sharing
-from ..mlp_sharing.route import get_route_recorder
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -172,11 +169,6 @@ def make_forward(block, layer_index, config, original_forward=None):
                 'the original block forward'
             )
 
-        route_recorder = get_route_recorder(transformer_options)
-        if route_recorder is not None:
-            # Each block forward writes its own route; never read a stale one.
-            route_recorder.clear(layer_index)
-
         (
             shift_msa,
             scale_msa,
@@ -220,14 +212,6 @@ def make_forward(block, layer_index, config, original_forward=None):
             rope_freqs=rope_freqs,
             transformer_options=transformer_options,
         )
-        if route_recorder is not None:
-            route_recorder.record_attention_energy(
-                layer_index,
-                attn_out,
-                gate_msa,
-                segments,
-                config.chunk_rows,
-            )
         for start, stop, selector in iter_modulation_chunks(
             segments,
             config.chunk_rows,
@@ -241,12 +225,6 @@ def make_forward(block, layer_index, config, original_forward=None):
         del h, attn_out
 
         held, mlp_path, held_error = _open_mlp(block, x[:1], config)
-        mlp_observer = get_mlp_observer(transformer_options)
-        mlp_sharing = get_mlp_sharing(transformer_options)
-        if mlp_observer is not None and mlp_sharing is not None:
-            raise RuntimeError(
-                'output-exact MLP observation and executable sharing cannot coexist'
-            )
         if held_error is not None:
             logging.warning(
                 '%s block %d selected a format-compatible MLP fallback: %s',
@@ -265,57 +243,13 @@ def make_forward(block, layer_index, config, original_forward=None):
                     chunk.mod_row,
                 )
 
-                def evaluate_mlp(value):
-                    return _run_mlp(
-                        block,
-                        value,
-                        held,
-                        mlp_path,
-                        config,
-                    )
-
-                if mlp_sharing is None:
-                    out, expanded, _path = evaluate_mlp(h)
-                else:
-                    out, expanded, _path = mlp_sharing.evaluate_chunk(
-                        layer_index,
-                        transformer_options,
-                        h=h,
-                        selector=chunk.mod_row,
-                        chunk_start=chunk.start,
-                        chunk_stop=chunk.stop,
-                        evaluate_mlp=evaluate_mlp,
-                    )
-
-                if mlp_observer is not None:
-                    def evaluate_probe_mlp(value):
-                        probe_out, probe_expanded, _probe_path = evaluate_mlp(value)
-                        del probe_expanded, _probe_path
-                        return probe_out
-
-                    def evaluate_probe_activation(value):
-                        return _run_fc1_swiglu(block, value, held, mlp_path)
-
-                    def apply_probe_fc2(value):
-                        return _run_fc2_activation(block, value, held, mlp_path)
-
-                    notify_exact_mlp(
-                        layer_index,
-                        transformer_options,
-                        h=h,
-                        y=out,
-                        residual=x[chunk.start:chunk.stop],
-                        gate=gate_mlp,
-                        shift=shift_mlp,
-                        scale=scale_mlp,
-                        selector=chunk.mod_row,
-                        chunk_start=chunk.start,
-                        chunk_stop=chunk.stop,
-                        evaluate_mlp=evaluate_probe_mlp,
-                        evaluate_activation=evaluate_probe_activation,
-                        apply_fc2=apply_probe_fc2,
-                        mlp_path=mlp_path,
-                    )
+                out, expanded, _path = _run_mlp(
+                    block,
+                    h,
+                    held,
+                    mlp_path,
+                    config,
+                )
                 _gate_add(
                     x[chunk.start:chunk.stop],
                     out,
@@ -326,10 +260,6 @@ def make_forward(block, layer_index, config, original_forward=None):
         finally:
             if held is not None:
                 held.__exit__(None, None, None)
-        if mlp_observer is not None:
-            notify_mlp_block_end(layer_index, transformer_options)
-        if mlp_sharing is not None:
-            mlp_sharing.end_mlp_block(layer_index, transformer_options)
         return x
 
     forward._h3_optimizations_memory = True

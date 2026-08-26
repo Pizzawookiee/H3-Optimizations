@@ -9,7 +9,7 @@ from comfy_api.latest import io, ui
 
 from .apply_policy import apply_plan
 from .dense_resolver import has_explicit_dense_attention
-from .nodes import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
+from .node_constants import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
 from .plan import (
     ATTENTION_AUTO,
     ATTENTION_EXISTING,

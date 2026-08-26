@@ -74,29 +74,6 @@ control.
   backend values remain accepted for workflow compatibility but are not shown
   in the dropdown.
 
-  Its advanced routing test controls can replace QK TopK with either a fresh
-  seeded random route on every router call or one fixed seeded route repeated
-  across calls. These modes exist only as deliberately unintelligent benchmark
-  baselines; QK TopK remains the default and production routing policy.
-
-Benchmark-only native geometry and quality arms execute 64Q x
-64KV, 128Q x 128KV, or 128Q x 64KV routed geometry through the native INT8
-kernel. They reuse the same
-chunked Kitchen Q128 quantization carrier; the 64Q kernel consumes each 64-row
-half directly rather than requantizing Q. Each geometry has a matched Sol arm.
-The hard arm drops rejected tiles. The Sol arm approximates rejected 64Q x 64KV
-tiles with block-mean K and block-sum V and merges that residual into the native
-kernel's softmax state. The explicit Sol arms retain BF16 Q and form their
-anchor-centred K means and V sums from BF16 values before the Kitchen carrier
-is quantized; routed exact attention and its LSE remain native INT8. In the 5
-percent FL2VA baker and robot stress cases, 64Q x 64KV was dramatically more
-robust than either larger geometry. The earlier INT8-derived Sol residual did
-not visibly improve 128Q x 64KV or 64Q x 64KV and added sampler time, so `auto`
-uses hard 64Q x 64KV and never selects Sol. The explicit Sol choices run the
-new BF16 residual for quality evaluation. These geometry and Sol controls remain available to
-repository benchmarks and saved workflows but are not shown in the production
-node selector.
-
 > **Sparse attention changes model computation. It is not free acceleration.**
 > Lower Video KV budgets retain fewer target-video attention connections and can
 > reduce prompt adherence, change motion/detail, or otherwise change the result.
@@ -284,8 +261,7 @@ contracts, explicit
 sparse-backend selection, chunk boundaries and RoPE slices, non-H3 no-op
 behavior, sparse contract and route geometry, runtime step/layout publication,
 explicit early/middle/late density schedules,
-deterministic video-only ordering permutations and inverses, fixed-density
-ordering metrics, and source isolation. GPU kernel validation is intentionally
+fixed-density routing, and source isolation. GPU kernel validation is intentionally
 separate because it requires the matching hardware and compiled backend
 packages. Flex CPU contracts cover the NVIDIA FP8 carrier path, the ROCm native
 BF16/FP16 path, explicit Triton/FA4 selection, and first-call dense fallback in
@@ -303,11 +279,6 @@ the linear output, checks pin cleanup, and reports persistent VBAR pages,
 temporary cast buffers, AIMDO usage, and whole-device VRAM separately:
 
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\.agents\skills\operate-comfy2-install\scripts\comfy_gpu_preflight.ps1 -- .\custom_nodes\H3-Optimizations\benchmarks\bench_aimdo_residency.py --i-understand-this-uses-gpu --output .\.agent\tmp\aimdo-residency.json
-
-The three-way attention benchmark derives each carrier contract from the
-current checkout and verifies identical sparse routes before timing:
-
-    .\.venv\Scripts\python.exe custom_nodes\H3-Optimizations\benchmarks\bench_sparse_backends.py --output sparse-backends.json --i-understand-this-uses-gpu
 
 ## Acknowledgements
 

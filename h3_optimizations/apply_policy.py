@@ -51,8 +51,6 @@ class PolicyChunkedKitchenQKVProjector(_BASE_KITCHEN_PROJECTOR):
                 routing_summaries=self.routing_summaries,
                 q_tile=self.q_tile,
                 kv_tile=self.kv_tile,
-                v_mode=self.v_mode,
-                v_backend=self.v_backend,
                 strided_qk_input=self.strided_qk_input,
                 stream_output=self.stream_output,
             )

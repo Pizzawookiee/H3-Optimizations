@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 
-from .mlp_sharing.config import MLPSharingConfig
-
 PLAN_KEY = 'h3_optimizations_plan'
 STATUS_KEY = 'h3_optimizations_status'
 PLAN_VERSION = 3
@@ -66,12 +64,6 @@ SPARSE_BACKEND_TRITON_LEGACY = 'INT8 Triton'
 SPARSE_BACKEND_FLEX = 'FP8 FlexAttention'
 SPARSE_BACKEND_FROST = 'FROST BF16 (SM89)'
 SPARSE_BACKEND_KITCHEN = 'Kitchen INT8'
-SPARSE_BACKEND_NATIVE_128X64 = 'Native INT8 128x64'
-SPARSE_BACKEND_SOL_128X64 = 'Native INT8 128x64 + Sol residual 64x64'
-SPARSE_BACKEND_NATIVE_64X64 = 'Native INT8 64x64'
-SPARSE_BACKEND_SOL_64X64 = 'Native INT8 64x64 + Sol residual 64x64'
-SPARSE_BACKEND_NATIVE_HARD = 'Native INT8 128x128 hard control'
-SPARSE_BACKEND_SOL = 'Native INT8 128x128 + Sol residual 64x64'
 SPARSE_BACKEND_KITCHEN_LEGACY = 'Kitchen INT8 (experimental)'
 SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_AUTO,
@@ -80,12 +72,6 @@ SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
-    SPARSE_BACKEND_NATIVE_128X64,
-    SPARSE_BACKEND_SOL_128X64,
-    SPARSE_BACKEND_NATIVE_64X64,
-    SPARSE_BACKEND_SOL_64X64,
-    SPARSE_BACKEND_NATIVE_HARD,
-    SPARSE_BACKEND_SOL,
 )
 SPARSE_BACKEND_COMPAT_REQUESTS = (
     *SPARSE_BACKEND_REQUESTS,
@@ -104,14 +90,6 @@ MIN_CHUNK_ROWS = 256
 MAX_CHUNK_ROWS = 65_536
 CHUNK_ALIGNMENT = 256
 DENSITY_FIXED = 'fixed'
-ROUTING_QK_TOPK = 'QK TopK'
-ROUTING_RANDOM_FRESH = 'Fresh random (test)'
-ROUTING_RANDOM_FIXED = 'Fixed random (test)'
-ROUTING_MODES = (
-    ROUTING_QK_TOPK,
-    ROUTING_RANDOM_FRESH,
-    ROUTING_RANDOM_FIXED,
-)
 DEFAULT_VIDEO_BUDGET = 0.3
 DEFAULT_EDGE_STEPS = 2
 DEFAULT_EDGE_KV = 0.5
@@ -231,9 +209,6 @@ class SparseRequest:
     late_kv: float | None = None
     backend: str = SPARSE_BACKEND_AUTO
     layer_video_budgets: tuple[float, ...] | None = None
-    routing_mode: str = ROUTING_QK_TOPK
-    routing_seed: int = 0
-
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
         if self.backend == SPARSE_BACKEND_KITCHEN_LEGACY:
@@ -242,15 +217,6 @@ class SparseRequest:
             object.__setattr__(self, 'backend', SPARSE_BACKEND_TRITON)
         if self.backend not in SPARSE_BACKEND_REQUESTS:
             raise ValueError('unknown sparse backend request %r' % self.backend)
-        if self.routing_mode not in ROUTING_MODES:
-            raise ValueError('unknown sparse routing mode %r' % self.routing_mode)
-        if (
-            isinstance(self.routing_seed, bool)
-            or int(self.routing_seed) != self.routing_seed
-            or not 0 <= int(self.routing_seed) <= 0x7FFFFFFFFFFFFFFF
-        ):
-            raise ValueError('routing_seed must be in [0, 2^63 - 1]')
-        object.__setattr__(self, 'routing_seed', int(self.routing_seed))
         _validate_edge_schedule(
             self.early_steps,
             self.early_kv,
@@ -297,8 +263,6 @@ class SparseRequest:
             None if self.early_kv is None else float(self.early_kv),
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
-            self.routing_mode,
-            int(self.routing_seed),
             self.layer_video_budgets,
         )
 
@@ -310,7 +274,6 @@ class H3OptimizationPlan:
     version: int = PLAN_VERSION
     memory: MemoryRequest | None = None
     sparse: SparseRequest | None = None
-    mlp_sharing: MLPSharingConfig | None = None
 
     def __post_init__(self):
         if int(self.version) != PLAN_VERSION:
@@ -338,23 +301,12 @@ class H3OptimizationPlan:
             )
         return replace(self, sparse=request)
 
-    def with_mlp_sharing(self, request: MLPSharingConfig):
-        if not isinstance(request, MLPSharingConfig):
-            raise TypeError('request must be MLPSharingConfig')
-        if self.mlp_sharing is not None and self.mlp_sharing != request:
-            raise ValueError(
-                'a different H3 MLP Sharing node is already present; '
-                'remove one instead of relying on node order'
-            )
-        return replace(self, mlp_sharing=request)
-
     @property
     def signature(self):
         return (
             int(self.version),
             None if self.memory is None else self.memory.signature,
             None if self.sparse is None else self.sparse.signature,
-            None if self.mlp_sharing is None else self.mlp_sharing.signature,
         )
 
 

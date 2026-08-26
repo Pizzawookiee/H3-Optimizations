@@ -39,7 +39,6 @@ from h3_optimizations.memory_migration_node import (  # noqa: E402
 from h3_optimizations.nodes import (  # noqa: E402
     H3SparseAttention,
     H3SparseAttentionAdvanced,
-    _memory_request,
 )
 from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_AUTO,
@@ -47,7 +46,6 @@ from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_BF16,
     FUSED_QKV_FORCE_QUANT,
-    FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_BF16,
@@ -76,46 +74,6 @@ class PublicNodeTests(unittest.TestCase):
             ],
         )
         self.assertFalse(any('MLPSharing' in node.__name__ for node in nodes))
-
-    def test_explicit_preserve_precision_off_keeps_quantizing_auto_policy(self):
-        request = _memory_request(
-            fused_qkv='auto',
-            mlp_memory='auto',
-            chunk_rows=2048,
-            preserve_precision=False,
-        )
-        self.assertEqual(request.attention, 'auto')
-        self.assertEqual(request.fused_qkv, 'auto')
-        self.assertEqual(request.mlp_memory, 'auto')
-        self.assertEqual(request.chunk_rows, 2048)
-
-    def test_preserve_precision_defaults_on(self):
-        request = _memory_request(chunk_rows=2048)
-        self.assertEqual(request.attention, ATTENTION_EXISTING)
-        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
-        self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
-        self.assertEqual(request.chunk_rows, 2048)
-
-    def test_preserve_precision_keeps_bf16_qkv_chunking_without_requantization(self):
-        request = _memory_request(
-            fused_qkv='auto',
-            mlp_memory='auto',
-            chunk_rows=2048,
-            preserve_precision=True,
-        )
-        self.assertEqual(request.attention, ATTENTION_EXISTING)
-        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
-        self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
-        self.assertEqual(request.chunk_rows, 2048)
-
-    def test_preserve_precision_respects_explicit_mlp_off(self):
-        request = _memory_request(
-            fused_qkv='off',
-            mlp_memory=MLP_MEMORY_OFF,
-            preserve_precision=True,
-        )
-        self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
-        self.assertEqual(request.mlp_memory, MLP_MEMORY_OFF)
 
     def test_legacy_precision_modes_map_to_new_policies(self):
         self.assertEqual(

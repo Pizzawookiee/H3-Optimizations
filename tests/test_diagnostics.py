@@ -87,9 +87,6 @@ class StageCoverageTests(unittest.TestCase):
         'anchor_projection': 'kitchen_qkv.py',
         'routing_summary_generation': 'kitchen_qkv.py',
         'v_retention_copy': 'kitchen_qkv.py',
-        'v_amax_update': 'kitchen_qkv.py',
-        'v_scale_finalize': 'kitchen_qkv.py',
-        'v_reprojection': 'kitchen_qkv.py',
         'carrier_finalize': 'kitchen_qkv.py',
         'producer_create': 'kitchen_qkv.py',
         'anchor_selection': 'native/producer.py',
@@ -100,8 +97,6 @@ class StageCoverageTests(unittest.TestCase):
         'full_carrier_pack': 'attention/sparse/kitchen_sparse.py',
         'sparse_route': 'attention/sparse/kitchen_sparse.py',
         'sparse_carrier_prepare': 'attention/sparse/kitchen_sparse.py',
-        'sol_residual_preprocess': 'attention/sparse/sol_residual.py',
-        'sol_residual_kernel': 'attention/sparse/sol_residual.py',
     }
 
     def test_every_required_stage_is_present_where_it_belongs(self):

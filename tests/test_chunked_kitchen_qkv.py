@@ -607,73 +607,6 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
         options = {'marker': True}
         self.assertEqual(forward(x, rope, options), 'upstream')
         self.assertEqual(calls, [(x, rope, options)])
-
-
-if __name__ == '__main__':
-    unittest.main()
-
-    def test_high_precision_sol_retains_bf16_q_and_centered_kv_summaries(self):
-        fake = FakeKitchen()
-        module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=4)
-        x = torch.arange(130, dtype=torch.bfloat16).unsqueeze(1).expand(130, 6)
-
-        def project(_module, values, _rope_rows):
-            rows = values[:, 0].view(-1, 1, 1)
-            q = rows.expand(-1, 2, 4).clone()
-            return q, q + 100, q + 200
-
-        with mock.patch.object(
-            kitchen_qkv,
-            'resolve_kitchen',
-            return_value=fake,
-        ), mock.patch.object(
-            kitchen_qkv,
-            'describe_linear',
-            return_value=SimpleNamespace(plain_float=False, w4a8=False),
-        ), mock.patch.object(
-            kitchen_qkv,
-            'project_qkv',
-            side_effect=project,
-        ), mock.patch.object(
-            chunked_qkv,
-            'project_qkv',
-            side_effect=project,
-        ):
-            prepared = kitchen_qkv.run_chunked_kitchen_qkv(
-                module,
-                x,
-                None,
-                layer_index=0,
-                transformer_options={},
-                spec=fake.int8_attention_producer_spec(),
-                chunk_rows=64,
-                routing_summaries=True,
-                high_precision_residual=True,
-            )
-
-        self.assertEqual(prepared.residual_q.dtype, torch.bfloat16)
-        self.assertEqual(tuple(prepared.residual_q.shape), (1, 2, 130, 4))
-        self.assertTrue(
-            torch.equal(
-                prepared.residual_q[0, 0, :, 0],
-                torch.arange(130, dtype=torch.bfloat16),
-            )
-        )
-        self.assertEqual(tuple(prepared.residual_k_mean.shape), (1, 2, 3, 4))
-        self.assertEqual(tuple(prepared.residual_v_sum.shape), (1, 2, 3, 4))
-        self.assertEqual(
-            prepared.residual_k_mean[0, 0, :, 0].float().tolist(),
-            [31.5, 95.5, 128.0],
-        )
-        self.assertTrue(
-            torch.allclose(
-                prepared.residual_v_sum[0, 0, :, 0].float(),
-                torch.tensor([14848.0, 18944.0, 656.0]),
-                atol=32.0,
-                rtol=0.0,
-            )
-        )
-
     def test_streamed_projector_keeps_the_disposable_input_with_the_carrier(self):
         fake = FakeKitchen()
         module = SimpleNamespace(qkv_proj=object(), heads=2, head_dim=4)
@@ -716,4 +649,8 @@ if __name__ == '__main__':
 
         self.assertIs(actual.output_buffer, x)
         self.assertIsNone(projected.output_buffer)
+
+
+if __name__ == '__main__':
+    unittest.main()
 

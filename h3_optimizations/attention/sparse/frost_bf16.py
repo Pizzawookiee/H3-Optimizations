@@ -8,7 +8,6 @@ import math
 import torch
 
 from ... import diagnostics
-from ...mlp_sharing.route import router_kwargs as _route_kwargs
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
 from .frost_loader import (
@@ -270,7 +269,6 @@ class FrostBF16Backend:
                     k,
                     snapshot.layout,
                     video_budget,
-                    **_route_kwargs(transformer_options, layer_index),
                 )
         except (SparseRouterError, TritonRouteError) as error:
             raise FrostBF16Error('FROST sparse routing failed: %s' % error) from error

@@ -19,14 +19,11 @@ from .attention.sparse import (
     MODE_SAGE128,
     MODE_SAGE128_FUSED_QKV,
     SparseSageError,
-    SolResidualBackend,
-    SolResidualSpec,
     TritonSparseBackend,
     TritonSparseError,
     preflight_fp8_flex,
     preflight_frost_bf16,
     preflight_sparse_sage,
-    preflight_sol_residual,
     preflight_triton_sparse,
 )
 from .attention.sparse.fused_qkv import (
@@ -56,7 +53,6 @@ from .kitchen_qkv import (
 from .memory.config import ActivationMemoryConfig
 from .memory.final_layer import install as install_final_layer
 from .memory.patch import install as install_memory_patch
-from .mlp_sharing.execution import install_sharing
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import configure_backend
 from .plan import (
@@ -68,16 +64,10 @@ from .plan import (
     H3OptimizationPlan,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
-    SPARSE_BACKEND_NATIVE_128X64,
-    SPARSE_BACKEND_NATIVE_64X64,
-    SPARSE_BACKEND_NATIVE_HARD,
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_SAGE,
-    SPARSE_BACKEND_SOL,
-    SPARSE_BACKEND_SOL_128X64,
-    SPARSE_BACKEND_SOL_64X64,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
     QKV_STREAMING_OFF,
@@ -118,25 +108,12 @@ ATTENTION_TRITON_SPARSE = 'triton_sparse_bf16'
 ATTENTION_FP8_FLEX = 'flex_attention_fp8'
 ATTENTION_FROST_BF16 = 'frost_bf16_sm89'
 ATTENTION_KITCHEN_SPARSE = 'sparse_kitchen_int8'
-ATTENTION_NATIVE_128X64 = 'native_int8_128x64'
-ATTENTION_NATIVE_64X64 = 'native_int8_64x64'
-ATTENTION_NATIVE_HARD = 'native_int8_128x128_hard_control'
-ATTENTION_SOL_RESIDUAL = 'native_int8_128x128_sol_residual_64x64'
-ATTENTION_SOL_128X64 = 'native_int8_128x64_sol_residual_64x64'
-ATTENTION_SOL_64X64 = 'native_int8_64x64_sol_residual_64x64'
-
 SPARSE_EXECUTION_BACKENDS = (
     ATTENTION_SPARSE,
     ATTENTION_TRITON_SPARSE,
     ATTENTION_FP8_FLEX,
     ATTENTION_FROST_BF16,
     ATTENTION_KITCHEN_SPARSE,
-    ATTENTION_NATIVE_128X64,
-    ATTENTION_NATIVE_64X64,
-    ATTENTION_NATIVE_HARD,
-    ATTENTION_SOL_RESIDUAL,
-    ATTENTION_SOL_128X64,
-    ATTENTION_SOL_64X64,
 )
 
 _BOUNDED_QKV_PROVIDERS = (
@@ -260,8 +237,6 @@ def _sparse_config_kwargs(plan):
         'late_steps': sparse.late_steps,
         'late_kv': sparse.late_kv,
         'layer_video_budgets': sparse.layer_video_budgets,
-        'routing_mode': sparse.routing_mode,
-        'routing_seed': int(sparse.routing_seed),
         'strict': True,
     }
 
@@ -284,9 +259,6 @@ def describe_memory_options(attention):
         installed.append('streamed_out')
     if getattr(projector, 'strided_qk_input', False):
         installed.append('strided_qk')
-    v_mode = getattr(projector, 'v_mode', None)
-    if v_mode is not None and v_mode != 'retain':
-        installed.append('v_%s' % v_mode)
     score_chunk = getattr(
         getattr(backend, 'router', None), 'score_chunk_tiles', None
     )
@@ -636,153 +608,6 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
     )
 
 
-def _resolve_sol_experiment(
-    plan,
-    environment,
-    inventory,
-    *,
-    approximate_rejected,
-    q_tile=128,
-    kv_tile=128,
-    selected=None,
-):
-    kitchen = preflight_sparse_kitchen(
-        cuda_available=lambda: environment.cuda_available,
-        capability_getter=lambda: environment.capability,
-        q_tile=q_tile,
-        kv_tile=kv_tile,
-    )
-    spec = (
-        preflight_sol_residual(
-            cuda_available=lambda: environment.cuda_available,
-            capability_getter=lambda: environment.capability,
-            kitchen=kitchen,
-            exact_q_tile=q_tile,
-            exact_kv_tile=kv_tile,
-        )
-        if approximate_rejected
-        else SolResidualSpec(exact_q_tile=q_tile, exact_kv_tile=kv_tile)
-    )
-    if selected is None:
-        selected = (
-            ATTENTION_SOL_RESIDUAL
-            if approximate_rejected else ATTENTION_NATIVE_HARD
-        )
-    qkv = resolve_qkv_provider(
-        inventory,
-        request=_qkv_request(plan),
-        backend_kind=selected,
-        kitchen_producer_available=producer_api_available(
-            device=getattr(environment, 'device_index', None),
-        ),
-    )
-    use_projected = qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED
-    if inventory.qkv_convrot_int8_256 and not use_projected:
-        raise RuntimeError(
-            'the native INT8 Sol architecture requires the chunked Kitchen '
-            'INT8 QKV carrier for a ConvRot-256 INT8 checkpoint'
-        )
-    config = HybridSparseConfig(
-        mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
-        **_sparse_config_kwargs(plan),
-    )
-    projector = (
-        ChunkedKitchenQKVProjector(
-            routing_summaries=True,
-            q_tile=q_tile,
-            kv_tile=kv_tile,
-            strided_qk_input=True,
-            high_precision_residual=approximate_rejected,
-        )
-        if use_projected else None
-    )
-    backend = SolResidualBackend(
-        config,
-        approximate_rejected=approximate_rejected,
-        kitchen=kitchen,
-        projector=projector,
-        spec=spec,
-    )
-    return (
-        ResolvedAttention(
-            requested=ATTENTION_SPARSE,
-            selected=selected,
-            backend=backend,
-            reason=(
-                'native INT8 %dQ x %dKV exact attention plus a 64x64 Sol residual'
-                % (q_tile, kv_tile)
-                if approximate_rejected
-                else 'matched native INT8 %dQ x %dKV hard-sparse control'
-                % (q_tile, kv_tile)
-            ),
-            backend_kind=selected,
-            projector=projector,
-        ),
-        qkv,
-    )
-
-
-def _resolve_native_geometry(
-    plan, environment, inventory, *, q_tile, kv_tile, selected
-):
-    kitchen = preflight_sparse_kitchen(
-        cuda_available=lambda: environment.cuda_available,
-        capability_getter=lambda: environment.capability,
-        q_tile=q_tile,
-        kv_tile=kv_tile,
-    )
-    qkv = resolve_qkv_provider(
-        inventory,
-        request=_qkv_request(plan),
-        backend_kind=selected,
-        kitchen_producer_available=producer_api_available(
-            device=getattr(environment, 'device_index', None),
-        ),
-    )
-    use_projected = qkv.provider_id == QKV_DENSE_KITCHEN_CHUNKED
-    if inventory.qkv_convrot_int8_256 and not use_projected:
-        raise RuntimeError(
-            'native INT8 %dQ x %dKV requires the chunked Kitchen INT8 QKV '
-            'carrier for a ConvRot-256 INT8 checkpoint' % (q_tile, kv_tile)
-        )
-    config = HybridSparseConfig(
-        mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
-        **_sparse_config_kwargs(plan),
-    )
-    projector = (
-        ChunkedKitchenQKVProjector(
-            routing_summaries=True,
-            q_tile=q_tile,
-            kv_tile=kv_tile,
-            strided_qk_input=True,
-            stream_output=True,
-        )
-        if use_projected else None
-    )
-    backend = SparseKitchenBackend(
-        config,
-        kitchen=kitchen,
-        projector=projector,
-        q_tile=q_tile,
-        kv_tile=kv_tile,
-        output_layout=OUTPUT_NHD,
-        release_carrier_before_out_proj=True,
-        stream_output=use_projected,
-    )
-    return (
-        ResolvedAttention(
-            requested=ATTENTION_SPARSE,
-            selected=selected,
-            backend=backend,
-            reason='exact native INT8 %dQ x %dKV sparse attention'
-            % (q_tile, kv_tile),
-            backend_kind=selected,
-            projector=projector,
-        ),
-        qkv,
-    )
-
-
 def _resolve_attention(plan, model, inventory, environment):
     if plan.sparse is not None:
         backend_request = plan.sparse.backend
@@ -802,58 +627,6 @@ def _resolve_attention(plan, model, inventory, environment):
             )
         if backend_request == SPARSE_BACKEND_FROST:
             return _resolve_frost_bf16(plan, environment, inventory)
-        if backend_request == SPARSE_BACKEND_NATIVE_128X64:
-            return _resolve_native_geometry(
-                plan,
-                environment,
-                inventory,
-                q_tile=128,
-                kv_tile=64,
-                selected=ATTENTION_NATIVE_128X64,
-            )
-        if backend_request == SPARSE_BACKEND_SOL_128X64:
-            return _resolve_sol_experiment(
-                plan,
-                environment,
-                inventory,
-                approximate_rejected=True,
-                q_tile=128,
-                kv_tile=64,
-                selected=ATTENTION_SOL_128X64,
-            )
-        if backend_request == SPARSE_BACKEND_NATIVE_64X64:
-            return _resolve_native_geometry(
-                plan,
-                environment,
-                inventory,
-                q_tile=64,
-                kv_tile=64,
-                selected=ATTENTION_NATIVE_64X64,
-            )
-        if backend_request == SPARSE_BACKEND_SOL_64X64:
-            return _resolve_sol_experiment(
-                plan,
-                environment,
-                inventory,
-                approximate_rejected=True,
-                q_tile=64,
-                kv_tile=64,
-                selected=ATTENTION_SOL_64X64,
-            )
-        if backend_request == SPARSE_BACKEND_NATIVE_HARD:
-            return _resolve_sol_experiment(
-                plan,
-                environment,
-                inventory,
-                approximate_rejected=False,
-            )
-        if backend_request == SPARSE_BACKEND_SOL:
-            return _resolve_sol_experiment(
-                plan,
-                environment,
-                inventory,
-                approximate_rejected=True,
-            )
         if backend_request != SPARSE_BACKEND_AUTO:
             raise ValueError('unknown sparse backend request %r' % backend_request)
 
@@ -974,7 +747,6 @@ def _status(
     *,
     attention_blocks,
     mlp_blocks,
-    mlp_sharing_installed,
     runtime_installed,
     inventory,
 ):
@@ -1005,8 +777,6 @@ def _status(
                 'early_kv': plan.sparse.early_kv,
                 'late_steps': plan.sparse.late_steps,
                 'late_kv': plan.sparse.late_kv,
-                'routing_mode': plan.sparse.routing_mode,
-                'routing_seed': int(plan.sparse.routing_seed),
                 'layer_video_budgets': (
                     None
                     if plan.sparse.layer_video_budgets is None
@@ -1024,7 +794,6 @@ def _status(
             'strided_qk_input': getattr(
                 attention.projector, 'strided_qk_input', None
             ),
-            'v_mode': getattr(attention.projector, 'v_mode', None),
             'output_streamed': bool(
                 getattr(attention.projector, 'stream_output', False)
                 or getattr(attention.backend, 'stream_output', False)
@@ -1055,22 +824,6 @@ def _status(
             else {
                 'chunked': True,
                 'chunk_rows': int(plan.memory.chunk_rows),
-            }
-        ),
-        'mlp_sharing': (
-            None
-            if plan.mlp_sharing is None
-            else {
-                'installed': bool(mlp_sharing_installed),
-                'selector': plan.mlp_sharing.selector,
-                'requested_removal_fraction': float(
-                    plan.mlp_sharing.removal_fraction
-                ),
-                'start_after_step': int(plan.mlp_sharing.start_after_step),
-                'layers': list(plan.mlp_sharing.layers),
-                'selector_seed': int(plan.mlp_sharing.selector_seed),
-                'geometry': list(plan.mlp_sharing.geometry),
-                'reconstruction': 'representative',
             }
         ),
         'weight_formats': _inventory_status(inventory),
@@ -1147,22 +900,10 @@ def apply_plan(model, plan: H3OptimizationPlan):
         inventory,
         environment,
     )
-    mlp_sharing_installed = False
-    if plan.mlp_sharing is not None and plan.memory is not None:
-        if mlp.provider_id in (MLP_OFF, MLP_PRESERVE_UPSTREAM):
-            raise RuntimeError(
-                'H3 MLP Sharing requires an executable H3 Memory Optimization '
-                'MLP provider; resolved %s' % mlp.provider_id
-            )
-        install_sharing(patched, plan.mlp_sharing)
-        mlp_sharing_installed = True
     runtime_installed = False
     if sparse_execution_selected:
         _session, _created = _ensure_sparse_runtime(patched)
         runtime_installed = True
-    if mlp_sharing_installed:
-        runtime_installed = True
-
     patched.model_options[PLAN_KEY] = plan
     options = patched.model_options['transformer_options'] = (
         patched.model_options.get('transformer_options', {}).copy()
@@ -1175,7 +916,6 @@ def apply_plan(model, plan: H3OptimizationPlan):
         mlp,
         attention_blocks=attention_blocks,
         mlp_blocks=mlp_blocks,
-        mlp_sharing_installed=mlp_sharing_installed,
         runtime_installed=runtime_installed,
         inventory=inventory,
     )

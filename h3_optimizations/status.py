@@ -79,10 +79,6 @@ def format_qkv_execution(status):
             projection,
         )
         details = []
-        if qkv.get('v_mode') == 'retain':
-            details.append('V retained in BF16')
-        elif qkv.get('v_mode') == 'two_pass':
-            details.append('V packed in two passes')
         if qkv.get('output_streamed'):
             details.append('output streamed')
         return text if not details else '%s; %s' % (text, '; '.join(details))
@@ -113,8 +109,8 @@ def format_qkv_execution(status):
             weights,
             chunk_rows,
         )
-    if provider == 'chunked_triton_int8_sparse':
-        return '%s -> %d-row projection -> Triton INT8 carrier' % (
+    if provider == 'chunked_triton_bf16_sparse':
+        return '%s -> %d-row projection -> Triton BF16 carrier' % (
             weights,
             chunk_rows,
         )
@@ -199,17 +195,6 @@ def format_sparse_status(model):
             'non-video context and mixed boundary tiles remain dense.'
         ),
     ]
-    routing_mode = sparse.get(
-        'routing_mode', getattr(plan_sparse, 'routing_mode', None)
-    )
-    if routing_mode and routing_mode != 'QK TopK':
-        routing_seed = sparse.get(
-            'routing_seed', getattr(plan_sparse, 'routing_seed', 0)
-        )
-        lines.insert(
-            2,
-            'Routing test: %s (seed %d)' % (routing_mode, int(routing_seed)),
-        )
     if backend_request != SPARSE_BACKEND_AUTO:
         lines.insert(1, 'Requested sparse backend: %s' % backend_request)
     elif selected != 'sparse_sage' and reason:

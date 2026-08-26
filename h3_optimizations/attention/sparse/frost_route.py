@@ -14,8 +14,6 @@ def build_full_absolute_route(
     k,
     layout,
     video_budget,
-    *,
-    sink=None,
 ):
     if q.ndim != 4 or k.ndim != 4 or q.shape != k.shape:
         raise TritonRouteError('FROST route expects equal rank-4 HND Q/K')
@@ -54,11 +52,4 @@ def build_full_absolute_route(
         start = geometry.pure_video_q_start
         route[..., start:, :compact.shape[-1]].copy_(compact)
         counts[..., start:] = compact.shape[-1]
-        selected = (
-            compact[..., geometry.pure_video_kv_start:]
-            - geometry.pure_video_kv_start
-        )
-    else:
-        selected = None
-    router._notify(sink, geometry, selected)
     return route.contiguous(), counts.contiguous(), metadata
