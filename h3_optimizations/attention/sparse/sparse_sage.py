@@ -6,6 +6,7 @@ import importlib.metadata
 
 import torch
 
+from ..sage_v_fp8 import TRITON_AVAILABLE, direct_per_channel_fp8
 from .router import KV_TILE, Q_TILE
 
 
@@ -92,6 +93,12 @@ class SparseSageKernelSpec:
             return carrier, torch.empty((0,), dtype=torch.float32, device=v.device)
         if not v.is_cuda:
             raise SparseSageError("Sparse Sage FP8 V preparation requires CUDA")
+        if TRITON_AVAILABLE:
+            return direct_per_channel_fp8(
+                v,
+                scale_max=self.v_quant_bound,
+                pad_to=128,
+            )
         fused = self.fused_v_ops
         if fused is None:
             raise SparseSageError("Sparse Sage FP8 V preparation requires the _fused extension")

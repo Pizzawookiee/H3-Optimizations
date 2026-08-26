@@ -3,10 +3,10 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from .. import stats
 from ..sage_mem_eff import EfficientSageError
+from ..sage_v_fp8 import prepare_sage_v_fp8
 from ..triton_i64 import per_thread_int8_i64
 from .common import (
     ArchitectureBackend,
@@ -144,19 +144,12 @@ class SageSM90MemoryEfficientBackend(ArchitectureBackend):
         )
 
     def prepare_streamed_v(self, v_source):
-        pad_rows = (-int(v_source.shape[-2])) % 128
-        if pad_rows:
-            v_source = F.pad(
-                v_source,
-                (0, 0, 0, pad_rows),
-            )
-        v_fp8, v_scale, _ = self.api.per_channel_fp8(
+        return prepare_sage_v_fp8(
             v_source,
-            tensor_layout="HND",
+            self.api.per_channel_fp8,
             scale_max=448.0,
-            smooth_v=False,
+            pad_to=128,
         )
-        return v_fp8, v_scale
 
     def execute_rectangular(
         self,

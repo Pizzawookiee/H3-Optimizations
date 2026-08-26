@@ -12,6 +12,7 @@ from .attention.sage_mem_eff import (
     PreparedSM89,
     guard_v_stride,
 )
+from .attention.sage_v_fp8 import prepare_sage_v_fp8
 
 from .dense_fused_qkv import (
     DENSE_QK_FORMAT,
@@ -82,14 +83,11 @@ class ProjectedSM89SageBackend:
                     "projected dense Sage is SM89-only; device capability is %d.%d"
                     % capability
                 )
-        guarded_v = guard_v_stride(projected.v)
-        v_fp8, v_scale, _ = self.api.per_channel_fp8(
-            guarded_v,
-            tensor_layout="HND",
+        v_fp8, v_scale = prepare_sage_v_fp8(
+            guard_v_stride(projected.v),
+            self.api.per_channel_fp8,
             scale_max=self.api.v_scale_max,
-            smooth_v=False,
         )
-        del guarded_v
 
         stats.observe_sequence(projected.sequence)
         if not self._projected_logged:

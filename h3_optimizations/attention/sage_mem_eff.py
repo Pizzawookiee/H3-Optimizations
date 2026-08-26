@@ -18,6 +18,7 @@ import logging
 import torch
 
 from . import stats
+from .sage_v_fp8 import prepare_sage_v_fp8
 from .triton_i64 import per_thread_int8_i64
 
 V_OFFSET_LIMIT = (1 << 32) - 1
@@ -298,20 +299,17 @@ class SM89SageMemoryEfficientBackend:
         batch, heads, sequence, head_dim = self._validate(q, k, v)
         q_int8, q_scale, k_int8, k_scale = self.quantize_projected_qk(q, k)
 
-        guarded_v = guard_v_stride(v)
-        v_fp8, v_scale, _ = self.api.per_channel_fp8(
-            guarded_v,
-            tensor_layout="HND",
+        v_fp8, v_scale = prepare_sage_v_fp8(
+            guard_v_stride(v),
+            self.api.per_channel_fp8,
             scale_max=self.api.v_scale_max,
-            smooth_v=False,
         )
-        del guarded_v
 
         stats.observe_sequence(sequence)
         if not self._logged:
             logging.info(
                 "[H3 attention] sage_mem_eff active: SageAttention %s, HND, "
-                "per-thread int64 Q/K, stock FP8 V, accumulation=%s, "
+                "per-thread int64 Q/K, FP8 V, accumulation=%s, "
                 "kernel=%s via %s",
                 self.api.version,
                 self.api.accumulation,
@@ -353,14 +351,11 @@ class SM89SageMemoryEfficientBackend:
         )
 
     def prepare_streamed_v(self, v):
-        guarded_v = guard_v_stride(v)
-        v_fp8, v_scale, _ = self.api.per_channel_fp8(
-            guarded_v,
-            tensor_layout="HND",
+        v_fp8, v_scale = prepare_sage_v_fp8(
+            guard_v_stride(v),
+            self.api.per_channel_fp8,
             scale_max=self.api.v_scale_max,
-            smooth_v=False,
         )
-        del guarded_v
         return v_fp8, v_scale
 
     def execute_rectangular(

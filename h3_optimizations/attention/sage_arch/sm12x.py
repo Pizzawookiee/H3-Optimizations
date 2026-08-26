@@ -6,6 +6,7 @@ import torch
 
 from .. import stats
 from ..sage_mem_eff import EfficientSageError
+from ..sage_v_fp8 import prepare_sage_v_fp8
 from .common import (
     ArchitectureBackend,
     KernelBinding,
@@ -151,13 +152,11 @@ class SageSM12xMemoryEfficientBackend(ArchitectureBackend):
         )
 
     def prepare_streamed_v(self, v_source):
-        v_fp8, v_scale, _ = self.api.per_channel_fp8(
+        return prepare_sage_v_fp8(
             v_source,
-            tensor_layout="HND",
+            self.api.per_channel_fp8,
             scale_max=2.25,
-            smooth_v=False,
         )
-        return v_fp8, v_scale
 
     def execute_rectangular(
         self,

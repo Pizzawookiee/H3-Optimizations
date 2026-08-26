@@ -32,7 +32,9 @@ control.
   Sage and source projector expose the required contract. The carrier follows
   each architecture's per-block, per-thread, or per-warp quantization and V
   format, while Q and attention output stay bounded to the configured chunk
-  size. Comfy's known built-in attention consumers retain full BF16 K/V,
+  size. With Triton available, FP8 V routes reduce channel scales from the
+  source V and write the final Sage carrier directly, without a full-size BF16
+  transpose temporary. Comfy's known built-in attention consumers retain full BF16 K/V,
   stream bounded BF16 Q, and write each output-projection chunk into the
   disposable block input. Unknown explicit attention overrides preserve a
   single full-Q invocation in Auto because their callable contract is opaque.
