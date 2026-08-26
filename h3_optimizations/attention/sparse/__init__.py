@@ -56,7 +56,7 @@ _EXPORT_MODULES = {
     'SolResidualError': '.sol_residual',
     'SolResidualSpec': '.sol_residual',
     'pack_exact_route': '.sol_residual',
-    'preflight_sol_residual': '.sol_residual',
+    'preflight_sol_residual': '.sol_preflight',
 }
 
 
