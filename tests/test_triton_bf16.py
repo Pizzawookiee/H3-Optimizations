@@ -73,7 +73,7 @@ class TritonBF16Tests(unittest.TestCase):
 
     def test_projector_exposes_the_bounded_chunk_stream_contract(self):
         projector = TritonSparseQKVProjector(chunk_rows=4096)
-        projector._implementation.stream = mock.Mock()
+        projector._implementation.stream = mock.Mock(return_value=None)
         module = mock.Mock()
         consume = mock.Mock()
         fmt = mock.Mock(

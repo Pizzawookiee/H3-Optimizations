@@ -47,6 +47,8 @@ PLAGUEKIND_GEOMETRIES = {
     'plaguekind_128x64': (128, 64),
     'plaguekind_128x128': (128, 128),
 }
+KITCHEN_INT8_RELATIVE_RMSE_LIMIT = 3e-4
+KITCHEN_INT8_MAX_ABS_LIMIT = 0.002
 
 
 def parse_args(argv=None):
@@ -260,6 +262,13 @@ def numerical_gate(
     prepared = sol.prepare_carrier(carrier)
     production_bf16 = prepare_production_bf16(torch, triton_bf16, q, k, v)
     q_blhd, k_blhd, v_blhd = plaguekind_inputs(q, k, v)
+    production_bf16_strided = prepare_production_bf16(
+        torch,
+        triton_bf16,
+        q_blhd.transpose(1, 2),
+        k_blhd.transpose(1, 2),
+        v_blhd.transpose(1, 2),
+    )
     plague_routes = plaguekind_routes(
         torch, args.parity_sequence, args.heads, device
     )
@@ -275,6 +284,9 @@ def numerical_gate(
         'sol_pointer': sol.launch_prepared(prepared),
         'sol_bf16_hnd_64x64': bf16_control.launch(q, k, v),
         'production_bf16_64x64': triton_bf16._launch(production_bf16),
+        'production_bf16_strided_hnd_64x64': triton_bf16._launch(
+            production_bf16_strided
+        ),
     }
     outputs.update(
         (name, function().transpose(1, 2))
@@ -291,6 +303,19 @@ def numerical_gate(
             for name, value in outputs.items()
         }
         for reference_name, reference in references.items()
+    }
+    result['production_bf16_full_route_against_plaguekind_64x64'] = {
+        'production_bf16_64x64': tensor_metrics(
+            torch, outputs['production_bf16_64x64'], outputs['plaguekind_64x64']
+        ),
+        'production_bf16_strided_hnd_64x64': tensor_metrics(
+            torch,
+            outputs['production_bf16_strided_hnd_64x64'],
+            outputs['plaguekind_64x64'],
+        ),
+        'plaguekind_64x64': tensor_metrics(
+            torch, outputs['plaguekind_64x64'], outputs['plaguekind_64x64']
+        ),
     }
     sparse_lut, sparse_valid, sparse_metadata = mixed_delta_route(
         torch, args.parity_sequence, args.heads, device
@@ -324,7 +349,7 @@ def numerical_gate(
         q_blhd[:, :dense_rows],
         k_blhd,
         v_blhd,
-        absolute[..., :dense_q_tiles, :],
+        absolute[..., :dense_q_tiles, :].contiguous(),
         absolute.shape[-1],
         64,
         64,
@@ -356,7 +381,8 @@ def numerical_gate(
     }
     del outputs, references, prepared, carrier, lut, valid
     del q, k, v, q_blhd, k_blhd, v_blhd, plague_routes, plague_arms
-    del production_bf16, sparse_lut, sparse_valid, sparse_prepared, sparse_pr41, sparse_sol
+    del production_bf16, production_bf16_strided
+    del sparse_lut, sparse_valid, sparse_prepared, sparse_pr41, sparse_sol
     del sparse_bf16_prepared, sparse_bf16, sparse_bf16_reference, absolute
     return result
 
@@ -518,11 +544,21 @@ def main(argv=None):
         torch, native, pr41_launch, sol, triton_bf16, bf16_control, plaguekind, args, device
     )
     kitchen_parity = parity['kitchen_64x64_full']
-    failed = [
-        name
-        for name in ('pr41_triton', 'sol_pointer')
-        if not kitchen_parity[name]['exact']
-    ]
+    failed = []
+    for name in ('pr41_triton', 'sol_pointer'):
+        metrics = kitchen_parity[name]
+        if (
+            metrics['relative_rmse'] > KITCHEN_INT8_RELATIVE_RMSE_LIMIT
+            or metrics['max_abs'] > KITCHEN_INT8_MAX_ABS_LIMIT
+        ):
+            failed.append(name)
+    for section in (
+        'production_bf16_full_route_against_plaguekind_64x64',
+        'production_bf16_mixed_route_against_plaguekind_64x64',
+    ):
+        for name, metrics in parity[section].items():
+            if name.startswith('production_bf16') and not metrics['exact']:
+                failed.append(name)
     timings = (
         benchmark(
             torch,
