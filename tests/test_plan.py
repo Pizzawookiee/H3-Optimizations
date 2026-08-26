@@ -30,8 +30,14 @@ class PlanTests(unittest.TestCase):
     def test_memory_request_defaults_to_four_thousand_rows(self):
         request = MemoryRequest()
         self.assertEqual(request.chunk_rows, 4096)
+        self.assertFalse(request.two_pass_v)
         self.assertTrue(request.prefer_held_weights)
         self.assertFalse(request.mlp_strict)
+
+    def test_two_pass_v_is_part_of_memory_identity(self):
+        request = MemoryRequest(two_pass_v=True)
+        self.assertTrue(request.two_pass_v)
+        self.assertIn(True, request.signature)
 
     def test_preserve_precision_is_a_valid_memory_request(self):
         request = MemoryRequest(mlp_memory=MLP_MEMORY_PRESERVE)

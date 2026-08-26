@@ -153,6 +153,7 @@ class MemoryRequest:
     mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 4096
     qkv_streaming: str = QKV_STREAMING_AUTO
+    two_pass_v: bool = False
     prefer_held_weights: bool = True
     mlp_strict: bool = False
 
@@ -201,6 +202,7 @@ class MemoryRequest:
             self.mlp_memory,
             int(self.chunk_rows),
             self.qkv_streaming,
+            bool(self.two_pass_v),
             bool(self.prefer_held_weights),
             bool(self.mlp_strict),
         )

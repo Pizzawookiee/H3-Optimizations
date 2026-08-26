@@ -75,6 +75,7 @@ def _memory_request(
     fused_qkv=FUSED_QKV_AUTO,
     mlp_memory=MLP_MEMORY_AUTO,
     chunk_rows=DEFAULT_CHUNK_ROWS,
+    two_pass_v=False,
     preserve_precision=True,
 ):
     '''Resolve the public memory controls into one immutable request.'''
@@ -83,6 +84,7 @@ def _memory_request(
             fused_qkv=fused_qkv,
             mlp_memory=mlp_memory,
             chunk_rows=int(chunk_rows),
+            two_pass_v=bool(two_pass_v),
         )
 
     # Preserve precision is a policy over the normal memory node rather than a
@@ -99,6 +101,7 @@ def _memory_request(
             else mlp_memory
         ),
         chunk_rows=int(chunk_rows),
+        two_pass_v=bool(two_pass_v),
     )
 
 
@@ -180,6 +183,21 @@ class H3MemoryOptimization(io.ComfyNode):
                     ),
                 ),
                 io.Boolean.Input(
+                    'two_pass_v',
+                    display_name='Two-pass exact V carrier',
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        'Low-VRAM exact V production for Kitchen INT8. Pass 1 '
+                        'streams V chunks only to accumulate the global per-channel '
+                        'amax; pass 2 reprojects V chunks and writes them directly '
+                        'into the final INT8 carrier. This avoids retaining the full '
+                        'BF16 V tensor and preserves the native Kitchen quantization '
+                        'bytes, at the cost of a second V projection pass. Applies '
+                        'when a Kitchen QKV producer is selected.'
+                    ),
+                ),
+                io.Boolean.Input(
                     'preserve_precision',
                     display_name='Preserve precision',
                     default=True,
@@ -206,6 +224,7 @@ class H3MemoryOptimization(io.ComfyNode):
         fused_qkv=FUSED_QKV_AUTO,
         mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
+        two_pass_v=False,
         preserve_precision=True,
     ):
         plan = read_plan(model).with_memory(
@@ -213,6 +232,7 @@ class H3MemoryOptimization(io.ComfyNode):
                 fused_qkv=fused_qkv,
                 mlp_memory=mlp_memory,
                 chunk_rows=chunk_rows,
+                two_pass_v=bool(two_pass_v),
                 preserve_precision=bool(preserve_precision),
             )
         )

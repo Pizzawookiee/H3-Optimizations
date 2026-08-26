@@ -75,6 +75,7 @@ _PACK_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 _sidecar_lock = threading.Lock()
 _sidecar = None
 _sidecar_searched = False
+_vendored_staging = None
 
 
 def _exports(library):
@@ -144,13 +145,20 @@ def _load_sidecar():
 
 
 def _library_with_v_staging():
-    """Whichever library carries the staging kernels, shipped one first."""
+    global _vendored_staging
+
+    if _vendored_staging is not None:
+        return _vendored_staging
+
     try:
         library = loader.load()
     except loader.NativeUnavailableError:
         library = None
+
     if library is not None and _exports(library):
-        return library
+        _vendored_staging = _bind_v_staging(library)
+        return _vendored_staging
+
     return _load_sidecar()
 
 

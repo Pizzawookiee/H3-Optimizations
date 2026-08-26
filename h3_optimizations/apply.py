@@ -49,6 +49,8 @@ from .kitchen_qkv import (
     PRODUCER_ABI as KITCHEN_PRODUCER_ABI,
     ChunkedKitchenAttentionBackend,
     ChunkedKitchenQKVProjector,
+    V_MODE_RETAIN,
+    V_MODE_TWO_PASS,
     producer_api_available,
 )
 from .memory.config import ActivationMemoryConfig
@@ -207,6 +209,19 @@ def _qkv_request(plan):
     return FUSED_QKV_OFF
 
 
+def _kitchen_v_kwargs(plan):
+    enabled = bool(
+        plan.memory is not None
+        and getattr(plan.memory, 'two_pass_v', False)
+    )
+    return {
+        'v_mode': V_MODE_TWO_PASS if enabled else V_MODE_RETAIN,
+        # Do not silently use the Torch reference when the user requested the
+        # exact low-VRAM path. The shipped native library contains v_staging.cu.
+        'v_backend': 'native' if enabled else None,
+    }
+
+
 def _fp8_execution_available(environment):
     if not bool(getattr(environment, 'cuda_available', False)):
         return False
@@ -331,6 +346,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
         projector = ChunkedKitchenQKVProjector(
             fp8_projection=qkv.provider_id == QKV_DENSE_FP8_CHUNKED,
             strided_qk_input=True,
+            **_kitchen_v_kwargs(plan),
         )
     return (
         ResolvedAttention(
@@ -529,6 +545,7 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             kv_tile=KITCHEN_KV_TILE,
             strided_qk_input=True,
             stream_output=True,
+            **_kitchen_v_kwargs(plan),
         )
     else:
         projector = None
@@ -614,6 +631,7 @@ def _resolve_sol_experiment(
             q_tile=q_tile,
             kv_tile=kv_tile,
             strided_qk_input=True,
+            **_kitchen_v_kwargs(plan),
         )
         if use_projected else None
     )
@@ -677,6 +695,7 @@ def _resolve_native_geometry(
             kv_tile=kv_tile,
             strided_qk_input=True,
             stream_output=True,
+            **_kitchen_v_kwargs(plan),
         )
         if use_projected else None
     )

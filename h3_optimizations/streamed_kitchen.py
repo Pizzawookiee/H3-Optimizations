@@ -1,8 +1,9 @@
 '''Explicit low-VRAM streamed-Q execution for native Kitchen sparse attention.
 
 This first implementation intentionally leaves the native ABI unchanged.
-Preparation retains full K/V INT8 carriers and routing summaries but never
-keeps a full Q INT8 carrier. Execution reprojects Q in bounded chunks, runs
+Preparation retains full K/V INT8 carriers and K routing summaries but never
+keeps a full Q INT8 carrier or full Q-summary tensor. Execution projects Q
+once in bounded chunks, routes that same chunk, quantizes it, and runs
 the existing short-Q/full-KV sparse kernel, immediately applies out_proj, and
 writes the hidden-size result into its final sequence buffer.
 
@@ -44,6 +45,8 @@ from .kitchen_qkv import (
     H3_ATTENTION_BACKEND_KEY,
     ChunkedKitchenQKVProjector,
     FusedQKVError,
+    V_MODE_RETAIN,
+    V_MODE_TWO_PASS,
     _project_anchor_samples,
     _qk_chunk_kwargs,
     _tile_mean,
@@ -124,6 +127,8 @@ class PreparedStreamedSparseKitchen:
     route: object
     layer_index: int
     metadata: dict
+    layout: object = None
+    video_budget: float | None = None
 
     def release(self):
         if self.projected is not None:
@@ -212,26 +217,6 @@ def _streamed_weight_workspace(device, required_size):
     alloc = entry.get(required_size)
     return aimdo_torch.aimdo_to_tensor(alloc, device)
 
-
-def _release_streamed_weight_workspace(device):
-    """Release this path's committed AIMDO VRAM between H3 blocks.
-
-    The global cache is useful while one block is executing because Q, K, V and
-    deferred-Q execution can reuse the same virtual buffer. On a 6 GB device,
-    however, retaining the committed pages after the block competes with
-    ComfyUI's next-block model prefetch cast buffer.
-
-    comfy-aimdo VRAMBuffer has grow/create/destroy but no shrink operation.
-    Dropping the final Python reference invokes VRAMBuffer.__del__(), whose
-    native vrambuf_destroy() unmaps and releases committed physical VRAM.
-    """
-    device_index = _workspace_device_index(device)
-    entry = _STREAMED_QKV_WORKSPACES.pop(device_index, None)
-    if entry is not None:
-        # CPython refcounting destroys this immediately once no gathered/view
-        # object still owns it. All gathered QuantizedTensor views are cleared
-        # before callers reach this helper.
-        del entry
 
 
 def _convrot_slice_source(module, index, label):
@@ -428,10 +413,14 @@ def run_streamed_kitchen_qkv(
     strided_qk_input,
     routing_q_tile,
     routing_kv_tile,
+    v_mode=V_MODE_RETAIN,
+    v_backend=None,
     stage_prefetch=False,
     qkv_prefetch_ticket=None,
 ):
     """Prepare streamed carriers with a one-third reusable ConvRot workspace."""
+    if v_mode not in (V_MODE_RETAIN, V_MODE_TWO_PASS):
+        raise FusedQKVError('unknown streamed Kitchen V mode %r' % v_mode)
     kitchen = resolve_kitchen(x.device)
     if kitchen is None:
         raise FusedQKVError('no INT8 attention producer is available')
@@ -480,6 +469,10 @@ def run_streamed_kitchen_qkv(
         # fused projection and this patch only specializes ConvRot TensorWise.
         held = _held_projector(module, x)
         retained_v = None
+        v_staging = None
+        if v_mode == V_MODE_TWO_PASS:
+            from .native.v_staging import TwoPassVCarrier
+            v_staging = TwoPassVCarrier(spec, backend=v_backend)
         try:
             with diagnostics.stage('streamed_anchor_projection'):
                 samples = _project_anchor_samples(
@@ -520,17 +513,41 @@ def run_streamed_kitchen_qkv(
                     **chunk_kwargs,
                 )
                 del q_stub
-                if retained_v is None:
-                    retained_v = v.new_empty(
-                        (1, heads, sequence, head_dim)
-                    )
-                retained_v[:, :, start:end, :].copy_(v)
+                if v_staging is not None:
+                    with diagnostics.stage('streamed_v_amax_update'):
+                        v_staging.update(v)
+                else:
+                    if retained_v is None:
+                        retained_v = v.new_empty(
+                            (1, heads, sequence, head_dim)
+                        )
+                    retained_v[:, :, start:end, :].copy_(v)
                 del q, k, v
 
-            with diagnostics.stage('streamed_v_carrier_pack'):
-                kitchen.quantize_int8_attention_v(producer, retained_v)
-            del retained_v
-            retained_v = None
+            if v_staging is not None:
+                with diagnostics.stage('streamed_v_scale_finalize'):
+                    v_staging.finalize_scale()
+                for start in range(0, sequence, int(chunk_rows)):
+                    end = min(start + int(chunk_rows), sequence)
+                    with diagnostics.stage('streamed_v_reprojection'):
+                        q_unused, k_unused, v = project_chunk_hnd(
+                            module,
+                            x,
+                            rope_freqs,
+                            start,
+                            end,
+                            projector=held,
+                        )
+                    del q_unused, k_unused
+                    with diagnostics.stage('streamed_v_carrier_pack'):
+                        v_staging.quantize(v, start)
+                    del v
+                producer.v, producer.v_scale = v_staging.finish()
+            else:
+                with diagnostics.stage('streamed_v_carrier_pack'):
+                    kitchen.quantize_int8_attention_v(producer, retained_v)
+                del retained_v
+                retained_v = None
             if producer.v is None or producer.v_scale is None:
                 raise FusedQKVError(
                     'streamed Kitchen V carrier was not produced'
@@ -561,21 +578,12 @@ def run_streamed_kitchen_qkv(
             if held is not None:
                 held.__exit__(None, None, None)
 
-    q_summaries = []
     k_summaries = []
-    q_stub = None
     chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
 
-    # Q pass: routing summaries only. No full-sequence Q INT8 carrier.
-    with _q_only_convrot_weight(module, x.device) as q_weight:
-        for start in range(0, sequence, int(chunk_rows)):
-            end = min(start + int(chunk_rows), sequence)
-            q = _project_q_only_hnd(module, x, rope_freqs, start, end, q_weight)
-            with diagnostics.stage('streamed_routing_q_summary_generation'):
-                q_summaries.append(_tile_mean(q, int(routing_q_tile)))
-            if q_stub is None:
-                q_stub = _query_stub(q).clone()
-            del q
+    # K producer still has a coupled Q input. Use one bounded throwaway Q
+    # carrier tile instead of projecting real Q during preparation.
+    q_stub = x.new_zeros(1, heads, Q_TILE, head_dim)
 
     # K pass: one-third weight workspace + persistent full K carrier.
     with _k_only_convrot_weight(module, x.device) as k_weight:
@@ -600,19 +608,48 @@ def run_streamed_kitchen_qkv(
             del k
     del q_stub
 
-    # V pass: exact one-pass V quantization, but with only the V weight third staged.
-    retained_v = None
-    with _v_only_convrot_weight(module, x.device) as v_weight:
-        for start in range(0, sequence, int(chunk_rows)):
-            end = min(start + int(chunk_rows), sequence)
-            v = _project_v_only_hnd(module, x, start, end, v_weight)
-            if retained_v is None:
-                retained_v = v.new_empty(1, heads, sequence, head_dim)
-            retained_v[..., start:end, :].copy_(v)
-            del v
+    # V path. Retain mode preserves the existing one-projection/full-BF16
+    # behavior. Two-pass mode uses the already-shipped exact staging kernels:
+    # pass 1 accumulates global per-channel amax from bounded V chunks, pass 2
+    # reprojects V-only chunks and writes directly into the final INT8 carrier.
+    if v_mode == V_MODE_TWO_PASS:
+        from .native.v_staging import TwoPassVCarrier
 
-    kitchen.quantize_int8_attention_v(producer, retained_v)
-    del retained_v
+        v_staging = TwoPassVCarrier(spec, backend=v_backend)
+        with _v_only_convrot_weight(module, x.device) as v_weight:
+            for start in range(0, sequence, int(chunk_rows)):
+                end = min(start + int(chunk_rows), sequence)
+                v = _project_v_only_hnd(module, x, start, end, v_weight)
+                with diagnostics.stage('streamed_v_amax_update'):
+                    v_staging.update(v)
+                del v
+
+        with diagnostics.stage('streamed_v_scale_finalize'):
+            v_staging.finalize_scale()
+
+        with _v_only_convrot_weight(module, x.device) as v_weight:
+            for start in range(0, sequence, int(chunk_rows)):
+                end = min(start + int(chunk_rows), sequence)
+                with diagnostics.stage('streamed_v_reprojection'):
+                    v = _project_v_only_hnd(module, x, start, end, v_weight)
+                with diagnostics.stage('streamed_v_carrier_pack'):
+                    v_staging.quantize(v, start)
+                del v
+
+        producer.v, producer.v_scale = v_staging.finish()
+    else:
+        retained_v = None
+        with _v_only_convrot_weight(module, x.device) as v_weight:
+            for start in range(0, sequence, int(chunk_rows)):
+                end = min(start + int(chunk_rows), sequence)
+                v = _project_v_only_hnd(module, x, start, end, v_weight)
+                if retained_v is None:
+                    retained_v = v.new_empty(1, heads, sequence, head_dim)
+                retained_v[..., start:end, :].copy_(v)
+                del v
+
+        kitchen.quantize_int8_attention_v(producer, retained_v)
+        del retained_v
 
     return PreparedStreamedKitchenQKV(
         x=x,
@@ -622,7 +659,7 @@ def run_streamed_kitchen_qkv(
         v=producer.v,
         k_scale=producer.k_scale,
         v_scale=producer.v_scale,
-        q_summary=torch.cat(q_summaries, dim=-2),
+        q_summary=None,
         k_summary=torch.cat(k_summaries, dim=-2),
         original_head_dim=int(spec.original_head_dim),
         input_dtype=spec.input_dtype,
@@ -740,11 +777,44 @@ def execute_streamed_projected(backend, module, prepared):
                     )
                     del k_unused, v_unused
 
+            if prepared.route is None:
+                with diagnostics.stage('streamed_query_route_summary'):
+                    q_summary = _tile_mean(
+                        q,
+                        int(backend.executor.q_tile),
+                    )
+                try:
+                    with diagnostics.stage('streamed_sparse_route'):
+                        lut, valid_block_num, _ = (
+                            backend.router.build_lut_rows_from_summaries(
+                                q_summary,
+                                projected.k_summary,
+                                prepared.layout,
+                                prepared.video_budget,
+                                q_tile_start=(
+                                    start // int(backend.executor.q_tile)
+                                ),
+                            )
+                        )
+                except SparseRouterError as exc:
+                    raise SparseKitchenError(
+                        'single-pass streamed sparse routing failed: %s'
+                        % exc
+                    ) from exc
+                del q_summary
+                route = backend.executor.kitchen.BlockSparseRoute(
+                    indices=lut,
+                    counts=valid_block_num,
+                    q_tile=backend.executor.q_tile,
+                    kv_tile=backend.executor.kv_tile,
+                    encoding='delta',
+                )
+            else:
+                route = _route_chunk(prepared.route, start, end)
+
             with diagnostics.stage('streamed_query_carrier_pack'):
                 quantized = _local_query_carrier(projected, q)
             del q
-
-            route = _route_chunk(prepared.route, start, end)
             with diagnostics.stage('streamed_sparse_attention_kernel'):
                 if backend.output_layout == OUTPUT_HND:
                     raw = (
@@ -825,12 +895,6 @@ def execute_streamed_projected(backend, module, prepared):
         if prepared.projected is not None:
             prepared.release()
 
-        # Low-VRAM policy: do not keep our private one-third ConvRot workspace
-        # committed across H3 blocks. The next block may immediately ask
-        # ComfyUI/AIMDO to grow its own model-prefetch cast buffer.
-        if fmt.convrot_int8_256:
-            _release_streamed_weight_workspace(result.device)
-
 
 _ORIGINAL_PROJECT = ChunkedKitchenQKVProjector.try_project
 _ORIGINAL_PREPARE_PROJECTED = (
@@ -901,6 +965,8 @@ def _stream_aware_project(
             strided_qk_input=self.strided_qk_input,
             routing_q_tile=(64 if self.q_tile is None else int(self.q_tile)),
             routing_kv_tile=(64 if self.kv_tile is None else int(self.kv_tile)),
+            v_mode=self.v_mode,
+            v_backend=self.v_backend,
             stage_prefetch=stage_prefetch_enabled(transformer_options),
             qkv_prefetch_ticket=qkv_ticket,
         )
@@ -922,12 +988,9 @@ def _stream_aware_prepare_projected(
             layer_index=layer_index,
             transformer_options=transformer_options,
         )
-    if (
-        projected.q_summary is None
-        or projected.k_summary is None
-    ):
+    if projected.k_summary is None:
         raise SparseKitchenError(
-            'streamed Kitchen carrier has no routing summaries'
+            'streamed Kitchen carrier has no K routing summaries'
         )
 
     snapshot = snapshot_for(
@@ -939,6 +1002,32 @@ def _stream_aware_prepare_projected(
         snapshot.total_steps,
         layer_index,
     )
+    if projected.q_summary is None:
+        route_kwargs = _route_kwargs(transformer_options, layer_index)
+        if route_kwargs:
+            raise SparseKitchenError(
+                'single-pass deferred Q is not yet compatible with the '
+                'attention-route recorder'
+            )
+        geometry = self.router.geometry(snapshot.layout)
+        retained = self.router._retained(video_budget, geometry)
+        mask_metadata = self.router._metadata(
+            geometry, video_budget, retained
+        )
+        metadata = route_metadata(
+            mask_metadata,
+            layer_index,
+            projected.k_summary.shape[1],
+        )
+        return PreparedStreamedSparseKitchen(
+            projected=projected,
+            route=None,
+            layer_index=int(layer_index),
+            metadata=metadata,
+            layout=snapshot.layout,
+            video_budget=float(video_budget),
+        )
+
     try:
         with diagnostics.stage('streamed_sparse_route'):
             lut, valid_block_num, mask_metadata = (

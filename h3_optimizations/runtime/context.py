@@ -12,6 +12,7 @@ from .layout import resolve_layout
 
 RUNTIME_KEY = 'h3_optimizations_runtime'
 RUNTIME_SESSION_KEY = 'h3_optimizations_runtime_session'
+DISABLE_LOOKAHEAD_PREFETCH_KEY = 'h3_optimizations_disable_lookahead_prefetch'
 WRAPPER_KEY = 'h3_optimizations_runtime_context'
 OUTER_WRAPPER_KEY = 'h3_optimizations_request_boundary'
 LOG_PREFIX = '[H3 Optimizations]'
@@ -196,6 +197,11 @@ def make_outer_wrapper(session):
 def make_diffusion_wrapper(session):
     def wrapper(executor, *args, **kwargs):
         options, args, kwargs = _transformer_options(args, kwargs, 3)
+        if options.get(DISABLE_LOOKAHEAD_PREFETCH_KEY, False):
+            # BaseModel._apply_model() overwrites prefetch_dynamic_vbars before
+            # this wrapper runs. Re-assert the explicit H3 policy here, just
+            # before MiniMax creates its model-prefetch queue.
+            options['prefetch_dynamic_vbars'] = False
         x = args[0] if args else kwargs.get('x')
         context = args[2] if len(args) > 2 else kwargs.get('context')
         session.observe(
@@ -231,6 +237,7 @@ def make_apply_model_wrapper(session):
         return executor(*args, **kwargs)
 
     return wrapper
+
 
 
 def install_runtime_wrapper(model_patcher, session=None):

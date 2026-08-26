@@ -7,6 +7,7 @@ ignored by execution. Appended authoritative controls own current behavior.
 
 from comfy_api.latest import io, ui
 
+from .runtime.context import DISABLE_LOOKAHEAD_PREFETCH_KEY
 from .apply_policy import apply_plan
 from .dense_resolver import has_explicit_dense_attention
 from .nodes import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
@@ -92,6 +93,7 @@ def _memory_request_for_modes(
     chunk_rows,
     precision_mode,
     qkv_streaming_mode,
+    two_pass_v=False,
     explicit_attention_selected=False,
 ):
     # fused_qkv is a serialized compatibility tombstone. QKV streaming is the
@@ -141,6 +143,7 @@ def _memory_request_for_modes(
         mlp_memory=mlp_request,
         chunk_rows=int(chunk_rows),
         qkv_streaming=streaming,
+        two_pass_v=bool(two_pass_v),
         mlp_strict=precision_mode in (
             PRECISION_MODE_BF16,
             PRECISION_MODE_FORCE_QUANT,
@@ -263,6 +266,31 @@ class H3MemoryOptimization(io.ComfyNode):
                     ),
                 ),
                 io.Boolean.Input(
+                    'disable_lookahead_prefetch',
+                    display_name='Disable lookahead prefetch',
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        'Disables ComfyUI dynamic-VBAR next-block lookahead '
+                        'prefetch for MiniMax H3. This can reduce peak VRAM at '
+                        'the cost of transfer overlap. Independent of Deferred Q.'
+                    ),
+                ),
+                io.Boolean.Input(
+                    'two_pass_v',
+                    display_name='Two-pass exact V carrier',
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        'Kitchen INT8 only. Uses the existing native TwoPassVCarrier '
+                        'to avoid retaining the full-sequence BF16 V tensor. Pass 1 '
+                        'accumulates the exact global per-channel V scale from bounded '
+                        'chunks; pass 2 reprojects V chunks and writes them directly '
+                        'into the final INT8 carrier. Preserves native Kitchen V '
+                        'quantization semantics at the cost of a second V projection.'
+                    ),
+                ),
+                io.Boolean.Input(
                     'deferred_q_low_vram',
                     display_name='Deferred Q low VRAM',
                     default=False,
@@ -296,6 +324,8 @@ class H3MemoryOptimization(io.ComfyNode):
         preserve_precision=True,
         precision_mode=PRECISION_MODE_AUTO,
         qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
+        disable_lookahead_prefetch=False,
+        two_pass_v=False,
         deferred_q_low_vram=False,
         deferred_q_rows=4096,
     ):
@@ -307,19 +337,25 @@ class H3MemoryOptimization(io.ComfyNode):
                 chunk_rows=chunk_rows,
                 precision_mode=precision_mode,
                 qkv_streaming_mode=qkv_streaming_mode,
+                two_pass_v=bool(two_pass_v),
                 explicit_attention_selected=has_explicit_dense_attention(model),
             )
         )
         patched = apply_plan(model, plan)
+        options = patched.model_options['transformer_options'] = (
+            patched.model_options.get('transformer_options', {}).copy()
+        )
+        options[DISABLE_LOOKAHEAD_PREFETCH_KEY] = bool(
+            disable_lookahead_prefetch
+        )
         if bool(deferred_q_low_vram):
             rows = int(deferred_q_rows)
             if rows < 128 or rows % 128:
                 raise ValueError('Deferred Q query rows must be a positive multiple of 128')
-            options = patched.model_options['transformer_options'] = (
-                patched.model_options.get('transformer_options', {}).copy()
-            )
             options[ATTENTION_MEMORY_MODE_KEY] = ATTENTION_MEMORY_STREAMED
             options[QUERY_CHUNK_ROWS_KEY] = rows
+            # Do not overlap next-block VBAR prefetch with the current
+            # low-VRAM attention/activation peak.
         return io.NodeOutput(
             patched,
             ui=ui.PreviewText(format_memory_status(patched)),
