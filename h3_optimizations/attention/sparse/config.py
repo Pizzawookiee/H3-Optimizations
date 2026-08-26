@@ -3,7 +3,11 @@
 from dataclasses import dataclass
 import math
 
-from ...plan import H3_LAYER_COUNT
+from ...plan import (
+    H3_LAYER_COUNT,
+    ROUTING_MODES,
+    ROUTING_QK_TOPK,
+)
 
 MODE_SAGE128 = 'sage128'
 MODE_SAGE128_FUSED_QKV = 'sage128_fused_qkv'
@@ -34,6 +38,8 @@ class HybridSparseConfig:
     late_steps: int | None = None
     late_kv: float | None = None
     layer_video_budgets: tuple[float, ...] | None = None
+    routing_mode: str = ROUTING_QK_TOPK
+    routing_seed: int = 0
 
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
@@ -41,6 +47,15 @@ class HybridSparseConfig:
                 'sparse mode %r is unavailable; implemented modes: %s'
                 % (self.mode, ', '.join(IMPLEMENTED_MODES))
             )
+        if self.routing_mode not in ROUTING_MODES:
+            raise ValueError('unknown sparse routing mode %r' % self.routing_mode)
+        if (
+            isinstance(self.routing_seed, bool)
+            or int(self.routing_seed) != self.routing_seed
+            or not 0 <= int(self.routing_seed) <= 0x7FFFFFFFFFFFFFFF
+        ):
+            raise ValueError('routing_seed must be in [0, 2^63 - 1]')
+        object.__setattr__(self, 'routing_seed', int(self.routing_seed))
         _validate_budget('video_budget', self.video_budget)
         _validate_budget('early_kv', self.early_kv)
         _validate_budget('late_kv', self.late_kv)
@@ -87,6 +102,8 @@ class HybridSparseConfig:
             None if self.early_kv is None else float(self.early_kv),
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
+            self.routing_mode,
+            int(self.routing_seed),
             self.layer_video_budgets,
         )
 

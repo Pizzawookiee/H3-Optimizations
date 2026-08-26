@@ -199,6 +199,17 @@ def format_sparse_status(model):
             'non-video context and mixed boundary tiles remain dense.'
         ),
     ]
+    routing_mode = sparse.get(
+        'routing_mode', getattr(plan_sparse, 'routing_mode', None)
+    )
+    if routing_mode and routing_mode != 'QK TopK':
+        routing_seed = sparse.get(
+            'routing_seed', getattr(plan_sparse, 'routing_seed', 0)
+        )
+        lines.insert(
+            2,
+            'Routing test: %s (seed %d)' % (routing_mode, int(routing_seed)),
+        )
     if backend_request != SPARSE_BACKEND_AUTO:
         lines.insert(1, 'Requested sparse backend: %s' % backend_request)
     elif selected != 'sparse_sage' and reason:

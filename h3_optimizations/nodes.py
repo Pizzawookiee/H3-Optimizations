@@ -36,6 +36,8 @@ from .plan import (
     SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
+    ROUTING_MODES,
+    ROUTING_QK_TOPK,
     MemoryRequest,
     SparseRequest,
     parse_layer_video_budgets,
@@ -697,6 +699,32 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'Bypass this node to force dense attention.'
                     ),
                 ),
+                io.Combo.Input(
+                    'routing_mode',
+                    display_name='Routing selection (test)',
+                    options=list(ROUTING_MODES),
+                    default=ROUTING_QK_TOPK,
+                    advanced=True,
+                    tooltip=(
+                        'Benchmark-only control. QK TopK is the production route. '
+                        'Fresh random draws independent head x query-tile routes '
+                        'on every router call. Fixed random repeats one seeded '
+                        'route across calls with the same shape.'
+                    ),
+                ),
+                io.Int.Input(
+                    'routing_seed',
+                    display_name='Routing seed (test)',
+                    default=0,
+                    min=0,
+                    max=0x7FFFFFFFFFFFFFFF,
+                    step=1,
+                    advanced=True,
+                    tooltip=(
+                        'Private random seed used only by the two test routing '
+                        'modes. It does not change the global Torch RNG.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -711,6 +739,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         late_steps=DEFAULT_EDGE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
         backend=SPARSE_BACKEND_KITCHEN,
+        routing_mode=ROUTING_QK_TOPK,
+        routing_seed=0,
     ):
         plan = read_plan(model).with_sparse(
             SparseRequest(
@@ -720,6 +750,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 late_steps=int(late_steps),
                 late_kv=float(late_kv),
                 backend=backend,
+                routing_mode=routing_mode,
+                routing_seed=int(routing_seed),
             )
         )
         patched = apply_plan(model, plan)

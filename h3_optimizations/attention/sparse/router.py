@@ -6,6 +6,11 @@ import math
 import torch
 
 from .config import DENSITY_FIXED
+from ...plan import (
+    ROUTING_QK_TOPK,
+    ROUTING_RANDOM_FIXED,
+    ROUTING_RANDOM_FRESH,
+)
 
 Q_TILE = 128
 KV_TILE = 64
@@ -66,6 +71,7 @@ class SparseMaskMetadata:
     pure_video_kv_tiles: int
     retained_video_kv_tiles: int
     density_mode: str = DENSITY_FIXED
+    routing_mode: str = ROUTING_QK_TOPK
 
     def as_dict(self):
         return dict(vars(self))
@@ -96,6 +102,9 @@ class SparseTileRouter:
             if score_chunk_tiles <= 0:
                 raise ValueError('score_chunk_tiles must be positive')
         self.score_chunk_tiles = score_chunk_tiles
+        self.routing_mode = getattr(config, 'routing_mode', ROUTING_QK_TOPK)
+        self.routing_seed = int(getattr(config, 'routing_seed', 0))
+        self._random_generators = {}
         self.q_tile = int(
             q_tile if q_tile is not None else getattr(spec, 'q_tile', Q_TILE)
         )
@@ -190,8 +199,7 @@ class SparseTileRouter:
             ),
         )
 
-    @staticmethod
-    def _metadata(geometry, video_budget, retained):
+    def _metadata(self, geometry, video_budget, retained):
         pure_q = geometry.pure_video_q_tiles
         pure_kv = geometry.pure_video_kv_tiles
         sparse_q = pure_q if retained < pure_kv else 0
@@ -212,6 +220,7 @@ class SparseTileRouter:
             pure_video_q_tiles=pure_q,
             pure_video_kv_tiles=pure_kv,
             retained_video_kv_tiles=retained,
+            routing_mode=self.routing_mode,
         )
 
     @staticmethod
@@ -264,6 +273,13 @@ class SparseTileRouter:
         if retained == geometry.pure_video_kv_tiles:
             self._notify(sink, geometry, None)
             return self._dense_lut(q, geometry, metadata)
+        if self.routing_mode != ROUTING_QK_TOPK:
+            return self._build_random_lut(
+                q,
+                geometry,
+                video_budget,
+                sink=sink,
+            )
         return self._build_lut_from_summaries(
             self._mean_pool(q, self.q_tile),
             self._mean_pool(k, self.kv_tile),
@@ -308,6 +324,17 @@ class SparseTileRouter:
                 'K router summary shape %s does not match %s'
                 % (tuple(k_summary.shape[-2:]), expected_k)
             )
+        retained = self._retained(video_budget, geometry)
+        if (
+            retained < geometry.pure_video_kv_tiles
+            and self.routing_mode != ROUTING_QK_TOPK
+        ):
+            return self._build_random_lut(
+                q_summary,
+                geometry,
+                video_budget,
+                sink=sink,
+            )
         return self._build_lut_from_summaries(
             q_summary,
             k_summary,
@@ -336,6 +363,39 @@ class SparseTileRouter:
             pieces.append(torch.topk(scores, retained, dim=-1).indices)
             del scores
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
+
+    def _random_generator(self, device):
+        if self.routing_mode == ROUTING_RANDOM_FIXED:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self.routing_seed)
+            return generator
+        if self.routing_mode != ROUTING_RANDOM_FRESH:
+            raise SparseRouterError(
+                'random route requested for mode %r' % self.routing_mode
+            )
+        key = str(device)
+        generator = self._random_generators.get(key)
+        if generator is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self.routing_seed)
+            self._random_generators[key] = generator
+        return generator
+
+    def _random_indices(self, source, geometry, retained):
+        scores = torch.rand(
+            (
+                source.shape[0],
+                source.shape[1],
+                geometry.pure_video_q_tiles,
+                geometry.pure_video_kv_tiles,
+            ),
+            dtype=torch.float32,
+            device=source.device,
+            generator=self._random_generator(source.device),
+        )
+        indices = torch.topk(scores, retained, dim=-1).indices
+        del scores
+        return indices
 
     @staticmethod
     def _pack_rows(indices, geometry, dense, dense_delta):
@@ -376,9 +436,51 @@ class SparseTileRouter:
         if retained == geometry.pure_video_kv_tiles:
             self._notify(sink, geometry, None)
             return self._dense_lut(q_means, geometry, metadata)
+        indices = self._select_indices(
+            q_means[..., geometry.pure_video_q_start:, :],
+            k_means[..., geometry.pure_video_kv_start:, :],
+            retained,
+        )
+        return self._build_lut_from_indices(
+            q_means,
+            geometry,
+            metadata,
+            indices,
+            sink=sink,
+        )
+
+    def _build_random_lut(
+        self,
+        source,
+        geometry,
+        video_budget,
+        *,
+        sink=None,
+    ):
+        retained = self._retained(video_budget, geometry)
+        metadata = self._metadata(geometry, video_budget, retained)
+        indices = self._random_indices(source, geometry, retained)
+        return self._build_lut_from_indices(
+            source,
+            geometry,
+            metadata,
+            indices,
+            sink=sink,
+        )
+
+    def _build_lut_from_indices(
+        self,
+        source,
+        geometry,
+        metadata,
+        indices,
+        *,
+        sink=None,
+    ):
+        batch, heads = source.shape[:2]
         dense = torch.arange(
             geometry.kv_tiles,
-            device=q_means.device,
+            device=source.device,
             dtype=torch.int32,
         )
         dense_delta = torch.cat((dense[:1], dense[1:] - dense[:-1]))
@@ -392,12 +494,7 @@ class SparseTileRouter:
             (batch, heads, geometry.q_tiles),
             geometry.kv_tiles,
             dtype=torch.int32,
-            device=q_means.device,
-        )
-        indices = self._select_indices(
-            q_means[..., geometry.pure_video_q_start:, :],
-            k_means[..., geometry.pure_video_kv_start:, :],
-            retained,
+            device=source.device,
         )
         self._notify(sink, geometry, indices)
         sparse_rows = self._pack_rows(
@@ -412,6 +509,6 @@ class SparseTileRouter:
             :sparse_rows.shape[-1],
         ].copy_(sparse_rows)
         valid[..., geometry.pure_video_q_start:] = (
-            geometry.pure_video_kv_start + retained
+            geometry.pure_video_kv_start + metadata.retained_video_kv_tiles
         )
         return lut.contiguous(), valid.contiguous(), metadata

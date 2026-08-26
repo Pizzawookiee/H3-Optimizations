@@ -17,6 +17,9 @@ from h3_optimizations.plan import (  # noqa: E402
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MLP_MEMORY_PRESERVE,
     MemoryRequest,
+    ROUTING_QK_TOPK,
+    ROUTING_RANDOM_FIXED,
+    ROUTING_RANDOM_FRESH,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_TRITON,
@@ -65,6 +68,8 @@ class PlanTests(unittest.TestCase):
         request = SparseRequest()
         self.assertEqual(request.video_budget, 0.3)
         self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
+        self.assertEqual(request.routing_mode, ROUTING_QK_TOPK)
+        self.assertEqual(request.routing_seed, 0)
         self.assertFalse(request.advanced_schedule)
 
     def test_legacy_sparse_request_positional_shape_is_preserved(self):
@@ -96,7 +101,20 @@ class PlanTests(unittest.TestCase):
         )
         self.assertTrue(request.advanced_schedule)
         self.assertIn(SPARSE_BACKEND_TRITON, request.signature)
-        self.assertEqual(request.signature[-5:-1], (2, 0.5, 2, 0.5))
+        self.assertEqual(request.signature[-7:-3], (2, 0.5, 2, 0.5))
+
+    def test_random_routing_is_explicit_and_part_of_request_identity(self):
+        fixed = SparseRequest(
+            routing_mode=ROUTING_RANDOM_FIXED,
+            routing_seed=1234,
+        )
+        fresh = SparseRequest(
+            routing_mode=ROUTING_RANDOM_FRESH,
+            routing_seed=1234,
+        )
+        self.assertNotEqual(fixed.signature, fresh.signature)
+        self.assertIn(ROUTING_RANDOM_FIXED, fixed.signature)
+        self.assertIn(1234, fixed.signature)
 
     def test_static_layer_budgets_are_parsed_and_part_of_identity(self):
         text = ','.join(['0.2'] * 7 + ['0.4'] + ['0.2'] * 42)
@@ -162,6 +180,11 @@ class PlanTests(unittest.TestCase):
                 SparseRequest(video_budget=budget)
         with self.assertRaisesRegex(ValueError, 'unknown sparse backend'):
             SparseRequest(backend='dense')
+        with self.assertRaisesRegex(ValueError, 'unknown sparse routing mode'):
+            SparseRequest(routing_mode='random')
+        for seed in (-1, 1.5, True, 2**63):
+            with self.assertRaises(ValueError):
+                SparseRequest(routing_seed=seed)
 
         SparseRequest(
             early_steps=0,

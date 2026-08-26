@@ -102,6 +102,14 @@ MIN_CHUNK_ROWS = 256
 MAX_CHUNK_ROWS = 65_536
 CHUNK_ALIGNMENT = 256
 DENSITY_FIXED = 'fixed'
+ROUTING_QK_TOPK = 'QK TopK'
+ROUTING_RANDOM_FRESH = 'Fresh random (test)'
+ROUTING_RANDOM_FIXED = 'Fixed random (test)'
+ROUTING_MODES = (
+    ROUTING_QK_TOPK,
+    ROUTING_RANDOM_FRESH,
+    ROUTING_RANDOM_FIXED,
+)
 DEFAULT_VIDEO_BUDGET = 0.3
 DEFAULT_EDGE_STEPS = 2
 DEFAULT_EDGE_KV = 0.5
@@ -221,6 +229,8 @@ class SparseRequest:
     late_kv: float | None = None
     backend: str = SPARSE_BACKEND_AUTO
     layer_video_budgets: tuple[float, ...] | None = None
+    routing_mode: str = ROUTING_QK_TOPK
+    routing_seed: int = 0
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
@@ -228,6 +238,15 @@ class SparseRequest:
             object.__setattr__(self, 'backend', SPARSE_BACKEND_KITCHEN)
         if self.backend not in SPARSE_BACKEND_REQUESTS:
             raise ValueError('unknown sparse backend request %r' % self.backend)
+        if self.routing_mode not in ROUTING_MODES:
+            raise ValueError('unknown sparse routing mode %r' % self.routing_mode)
+        if (
+            isinstance(self.routing_seed, bool)
+            or int(self.routing_seed) != self.routing_seed
+            or not 0 <= int(self.routing_seed) <= 0x7FFFFFFFFFFFFFFF
+        ):
+            raise ValueError('routing_seed must be in [0, 2^63 - 1]')
+        object.__setattr__(self, 'routing_seed', int(self.routing_seed))
         _validate_edge_schedule(
             self.early_steps,
             self.early_kv,
@@ -274,6 +293,8 @@ class SparseRequest:
             None if self.early_kv is None else float(self.early_kv),
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
+            self.routing_mode,
+            int(self.routing_seed),
             self.layer_video_budgets,
         )
 

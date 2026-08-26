@@ -260,6 +260,8 @@ def _sparse_config_kwargs(plan):
         'late_steps': sparse.late_steps,
         'late_kv': sparse.late_kv,
         'layer_video_budgets': sparse.layer_video_budgets,
+        'routing_mode': sparse.routing_mode,
+        'routing_seed': int(sparse.routing_seed),
         'strict': True,
     }
 
@@ -1003,6 +1005,8 @@ def _status(
                 'early_kv': plan.sparse.early_kv,
                 'late_steps': plan.sparse.late_steps,
                 'late_kv': plan.sparse.late_kv,
+                'routing_mode': plan.sparse.routing_mode,
+                'routing_seed': int(plan.sparse.routing_seed),
                 'layer_video_budgets': (
                     None
                     if plan.sparse.layer_video_budgets is None

@@ -56,6 +56,21 @@ class QKVStatusReadabilityTests(unittest.TestCase):
         )
         self.assertNotIn('streamed_bf16_kitchen_qkv', text)
 
+    def test_sparse_preview_identifies_random_test_routing(self):
+        self.status['sparse'].update(
+            routing_mode='Fixed random (test)',
+            routing_seed=1234,
+        )
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: self.status},
+            }
+        )
+
+        text = format_sparse_status(model)
+
+        self.assertIn('Routing test: Fixed random (test) (seed 1234)', text)
+
     def test_standard_path_keeps_the_fallback_reason(self):
         status = {
             'fused_qkv': {

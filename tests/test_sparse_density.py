@@ -205,8 +205,10 @@ def test_advanced_node_schema_and_request():
             'late_steps',
             'late_kv',
             'backend',
+            'routing_mode',
+            'routing_seed',
         ],
-        'advanced schema preserves existing controls and appends backend selection',
+        'advanced schema appends explicit benchmark-only routing controls',
     )
     backend = input_by_id(schema, 'backend')
     check(
@@ -220,6 +222,13 @@ def test_advanced_node_schema_and_request():
             'FP8 FlexAttention',
         ],
         'advanced backend selector exposes the supported sparse backends',
+    )
+    check(
+        input_by_id(schema, 'routing_mode').default == 'QK TopK'
+        and input_by_id(schema, 'routing_mode').options
+        == ['QK TopK', 'Fresh random (test)', 'Fixed random (test)']
+        and input_by_id(schema, 'routing_seed').default == 0,
+        'random routing controls are advanced and default to production TopK',
     )
     check(
         input_by_id(schema, 'early_steps').default == 2
@@ -243,6 +252,8 @@ def test_advanced_node_schema_and_request():
             late_steps=4,
             late_kv=0.7,
             backend='INT8 Triton',
+            routing_mode='Fresh random (test)',
+            routing_seed=1234,
         )
     request = apply.call_args.args[1].sparse
     check(
@@ -253,6 +264,8 @@ def test_advanced_node_schema_and_request():
         and request.early_kv == 0.6
         and request.late_steps == 4
         and request.late_kv == 0.7
+        and request.routing_mode == 'Fresh random (test)'
+        and request.routing_seed == 1234
         and request.denser_early_late_steps is False,
         'advanced node carries the backend and complete explicit schedule',
     )

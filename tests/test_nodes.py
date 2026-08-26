@@ -122,6 +122,8 @@ class NodeTests(unittest.TestCase):
                 'late_steps',
                 'late_kv',
                 'backend',
+                'routing_mode',
+                'routing_seed',
             ],
         )
         self.assertEqual(
@@ -147,6 +149,11 @@ class NodeTests(unittest.TestCase):
                 'FP8 FlexAttention',
             ],
         )
+        self.assertEqual(
+            input_by_id(advanced, 'routing_mode').default,
+            'QK TopK',
+        )
+        self.assertEqual(input_by_id(advanced, 'routing_seed').default, 0)
         self.assertIn('Kitchen INT8 64x64 is the default', advanced.description)
         self.assertIn('Bypass this node', backend.tooltip)
         self.assertIn(

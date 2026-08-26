@@ -74,6 +74,11 @@ control.
   bypass the node to force dense attention. Legacy saved backend values remain
   accepted for workflow compatibility but are not shown in the dropdown.
 
+  Its advanced routing test controls can replace QK TopK with either a fresh
+  seeded random route on every router call or one fixed seeded route repeated
+  across calls. These modes exist only as deliberately unintelligent benchmark
+  baselines; QK TopK remains the default and production routing policy.
+
 Benchmark-only native geometry and quality arms execute 64Q x
 64KV, 128Q x 128KV, or 128Q x 64KV routed geometry through the native INT8
 kernel. They reuse the same
