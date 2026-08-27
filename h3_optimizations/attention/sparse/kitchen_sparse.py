@@ -88,9 +88,9 @@ def preflight_sparse_kitchen(
     if capability is None:
         raise SparseKitchenError('Kitchen sparse GPU capability is unavailable')
     capability = tuple(int(value) for value in capability)
-    if len(capability) != 2 or capability < (8, 0):
+    if len(capability) != 2 or capability < (7, 5):
         raise SparseKitchenError(
-            'Kitchen sparse attention requires NVIDIA compute capability 8.0 '
+            'Kitchen sparse attention requires NVIDIA compute capability 7.5 '
             'or newer; found %d.%d' % capability
         )
     if not module.int8_attention_is_available():
@@ -176,7 +176,6 @@ class PreparedSparseKitchen:
         self.quantized = None
         self.route = None
         self.output_buffer = None
-
 
 class SparseKitchenExecutor:
     '''Quantize with Kitchen, then attend over the routed KV tiles.'''
