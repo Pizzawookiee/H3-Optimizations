@@ -171,6 +171,8 @@ class FinalLayerTests(unittest.TestCase):
         with mock.patch.object(
             apply_module, 'install_final_layer'
         ) as install, mock.patch.object(
+            apply_module, 'install_embedding_memory'
+        ) as install_embedding, mock.patch.object(
             apply_module, 'resolve_mlp_provider', return_value=disabled
         ):
             resolution, patched_blocks = apply_module._install_mlp(
@@ -178,6 +180,7 @@ class FinalLayerTests(unittest.TestCase):
             )
 
         install.assert_called_once_with(patcher, 4096)
+        install_embedding.assert_called_once_with(patcher)
         self.assertIs(resolution, disabled)
         self.assertEqual(patched_blocks, 0)
 

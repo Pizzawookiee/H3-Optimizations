@@ -12,6 +12,9 @@ from .node_constants import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
 from .plan import (
     ATTENTION_AUTO,
     ATTENTION_EXISTING,
+    EMBEDDING_MEMORY_AUTO,
+    EMBEDDING_MEMORY_RELEASE,
+    EMBEDDING_MEMORY_STOCK,
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_BF16,
     FUSED_QKV_FORCE_QUANT,
@@ -58,6 +61,15 @@ QKV_STREAMING_MODE_OPTIONS = (
     QKV_STREAMING_MODE_FORCED,
 )
 
+EMBEDDING_MEMORY_MODE_AUTO = 'Auto'
+EMBEDDING_MEMORY_MODE_STOCK = 'Stock'
+EMBEDDING_MEMORY_MODE_RELEASE = 'Release early'
+EMBEDDING_MEMORY_MODE_OPTIONS = (
+    EMBEDDING_MEMORY_MODE_AUTO,
+    EMBEDDING_MEMORY_MODE_STOCK,
+    EMBEDDING_MEMORY_MODE_RELEASE,
+)
+
 
 def _normalize_precision_mode(precision_mode):
     mode = _PRECISION_MODE_COMPATIBILITY.get(precision_mode, precision_mode)
@@ -83,6 +95,7 @@ def _memory_request_for_modes(
     chunk_rows,
     precision_mode,
     qkv_streaming_mode,
+    embedding_memory_mode=EMBEDDING_MEMORY_MODE_AUTO,
 ):
     # fused_qkv is a serialized compatibility tombstone. QKV streaming is the
     # authoritative public policy now; keeping the argument preserves old
@@ -122,6 +135,18 @@ def _memory_request_for_modes(
         else mlp_memory
     )
 
+    embedding_requests = {
+        EMBEDDING_MEMORY_MODE_AUTO: EMBEDDING_MEMORY_AUTO,
+        EMBEDDING_MEMORY_MODE_STOCK: EMBEDDING_MEMORY_STOCK,
+        EMBEDDING_MEMORY_MODE_RELEASE: EMBEDDING_MEMORY_RELEASE,
+    }
+    try:
+        embedding_request = embedding_requests[embedding_memory_mode]
+    except KeyError as exc:
+        raise ValueError(
+            'unknown embedding memory mode %r' % embedding_memory_mode
+        ) from exc
+
     return MemoryRequest(
         attention=attention,
         fused_qkv=qkv_request,
@@ -132,6 +157,7 @@ def _memory_request_for_modes(
             PRECISION_MODE_BF16,
             PRECISION_MODE_FORCE_QUANT,
         ),
+        embedding_memory=embedding_request,
     )
 
 
@@ -250,6 +276,18 @@ class H3MemoryOptimization(io.ComfyNode):
                         'Kitchen. H3 Sparse Attention remains authoritative.'
                     ),
                 ),
+                io.Combo.Input(
+                    'embedding_memory_mode',
+                    display_name='Embedding memory',
+                    options=list(EMBEDDING_MEMORY_MODE_OPTIONS),
+                    default=EMBEDDING_MEMORY_MODE_AUTO,
+                    advanced=True,
+                    tooltip=(
+                        'Auto releases visual and audio embedding-assembly tensors '
+                        'after they are copied into the packed hidden state. Stock '
+                        'keeps ComfyUI\'s original lifetime for comparison.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -264,6 +302,7 @@ class H3MemoryOptimization(io.ComfyNode):
         preserve_precision=True,
         precision_mode=PRECISION_MODE_AUTO,
         qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
+        embedding_memory_mode=EMBEDDING_MEMORY_MODE_AUTO,
     ):
         del preserve_precision
         plan = read_plan(model).with_memory(
@@ -273,6 +312,7 @@ class H3MemoryOptimization(io.ComfyNode):
                 chunk_rows=chunk_rows,
                 precision_mode=precision_mode,
                 qkv_streaming_mode=qkv_streaming_mode,
+                embedding_memory_mode=embedding_memory_mode,
             )
         )
         patched = apply_plan(model, plan)

@@ -173,8 +173,10 @@ class PublicNodeTests(unittest.TestCase):
         legacy_index = ids.index('preserve_precision')
         precision_index = ids.index('precision_mode')
         streaming_index = ids.index('qkv_streaming_mode')
+        embedding_index = ids.index('embedding_memory_mode')
         self.assertEqual(precision_index, legacy_index + 1)
         self.assertEqual(streaming_index, precision_index + 1)
+        self.assertEqual(embedding_index, streaming_index + 1)
 
         legacy = inputs[legacy_index]
         precision = inputs[precision_index]
@@ -183,6 +185,7 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(precision.options, list(PRECISION_MODE_OPTIONS))
         self.assertEqual(precision.default, PRECISION_MODE_AUTO)
         self.assertEqual(streaming.default, QKV_STREAMING_MODE_AUTO)
+        self.assertEqual(inputs[embedding_index].default, 'Auto')
 
     def test_memory_node_accepts_legacy_precision_values(self):
         self.assertTrue(H3MemoryOptimization.validate_inputs(PRECISION_MODE_PRESERVE))

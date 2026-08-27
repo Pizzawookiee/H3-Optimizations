@@ -10,6 +10,8 @@ sys.path.insert(0, str(PACK))
 
 from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_EXISTING,
+    EMBEDDING_MEMORY_AUTO,
+    EMBEDDING_MEMORY_RELEASE,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
@@ -31,6 +33,13 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.chunk_rows, 4096)
         self.assertTrue(request.prefer_held_weights)
         self.assertFalse(request.mlp_strict)
+        self.assertEqual(request.embedding_memory, EMBEDDING_MEMORY_AUTO)
+
+    def test_embedding_memory_is_part_of_memory_identity(self):
+        request = MemoryRequest(embedding_memory=EMBEDDING_MEMORY_RELEASE)
+        self.assertIn(EMBEDDING_MEMORY_RELEASE, request.signature)
+        with self.assertRaisesRegex(ValueError, 'embedding memory'):
+            MemoryRequest(embedding_memory='unknown')
 
     def test_preserve_precision_is_a_valid_memory_request(self):
         request = MemoryRequest(mlp_memory=MLP_MEMORY_PRESERVE)
