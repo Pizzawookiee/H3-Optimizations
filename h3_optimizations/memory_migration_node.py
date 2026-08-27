@@ -274,10 +274,10 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=False,
                     advanced=True,
                     tooltip=(
-                        'Kitchen INT8 low-VRAM Q path. Sparse Kitchen does not keep '
-                        'the full Q carrier and instead reprojects bounded Q chunks. '
-                        'Each Q chunk uses the normal Comfy fused-QKV acquisition and '
-                        'releases it before out_proj, avoiding cast-buffer aliasing.'
+                        'Kitchen INT8 low-VRAM Q path. Clones only the Q rows of the '
+                        'fused INT8 QKV weight into an owned Q projection after K/V '
+                        'preparation, then reuses it for bounded Q chunks. Q packing '
+                        'uses reusable buffers, avoiding repeated fused-QKV acquisition.'
                     ),
                 ),
                 io.Boolean.Input(
@@ -286,10 +286,10 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=False,
                     advanced=True,
                     tooltip=(
-                        'Kitchen INT8 exact two-pass V carrier. Pass 1 accumulates '
-                        'global per-channel V absmax from bounded chunks; pass 2 '
-                        'reprojects V-only chunks into the final INT8 carrier. This '
-                        'avoids full-sequence BF16 V at the cost of one extra V GEMM.'
+                        'Kitchen INT8 tile-local V path. V is quantized directly during '
+                        'the first K/V projection pass in 64-token tiles with per-tile '
+                        'scales. This avoids full-sequence BF16 V and removes the second '
+                        'V projection/GEMM required by the older two-pass path.'
                     ),
                 ),
             ],
