@@ -11,23 +11,33 @@
 cmake_minimum_required(VERSION 3.26)
 project(h3_int8_attention LANGUAGES CXX CUDA)
 
+if(MSVC AND CMAKE_GENERATOR MATCHES "^Visual Studio")
+    message(FATAL_ERROR
+        "The Visual Studio CUDA targets hardcode /EHsc after project flags. "
+        "Configure from an x64 Visual Studio developer shell with -G Ninja "
+        "so the required /EHs exception boundary is preserved."
+    )
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED H3_CUDA_ARCHS)
-    # Real SASS for the older parts and PTX on the newest, so hardware that
-    # does not exist yet degrades to a JIT rather than failing to load. This
-    # mirrors Kitchen's own arch policy; Windows toolkits often lack 90a.
+    # Real SASS for every shipped target plus one compute_89 PTX fallback.
+    # A compute_120f payload is only forward-compatible within the 12.x
+    # family, so carrying it in addition to compute_89 adds size without being
+    # the general fallback for a future architecture. Windows toolkits often
+    # lack 90a.
     #
     # Turing composes the Ampere-shaped INT8 fragments from m8n8k16 and uses
     # synchronous shared-memory copies in place of cp.async. Runtime use stays
     # fail-closed behind the same per-GPU numerical self-test as newer parts.
     if(WIN32)
-        set(H3_CUDA_ARCHS "75-real;80-real;89;120f")
+        set(H3_CUDA_ARCHS "75-real;80-real;89-real;120f-real;89-virtual")
     else()
-        set(H3_CUDA_ARCHS "75-real;80-real;89;90a-real;120f")
+        set(H3_CUDA_ARCHS "75-real;80-real;89-real;90a-real;120f-real;89-virtual")
     endif()
 endif()
 message(STATUS "H3 INT8 attention architectures: ${H3_CUDA_ARCHS}")
@@ -60,6 +70,15 @@ target_compile_options(h3_int8_attention PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=177>
 )
 
+# CUDA 13 compresses fatbins by default, but its size mode is materially
+# smaller than the balanced default. Keep older toolkits buildable: they do
+# not recognize this option.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+    target_compile_options(h3_int8_attention PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>
+    )
+endif()
+
 # /EHs, deliberately NOT /EHsc. The trailing c in /EHsc means "extern \"C\"
 # functions never throw", and the vendored launchers throw across exactly that
 # boundary -- which is what MSVC keeps warning about as C4297. Compiled with
@@ -71,9 +90,25 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHs>
         $<$<COMPILE_LANGUAGE:CXX>:/EHs>
     )
-    # CMake puts /EHsc in the default flags; strip it so ours is not overridden.
+    # CMake puts /EHsc in both host and CUDA-host defaults. Strip both so a
+    # trailing CUDA flag cannot override the required /EHs above.
     string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-    
+    string(REPLACE "/EHsc" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
+else()
+    # Give the ELF linker independent sections to discard and hide every
+    # host symbol except the H3_API functions explicitly marked default in
+    # h3_int8_attention_api.cu.
+    target_compile_options(h3_int8_attention PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-ffunction-sections>
+        $<$<COMPILE_LANGUAGE:CXX>:-fdata-sections>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffunction-sections,-fdata-sections>
+    )
+    target_link_options(h3_int8_attention PRIVATE LINKER:--gc-sections)
+    set_target_properties(h3_int8_attention PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        CUDA_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES
+    )
 endif()
 
 # Static CUDA runtime: one fewer thing for a user to have on their path.

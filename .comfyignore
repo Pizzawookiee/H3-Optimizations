@@ -12,7 +12,6 @@ native/Dockerfile.linux
 native/build_linux.sh
 native/build_v_staging.ps1
 native/README.md
-native/bin/h3_int8_attention_v3.dll
 
 # Repository-only metadata and local caches.
 .gitignore

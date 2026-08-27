@@ -26,11 +26,22 @@ container="$(docker create "${IMAGE}")"
 trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
 docker cp "${container}:/src/build/libh3_int8_attention.so" "${OUTPUT}"
 
+size_bytes="$(wc -c < "${OUTPUT}")"
+max_bytes=$((50 * 1024 * 1024))
+if (( size_bytes >= max_bytes )); then
+    echo "Linux library is ${size_bytes} bytes; expected less than ${max_bytes}." >&2
+    exit 1
+fi
+
 echo
 ls -la "${OUTPUT}"
 echo
 echo "Architectures:"
 docker run --rm "${IMAGE}" cuobjdump --list-elf build/libh3_int8_attention.so \
     | sed 's/.*\.\(sm_[0-9a-z]*\)\.cubin/\1/' | sort -u | tr '\n' ' '
+echo
+echo "PTX fallback:"
+docker run --rm "${IMAGE}" cuobjdump --list-ptx build/libh3_int8_attention.so \
+    | sed 's/.*\.\(sm_[0-9a-z]*\)\.ptx/\1/' | sort -u | tr '\n' ' '
 echo
 echo "Done. Commit native/bin/libh3_int8_attention.so."

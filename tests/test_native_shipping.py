@@ -22,10 +22,15 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations import __version__  # noqa: E402
+from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
+    SparseKitchenError,
+    preflight_sparse_kitchen,
+)
 from h3_optimizations.native import artifacts, int8_attention, loader, selftest  # noqa: E402
 
 
 BIN_DIR = PACK / 'native' / 'bin'
+MAX_LINUX_BINARY_BYTES = 50 * 1024 * 1024
 
 
 class NativeShippingTests(unittest.TestCase):
@@ -42,6 +47,13 @@ class NativeShippingTests(unittest.TestCase):
             (BIN_DIR / 'BUILD_ID').read_text(encoding='utf-8').strip(),
             artifacts.NATIVE_BUILD,
         )
+
+    def test_linux_binary_stays_below_registry_warning_threshold(self):
+        linux_binary = BIN_DIR / 'libh3_int8_attention.so'
+        self.assertLess(linux_binary.stat().st_size, MAX_LINUX_BINARY_BYTES)
+
+    def test_obsolete_windows_binary_is_not_shipped(self):
+        self.assertFalse((BIN_DIR / 'h3_int8_attention_v3.dll').exists())
 
     def test_linux_binary_keeps_old_libstdcxx_compatibility(self):
         contents = (BIN_DIR / 'libh3_int8_attention.so').read_bytes()
@@ -103,6 +115,42 @@ class NativeShippingTests(unittest.TestCase):
             self.assertFalse(int8_attention.int8_attention_is_available('cuda'))
             selftest_check.assert_not_called()
 
+    def test_sparse_preflight_allows_sm75_after_native_selftest(self):
+        kitchen = mock.Mock(
+            SPARSE_GEOMETRIES=((64, 64),),
+        )
+        kitchen.int8_attention_is_available.return_value = True
+
+        self.assertIs(
+            preflight_sparse_kitchen(
+                cuda_available=lambda: True,
+                capability_getter=lambda: (7, 5),
+                kitchen=kitchen,
+                q_tile=64,
+                kv_tile=64,
+            ),
+            kitchen,
+        )
+
+    def test_sparse_preflight_rejects_capabilities_below_sm75(self):
+        with self.assertRaisesRegex(SparseKitchenError, 'compute capability 7.5'):
+            preflight_sparse_kitchen(
+                cuda_available=lambda: True,
+                capability_getter=lambda: (7, 0),
+                kitchen=mock.Mock(),
+            )
+
+    def test_sparse_preflight_keeps_sm75_fail_closed(self):
+        kitchen = mock.Mock()
+        kitchen.int8_attention_is_available.return_value = False
+
+        with self.assertRaisesRegex(SparseKitchenError, 'extension is not available'):
+            preflight_sparse_kitchen(
+                cuda_available=lambda: True,
+                capability_getter=lambda: (7, 5),
+                kitchen=kitchen,
+            )
+
     def test_selftest_covers_every_shipped_sparse_geometry(self):
         self.assertEqual(
             selftest._SPARSE_PARITY_GEOMETRIES,
@@ -121,14 +169,14 @@ class NativeShippingTests(unittest.TestCase):
             ),
             mock.patch(
                 'h3_optimizations.native.bootstrap.installed_build_id',
-                return_value='native-v5',
+                return_value='native-v6',
             ),
         ):
             key = selftest._cache_key('cuda')
 
         self.assertEqual(
             key,
-            'sm120|native-v5|%s|NVIDIA GeForce RTX 5070 Ti'
+            'sm120|native-v6|%s|NVIDIA GeForce RTX 5070 Ti'
             % selftest._SELFTEST_REVISION,
         )
 

@@ -23,7 +23,8 @@ COPY src ./src
 # the exception-handling settings are load-bearing (see the extern "C" note in
 # h3_int8_attention_api.cu).
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --parallel
+    && cmake --build build --parallel \
+    && strip --strip-unneeded build/libh3_int8_attention.so
 
 # The caller copies this out; see build_linux.sh.
 RUN test -f build/libh3_int8_attention.so \

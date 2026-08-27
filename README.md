@@ -196,8 +196,9 @@ fallback chain. Each sparse geometry is gated independently on finite output,
 relative L2 below 0.002, and max absolute error below 0.01 against matched dense
 Kitchen. Exact bit identity is retained as diagnostic information only.
 
-The shipped CUDA targets are SM80, SM89, and SM120 on Windows, with SM90a also
-included on Linux. Sparse Sage remains an optional explicit backend and an
+The shipped CUDA targets are SM75, SM80, SM89, and SM120 on Windows, with SM90a
+also included on Linux. Each target ships real SASS and one SM89 PTX fallback
+is retained for forward compatibility. Sparse Sage remains an optional explicit backend and an
 automatic fallback when a compatible `spas_sage_attn` package is already
 installed; this pack no longer installs or repairs it.
 

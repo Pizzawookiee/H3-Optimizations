@@ -58,18 +58,25 @@ until the next normal restart.
 ## Building
 
 ```
-cmake -S native -B native/build
+cmake -S native -B native/build -G Ninja
 cmake --build native/build --config Release
 ```
+
+On Windows, run those commands from an x64 Visual Studio developer shell. The
+Visual Studio CUDA MSBuild targets hardcode `/EHsc` after project flags, so the
+Visual Studio generator is rejected; Ninja preserves the required `/EHs`
+exception boundary described above.
 
 The loader first uses the platform binary committed under `native/bin/`, then
 checks local `native/build/Release/`, `native/build/`, and `native/lib/` paths.
 `H3_INT8_ATTENTION_LIBRARY` overrides all of them.
 
-Architectures default to `75-real;80-real;89;120f` on Windows and add
-`90a-real` on Linux: real SASS for the older parts and PTX on the newest, so
-hardware that does not exist yet degrades to a JIT rather than failing to load.
-Override with `-DH3_CUDA_ARCHS=89` to build just one while iterating.
+Architectures default to
+`75-real;80-real;89-real;120f-real;89-virtual` on Windows and add `90a-real`
+on Linux. Every shipped target has real SASS, while one `compute_89` PTX
+payload provides the forward-compatible fallback without duplicating the
+family-limited `compute_120f` PTX. Override with `-DH3_CUDA_ARCHS=89` to build
+just one while iterating.
 
 SM75 composes the Ampere-shaped INT8 MMA fragments from Turing's m8n8k16
 instructions and uses synchronous shared-memory copies where newer GPUs use
@@ -79,7 +86,9 @@ and sparse numerical self-test passes.
 Linux release binaries are built in the CUDA 13 Ubuntu 22.04 image with GCC 11
 and pinned CMake 3.28.3. The packaged library requires no newer than
 `GLIBCXX_3.4.21` and keeps its existing `GLIBC_2.34` floor. The shipping test
-rejects a binary built against a newer libstdc++ ABI.
+rejects a binary built against a newer libstdc++ ABI. CUDA fatbins use size
+compression, unused ELF sections are discarded, and the final shared library
+is stripped while retaining its exported C ABI.
 
 There is no CUTLASS, cuBLAS or flash-attention dependency — the vendored subset
 needs only the CUDA toolkit, which is what makes a single fat multi-architecture
