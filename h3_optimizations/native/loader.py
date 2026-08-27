@@ -31,7 +31,7 @@ import torch
 ABI_VERSION = 3
 
 _LIBRARY_NAMES = {
-    'Windows': 'h3_int8_attention_v3.dll',
+    'Windows': 'h3_int8_attention_v4.dll',
     'Linux': 'libh3_int8_attention.so',
     'Darwin': 'libh3_int8_attention.dylib',
 }

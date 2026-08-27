@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import sys
 import tomllib
 import unittest
@@ -21,7 +22,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations import __version__  # noqa: E402
-from h3_optimizations.native import artifacts, int8_attention, selftest  # noqa: E402
+from h3_optimizations.native import artifacts, int8_attention, loader, selftest  # noqa: E402
 
 
 BIN_DIR = PACK / 'native' / 'bin'
@@ -29,9 +30,10 @@ BIN_DIR = PACK / 'native' / 'bin'
 
 class NativeShippingTests(unittest.TestCase):
     def test_native_binaries_are_packaged(self):
-        windows_binary = BIN_DIR / 'h3_int8_attention_v3.dll'
+        windows_binary = BIN_DIR / 'h3_int8_attention_v4.dll'
         linux_binary = BIN_DIR / 'libh3_int8_attention.so'
 
+        self.assertEqual(loader._LIBRARY_NAMES['Windows'], windows_binary.name)
         self.assertGreater(windows_binary.stat().st_size, 1_000_000)
         self.assertEqual(windows_binary.read_bytes()[:2], b'MZ')
         self.assertGreater(linux_binary.stat().st_size, 1_000_000)
@@ -40,6 +42,16 @@ class NativeShippingTests(unittest.TestCase):
             (BIN_DIR / 'BUILD_ID').read_text(encoding='utf-8').strip(),
             artifacts.NATIVE_BUILD,
         )
+
+    def test_linux_binary_keeps_old_libstdcxx_compatibility(self):
+        contents = (BIN_DIR / 'libh3_int8_attention.so').read_bytes()
+        versions = {
+            tuple(int(part) for part in match.split(b'.'))
+            for match in re.findall(rb'GLIBCXX_(\d+\.\d+\.\d+)', contents)
+        }
+
+        self.assertTrue(versions)
+        self.assertLessEqual(max(versions), (3, 4, 21))
 
     def test_package_versions_match(self):
         metadata = tomllib.loads((PACK / 'pyproject.toml').read_text(encoding='utf-8'))
@@ -71,11 +83,21 @@ class NativeShippingTests(unittest.TestCase):
             self.assertTrue(int8_attention.int8_attention_is_available('cuda'))
             selftest_check.assert_called_once_with('cuda')
 
-    def test_native_availability_rejects_unsupported_capability_before_selftest(self):
+    def test_native_availability_allows_sm75_only_after_selftest(self):
         with (
             mock.patch.object(int8_attention.torch.cuda, 'is_available', return_value=True),
             mock.patch.object(int8_attention.loader, 'is_available', return_value=True),
             mock.patch.object(int8_attention.torch.cuda, 'get_device_capability', return_value=(7, 5)),
+            mock.patch('h3_optimizations.native.selftest.check', return_value=True) as selftest_check,
+        ):
+            self.assertTrue(int8_attention.int8_attention_is_available('cuda'))
+            selftest_check.assert_called_once_with('cuda')
+
+    def test_native_availability_rejects_unsupported_capability_before_selftest(self):
+        with (
+            mock.patch.object(int8_attention.torch.cuda, 'is_available', return_value=True),
+            mock.patch.object(int8_attention.loader, 'is_available', return_value=True),
+            mock.patch.object(int8_attention.torch.cuda, 'get_device_capability', return_value=(7, 0)),
             mock.patch('h3_optimizations.native.selftest.check') as selftest_check,
         ):
             self.assertFalse(int8_attention.int8_attention_is_available('cuda'))
@@ -99,14 +121,14 @@ class NativeShippingTests(unittest.TestCase):
             ),
             mock.patch(
                 'h3_optimizations.native.bootstrap.installed_build_id',
-                return_value='native-v3',
+                return_value='native-v5',
             ),
         ):
             key = selftest._cache_key('cuda')
 
         self.assertEqual(
             key,
-            'sm120|native-v3|%s|NVIDIA GeForce RTX 5070 Ti'
+            'sm120|native-v5|%s|NVIDIA GeForce RTX 5070 Ti'
             % selftest._SELFTEST_REVISION,
         )
 

@@ -286,15 +286,26 @@ Unmarked overrides retain full-Q, single-call behavior in Auto.
 - Current ComfyUI with MiniMax H3 support and the `comfy_api.latest` extension API
 - Python 3.10 or newer
 - Windows x64 or Linux x86-64 for the shipped native Kitchen binaries
+- Linux glibc 2.34+ and libstdc++ with `GLIBCXX_3.4.21`+ for the shipped native
+  Kitchen binary
 - Any backend supported by ComfyUI's MiniMax H3 implementation for the final
   dense fallback
-- NVIDIA SM80 or newer for the shipped native Kitchen default
+- NVIDIA SM75 or newer for the shipped native Kitchen default; SM75 uses its
+  Turing INT8 implementation only when the per-GPU numerical self-test passes
 - NVIDIA SM80 or newer with Triton for the next local sparse fallback
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the NVIDIA Flex
   fallback when BF16 Triton is unavailable
 - A ROCm-capable PyTorch build with FlexAttention/Triton for the AMD sparse Flex
   fallback; incompatible ROCm stacks fall back to dense on first validation
 - NVIDIA CUDA SM80, SM86, SM87, SM89, SM90, or SM120 for Sparse Sage
+
+SM75/Turing is a reduced-feature supported target. H3 Memory Optimization,
+AIMDO, bounded FP16 QKV/MLP/FinalLayer execution, dense Comfy Kitchen INT8, and
+the shipped native sparse Kitchen path are eligible. Native sparse execution
+remains fail-closed behind its cached per-GPU parity test. BF16 Triton, FROST,
+FP8, and Sparse Sage remain unavailable on SM75; `auto` falls back to the
+resolved dense attention path when the native self-test fails. GPUs below SM75
+retain architecture-neutral memory management and chunking only.
 
 Dense QKV eligibility follows the complete producer specification returned by
 Comfy Kitchen; it is not gated on a particular compute capability. Sparse Sage

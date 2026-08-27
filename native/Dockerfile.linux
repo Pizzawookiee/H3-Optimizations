@@ -4,15 +4,15 @@
 # SASS for the architectures named in CMakeLists without one -- so this runs
 # anywhere Docker does, including a Windows host.
 #
-# Ubuntu 24.04 ships glibc 2.39. Building against an older base widens the
-# range of distributions the .so will load on, at the cost of an older
-# toolchain; 24.04 matches what current ComfyUI installs target. If someone
-# reports a GLIBC_2.3x error, rebuild on 22.04 rather than shipping two.
+# Build on Ubuntu 22.04 so the shipped library does not require GCC 13's
+# GLIBCXX_3.4.31. CUDA 13 still emits every packaged architecture, while the
+# older host toolchain keeps the library loadable in stock RunPod images.
 
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake ninja-build \
+    && apt-get install -y --no-install-recommends python3-pip ninja-build \
+    && python3 -m pip install --no-cache-dir cmake==3.28.3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

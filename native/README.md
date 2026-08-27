@@ -26,9 +26,9 @@ Two pieces are needed and neither is in 0.2.31:
 Kitchen (Apache-2.0, see `LICENSE` and `NOTICE.upstream`), which derives them
 in turn from SageAttention. The exact commit is recorded in `src/PROVENANCE`.
 
-Only one change was made to the vendored sources, and it is marked in each
-file with a `VENDORING CHANGE` comment: the launchers lost their `extern "C"`
-linkage. Upstream they are reached through nanobind; here they are internal to
+The launcher change is marked with a `VENDORING CHANGE` comment: the launchers
+lost their `extern "C"` linkage. Upstream they are reached through nanobind;
+here they are internal to
 this library and only `h3_int8_attention_api.cu` calls them. C linkage bought
 nothing and cost correctness — under MSVC's `/EHsc` the trailing `c` means
 *extern "C" functions never throw*, so the compiler elides the unwind and a
@@ -52,7 +52,7 @@ ABI 3 adds explicit sparse Q geometry and Q-scale strides. It exposes exact
 128Q x 64KV and 64Q x 64KV traversal without changing Kitchen's Q128
 quantization carrier. ABI 2 added `h3_int8_sparse_attention_lse`; that output
 remains one FP32 base-2 log-sum-exp value per query row. The packaged Windows
-DLL is ABI-versioned so a running Comfy process can keep an older mapped DLL
+DLL is build-versioned so a running Comfy process can keep an older mapped DLL
 until the next normal restart.
 
 ## Building
@@ -66,10 +66,20 @@ The loader first uses the platform binary committed under `native/bin/`, then
 checks local `native/build/Release/`, `native/build/`, and `native/lib/` paths.
 `H3_INT8_ATTENTION_LIBRARY` overrides all of them.
 
-Architectures default to `80-real;89;120f` on Windows and add `90a-real` on
-Linux: real SASS for the older parts and PTX on the newest, so
+Architectures default to `75-real;80-real;89;120f` on Windows and add
+`90a-real` on Linux: real SASS for the older parts and PTX on the newest, so
 hardware that does not exist yet degrades to a JIT rather than failing to load.
 Override with `-DH3_CUDA_ARCHS=89` to build just one while iterating.
+
+SM75 composes the Ampere-shaped INT8 MMA fragments from Turing's m8n8k16
+instructions and uses synchronous shared-memory copies where newer GPUs use
+`cp.async`. The packaged path is still accepted only after its per-GPU dense
+and sparse numerical self-test passes.
+
+Linux release binaries are built in the CUDA 13 Ubuntu 22.04 image with GCC 11
+and pinned CMake 3.28.3. The packaged library requires no newer than
+`GLIBCXX_3.4.21` and keeps its existing `GLIBC_2.34` floor. The shipping test
+rejects a binary built against a newer libstdc++ ABI.
 
 There is no CUTLASS, cuBLAS or flash-attention dependency — the vendored subset
 needs only the CUDA toolkit, which is what makes a single fat multi-architecture

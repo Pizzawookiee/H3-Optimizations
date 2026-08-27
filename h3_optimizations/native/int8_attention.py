@@ -537,7 +537,7 @@ def int8_attention_is_available(device=None):
     if not loader.is_available():
         return False
     capability = torch.cuda.get_device_capability(device)
-    if tuple(capability) < (8, 0):
+    if tuple(capability) < (7, 5):
         return False
     from . import selftest
 

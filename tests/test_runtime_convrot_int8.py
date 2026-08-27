@@ -82,6 +82,26 @@ class RuntimeConvRotINT8Tests(unittest.TestCase):
                 handle,
             )
 
+    def test_fp16_activation_uses_convrot_layout(self):
+        sample = self.sample.to(torch.float16)
+        weight = self.weight.to(torch.float16)
+        module = floating_linear(weight)
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(weight, None, object()),
+        ), mock.patch.object(comfy.ops, "uncast_bias_weight"):
+            with HeldConvRotINT8Linear(
+                module,
+                sample[:1],
+                allow_float_conversion=True,
+            ) as binding:
+                output = binding.linear(sample)
+
+        self.assertIsNone(binding.weight)
+        self.assertEqual(output.dtype, torch.float16)
+        self.assertEqual(tuple(output.shape), (2, 256))
+
     def test_lazy_binding_quantizes_once_for_multiple_output_slabs(self):
         handle = object()
         with mock.patch.object(

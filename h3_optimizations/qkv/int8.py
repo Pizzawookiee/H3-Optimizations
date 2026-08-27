@@ -55,9 +55,12 @@ class HeldConvRotINT8Linear:
             raise ConvRotINT8BindingError(
                 "module explicitly requests full-precision matmul"
             )
-        if self.sample.ndim < 2 or self.sample.dtype != torch.bfloat16:
+        if self.sample.ndim < 2 or self.sample.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
             raise ConvRotINT8BindingError(
-                "ConvRot INT8 execution requires BF16 activations"
+                "ConvRot INT8 execution requires BF16/FP16 activations"
             )
 
         source = describe_linear(self.module)
