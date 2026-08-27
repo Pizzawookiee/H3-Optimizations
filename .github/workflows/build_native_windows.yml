@@ -1,0 +1,90 @@
+name: Build Windows native DLL (SM89)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["0224_v2"]
+    paths:
+      - ".github/workflows/build_native_windows.yml"
+      - "native/CMakeLists.txt"
+      - "native/src/**/*.cu"
+      - "native/src/**/*.cuh"
+      - "native/src/PROVENANCE"
+
+permissions:
+  contents: read
+
+jobs:
+  build-sm89:
+    runs-on: windows-2022
+    env:
+      CUDA_VERSION: "13.0.0"
+      CUDA_CACHE_DIR: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Restore CUDA toolkit
+        id: cuda-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CUDA_CACHE_DIR }}
+          key: windows-2022-cuda-13.0.0-nvcc-nvvm-crt-cudart-v3
+      - name: Validate CUDA cache
+        id: cuda-valid
+        shell: pwsh
+        run: |
+          $toolkit = $env:CUDA_CACHE_DIR
+          $required = @("bin/nvcc.exe","include/cuda_runtime.h","lib/x64/cudart_static.lib","nvvm/bin/cicc.exe")
+          $valid = $true
+          foreach ($r in $required) { if (-not (Test-Path (Join-Path $toolkit $r))) { $valid = $false } }
+          if ($valid) { & (Join-Path $toolkit "bin/nvcc.exe") --version; if ($LASTEXITCODE -ne 0) { $valid = $false } }
+          "valid=$($valid.ToString().ToLowerInvariant())" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Install minimal CUDA toolkit
+        if: steps.cuda-valid.outputs.valid != 'true'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.0.0"
+          method: network
+          sub-packages: '["nvcc", "nvvm", "crt", "cudart"]'
+          use-github-cache: "true"
+          use-local-cache: "true"
+      - name: Activate CUDA
+        shell: pwsh
+        run: |
+          $toolkit = (Resolve-Path $env:CUDA_CACHE_DIR).Path
+          "CUDA_PATH=$toolkit" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_HOME=$toolkit" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $toolkit "bin") | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Locate MSVC
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw "MSVC build tools not found" }
+          "VS_INSTALL=$($installation.Trim())" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure
+        shell: cmd
+        run: |
+          call "%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S native -B native/build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe"
+      - name: Build
+        shell: cmd
+        run: |
+          call "%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build native/build --parallel
+      - name: Package v4 DLL (ABI 3)
+        shell: pwsh
+        run: |
+          $artifactDir = Join-Path $env:RUNNER_TEMP "h3-int8-attention-sm89"
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          $dll = Resolve-Path "native/build/h3_int8_attention.dll"
+          $name = "h3_int8_attention_v4.dll"
+          Copy-Item $dll (Join-Path $artifactDir $name)
+          $hash = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content (Join-Path $artifactDir "SHA256.txt") -Encoding ascii
+          "ARTIFACT_DIR=$artifactDir" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: actions/upload-artifact@v7
+        with:
+          name: h3-int8-attention-windows-sm89-${{ github.sha }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
+          compression-level: 0
