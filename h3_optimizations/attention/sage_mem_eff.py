@@ -11,7 +11,6 @@ depending on a wheel-specific extension namespace.
 """
 
 from dataclasses import dataclass
-import importlib
 import importlib.metadata
 import logging
 

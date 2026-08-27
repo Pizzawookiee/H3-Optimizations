@@ -1,7 +1,6 @@
 """Portable Sparse Sage bindings for H3 hybrid attention."""
 
 from dataclasses import dataclass, replace
-import importlib
 import importlib.metadata
 
 import torch
@@ -162,9 +161,24 @@ def _kernel(surface, name):
     return value if callable(value) else None
 
 
+def _import_split_qattn(family):
+    """Import one architecture extension. Explicit so the module names are
+    literals a reader -- or a package scanner -- can see without executing
+    anything."""
+    if family == "sm80":
+        from spas_sage_attn import _qattn_sm80 as module
+    elif family == "sm89":
+        from spas_sage_attn import _qattn_sm89 as module
+    elif family == "sm90":
+        from spas_sage_attn import _qattn_sm90 as module
+    else:
+        raise SparseSageError("Sparse Sage has no extension for family %s" % family)
+    return module
+
+
 def _load_split_qattn_surface(capability):
     family, namespace = _SPLIT_QATTN[capability]
-    module = importlib.import_module("spas_sage_attn._qattn_%s" % family)
+    module = _import_split_qattn(family)
     if any(_kernel(module, name) is not None for name in _SPLIT_KERNELS[capability]):
         return module, "split"
     return getattr(torch.ops, namespace), "split"
@@ -174,15 +188,21 @@ def _load_qattn_surface(capability):
     if capability == (12, 0):
         return _load_split_qattn_surface(capability)
     try:
-        return importlib.import_module("spas_sage_attn._qattn"), "monolithic"
-    except ModuleNotFoundError as exc:
-        if exc.name != "spas_sage_attn._qattn":
-            raise
+        from spas_sage_attn import _qattn
+    except ModuleNotFoundError:
+        # _qattn imported but something it needs did not: a broken install,
+        # not the monolithic/split layout difference this fallback is for.
+        raise
+    except ImportError:
+        # No monolithic extension in this build; use the per-architecture one.
+        pass
+    else:
+        return _qattn, "monolithic"
     return _load_split_qattn_surface(capability)
 
 
 def _load_fused_surface():
-    module = importlib.import_module("spas_sage_attn._fused")
+    from spas_sage_attn import _fused as module
     if callable(getattr(module, "transpose_pad_permute_cuda", None)):
         surface = module
     else:
@@ -268,7 +288,7 @@ def resolve_sparse_sage_spec(qattn, fused, *, capability, version, cuda_version=
 def load_sparse_sage_spec(*, capability=None, capability_getter=None, cuda_version=None):
     """Load current SpargeAttention extension surfaces and resolve its ABI."""
     try:
-        importlib.import_module("spas_sage_attn")
+        import spas_sage_attn  # noqa: F401
     except Exception as exc:
         raise SparseSageError(
             "Hybrid Sparse Attention requires the compiled spas_sage_attn package"

@@ -6,7 +6,6 @@ block-sparse routing without depending on CUDA or FP8 support.
 '''
 
 from dataclasses import dataclass
-import importlib
 import inspect
 import logging
 
@@ -90,7 +89,7 @@ def load_fp8_flex_spec(
 
 def _flash_attention_available():
     try:
-        interface = importlib.import_module('flash_attn.cute.interface')
+        from flash_attn.cute import interface
     except (ImportError, OSError):
         return False
     return callable(getattr(interface, '_flash_attn_fwd', None))

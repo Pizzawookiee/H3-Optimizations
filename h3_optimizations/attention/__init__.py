@@ -1,7 +1,5 @@
 '''Production Sparse Sage attention exports owned by this package.'''
 
-from importlib import import_module
-
 
 class AttentionBackendUnavailable(RuntimeError):
     pass
@@ -17,7 +15,10 @@ _SPARSE_EXPORTS = {
 
 def __getattr__(name):
     if name in _SPARSE_EXPORTS:
-        return getattr(import_module('.sparse', __name__), name)
+        # Imported here, not at module scope, so importing this package does
+        # not pull in every optional sparse backend and its dependencies.
+        from . import sparse
+        return getattr(sparse, name)
     raise AttributeError(name)
 
 

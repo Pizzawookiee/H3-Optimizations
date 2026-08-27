@@ -13,6 +13,20 @@ native/build_linux.sh
 native/build_v_staging.ps1
 native/README.md
 
+# FROST is build tooling plus a shipped artifact, so it is filtered by file.
+# Keep h3_frost_bf16_sm89.cubin, its .symbol, LICENSE.txt, PROVENANCE and the
+# README that PROVENANCE cites for the kernel ABI; drop the rebuild inputs.
+native/frost/compile_sm89.py
+native/frost/Dockerfile
+native/frost/frost_h3.patch
+
+# Local build output and machine-local caches. Git ignores these, so they exist
+# only in a working tree, but the Registry package is built from the tree.
+native/build*/
+native/lib/
+native/selftest.json
+native/library_path.txt
+
 # Repository-only metadata and local caches.
 .gitignore
 __pycache__/

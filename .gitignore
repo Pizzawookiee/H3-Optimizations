@@ -5,3 +5,4 @@ __pycache__/
 native/build*/
 native/lib/
 native/selftest.json
+native/library_path.txt

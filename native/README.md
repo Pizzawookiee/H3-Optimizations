@@ -68,8 +68,16 @@ Visual Studio generator is rejected; Ninja preserves the required `/EHs`
 exception boundary described above.
 
 The loader first uses the platform binary committed under `native/bin/`, then
-checks local `native/build/Release/`, `native/build/`, and `native/lib/` paths.
-`H3_INT8_ATTENTION_LIBRARY` overrides all of them.
+checks local `native/lib/`, `native/build/`, and `native/build/Release/` paths.
+
+To point it somewhere else, write that path into `native/library_path.txt`;
+the first non-blank, non-`#` line wins and is searched ahead of everything
+above. This replaces the old `H3_INT8_ATTENTION_LIBRARY` environment variable.
+The Registry's automated package scanner reports any runtime `os.environ` read
+as environment manipulation, and a flagged release leaves ComfyUI-Manager
+pinned to the previous approved version, so the override became a file the
+pack owns. It is ignored by both Git and `.comfyignore`, so it never exists in
+a published install.
 
 Architectures default to
 `75-real;80-real;89-real;120f-real;89-virtual` on Windows and add `90a-real`

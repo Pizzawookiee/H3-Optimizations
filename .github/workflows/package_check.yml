@@ -1,0 +1,24 @@
+name: Registry package check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package-check:
+    name: Check the published artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pathspec
+        run: pip install pathspec
+      - name: Check the Registry package
+        run: python .github/scripts/check_registry_package.py

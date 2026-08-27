@@ -1,7 +1,6 @@
 """Shared prepared-QKV Sage architecture infrastructure."""
 
 from dataclasses import dataclass
-import importlib
 import importlib.metadata
 import logging
 import sys
@@ -64,6 +63,113 @@ def _append_unique(items, item, label):
         items.append((item, label))
 
 
+def _collect(found, label, module):
+    if module is not None:
+        found.append((label, module))
+
+
+def _current_family_modules(family):
+    """SageAttention's present-day per-architecture module layout."""
+    found = []
+    if family == "sm80":
+        try:
+            from sageattention import sm80_compile
+            _collect(found, "sageattention.sm80_compile", sm80_compile)
+        except Exception:
+            pass
+        try:
+            from sageattention import _qattn_sm80
+            _collect(found, "sageattention._qattn_sm80", _qattn_sm80)
+        except Exception:
+            pass
+        try:
+            from sageattention import qattn_sm80
+            _collect(found, "sageattention.qattn_sm80", qattn_sm80)
+        except Exception:
+            pass
+    elif family == "sm89":
+        try:
+            from sageattention import sm89_compile
+            _collect(found, "sageattention.sm89_compile", sm89_compile)
+        except Exception:
+            pass
+        try:
+            from sageattention import _qattn_sm89
+            _collect(found, "sageattention._qattn_sm89", _qattn_sm89)
+        except Exception:
+            pass
+        try:
+            from sageattention import qattn_sm89
+            _collect(found, "sageattention.qattn_sm89", qattn_sm89)
+        except Exception:
+            pass
+    elif family == "sm90":
+        try:
+            from sageattention import sm90_compile
+            _collect(found, "sageattention.sm90_compile", sm90_compile)
+        except Exception:
+            pass
+        try:
+            from sageattention import _qattn_sm90
+            _collect(found, "sageattention._qattn_sm90", _qattn_sm90)
+        except Exception:
+            pass
+        try:
+            from sageattention import qattn_sm90
+            _collect(found, "sageattention.qattn_sm90", qattn_sm90)
+        except Exception:
+            pass
+    return found
+
+
+def _legacy_family_modules(family):
+    """The ``sage_attention`` spelling some older builds installed under."""
+    found = []
+    if family == "sm80":
+        try:
+            from sage_attention import sm80_compile
+            _collect(found, "sage_attention.sm80_compile", sm80_compile)
+        except Exception:
+            pass
+    elif family == "sm89":
+        try:
+            from sage_attention import sm89_compile
+            _collect(found, "sage_attention.sm89_compile", sm89_compile)
+        except Exception:
+            pass
+    elif family == "sm90":
+        try:
+            from sage_attention import sm90_compile
+            _collect(found, "sage_attention.sm90_compile", sm90_compile)
+        except Exception:
+            pass
+    return found
+
+
+def _optional_kernel_modules(family):
+    """Force-import every SageAttention submodule that might carry a kernel.
+
+    SageAttention has moved its compiled exports between releases, so this
+    probes each layout it has shipped, in preference order. The architecture
+    set is finite, so the module names are written as literal imports rather
+    than built from ``family``: nothing is resolved at runtime that a reader
+    -- or the Registry package scanner -- cannot see statically.
+    """
+    found = _current_family_modules(family)
+    try:
+        from sageattention import _ops
+        _collect(found, "sageattention._ops", _ops)
+    except Exception:
+        pass
+    found.extend(_legacy_family_modules(family))
+    try:
+        from sage_attention import _ops as legacy_ops
+        _collect(found, "sage_attention._ops", legacy_ops)
+    except Exception:
+        pass
+    return found
+
+
 def _candidate_surfaces(core, family, public_names):
     surfaces = []
     _append_unique(surfaces, core, "sageattention.core")
@@ -91,19 +197,7 @@ def _candidate_surfaces(core, family, public_names):
                 label + ".ops",
             )
 
-    module_names = (
-        "sageattention.%s_compile" % family,
-        "sageattention._qattn_%s" % family,
-        "sageattention.qattn_%s" % family,
-        "sageattention._ops",
-        "sage_attention.%s_compile" % family,
-        "sage_attention._ops",
-    )
-    for module_name in module_names:
-        try:
-            module = importlib.import_module(module_name)
-        except Exception:
-            continue
+    for module_name, module in _optional_kernel_modules(family):
         _append_unique(surfaces, module, module_name)
         _append_unique(
             surfaces,
