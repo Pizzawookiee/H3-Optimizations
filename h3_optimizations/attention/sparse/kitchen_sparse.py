@@ -23,6 +23,7 @@ incompatible because it emits a different per-tile carrier.
 from dataclasses import dataclass, replace
 
 from ... import diagnostics
+from ...native.int8_attention import quantize_int8_attention_q
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
@@ -609,62 +610,19 @@ class SparseKitchenBackend:
                     ) from exc
                 del q_summary
 
-                q_shape = tuple(q.shape)
-                k_shape = (
-                    q_shape[0],
-                    quantized.k.shape[1],
-                    1,
-                    q_shape[3],
-                )
-                spec = producer_kitchen.int8_attention_producer_spec(
-                    q_shape,
-                    k_shape,
-                    dtype=q.dtype,
-                    device=q.device,
-                    cta_k=quantized.cta_k,
-                )
-                samples = q.new_zeros(
-                    k_shape[0],
-                    k_shape[1],
-                    len(spec.k_anchor_positions),
-                    k_shape[3],
-                )
-                anchor = producer_kitchen.select_int8_attention_k_anchor(
-                    spec, samples
-                )
-                del samples
-                producer = producer_kitchen.create_int8_attention_producer(
-                    spec, anchor
-                )
-                producer_kitchen.quantize_int8_attention_q_chunk(
-                    producer,
+                # Quantize this bounded Q slab using the REAL full key
+                # sequence length. This matches the known-good test2 Q-only
+                # Kitchen path while preserving the fused-QKV projection.
+                q_int8, q_scale = quantize_int8_attention_q(
                     q,
-                    q_start=0,
-                    allow_strided_input=True,
-                )
-                producer_kitchen.quantize_int8_attention_v(
-                    producer,
-                    q[..., :1, :],
-                )
-
-                q_carrier = (
-                    producer_kitchen.finalize_int8_attention_producer(
-                        producer
-                    )
+                    full_k_length=sequence,
                 )
                 chunk_carrier = replace(
-                    q_carrier,
-                    k=quantized.k,
-                    v=quantized.v,
-                    k_scale=quantized.k_scale,
-                    v_scale=quantized.v_scale,
-                    input_dtype=quantized.input_dtype,
-                    attention_scale=quantized.attention_scale,
-                    cta_k=quantized.cta_k,
-                    anchor_indices=quantized.anchor_indices,
+                    quantized,
+                    q=q_int8,
+                    q_scale=q_scale,
                 )
-                q_scale = q_carrier.q_scale
-                del q_carrier
+                del q_int8
 
                 chunk_route = self.executor.kitchen.BlockSparseRoute(
                     indices=lut,
