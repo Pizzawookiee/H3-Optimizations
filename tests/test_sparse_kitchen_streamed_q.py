@@ -3,11 +3,13 @@
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
-
-import torch
+from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
+import torch
 
 PACK = Path(__file__).resolve().parents[1]
 ROOT = PACK.parents[1]
@@ -15,14 +17,26 @@ for _root in (str(PACK), str(ROOT)):
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
+TEST_ARGS = sys.argv[1:]
+sys.argv = [sys.argv[0], "--cpu"]
+
+import comfy.options  # noqa: E402
+
+comfy.options.enable_args_parsing()
+
 from h3_optimizations.attention.sparse.kitchen_streamed_q import (
+    PreparedStreamedSparseKitchen,
     StreamedSparseKitchenBackend,
+    StreamedSparseKitchenQKV,
     _build_route_chunk,
     _prepare_route_plan,
 )
+from h3_optimizations.attention.sparse import kitchen_streamed_q
 from h3_optimizations.attention.sparse.router import SparseTileRouter
 from h3_optimizations.attention.sparse import kitchen_sparse
 from h3_optimizations.kitchen_qkv import ChunkedKitchenQKVProjector
+
+sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 class _Layout:
@@ -39,6 +53,68 @@ class _Layout:
 
 
 class StreamedSparseKitchenRoutingTests(unittest.TestCase):
+    def test_query_chunks_use_the_carrier_producer_not_the_sparse_executor(self):
+        class Held:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class StopAfterQuantize(Exception):
+            pass
+
+        producer_module = object()
+        sparse_executor_module = object()
+        module = SimpleNamespace(heads=1, head_dim=1)
+        projected = StreamedSparseKitchenQKV(
+            module=module,
+            producer_module=producer_module,
+            x=torch.zeros(64, 1),
+            rope_freqs=None,
+            carrier=object(),
+            k_summary=None,
+            projection_mode="native",
+            output_buffer=torch.empty(64, 1),
+        )
+        prepared = PreparedStreamedSparseKitchen(
+            projected=projected,
+            route_plan=SimpleNamespace(release=lambda: None),
+            metadata={},
+        )
+        backend = StreamedSparseKitchenBackend.__new__(StreamedSparseKitchenBackend)
+        backend.executor = SimpleNamespace(
+            kitchen=sparse_executor_module,
+            q_tile=64,
+            kv_tile=64,
+        )
+        backend.query_chunk_rows = 64
+        backend.router = object()
+
+        with (
+            mock.patch.object(kitchen_streamed_q, "create_held_qkv", return_value=Held()),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "project_q_hnd",
+                return_value=torch.zeros(1, 1, 64, 1),
+            ),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "_build_route_chunk",
+                return_value=(torch.zeros(1, 1, 1, 1), torch.ones(1, 1, 1)),
+            ),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "_quantize_q_chunk",
+                side_effect=StopAfterQuantize,
+            ) as quantize,
+        ):
+            with self.assertRaises(StopAfterQuantize):
+                backend.execute_projected(module, prepared)
+
+        self.assertIs(quantize.call_args.args[0], producer_module)
+        self.assertIsNot(quantize.call_args.args[0], sparse_executor_module)
+
     def test_production_sparse_projector_marks_streamed_q(self):
         projector = ChunkedKitchenQKVProjector(
             routing_summaries=True,

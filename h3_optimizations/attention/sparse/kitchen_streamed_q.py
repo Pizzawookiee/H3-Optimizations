@@ -59,6 +59,7 @@ from .router import SparseRouterError
 @dataclass
 class StreamedSparseKitchenQKV:
     module: object
+    producer_module: object
     x: torch.Tensor
     rope_freqs: torch.Tensor | None
     carrier: object
@@ -68,6 +69,7 @@ class StreamedSparseKitchenQKV:
 
     def release(self):
         self.module = None
+        self.producer_module = None
         self.x = None
         self.rope_freqs = None
         self.carrier = None
@@ -255,6 +257,7 @@ def _run_streamed_sparse_kitchen_qkv(
 
     return StreamedSparseKitchenQKV(
         module=module,
+        producer_module=kitchen,
         x=x,
         rope_freqs=rope_freqs,
         carrier=carrier,
@@ -452,6 +455,9 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
             raise SparseKitchenError("streamed Sparse Kitchen route was released")
 
         kitchen = self.executor.kitchen
+        producer_module = projected.producer_module
+        if producer_module is None:
+            raise SparseKitchenError("streamed Sparse Kitchen producer was released")
         output = projected.output_buffer
         if output is None:
             raise SparseKitchenError(
@@ -498,7 +504,7 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                     del q_summary
 
                 chunk_carrier = _quantize_q_chunk(
-                    kitchen,
+                    producer_module,
                     projected.carrier,
                     q,
                 )
