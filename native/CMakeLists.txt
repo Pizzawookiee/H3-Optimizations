@@ -38,10 +38,12 @@ set(CMAKE_CUDA_ARCHITECTURES ${H3_CUDA_ARCHS})
 
 add_library(h3_int8_attention SHARED
     src/h3_int8_attention_api.cu
+    src/h3_v_staging_api.cu
     src/sage_attention/sage_attn_launcher.cu
     src/sage_attention/sage_attn_sparse_launcher.cu
     src/sage_attention/quant_qk_int8.cu
     src/sage_attention/quant_v_int8.cu
+    src/sage_attention/v_staging.cu
 )
 
 target_include_directories(h3_int8_attention PRIVATE

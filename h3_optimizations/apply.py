@@ -255,6 +255,20 @@ def _qkv_request(plan):
     return FUSED_QKV_OFF
 
 
+def _q_optimization(plan):
+    return bool(
+        plan.memory is not None
+        and getattr(plan.memory, 'q_optimization', False)
+    )
+
+
+def _v_optimization(plan):
+    return bool(
+        plan.memory is not None
+        and getattr(plan.memory, 'v_optimization', False)
+    )
+
+
 def _fp8_execution_available(environment):
     if not bool(getattr(environment, 'cuda_available', False)):
         return False
@@ -407,6 +421,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
             strided_qk_input=True,
             stream_output=True,
             streamed_q=True,
+            v_optimization=_v_optimization(plan),
         )
     return (
         ResolvedAttention(
@@ -677,6 +692,8 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             convrot_int8_projection=(
                 qkv.provider_id == QKV_FORCE_CONVROT_INT8_KITCHEN
             ),
+            streamed_q=_q_optimization(plan),
+            v_optimization=_v_optimization(plan),
         )
     else:
         projector = None

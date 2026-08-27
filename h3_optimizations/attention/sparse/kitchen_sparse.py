@@ -26,7 +26,11 @@ from ... import diagnostics
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
-from ...kitchen_qkv import PreparedChunkedKitchenQKV
+from ...kitchen_qkv import (
+    PreparedChunkedKitchenQKV,
+    PreparedStreamedKitchenQKV,
+)
+from ...qkv.streamed import create_held_qkv, project_q_hnd
 
 
 class SparseKitchenError(RuntimeError):
@@ -162,6 +166,7 @@ class PreparedSparseKitchen:
     layer_index: int
     metadata: dict
     output_buffer: object = None
+    streamed_projected: object = None
 
     def release(self):
         """Drop the carriers and route once the kernel no longer needs them.
@@ -173,6 +178,9 @@ class PreparedSparseKitchen:
         caller's local means every holder loses them at once -- the projected
         carrier outlives its usefulness by a full output projection otherwise.
         """
+        if self.streamed_projected is not None:
+            self.streamed_projected.release()
+        self.streamed_projected = None
         self.quantized = None
         self.route = None
         self.output_buffer = None
@@ -440,7 +448,10 @@ class SparseKitchenBackend:
             raise SparseKitchenError(
                 'Kitchen sparse attention has no chunked QKV producer'
             )
-        if not isinstance(projected, PreparedChunkedKitchenQKV):
+        if not isinstance(
+            projected,
+            (PreparedChunkedKitchenQKV, PreparedStreamedKitchenQKV),
+        ):
             raise SparseKitchenError(
                 'Kitchen sparse attention received an invalid projected carrier'
             )
@@ -448,7 +459,8 @@ class SparseKitchenBackend:
             raise SparseKitchenError(
                 'Kitchen sparse QKV carrier has no routing summaries'
             )
-        sequence = int(projected.carrier.q.shape[-2])
+        streamed = isinstance(projected, PreparedStreamedKitchenQKV)
+        sequence = int(projected.x.shape[0]) if streamed else int(projected.carrier.q.shape[-2])
         snapshot = snapshot_for(transformer_options, sequence)
         video_budget = resolve_video_budget(
             self.config,
@@ -458,26 +470,42 @@ class SparseKitchenBackend:
         )
         try:
             with diagnostics.stage('sparse_route'):
-                lut, valid_block_num, mask_metadata = (
-                    self.router.build_lut_from_summaries(
-                        projected.q_summary,
-                        projected.k_summary,
-                        snapshot.layout,
-                        video_budget,
-                    )
+                lut, valid_block_num, mask_metadata = self.router.build_lut_from_summaries(
+                    projected.q_summary,
+                    projected.k_summary,
+                    snapshot.layout,
+                    video_budget,
                 )
         except SparseRouterError as exc:
             raise SparseKitchenError('sparse routing failed: %s' % exc) from exc
+        metadata = route_metadata(
+            mask_metadata,
+            layer_index,
+            projected.q_summary.shape[1],
+        )
+        if streamed:
+            route = self.executor.kitchen.BlockSparseRoute(
+                indices=lut,
+                counts=valid_block_num,
+                q_tile=self.executor.q_tile,
+                kv_tile=self.executor.kv_tile,
+                encoding='delta',
+            )
+            return PreparedSparseKitchen(
+                quantized=projected.carrier,
+                route=route,
+                original_head_dim=int(projected.carrier.original_head_dim),
+                layer_index=int(layer_index),
+                metadata=metadata,
+                output_buffer=projected.output_buffer,
+                streamed_projected=projected,
+            )
         prepared = self.executor.prepare_projected(
             projected.carrier,
             lut,
             valid_block_num,
             layer_index=layer_index,
-            metadata=route_metadata(
-                mask_metadata,
-                layer_index,
-                projected.q_summary.shape[1],
-            ),
+            metadata=metadata,
         )
         prepared.output_buffer = projected.output_buffer
         return prepared
@@ -497,54 +525,129 @@ class SparseKitchenBackend:
         route = prepared.route
         output = prepared.output_buffer
         route_q_tile = int(route.q_tile)
-        sequence = int(quantized.q.shape[-2])
-        packed_q_tiles = (sequence + 127) // 128
-        if quantized.q_scale.shape[-1] % packed_q_tiles:
-            raise SparseKitchenError(
-                'streamed Kitchen output received invalid Q scales'
-            )
-        scales_per_packed_q_tile = (
-            quantized.q_scale.shape[-1] // packed_q_tiles
-        )
+        streamed = prepared.streamed_projected is not None
 
-        for start in range(0, sequence, self.query_chunk_rows):
-            stop = min(start + self.query_chunk_rows, sequence)
-            first_route_tile = start // route_q_tile
-            stop_route_tile = (stop + route_q_tile - 1) // route_q_tile
-            first_scale_tile = start // 128
-            stop_scale_tile = (stop + 127) // 128
-            q = quantized.q[..., start:stop, :].contiguous()
-            q_scale = quantized.q_scale[
-                ...,
-                first_scale_tile * scales_per_packed_q_tile:
-                stop_scale_tile * scales_per_packed_q_tile,
-            ].contiguous()
-            chunk_carrier = replace(quantized, q=q, q_scale=q_scale)
-            chunk_route = replace(
-                route,
-                indices=route.indices[
-                    ..., first_route_tile:stop_route_tile, :
-                ].contiguous(),
-                counts=route.counts[
-                    ..., first_route_tile:stop_route_tile
-                ].contiguous(),
-            )
-            raw = self.executor.kitchen.block_sparse_int8_attention_from_prequantized(
-                chunk_carrier,
-                chunk_route,
-                output_layout=OUTPUT_NHD,
-            )
-            flat = raw.transpose(1, 2).reshape(
-                raw.shape[0],
-                raw.shape[2],
-                module.heads * module.head_dim,
-            )
-            with diagnostics.stage('attention_out'):
-                output[start:stop].copy_(module.out_proj(flat.squeeze(0)))
-            del raw, flat, chunk_carrier, chunk_route, q, q_scale
+        if streamed:
+            projected = prepared.streamed_projected
+            sequence = int(projected.x.shape[0])
+            q_held = None
+        else:
+            projected = None
+            q_held = None
+            sequence = int(quantized.q.shape[-2])
+            packed_q_tiles = (sequence + 127) // 128
+            if quantized.q_scale.shape[-1] % packed_q_tiles:
+                raise SparseKitchenError(
+                    'streamed Kitchen output received invalid Q scales'
+                )
+            scales_per_packed_q_tile = quantized.q_scale.shape[-1] // packed_q_tiles
 
-        prepared.release()
-        return output
+        try:
+            for start in range(0, sequence, self.query_chunk_rows):
+                stop = min(start + self.query_chunk_rows, sequence)
+                first_route_tile = start // route_q_tile
+                stop_route_tile = (stop + route_q_tile - 1) // route_q_tile
+
+                if streamed:
+                    # Acquire fused QKV only for this Q projection and release
+                    # it before attention/out_proj can acquire another offloaded
+                    # module. This preserves Comfy cast-buffer lifetime safety.
+                    local_held = create_held_qkv(
+                        projected.module,
+                        projected.x[start:start + 1],
+                        projected.projection_mode,
+                    )
+                    local_held.__enter__()
+                    try:
+                        q = project_q_hnd(
+                            local_held,
+                            projected.x,
+                            projected.rope_freqs,
+                            start,
+                            stop,
+                        )
+                    finally:
+                        local_held.__exit__(None, None, None)
+
+                    q_shape = tuple(q.shape)
+                    k_shape = (
+                        q_shape[0],
+                        quantized.k.shape[1],
+                        1,
+                        q_shape[3],
+                    )
+                    spec = self.executor.kitchen.int8_attention_producer_spec(
+                        q_shape,
+                        k_shape,
+                        dtype=q.dtype,
+                        device=q.device,
+                        cta_k=quantized.cta_k,
+                    )
+                    samples = q.new_zeros(
+                        k_shape[0],
+                        k_shape[1],
+                        len(spec.k_anchor_positions),
+                        k_shape[3],
+                    )
+                    anchor = self.executor.kitchen.select_int8_attention_k_anchor(spec, samples)
+                    del samples
+                    producer = self.executor.kitchen.create_int8_attention_producer(spec, anchor)
+                    self.executor.kitchen.quantize_int8_attention_q_chunk(
+                        producer, q, q_start=0, allow_strided_input=True
+                    )
+                    self.executor.kitchen.quantize_int8_attention_v(
+                        producer, q[..., :1, :]
+                    )
+                    q_carrier = self.executor.kitchen.finalize_int8_attention_producer(producer)
+                    chunk_carrier = replace(
+                        q_carrier,
+                        k=quantized.k,
+                        v=quantized.v,
+                        k_scale=quantized.k_scale,
+                        v_scale=quantized.v_scale,
+                        input_dtype=quantized.input_dtype,
+                        attention_scale=quantized.attention_scale,
+                        cta_k=quantized.cta_k,
+                        anchor_indices=quantized.anchor_indices,
+                    )
+                    q_scale = q_carrier.q_scale
+                    del q_carrier
+                else:
+                    first_scale_tile = start // 128
+                    stop_scale_tile = (stop + 127) // 128
+                    q = quantized.q[..., start:stop, :].contiguous()
+                    q_scale = quantized.q_scale[
+                        ...,
+                        first_scale_tile * scales_per_packed_q_tile:
+                        stop_scale_tile * scales_per_packed_q_tile,
+                    ].contiguous()
+                    chunk_carrier = replace(quantized, q=q, q_scale=q_scale)
+
+                chunk_route = replace(
+                    route,
+                    indices=route.indices[
+                        ..., first_route_tile:stop_route_tile, :
+                    ].contiguous(),
+                    counts=route.counts[
+                        ..., first_route_tile:stop_route_tile
+                    ].contiguous(),
+                )
+                raw = self.executor.kitchen.block_sparse_int8_attention_from_prequantized(
+                    chunk_carrier,
+                    chunk_route,
+                    output_layout=OUTPUT_NHD,
+                )
+                flat = raw.transpose(1, 2).reshape(
+                    raw.shape[0], raw.shape[2], module.heads * module.head_dim
+                )
+                with diagnostics.stage('attention_out'):
+                    output[start:stop].copy_(module.out_proj(flat.squeeze(0)))
+                del raw, flat, chunk_carrier, chunk_route, q, q_scale
+
+            prepared.release()
+            return output
+        finally:
+            pass
 
     def execute_with_lse(self, prepared):
         return self.executor.execute_with_lse(prepared)

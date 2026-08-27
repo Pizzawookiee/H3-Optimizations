@@ -12,6 +12,7 @@ from .layout import resolve_layout
 
 RUNTIME_KEY = 'h3_optimizations_runtime'
 RUNTIME_SESSION_KEY = 'h3_optimizations_runtime_session'
+DISABLE_LOOKAHEAD_PREFETCH_KEY = 'h3_optimizations_disable_lookahead_prefetch'
 WRAPPER_KEY = 'h3_optimizations_runtime_context'
 OUTER_WRAPPER_KEY = 'h3_optimizations_request_boundary'
 LOG_PREFIX = '[H3 Optimizations]'
@@ -193,9 +194,16 @@ def make_outer_wrapper(session):
     return wrapper
 
 
+def _apply_low_vram_prefetch_policy(options):
+    if options.get(DISABLE_LOOKAHEAD_PREFETCH_KEY, False):
+        # BaseModel may repopulate this before the diffusion wrapper runs.
+        options['prefetch_dynamic_vbars'] = False
+
+
 def make_diffusion_wrapper(session):
     def wrapper(executor, *args, **kwargs):
         options, args, kwargs = _transformer_options(args, kwargs, 3)
+        _apply_low_vram_prefetch_policy(options)
         x = args[0] if args else kwargs.get('x')
         context = args[2] if len(args) > 2 else kwargs.get('context')
         session.observe(
@@ -214,6 +222,7 @@ def make_apply_model_wrapper(session):
 
     def wrapper(executor, *args, **kwargs):
         options, args, kwargs = _transformer_options(args, kwargs, 5)
+        _apply_low_vram_prefetch_policy(options)
         x = args[0] if args else kwargs.get('x')
         latent_shapes = kwargs.get('latent_shapes')
         layout_x = (

@@ -8,6 +8,7 @@ ignored by execution. Appended authoritative controls own current behavior.
 from comfy_api.latest import io, ui
 
 from .apply_policy import apply_plan
+from .runtime.context import DISABLE_LOOKAHEAD_PREFETCH_KEY
 from .node_constants import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
 from .plan import (
     ATTENTION_AUTO,
@@ -83,6 +84,9 @@ def _memory_request_for_modes(
     chunk_rows,
     precision_mode,
     qkv_streaming_mode,
+    q_optimization=False,
+    v_optimization=False,
+    disable_lookahead_prefetch=False,
 ):
     # fused_qkv is a serialized compatibility tombstone. QKV streaming is the
     # authoritative public policy now; keeping the argument preserves old
@@ -128,6 +132,9 @@ def _memory_request_for_modes(
         mlp_memory=mlp_request,
         chunk_rows=int(chunk_rows),
         qkv_streaming=streaming,
+        q_optimization=bool(q_optimization),
+        v_optimization=bool(v_optimization),
+        disable_lookahead_prefetch=bool(disable_lookahead_prefetch),
         mlp_strict=precision_mode in (
             PRECISION_MODE_BF16,
             PRECISION_MODE_FORCE_QUANT,
@@ -250,6 +257,41 @@ class H3MemoryOptimization(io.ComfyNode):
                         'Kitchen. H3 Sparse Attention remains authoritative.'
                     ),
                 ),
+                io.Boolean.Input(
+                    'disable_lookahead_prefetch',
+                    display_name='Disable lookahead prefetch',
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        'Disables ComfyUI DynamicVRAM next-block VBAR prefetch for '
+                        'this H3 model. Useful as a low-VRAM pressure diagnostic; '
+                        'it may reduce transfer overlap.'
+                    ),
+                ),
+                io.Boolean.Input(
+                    'q_optimization',
+                    display_name='Q optimization',
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        'Kitchen INT8 low-VRAM Q path. Sparse Kitchen does not keep '
+                        'the full Q carrier and instead reprojects bounded Q chunks. '
+                        'Each Q chunk uses the normal Comfy fused-QKV acquisition and '
+                        'releases it before out_proj, avoiding cast-buffer aliasing.'
+                    ),
+                ),
+                io.Boolean.Input(
+                    'v_optimization',
+                    display_name='V optimization',
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        'Kitchen INT8 exact two-pass V carrier. Pass 1 accumulates '
+                        'global per-channel V absmax from bounded chunks; pass 2 '
+                        'reprojects V-only chunks into the final INT8 carrier. This '
+                        'avoids full-sequence BF16 V at the cost of one extra V GEMM.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -264,6 +306,9 @@ class H3MemoryOptimization(io.ComfyNode):
         preserve_precision=True,
         precision_mode=PRECISION_MODE_AUTO,
         qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
+        disable_lookahead_prefetch=False,
+        q_optimization=False,
+        v_optimization=False,
     ):
         del preserve_precision
         plan = read_plan(model).with_memory(
@@ -273,9 +318,18 @@ class H3MemoryOptimization(io.ComfyNode):
                 chunk_rows=chunk_rows,
                 precision_mode=precision_mode,
                 qkv_streaming_mode=qkv_streaming_mode,
+                q_optimization=bool(q_optimization),
+                v_optimization=bool(v_optimization),
+                disable_lookahead_prefetch=bool(disable_lookahead_prefetch),
             )
         )
         patched = apply_plan(model, plan)
+        options = patched.model_options['transformer_options'] = (
+            patched.model_options.get('transformer_options', {}).copy()
+        )
+        options[DISABLE_LOOKAHEAD_PREFETCH_KEY] = bool(
+            disable_lookahead_prefetch
+        )
         return io.NodeOutput(
             patched,
             ui=ui.PreviewText(format_memory_status(patched)),

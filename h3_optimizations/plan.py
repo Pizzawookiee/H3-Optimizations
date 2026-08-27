@@ -144,6 +144,9 @@ class MemoryRequest:
     mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 4096
     qkv_streaming: str = QKV_STREAMING_AUTO
+    q_optimization: bool = False
+    v_optimization: bool = False
+    disable_lookahead_prefetch: bool = False
     prefer_held_weights: bool = True
     mlp_strict: bool = False
 
@@ -192,6 +195,9 @@ class MemoryRequest:
             self.mlp_memory,
             int(self.chunk_rows),
             self.qkv_streaming,
+            bool(self.q_optimization),
+            bool(self.v_optimization),
+            bool(self.disable_lookahead_prefetch),
             bool(self.prefer_held_weights),
             bool(self.mlp_strict),
         )

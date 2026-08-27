@@ -66,6 +66,16 @@ def project_q_hnd(held, x, rope_freqs, start, end):
     return q
 
 
+def project_v_hnd(held, x, rope_freqs, start, end):
+    """Project only V when the source binding exposes an output-row slice."""
+    project_v = getattr(held, "project_v_hnd", None)
+    if callable(project_v):
+        return project_v(x, start, end)
+    q, k, v = held.project_hnd(x, rope_freqs, start, end)
+    del q, k
+    return v
+
+
 def project_kv_hnd(held, x, rope_freqs, start, end):
     """Project K/V without Q when the source binding exposes a split path."""
     project_kv = getattr(held, "project_kv_hnd", None)
@@ -86,4 +96,5 @@ __all__ = [
     "create_held_qkv",
     "project_kv_hnd",
     "project_q_hnd",
+    "project_v_hnd",
 ]
