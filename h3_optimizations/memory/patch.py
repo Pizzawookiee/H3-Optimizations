@@ -9,6 +9,7 @@ from ..model import get_h3_blocks, is_minimax_h3
 BLOCKS_ATTR = 'diffusion_model.blocks'
 OWNER_MARKER = '_h3_optimizations_memory'
 SIGNATURE_MARKER = '_h3_optimizations_memory_signature'
+ORIGINAL_MARKER = '_h3_optimizations_memory_original'
 REQUIRED_BLOCK_ATTRS = ('norm1', 'norm2', 'attn', 'mlp', 'adaln_proj')
 REQUIRED_MLP_ATTRS = ('fc1', 'fc2')
 
@@ -50,7 +51,7 @@ def validate(model_patcher):
     return blocks
 
 
-def install(model_patcher, config=None):
+def install(model_patcher, config=None, *, force_rebuild=False):
     '''Patch every main H3 block; identical installation is idempotent.'''
 
     config = config or ActivationMemoryConfig()
@@ -59,58 +60,50 @@ def install(model_patcher, config=None):
     blocks = validate(model_patcher)
     existing = getattr(model_patcher, 'object_patches', {})
 
-    foreign = [
-        key_for(index)
-        for index in range(len(blocks))
-        if key_for(index) in existing
-        and not getattr(existing[key_for(index)], OWNER_MARKER, False)
-    ]
-    if foreign:
-        raise H3MemoryPatchError(
-            'another patch already owns %s; remove one H3 memory patch'
-            % foreign[0]
-        )
-
-    owned = [
-        index
-        for index in range(len(blocks))
-        if getattr(existing.get(key_for(index)), OWNER_MARKER, False)
-    ]
-    if owned:
-        if len(owned) != len(blocks):
-            raise H3MemoryPatchError(
-                'only %d of %d H3 blocks carry this memory patch'
-                % (len(owned), len(blocks))
-            )
-        installed = {
-            getattr(existing[key_for(index)], SIGNATURE_MARKER, None)
-            for index in owned
-        }
-        if installed == {config.signature}:
-            return 0
-        raise H3MemoryPatchError(
-            'H3 Memory Optimization is already configured for %s; requested '
-            '%s. Remove the earlier node instead of relying on node order.'
-            % (
-                sorted(str(item) for item in installed),
-                config.signature,
-            )
-        )
-
+    foreign = []
+    patched = 0
     for index, block in enumerate(blocks):
+        key = key_for(index)
+        current = existing.get(key)
+        if current is not None and not getattr(current, OWNER_MARKER, False):
+            foreign.append(key)
+            continue
+        if current is not None:
+            installed = getattr(current, SIGNATURE_MARKER, None)
+            if installed == config.signature and not force_rebuild:
+                continue
+            original = getattr(current, ORIGINAL_MARKER, None)
+            if original is None:
+                raise H3MemoryPatchError(
+                    'installed H3 memory patch for %s has no recoverable original'
+                    % key
+                )
+        else:
+            original = block.forward
         model_patcher.add_object_patch(
-            key_for(index),
+            key,
             make_forward(
                 block,
                 index,
                 config,
-                original_forward=block.forward,
+                original_forward=original,
             ),
+        )
+        patched += 1
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    options['h3_optimizations_preserved_block_patches'] = foreign
+    if foreign:
+        logging.debug(
+            '[H3 Optimizations] preserved %d foreign block forward patch(es); '
+            'bounded MLP execution is disabled for those blocks',
+            len(foreign),
         )
     logging.debug(
         '[H3 Optimizations] patched %d MLP blocks: mode=%s chunk_rows=%d',
-        len(blocks),
+        patched,
         config.mode,
         config.chunk_rows,
     )
-    return len(blocks)
+    return patched

@@ -25,6 +25,7 @@ import h3_optimizations.apply as apply_module  # noqa: E402
 from h3_optimizations.memory_migration_node import (  # noqa: E402
     PRECISION_MODE_PRESERVE,
     QKV_STREAMING_MODE_AUTO,
+    QKV_STREAMING_MODE_FORCED,
     _memory_request_for_modes,
 )
 from h3_optimizations.plan import (  # noqa: E402
@@ -32,7 +33,10 @@ from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_EXISTING,
     H3OptimizationPlan,
 )
-from h3_optimizations.qkv.providers import QKV_DENSE_KITCHEN_CHUNKED  # noqa: E402
+from h3_optimizations.qkv.providers import (  # noqa: E402
+    QKV_DENSE_KITCHEN_CHUNKED,
+    QKV_STANDARD,
+)
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -112,28 +116,30 @@ class ComfyKitchenSelectorStreamingTests(unittest.TestCase):
     def test_unknown_explicit_selector_preserves_full_q_single_call(self):
         model = FakePatcher()
         model.set_model_optimized_attention(pytorch_attention)
-        request = _memory_request_for_modes(
-            fused_qkv='auto',
-            mlp_memory='auto',
-            chunk_rows=4096,
-            precision_mode=PRECISION_MODE_PRESERVE,
-            qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
-        )
-        self.assertEqual(request.attention, ATTENTION_EXISTING)
-        plan = H3OptimizationPlan().with_memory(request)
-        with patch.object(
-            apply_module,
-            'producer_api_available',
-            return_value=True,
-        ):
-            attention, _qkv = apply_module._resolve_dense(
-                plan,
-                model,
-                convrot_inventory(),
-            )
-        self.assertEqual(attention.selected, ATTENTION_EXISTING)
-        self.assertEqual(attention.projector.name, 'chunked_bf16_qkv')
-        self.assertIn('full-Q single-call', attention.reason)
+        for streaming in (QKV_STREAMING_MODE_AUTO, QKV_STREAMING_MODE_FORCED):
+            with self.subTest(streaming=streaming):
+                request = _memory_request_for_modes(
+                    fused_qkv='auto',
+                    mlp_memory='auto',
+                    chunk_rows=4096,
+                    precision_mode=PRECISION_MODE_PRESERVE,
+                    qkv_streaming_mode=streaming,
+                )
+                plan = H3OptimizationPlan().with_memory(request)
+                with patch.object(
+                    apply_module,
+                    'producer_api_available',
+                    return_value=True,
+                ):
+                    attention, qkv = apply_module._resolve_dense(
+                        plan,
+                        model,
+                        convrot_inventory(),
+                    )
+                self.assertEqual(attention.selected, ATTENTION_EXISTING)
+                self.assertIsNone(attention.projector)
+                self.assertEqual(qkv.provider_id, QKV_STANDARD)
+                self.assertIn('full-Q single-call', attention.reason)
 
     def test_registered_comfy_selector_uses_bounded_q(self):
         model = FakePatcher()
@@ -158,7 +164,7 @@ class ComfyKitchenSelectorStreamingTests(unittest.TestCase):
             'producer_api_available',
             return_value=False,
         ):
-            attention, _qkv = apply_module._resolve_dense(
+            attention, qkv = apply_module._resolve_dense(
                 plan,
                 model,
                 convrot_inventory(),

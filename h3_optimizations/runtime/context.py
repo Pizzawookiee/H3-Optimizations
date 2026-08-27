@@ -14,6 +14,7 @@ RUNTIME_KEY = 'h3_optimizations_runtime'
 RUNTIME_SESSION_KEY = 'h3_optimizations_runtime_session'
 WRAPPER_KEY = 'h3_optimizations_runtime_context'
 OUTER_WRAPPER_KEY = 'h3_optimizations_request_boundary'
+CLONE_CALLBACK_KEY = 'h3_optimizations_runtime_clone'
 LOG_PREFIX = '[H3 Optimizations]'
 
 
@@ -35,8 +36,9 @@ class RuntimeSnapshot:
 class H3RuntimeSession:
     '''Publish layout and callback-owned sampler-step metadata.'''
 
-    def __init__(self, *, strict_layout=False):
+    def __init__(self, *, strict_layout=False, generation=0):
         self.strict_layout = bool(strict_layout)
+        self.generation = int(generation)
         self.request_id = -1
         self.last_snapshot = None
         self._active_request = None
@@ -233,16 +235,62 @@ def make_apply_model_wrapper(session):
     return wrapper
 
 
+def _replace_wrapper(transformer_options, wrapper_type, key, wrapper):
+    wrappers = transformer_options.setdefault('wrappers', {})
+    wrappers.setdefault(wrapper_type, {})[key] = [wrapper]
+
+
+def _remove_wrapper(transformer_options, wrapper_type, key):
+    wrappers = transformer_options.get('wrappers', {})
+    keyed = wrappers.get(wrapper_type, {})
+    keyed.pop(key, None)
+    if not keyed:
+        wrappers.pop(wrapper_type, None)
+
+
+def _runtime_on_clone(parent, child):
+    del parent
+    options = child.model_options.get('transformer_options', {})
+    inherited = options.get(RUNTIME_SESSION_KEY)
+    if not isinstance(inherited, H3RuntimeSession):
+        return
+    install_runtime_wrapper(
+        child,
+        H3RuntimeSession(
+            strict_layout=inherited.strict_layout,
+            generation=inherited.generation + 1,
+        ),
+    )
+    logging.debug(
+        '%s reconstructed runtime context after clone: session=%s generation=%d',
+        LOG_PREFIX,
+        id(child.model_options['transformer_options'][RUNTIME_SESSION_KEY]),
+        inherited.generation + 1,
+    )
+
+
 def install_runtime_wrapper(model_patcher, session=None):
     import comfy.patcher_extension
 
     session = session or H3RuntimeSession()
-    comfy.patcher_extension.add_wrapper_with_key(
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    _replace_wrapper(
+        options,
         comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
         OUTER_WRAPPER_KEY,
         make_outer_wrapper(session),
-        model_patcher.model_options,
-        is_model_options=True,
+    )
+    _remove_wrapper(
+        options,
+        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+        WRAPPER_KEY,
+    )
+    _remove_wrapper(
+        options,
+        comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+        WRAPPER_KEY,
     )
     wrapper_type = (
         comfy.patcher_extension.WrappersMP.APPLY_MODEL
@@ -254,19 +302,55 @@ def install_runtime_wrapper(model_patcher, session=None):
         if wrapper_type == comfy.patcher_extension.WrappersMP.APPLY_MODEL
         else make_diffusion_wrapper(session)
     )
-    comfy.patcher_extension.add_wrapper_with_key(
+    _replace_wrapper(
+        options,
         wrapper_type,
         WRAPPER_KEY,
         wrapper,
-        model_patcher.model_options,
-        is_model_options=True,
     )
+    options[RUNTIME_SESSION_KEY] = session
+    model_patcher.remove_callbacks_with_key(
+        comfy.patcher_extension.CallbacksMP.ON_CLONE,
+        CLONE_CALLBACK_KEY,
+    )
+    model_patcher.add_callback_with_key(
+        comfy.patcher_extension.CallbacksMP.ON_CLONE,
+        CLONE_CALLBACK_KEY,
+        _runtime_on_clone,
+    )
+    logging.debug(
+        '%s installed sampler-step and packed-layout runtime context: '
+        'session=%s generation=%d',
+        LOG_PREFIX,
+        id(session),
+        session.generation,
+    )
+    return session
+
+
+def remove_runtime_wrapper(model_patcher):
+    import comfy.patcher_extension
+
     options = model_patcher.model_options['transformer_options'] = (
         model_patcher.model_options.get('transformer_options', {}).copy()
     )
-    options[RUNTIME_SESSION_KEY] = session
-    logging.debug(
-        '%s installed sampler-step and packed-layout runtime context',
-        LOG_PREFIX,
+    _remove_wrapper(
+        options,
+        comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
+        OUTER_WRAPPER_KEY,
     )
-    return session
+    _remove_wrapper(
+        options,
+        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+        WRAPPER_KEY,
+    )
+    _remove_wrapper(
+        options,
+        comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+        WRAPPER_KEY,
+    )
+    options.pop(RUNTIME_SESSION_KEY, None)
+    model_patcher.remove_callbacks_with_key(
+        comfy.patcher_extension.CallbacksMP.ON_CLONE,
+        CLONE_CALLBACK_KEY,
+    )

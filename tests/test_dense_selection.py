@@ -319,8 +319,9 @@ class DenseSelectionTests(unittest.TestCase):
                 model,
                 self._convrot_inventory(),
             )
-        self.assertEqual(qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
-        self.assertEqual(attention.projector.name, 'chunked_kitchen_qkv')
+        self.assertEqual(qkv.provider_id, QKV_STANDARD)
+        self.assertIsNone(attention.projector)
+        self.assertIn('full-Q', attention.reason)
 
     def test_preserve_precision_convrot_can_stream_through_dense_kitchen(self):
         model = FakePatcher()

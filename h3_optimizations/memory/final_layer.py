@@ -96,7 +96,7 @@ def make_forward(layer, chunk_rows):
     return forward
 
 
-def install(model_patcher, chunk_rows):
+def install(model_patcher, chunk_rows, *, force_rebuild=False):
     '''Patch FinalLayer once; identical installation is idempotent.'''
 
     chunk_rows = int(chunk_rows)
@@ -114,23 +114,28 @@ def install(model_patcher, chunk_rows):
     existing = getattr(model_patcher, 'object_patches', {}).get(FINAL_LAYER_KEY)
     if existing is not None:
         if not getattr(existing, OWNER_MARKER, False):
-            raise H3FinalLayerPatchError(
-                'another patch already owns %s; remove one H3 memory patch'
-                % FINAL_LAYER_KEY
+            options = model_patcher.model_options['transformer_options'] = (
+                model_patcher.model_options.get('transformer_options', {}).copy()
             )
-        installed = getattr(existing, SIGNATURE_MARKER, None)
-        if installed == chunk_rows:
+            options['h3_optimizations_preserved_final_layer_patch'] = True
+            logging.debug(
+                '[H3 Optimizations] preserved foreign %s; FinalLayer chunking '
+                'is disabled',
+                FINAL_LAYER_KEY,
+            )
             return False
-        raise H3FinalLayerPatchError(
-            'H3 FinalLayer is already configured for %s rows; requested %s. '
-            'Remove the earlier node instead of relying on node order.'
-            % (installed, chunk_rows)
-        )
+        installed = getattr(existing, SIGNATURE_MARKER, None)
+        if installed == chunk_rows and not force_rebuild:
+            return False
 
     model_patcher.add_object_patch(
         FINAL_LAYER_KEY,
         make_forward(layer, chunk_rows),
     )
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    options['h3_optimizations_preserved_final_layer_patch'] = False
     logging.debug(
         '[H3 Optimizations] patched FinalLayer: chunk_rows=%d',
         chunk_rows,

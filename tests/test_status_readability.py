@@ -102,6 +102,27 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             format_sparse_status(model),
         )
 
+    def test_composition_status_reports_preserved_external_and_object_patches(self):
+        self.status['composition'] = {
+            'external_attention_preserved': True,
+            'preserved_object_patches': {
+                'attention': ['block.0.attn.forward'],
+                'blocks': ['block.1.forward'],
+                'final_layer': True,
+            },
+        }
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: self.status},
+            }
+        )
+
+        text = format_sparse_status(model)
+
+        self.assertIn('preserved explicit external attention', text)
+        self.assertIn('1 attention, 1 block, FinalLayer', text)
+        self.assertIn('conflicting H3 sub-optimizations are disabled', text)
+
     def test_standard_path_keeps_the_fallback_reason(self):
         status = {
             'fused_qkv': {

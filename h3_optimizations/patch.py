@@ -96,6 +96,7 @@ def configure_backend(
     projector_fallback_to_original=False,
     backend_fallback_to_dense=False,
     force_out_proj_int8=False,
+    force_rebuild=False,
 ):
     '''Install or replace the package-owned H3 attention transaction.'''
 
@@ -112,53 +113,35 @@ def configure_backend(
         bool(backend_fallback_to_dense),
         bool(force_out_proj_int8),
     )
-    owned = [
-        index
-        for index in range(len(modules))
-        if getattr(existing.get(key_for(index)), OWNER_MARKER, False)
-    ]
-    if owned and len(owned) != len(modules):
-        raise H3AttentionPatchError(
-            'only %d of %d H3 attention blocks carry this patch'
-            % (len(owned), len(modules))
-        )
-
-    if owned:
-        installed = {
-            getattr(existing[key_for(index)], SIGNATURE_MARKER, None)
-            for index in owned
-        }
-        if installed == {desired}:
-            return backend, 0
-        originals = [
-            getattr(existing[key_for(index)], ORIGINAL_MARKER, None)
-            for index in range(len(modules))
-        ]
-        if any(original is None for original in originals):
-            raise H3AttentionPatchError(
-                'installed H3 attention patch has no recoverable original'
-            )
-    else:
-        conflicts = [
-            key_for(index)
-            for index in range(len(modules))
-            if key_for(index) in existing
-        ]
-        if conflicts:
-            raise H3AttentionPatchError(
-                'another patch already owns %s; remove one H3 attention patch'
-                % conflicts[0]
-            )
-        originals = [module.forward for module in modules]
-
+    conflicts = []
+    patched = 0
     for index, module in enumerate(modules):
+        key = key_for(index)
+        current = existing.get(key)
+        if current is not None and not getattr(current, OWNER_MARKER, False):
+            conflicts.append(key)
+            continue
+        if current is not None:
+            if (
+                getattr(current, SIGNATURE_MARKER, None) == desired
+                and not force_rebuild
+            ):
+                continue
+            original = getattr(current, ORIGINAL_MARKER, None)
+            if original is None:
+                raise H3AttentionPatchError(
+                    'installed H3 attention patch for %s has no recoverable original'
+                    % key
+                )
+        else:
+            original = module.forward
         forward = make_forward(
             module,
             index,
             backend=backend,
             projector=projector,
             fallback_forward=(
-                originals[index]
+                original
                 if projector_fallback_to_original
                 else None
             ),
@@ -167,8 +150,9 @@ def configure_backend(
         )
         setattr(forward, OWNER_MARKER, True)
         setattr(forward, SIGNATURE_MARKER, desired)
-        setattr(forward, ORIGINAL_MARKER, originals[index])
-        model_patcher.add_object_patch(key_for(index), forward)
+        setattr(forward, ORIGINAL_MARKER, original)
+        model_patcher.add_object_patch(key, forward)
+        patched += 1
 
     options = model_patcher.model_options['transformer_options'] = (
         model_patcher.model_options.get('transformer_options', {}).copy()
@@ -178,11 +162,38 @@ def configure_backend(
         'name',
         type(backend).__name__,
     )
+    options['h3_optimizations_preserved_attention_patches'] = conflicts
+    if conflicts:
+        logging.debug(
+            '[H3 Optimizations] preserved %d foreign attention forward '
+            'patch(es); H3 attention is disabled for those blocks',
+            len(conflicts),
+        )
     logging.debug(
         '[H3 Optimizations] resolved %d attention forwards: backend=%s '
         'projector=%s',
-        len(modules),
+        patched,
         getattr(backend, 'name', type(backend).__name__),
         getattr(projector, 'name', 'standard_qkv'),
     )
-    return backend, len(modules)
+    return backend, patched
+
+
+def clear_backend(model_patcher):
+    '''Remove only package-owned attention replacements.'''
+
+    existing = getattr(model_patcher, 'object_patches', {})
+    removed = 0
+    foreign = []
+    for key, value in tuple(existing.items()):
+        if getattr(value, OWNER_MARKER, False):
+            existing.pop(key)
+            removed += 1
+        elif key.startswith(BLOCKS_ATTR + '.') and key.endswith('.attn.forward'):
+            foreign.append(key)
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    options.pop('h3_optimizations_attention_backend', None)
+    options['h3_optimizations_preserved_attention_patches'] = sorted(foreign)
+    return removed

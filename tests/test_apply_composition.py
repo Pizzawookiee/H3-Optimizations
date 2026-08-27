@@ -21,6 +21,7 @@ import comfy.options  # noqa: E402
 
 comfy.options.enable_args_parsing()
 
+import comfy.patcher_extension  # noqa: E402
 import h3_optimizations.apply as apply_module  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_OFF,
@@ -29,6 +30,7 @@ from h3_optimizations.plan import (  # noqa: E402
     QKV_STREAMING_OFF,
     SparseRequest,
     STATUS_KEY,
+    PLAN_KEY,
     read_plan,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
@@ -44,11 +46,27 @@ class FakeModel:
     def __init__(self, options=None):
         self.model_options = deepcopy(options or {})
         self.object_patches = {}
+        self.callbacks = {}
+        self.wrappers = {}
 
     def clone(self):
         cloned = FakeModel(self.model_options)
         cloned.object_patches = dict(self.object_patches)
+        cloned.callbacks = deepcopy(self.callbacks)
+        cloned.wrappers = deepcopy(self.wrappers)
         return cloned
+
+    def remove_callbacks_with_key(self, call_type, key):
+        self.callbacks.get(call_type, {}).pop(key, None)
+
+    def add_callback_with_key(self, call_type, key, callback):
+        self.callbacks.setdefault(call_type, {})[key] = [callback]
+
+    def remove_wrappers_with_key(self, wrapper_type, key):
+        self.wrappers.get(wrapper_type, {}).pop(key, None)
+
+    def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+        self.wrappers.setdefault(wrapper_type, {})[key] = [wrapper]
 
 
 def resolved_attention(plan):
@@ -80,6 +98,120 @@ def apply_in_order(base, first_request, second_request):
 
 
 class ApplyCompositionTests(unittest.TestCase):
+    def test_live_option_sync_is_a_no_op_for_the_patcher_options_object(self):
+        wrapper = lambda executor, *args, **kwargs: executor(*args, **kwargs)
+        model = FakeModel({
+            'transformer_options': {
+                'h3_optimizations_status': {'ready': True},
+                'wrappers': {
+                    'outer_sample': {
+                        apply_module.OUTER_WRAPPER_KEY: [wrapper],
+                    },
+                },
+            },
+        })
+
+        apply_module._sync_h3_live_options(model, model.model_options)
+
+        self.assertIs(
+            model.model_options['transformer_options']['wrappers'][
+                'outer_sample'
+            ][apply_module.OUTER_WRAPPER_KEY][0],
+            wrapper,
+        )
+
+    def test_prepare_finalization_observes_downstream_wrapper_mutations(self):
+        external = lambda value: value * 3
+        plan = H3OptimizationPlan(memory=MemoryRequest())
+
+        def reconcile(patcher, actual_plan, **_kwargs):
+            self.assertIs(actual_plan, plan)
+            self.assertIs(
+                patcher.model_options['transformer_options'][
+                    'optimized_attention_override'
+                ],
+                external,
+            )
+            return patcher
+
+        def downstream_wrapper(executor, patcher, *args, **kwargs):
+            kwargs['model_options']['transformer_options'][
+                'optimized_attention_override'
+            ] = external
+            return executor(patcher, *args, **kwargs)
+
+        def executor(patcher, *_args, model_options=None, **_kwargs):
+            override = model_options['transformer_options'][
+                'optimized_attention_override'
+            ]
+            self.assertIs(
+                patcher.model_options['transformer_options'][
+                    'optimized_attention_override'
+                ],
+                external,
+            )
+            return override(2)
+
+        for wrappers in (
+            (apply_module._prepare_sampling_wrapper, downstream_wrapper),
+            (downstream_wrapper, apply_module._prepare_sampling_wrapper),
+        ):
+            with self.subTest(order=wrappers):
+                model = FakeModel()
+                model.model_options[PLAN_KEY] = plan
+                live_options = {'transformer_options': {}}
+                with mock.patch.object(
+                    apply_module, 'is_minimax_h3', return_value=True
+                ), mock.patch.object(
+                    apply_module, '_reconcile_plan', side_effect=reconcile
+                ):
+                    result = comfy.patcher_extension.WrapperExecutor.new_executor(
+                        executor,
+                        list(wrappers),
+                    ).execute(
+                        model,
+                        None,
+                        None,
+                        model_options=live_options,
+                    )
+                self.assertEqual(result, 6)
+
+    def test_sparse_policy_preserves_an_explicit_external_attention_override(self):
+        external = lambda value: value
+        model = FakeModel({
+            'transformer_options': {
+                'optimized_attention_override': external,
+            },
+        })
+        dense = SimpleNamespace(
+            requested='existing',
+            selected='existing',
+            backend=None,
+            reason='preserved external',
+            backend_kind=apply_module.ATTENTION_EXISTING_FULL_Q,
+        )
+        plan = H3OptimizationPlan(sparse=SparseRequest())
+        with mock.patch.object(
+            apply_module,
+            'resolve_current_dense_attention',
+            return_value=dense,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+        ) as kitchen:
+            attention, qkv = apply_module._resolve_attention(
+                plan,
+                model,
+                object(),
+                object(),
+            )
+
+        kitchen.assert_not_called()
+        self.assertEqual(attention.selected, 'existing')
+        self.assertIsNone(attention.backend)
+        self.assertEqual(qkv.provider_id, 'standard_h3_qkv')
+        self.assertIn('explicit external attention override', attention.reason)
+
     def test_streaming_off_disables_qkv_carriers_with_sparse_present(self):
         plan = H3OptimizationPlan(
             memory=MemoryRequest(qkv_streaming=QKV_STREAMING_OFF),

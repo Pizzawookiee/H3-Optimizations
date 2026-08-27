@@ -126,11 +126,25 @@ class HeldConvRotINT8Linear:
         self.release()
         return False
 
+    def _linear(self, x, weight):
+        override = getattr(
+            self.module,
+            "_h3_benchmark_convrot_linear",
+            None,
+        )
+        if override is not None:
+            if not callable(override):
+                raise ConvRotINT8BindingError(
+                    "benchmark ConvRot linear override is not callable"
+                )
+            return override(x, weight, self.bias)
+        return F.linear(x, weight, self.bias)
+
     def linear(self, x):
         if self.weight is None:
             raise RuntimeError("ConvRot INT8 binding is not active")
         comfy.ops.run_every_op()
-        return F.linear(x, self.weight, self.bias)
+        return self._linear(x, self.weight)
 
     def linear_range(self, x, start, end):
         if self.weight is None:
@@ -157,7 +171,7 @@ class HeldConvRotINT8Linear:
             ),
         )
         comfy.ops.run_every_op()
-        return F.linear(x, sliced, None)
+        return self._linear(x, sliced)
 
 
 class HeldConvRotINT8QKV:

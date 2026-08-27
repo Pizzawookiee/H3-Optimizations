@@ -63,11 +63,25 @@ class FakeModel:
     def __init__(self, options=None):
         self.model_options = deepcopy(options or {})
         self.object_patches = {}
+        self.callbacks = {}
+        self.wrappers = {}
 
     def clone(self):
         cloned = FakeModel(self.model_options)
         cloned.object_patches = dict(self.object_patches)
         return cloned
+
+    def remove_callbacks_with_key(self, call_type, key):
+        self.callbacks.get(call_type, {}).pop(key, None)
+
+    def add_callback_with_key(self, call_type, key, callback):
+        self.callbacks.setdefault(call_type, {})[key] = [callback]
+
+    def remove_wrappers_with_key(self, wrapper_type, key):
+        self.wrappers.get(wrapper_type, {}).pop(key, None)
+
+    def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+        self.wrappers.setdefault(wrapper_type, {})[key] = [wrapper]
 
 
 class FakeMetadata:

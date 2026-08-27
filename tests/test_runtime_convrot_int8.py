@@ -144,6 +144,31 @@ class RuntimeConvRotINT8Tests(unittest.TestCase):
 
         torch.testing.assert_close(sliced, full, rtol=0, atol=0)
 
+    def test_benchmark_override_receives_full_and_sliced_weights(self):
+        seen = []
+
+        def override(x, weight, bias):
+            seen.append((int(weight.shape[0]), bias))
+            return x.new_zeros((x.shape[0], weight.shape[0]))
+
+        self.module._h3_benchmark_convrot_linear = override
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(self.weight, None, object()),
+        ), mock.patch.object(comfy.ops, "uncast_bias_weight"):
+            with HeldConvRotINT8Linear(
+                self.module,
+                self.sample[:1],
+                allow_float_conversion=True,
+            ) as binding:
+                full = binding.linear(self.sample)
+                sliced = binding.linear_range(self.sample, 32, 96)
+
+        self.assertEqual(tuple(full.shape), (2, 256))
+        self.assertEqual(tuple(sliced.shape), (2, 64))
+        self.assertEqual(seen, [(256, None), (64, None)])
+
     def test_bias_is_not_silently_quantized(self):
         bias = torch.zeros((256,), dtype=torch.bfloat16)
         module = floating_linear(self.weight, bias)

@@ -214,6 +214,31 @@ def _mark_runtime_fallback(qkv, line):
     return line
 
 
+def _composition_lines(status):
+    composition = status.get('composition') or {}
+    lines = []
+    if composition.get('external_attention_preserved'):
+        lines.append('Composition: preserved explicit external attention.')
+    preserved = composition.get('preserved_object_patches') or {}
+    attention = len(preserved.get('attention') or ())
+    blocks = len(preserved.get('blocks') or ())
+    final_layer = bool(preserved.get('final_layer'))
+    if attention or blocks or final_layer:
+        details = []
+        if attention:
+            details.append('%d attention' % attention)
+        if blocks:
+            details.append('%d block' % blocks)
+        if final_layer:
+            details.append('FinalLayer')
+        lines.append(
+            'Composition: preserved foreign object patches (%s); conflicting '
+            'H3 sub-optimizations are disabled.'
+            % ', '.join(details)
+        )
+    return lines
+
+
 def format_memory_status(model):
     status = _status(model)
     if status is None:
@@ -246,6 +271,7 @@ def format_memory_status(model):
             index for index, line in enumerate(lines) if line.startswith('MLP:')
         )
         lines[mlp_index] += ' (%d-row chunks)' % int(chunk_rows)
+    lines.extend(_composition_lines(status))
     return '\n'.join(lines)
 
 
@@ -363,4 +389,5 @@ def format_sparse_status(model):
             'MLP: %s'
             % _provider_text(mlp, 'off')
         )
+    lines.extend(_composition_lines(status))
     return '\n'.join(lines)

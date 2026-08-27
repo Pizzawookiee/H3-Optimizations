@@ -37,14 +37,15 @@ control.
   transpose temporary. Comfy's known built-in attention consumers retain full BF16 K/V,
   stream bounded BF16 Q, and write each output-projection chunk into the
   disposable block input. Unknown explicit attention overrides preserve a
-  single full-Q invocation in Auto because their callable contract is opaque.
+  single full-Q invocation because their callable contract is opaque.
   Overrides that explicitly implement the streamed-H3 consumer contract below
   receive bounded Q against global K/V instead.
   An external Comfy Kitchen selection retains global INT8 K/V while streaming
   bounded Q and output-projection slabs for all four formats. `Off` leaves QKV
   projection and attention entirely upstream;
-  `Forced` may replace dense attention with the private full-density Kitchen
-  path. Native ConvRot, W4A8, and FP8 expose separate K/V-only and Q-only
+  `Forced` may replace a compatible dense attention selection with the private
+  full-density Kitchen path, but never replaces an unknown explicit override.
+  Native ConvRot, W4A8, and FP8 expose separate K/V-only and Q-only
   projections, so bounded-query consumers do not repeat the complete QKV
   linear. MLP auto keeps
   BF16/FP16 weights floating and still uses bounded token chunking.
@@ -250,6 +251,28 @@ without changing the already selected attention backend.
 
 ## Compatibility
 
+### ModelPatcher composition
+
+H3 stores an immutable optimization plan on the cloned `ModelPatcher` and
+reconciles consumer-dependent choices again at ComfyUI's prepare-sampling
+boundary. A downstream node may therefore clone the model, add keyed wrappers,
+apply LoRA/weight patches, select compile options, or change attention without
+requiring H3 to be the last node before the sampler.
+
+Every descendant clone receives a fresh request-local H3 runtime session and
+fresh H3 execution callables. Package-owned keyed wrappers and clone callbacks
+are replaced rather than appended, so repeated cloning does not accumulate
+hooks. Model modules remain shared according to ComfyUI's normal clone
+contract.
+
+Explicit external attention overrides are preserved. Unmarked consumers keep
+their normal full-Q, single-call behavior; the streamed-H3 contract below is
+the opt-in for bounded-Q execution. Sparse attention is disabled when an
+explicit external consumer has no sparse-composition contract. Foreign block,
+attention, and FinalLayer object patches are preserved per conflicting key;
+the conflicting H3 sub-optimization is disabled and reported in status instead
+of overwriting the other patch.
+
 ### External streamed-H3 attention consumers
 
 An `optimized_attention_override` can opt into the Memory node's bounded-Q
@@ -279,7 +302,8 @@ H3 Memory Optimization owns source-aware Q/K/V projection, carrier lifetime,
 chunk scheduling, and bounded output projection; the external consumer owns
 only its attention math and any state keyed by `layer_index` and global query
 rows. Advertising the marker without a callable `consume` is an error.
-Unmarked overrides retain full-Q, single-call behavior in Auto.
+Unmarked overrides retain full-Q, single-call behavior for every QKV streaming
+request.
 
 ### Requirements
 
@@ -333,6 +357,12 @@ separate because it requires the matching hardware and compiled backend
 packages. Flex CPU contracts cover the NVIDIA FP8 carrier path, the ROCm native
 BF16/FP16 path, explicit Triton/FA4 selection, and first-call dense fallback in
 backend `auto`.
+
+The CPU composition matrix covers both `X -> H3` and `H3 -> X` for clone-only,
+OUTER_SAMPLE, DIFFUSION_MODEL, APPLY_MODEL, attention-override, block-forward,
+attention-forward, FinalLayer, weight/LoRA, and compile-changing synthetic
+ModelPatcher nodes across Memory, Sparse, combined, Advanced Sparse, and all QKV
+streaming policies. It asserts both final metadata and numerical execution.
 
 Run the CPU suite from the ComfyUI root:
 

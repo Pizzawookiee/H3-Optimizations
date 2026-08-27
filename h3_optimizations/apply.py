@@ -8,6 +8,7 @@ import logging
 import torch
 
 import comfy.model_management
+import comfy.patcher_extension
 import comfy.quant_ops
 
 from .attention.sparse import (
@@ -41,6 +42,7 @@ from .dense_resolver import (
     ATTENTION_EXISTING_FULL_Q,
     ATTENTION_SAGE_PREFIX,
     ATTENTION_SAGE_SM89,
+    is_installed_dense_attention,
     install_dense_attention,
     preserve_dense_attention,
     resolve_current_dense_attention,
@@ -57,7 +59,7 @@ from .memory.config import ActivationMemoryConfig
 from .memory.final_layer import install as install_final_layer
 from .memory.patch import install as install_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
-from .patch import configure_backend
+from .patch import clear_backend, configure_backend
 from .plan import (
     ATTENTION_EXISTING,
     DENSITY_FIXED,
@@ -107,17 +109,23 @@ from .qkv.providers import (
     QKV_STANDARD,
     QKV_STREAMED_BF16_KITCHEN,
     QKV_TRITON_SPARSE_CHUNKED,
+    QKVProviderResolution,
     resolve_mlp_provider,
     resolve_qkv_provider,
 )
 from .runtime.context import (
     H3RuntimeSession,
+    OUTER_WRAPPER_KEY,
     RUNTIME_SESSION_KEY,
+    WRAPPER_KEY,
     install_runtime_wrapper,
+    remove_runtime_wrapper,
 )
 from .status import format_qkv_execution
 
 LOG_PREFIX = '[H3 Optimizations]'
+CLONE_CALLBACK_KEY = 'h3_optimizations_plan_clone'
+PREPARE_WRAPPER_KEY = 'h3_optimizations_finalize_plan'
 ATTENTION_SPARSE = 'sparse_sage'
 ATTENTION_TRITON_SPARSE = 'triton_sparse_bf16'
 ATTENTION_FP8_FLEX = 'flex_attention_fp8'
@@ -318,12 +326,20 @@ def describe_memory_options(attention):
 
 def _resolve_dense(plan, model, inventory, environment=None):
     memory = plan.memory
+    options = getattr(model, 'model_options', {}).get(
+        'transformer_options',
+        {},
+    )
+    external_override = (
+        options.get('optimized_attention_override') is not None
+        and not is_installed_dense_attention(options)
+    )
     dense = (
         preserve_dense_attention('no memory optimization requested')
         if memory is None
         else (
             resolve_current_dense_attention(model, environment)
-            if memory.attention == ATTENTION_EXISTING
+            if memory.attention == ATTENTION_EXISTING or external_override
             else resolve_dense_attention(model)
         )
     )
@@ -340,6 +356,27 @@ def _resolve_dense(plan, model, inventory, environment=None):
             dense_carrier_available = bool(TRITON_AVAILABLE)
         else:
             dense_carrier_available = True
+    if (
+        memory is not None
+        and dense.backend_kind == ATTENTION_EXISTING_FULL_Q
+    ):
+        return (
+            ResolvedAttention(
+                requested=dense.requested,
+                selected=dense.selected,
+                backend=None,
+                reason=dense.reason,
+                backend_kind=dense.backend_kind,
+                projector=None,
+                dense_resolution=dense,
+            ),
+            QKVProviderResolution(
+                QKV_STANDARD,
+                False,
+                'disabled bounded QKV to preserve an unknown explicit '
+                'attention override with full-Q single-call semantics',
+            ),
+        )
     qkv = resolve_qkv_provider(
         inventory,
         request=_qkv_request(plan),
@@ -707,6 +744,61 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
 
 
 def _resolve_attention(plan, model, inventory, environment):
+    options = getattr(model, 'model_options', {}).get(
+        'transformer_options',
+        {},
+    )
+    explicit_override = options.get('optimized_attention_override')
+    if (
+        plan.sparse is not None
+        and explicit_override is not None
+        and not is_installed_dense_attention(options)
+    ):
+        if plan.memory is None:
+            dense = resolve_current_dense_attention(model, environment)
+            return (
+                ResolvedAttention(
+                    requested=ATTENTION_SPARSE,
+                    selected=dense.selected,
+                    backend=None,
+                    reason=(
+                        'preserved an explicit external attention override; '
+                        'sparse attention is disabled because the consumer '
+                        'does not expose an H3 sparse composition contract'
+                    ),
+                    backend_kind=dense.backend_kind,
+                    dense_resolution=dense,
+                ),
+                QKVProviderResolution(
+                    QKV_STANDARD,
+                    False,
+                    'standard QKV preserves the explicit external attention '
+                    'consumer',
+                ),
+            )
+        dense_attention, dense_qkv = _resolve_dense(
+            plan,
+            model,
+            inventory,
+            environment,
+        )
+        return (
+            ResolvedAttention(
+                requested=ATTENTION_SPARSE,
+                selected=dense_attention.selected,
+                backend=dense_attention.backend,
+                reason=(
+                    '%s; sparse attention is disabled because the explicit '
+                    'external consumer does not expose an H3 sparse '
+                    'composition contract'
+                    % dense_attention.reason
+                ),
+                backend_kind=dense_attention.backend_kind,
+                projector=dense_attention.projector,
+                dense_resolution=dense_attention.dense_resolution,
+            ),
+            dense_qkv,
+        )
     if plan.sparse is not None:
         backend_request = plan.sparse.backend
         if backend_request == SPARSE_BACKEND_SAGE:
@@ -789,11 +881,23 @@ def _resolve_attention(plan, model, inventory, environment):
                     )
 
 
-def _install_mlp(model_patcher, plan, inventory, environment):
+def _install_mlp(
+    model_patcher,
+    plan,
+    inventory,
+    environment,
+    *,
+    force_rebuild=False,
+):
     memory = plan.memory
     if memory is None:
         return resolve_mlp_provider(inventory, request='off'), 0
-    install_final_layer(model_patcher, int(memory.chunk_rows))
+    rebuild_kwargs = {'force_rebuild': True} if force_rebuild else {}
+    install_final_layer(
+        model_patcher,
+        int(memory.chunk_rows),
+        **rebuild_kwargs,
+    )
     resolution = resolve_mlp_provider(
         inventory,
         request=memory.mlp_memory,
@@ -807,7 +911,11 @@ def _install_mlp(model_patcher, plan, inventory, environment):
         strict=bool(memory.mlp_strict),
         prefer_held_weights=bool(memory.prefer_held_weights),
     )
-    return resolution, int(install_memory_patch(model_patcher, config))
+    return resolution, int(install_memory_patch(
+        model_patcher,
+        config,
+        **rebuild_kwargs,
+    ))
 
 
 def _ensure_sparse_runtime(model_patcher):
@@ -822,6 +930,7 @@ def _ensure_sparse_runtime(model_patcher):
                 % RUNTIME_SESSION_KEY
             )
         session.strict_layout = True
+        install_runtime_wrapper(model_patcher, session)
         return session, False
     session = H3RuntimeSession(strict_layout=True)
     install_runtime_wrapper(model_patcher, session)
@@ -949,18 +1058,131 @@ def _status(
     }
 
 
-def apply_plan(model, plan: H3OptimizationPlan):
-    '''Apply compatible H3 features; other model families are exact no-ops.'''
-    if not isinstance(plan, H3OptimizationPlan):
-        raise TypeError('plan must be H3OptimizationPlan')
-    if not is_minimax_h3(model):
-        return model
+def _install_composition_hooks(model_patcher):
+    callback_type = comfy.patcher_extension.CallbacksMP.ON_CLONE
+    model_patcher.remove_callbacks_with_key(callback_type, CLONE_CALLBACK_KEY)
+    model_patcher.add_callback_with_key(
+        callback_type,
+        CLONE_CALLBACK_KEY,
+        _plan_on_clone,
+    )
+    wrapper_type = comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING
+    model_patcher.remove_wrappers_with_key(wrapper_type, PREPARE_WRAPPER_KEY)
+    model_patcher.add_wrapper_with_key(
+        wrapper_type,
+        PREPARE_WRAPPER_KEY,
+        _prepare_sampling_wrapper,
+    )
 
-    blocks = get_h3_blocks(model)
+
+def _plan_on_clone(parent, child):
+    del parent
+    plan = child.model_options.get(PLAN_KEY)
+    if isinstance(plan, H3OptimizationPlan) and is_minimax_h3(child):
+        _reconcile_plan(child, plan, phase='clone', force_rebuild=True)
+
+
+def _live_model_options(args, kwargs):
+    if len(args) > 2:
+        return args[2]
+    return kwargs.get('model_options')
+
+
+def _sync_final_consumer(model_patcher, live_model_options):
+    if live_model_options is None:
+        return
+    live_transformer = live_model_options.get('transformer_options', {})
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    if 'optimized_attention_override' in live_transformer:
+        options['optimized_attention_override'] = live_transformer[
+            'optimized_attention_override'
+        ]
+    else:
+        options.pop('optimized_attention_override', None)
+    if 'torch_compile_kwargs' in live_model_options:
+        model_patcher.model_options['torch_compile_kwargs'] = live_model_options[
+            'torch_compile_kwargs'
+        ]
+    else:
+        model_patcher.model_options.pop('torch_compile_kwargs', None)
+
+
+def _sync_h3_live_options(model_patcher, live_model_options):
+    if live_model_options is None:
+        return
+    source = model_patcher.model_options.get('transformer_options', {})
+    target = live_model_options.setdefault('transformer_options', {})
+    if source is target:
+        return
+    for key in tuple(target):
+        if key.startswith('h3_optimizations_') and key not in source:
+            target.pop(key)
+    for key, value in source.items():
+        if key.startswith('h3_optimizations_'):
+            target[key] = value
+    if 'optimized_attention_override' in source:
+        target['optimized_attention_override'] = source[
+            'optimized_attention_override'
+        ]
+    elif is_installed_dense_attention(target):
+        target.pop('optimized_attention_override', None)
+
+    source_wrappers = source.get('wrappers', {})
+    target_wrappers = target.setdefault('wrappers', {})
+    for wrapper_type in (
+        comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
+        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+        comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+    ):
+        target_keyed = target_wrappers.setdefault(wrapper_type, {})
+        for key in (OUTER_WRAPPER_KEY, WRAPPER_KEY):
+            target_keyed.pop(key, None)
+        source_keyed = source_wrappers.get(wrapper_type, {})
+        for key in (OUTER_WRAPPER_KEY, WRAPPER_KEY):
+            if key in source_keyed:
+                target_keyed[key] = source_keyed[key].copy()
+        if not target_keyed:
+            target_wrappers.pop(wrapper_type, None)
+
+
+def _finalize_prepare_sampling(executor, model, *args, **kwargs):
+    plan = model.model_options.get(PLAN_KEY)
+    live_model_options = _live_model_options(args, kwargs)
+    if isinstance(plan, H3OptimizationPlan) and is_minimax_h3(model):
+        _sync_final_consumer(model, live_model_options)
+        _reconcile_plan(model, plan, phase='prepare')
+        _sync_h3_live_options(model, live_model_options)
+    return executor(model, *args, **kwargs)
+
+
+def _prepare_sampling_wrapper(executor, model, *args, **kwargs):
+    executor.wrappers.append(_finalize_prepare_sampling)
+    return executor(model, *args, **kwargs)
+
+
+def _reconcile_plan(
+    patched,
+    plan: H3OptimizationPlan,
+    *,
+    phase='node',
+    force_rebuild=False,
+):
+    blocks = get_h3_blocks(patched)
     inventory = inspect_h3_linears(blocks)
     environment = RuntimeEnvironment.detect()
-    attention, qkv = _resolve_attention(plan, model, inventory, environment)
-    previous_options = model.model_options.get('transformer_options', {})
+    attention, qkv = _resolve_attention(
+        plan,
+        patched,
+        inventory,
+        environment,
+    )
+    previous_options = patched.model_options.get('transformer_options', {})
+    external_attention = (
+        previous_options.get('optimized_attention_override') is not None
+        and not is_installed_dense_attention(previous_options)
+    )
     previous_status = previous_options.get(STATUS_KEY)
     previous_attention = previous_options.get(
         'h3_optimizations_attention_backend'
@@ -968,19 +1190,21 @@ def apply_plan(model, plan: H3OptimizationPlan):
     if previous_attention is None and previous_status is not None:
         previous_attention = previous_status['attention']['selected']
 
-    patched = model.clone()
     attention_blocks = 0
     out_proj_kwargs = (
         {'force_out_proj_int8': True}
         if _force_out_proj_int8(plan, inventory)
         else {}
     )
+    rebuild_kwargs = {'force_rebuild': True} if force_rebuild else {}
     sparse_execution_selected = attention.backend_kind in SPARSE_EXECUTION_BACKENDS
     flex_dense_fallback = (
         attention.backend_kind == ATTENTION_FP8_FLEX
         and plan.sparse is not None
         and plan.sparse.backend == SPARSE_BACKEND_AUTO
     )
+    if not sparse_execution_selected and attention.backend is None:
+        clear_backend(patched)
     if sparse_execution_selected:
         if attention.backend_kind == ATTENTION_FP8_FLEX:
             _backend, attention_blocks = configure_backend(
@@ -988,6 +1212,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
                 attention.backend,
                 projector=attention.projector,
                 backend_fallback_to_dense=flex_dense_fallback,
+                **rebuild_kwargs,
                 **out_proj_kwargs,
             )
         else:
@@ -995,6 +1220,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
                 patched,
                 attention.backend,
                 projector=attention.projector,
+                **rebuild_kwargs,
                 **out_proj_kwargs,
             )
         if flex_dense_fallback and attention.dense_resolution is not None:
@@ -1016,8 +1242,11 @@ def apply_plan(model, plan: H3OptimizationPlan):
                 attention.backend,
                 projector=attention.projector,
                 projector_fallback_to_original=True,
+                **rebuild_kwargs,
                 **out_proj_kwargs,
             )
+        else:
+            clear_backend(patched)
         install_dense_attention(patched, attention.dense_resolution)
 
     mlp, mlp_blocks = _install_mlp(
@@ -1025,11 +1254,19 @@ def apply_plan(model, plan: H3OptimizationPlan):
         plan,
         inventory,
         environment,
+        **rebuild_kwargs,
     )
     runtime_installed = False
     if sparse_execution_selected:
         _session, _created = _ensure_sparse_runtime(patched)
         runtime_installed = True
+    elif isinstance(
+        patched.model_options.get('transformer_options', {}).get(
+            RUNTIME_SESSION_KEY
+        ),
+        H3RuntimeSession,
+    ):
+        remove_runtime_wrapper(patched)
     patched.model_options[PLAN_KEY] = plan
     options = patched.model_options['transformer_options'] = (
         patched.model_options.get('transformer_options', {}).copy()
@@ -1046,6 +1283,62 @@ def apply_plan(model, plan: H3OptimizationPlan):
         inventory=inventory,
     )
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
+    session = options.get(RUNTIME_SESSION_KEY)
+    preserved = {
+        'attention': list(options.get(
+            'h3_optimizations_preserved_attention_patches',
+            (),
+        )),
+        'blocks': list(options.get(
+            'h3_optimizations_preserved_block_patches',
+            (),
+        )),
+        'final_layer': bool(options.get(
+            'h3_optimizations_preserved_final_layer_patch',
+            False,
+        )),
+    }
+    options[STATUS_KEY]['composition'] = {
+        'phase': phase,
+        'reconstructed_after_clone': phase == 'clone',
+        'final_attention_consumer': attention.selected,
+        'qkv_mode': (
+            'standard_full_q'
+            if attention.backend_kind == ATTENTION_EXISTING_FULL_Q
+            else (
+                'streamed_bounded_q'
+                if bool(getattr(attention.projector, 'streamed_q', False))
+                else (
+                    'standard'
+                    if qkv.provider_id == QKV_STANDARD
+                    else 'bounded_materialized'
+                )
+            )
+        ),
+        'streaming_disabled_reason': (
+            qkv.reason if qkv.provider_id == QKV_STANDARD else None
+        ),
+        'external_attention_preserved': (
+            external_attention
+        ),
+        'preserved_object_patches': preserved,
+        'runtime_session_id': None if session is None else id(session),
+        'runtime_generation': (
+            None if session is None else session.generation
+        ),
+        'object_patches_rebuilt': bool(
+            force_rebuild
+            and (
+                attention_blocks
+                or mlp_blocks
+                or (
+                    plan.memory is not None
+                    and not preserved['final_layer']
+                )
+            )
+        ),
+    }
+    _install_composition_hooks(patched)
     _warn_about_slow_paths(attention, qkv)
     qkv_labels = inventory.labels('qkv')
     features = '+'.join(
@@ -1067,9 +1360,11 @@ def apply_plan(model, plan: H3OptimizationPlan):
         and previous_attention != attention_name
         else ''
     )
-    logging.info(
-        '%s applied plan: features=%s attention=%s%s qkv="%s" qkv_provider=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s memory=%s device=%s',
+    log = logging.debug if phase == 'prepare' else logging.info
+    log(
+        '%s applied plan: phase=%s features=%s attention=%s%s qkv="%s" qkv_provider=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s memory=%s device=%s',
         LOG_PREFIX,
+        phase,
         features,
         attention_name,
         replacement,
@@ -1089,3 +1384,14 @@ def apply_plan(model, plan: H3OptimizationPlan):
         environment.device_name,
     )
     return patched
+
+
+def apply_plan(model, plan: H3OptimizationPlan):
+    '''Declare and apply compatible H3 policy to a cloned ModelPatcher.'''
+    if not isinstance(plan, H3OptimizationPlan):
+        raise TypeError('plan must be H3OptimizationPlan')
+    if not is_minimax_h3(model):
+        return model
+    patched = model.clone()
+    patched.model_options[PLAN_KEY] = plan
+    return _reconcile_plan(patched, plan)

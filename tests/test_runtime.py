@@ -1,6 +1,7 @@
 '''CPU tests for standalone sampler-step and packed-layout publication.'''
 
 from pathlib import Path
+import os
 import sys
 from types import SimpleNamespace
 import unittest
@@ -12,17 +13,43 @@ PACK = Path(__file__).resolve().parents[1]
 ROOT = PACK.parents[1]
 sys.path.insert(0, str(PACK))
 sys.path.insert(0, str(ROOT))
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
+TEST_ARGS = sys.argv[1:]
+sys.argv = [sys.argv[0], '--cpu']
+
+import comfy.options  # noqa: E402
+
+comfy.options.enable_args_parsing()
 
 from h3_optimizations.runtime.context import (  # noqa: E402
+    CLONE_CALLBACK_KEY,
     H3RuntimeSession,
+    OUTER_WRAPPER_KEY,
     RUNTIME_KEY,
+    RUNTIME_SESSION_KEY,
+    WRAPPER_KEY,
     get_runtime_snapshot,
+    install_runtime_wrapper,
     make_diffusion_wrapper,
     make_outer_wrapper,
 )
+from comfy.model_patcher import ModelPatcher  # noqa: E402
+from comfy.patcher_extension import CallbacksMP, WrappersMP  # noqa: E402
+
+sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 class RuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _patcher():
+        model = torch.nn.Module()
+        model.device = torch.device('cpu')
+        return ModelPatcher(
+            model,
+            torch.device('cpu'),
+            torch.device('cpu'),
+        )
+
     def test_sampler_callback_owns_step_progress(self):
         layout = SimpleNamespace(seq_len=384)
         options = {'sample_sigmas': torch.empty((11,))}
@@ -147,6 +174,102 @@ class RuntimeTests(unittest.TestCase):
                 minimax_payload={},
             )
         self.assertEqual(result, 'ok')
+
+    def test_clone_reconstructs_runtime_session_and_keyed_wrappers(self):
+        parent = self._patcher()
+        parent_session = install_runtime_wrapper(
+            parent,
+            H3RuntimeSession(strict_layout=True),
+        )
+
+        child_a = parent.clone()
+        child_b = parent.clone()
+        child_a_session = child_a.model_options['transformer_options'][
+            RUNTIME_SESSION_KEY
+        ]
+        child_b_session = child_b.model_options['transformer_options'][
+            RUNTIME_SESSION_KEY
+        ]
+
+        self.assertIsNot(parent_session, child_a_session)
+        self.assertIsNot(parent_session, child_b_session)
+        self.assertIsNot(child_a_session, child_b_session)
+        self.assertTrue(child_a_session.strict_layout)
+
+        for child in (child_a, child_b):
+            wrappers = child.model_options['transformer_options']['wrappers']
+            self.assertEqual(
+                len(wrappers[WrappersMP.OUTER_SAMPLE][OUTER_WRAPPER_KEY]),
+                1,
+            )
+            self.assertEqual(
+                len(wrappers[WrappersMP.DIFFUSION_MODEL][WRAPPER_KEY]),
+                1,
+            )
+            self.assertEqual(
+                len(child.callbacks[CallbacksMP.ON_CLONE][CLONE_CALLBACK_KEY]),
+                1,
+            )
+
+    def test_sibling_clone_requests_can_overlap(self):
+        parent = self._patcher()
+        install_runtime_wrapper(parent, H3RuntimeSession(strict_layout=True))
+        child_a = parent.clone()
+        child_b = parent.clone()
+        session_a = child_a.model_options['transformer_options'][
+            RUNTIME_SESSION_KEY
+        ]
+        session_b = child_b.model_options['transformer_options'][
+            RUNTIME_SESSION_KEY
+        ]
+
+        token_a = session_a.begin_request(10)
+        try:
+            token_b = session_b.begin_request(10)
+            session_b.end_request(token_b)
+        finally:
+            session_a.end_request(token_a)
+
+    def test_repeated_cloning_does_not_accumulate_runtime_hooks(self):
+        patcher = self._patcher()
+        install_runtime_wrapper(patcher, H3RuntimeSession(strict_layout=True))
+
+        for _ in range(4):
+            patcher = patcher.clone()
+            wrappers = patcher.model_options['transformer_options']['wrappers']
+            self.assertEqual(
+                len(wrappers[WrappersMP.OUTER_SAMPLE][OUTER_WRAPPER_KEY]),
+                1,
+            )
+            self.assertEqual(
+                len(wrappers[WrappersMP.DIFFUSION_MODEL][WRAPPER_KEY]),
+                1,
+            )
+            self.assertEqual(
+                len(patcher.callbacks[CallbacksMP.ON_CLONE][CLONE_CALLBACK_KEY]),
+                1,
+            )
+
+    def test_compile_change_repairs_the_runtime_wrapper_type(self):
+        parent = self._patcher()
+        install_runtime_wrapper(parent, H3RuntimeSession(strict_layout=True))
+        child = parent.clone()
+        session = child.model_options['transformer_options'][
+            RUNTIME_SESSION_KEY
+        ]
+        child.model_options['torch_compile_kwargs'] = {'backend': 'inductor'}
+
+        install_runtime_wrapper(child, session)
+
+        wrappers = child.model_options['transformer_options']['wrappers']
+        self.assertNotIn(
+            WRAPPER_KEY,
+            wrappers.get(WrappersMP.DIFFUSION_MODEL, {}),
+        )
+        self.assertEqual(
+            len(wrappers[WrappersMP.APPLY_MODEL][WRAPPER_KEY]),
+            1,
+        )
 
 
 if __name__ == '__main__':

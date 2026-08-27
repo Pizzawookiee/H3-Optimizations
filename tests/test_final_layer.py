@@ -69,6 +69,7 @@ class _Layer:
 class _Patcher:
     def __init__(self):
         self.object_patches = {}
+        self.model_options = {'transformer_options': {}}
 
     def add_object_patch(self, key, value):
         self.object_patches[key] = value
@@ -105,8 +106,28 @@ class FinalLayerTests(unittest.TestCase):
         ):
             self.assertTrue(final_layer.install(patcher, 4096))
             self.assertFalse(final_layer.install(patcher, 4096))
-            with self.assertRaises(final_layer.H3FinalLayerPatchError):
-                final_layer.install(patcher, 2048)
+            self.assertTrue(final_layer.install(patcher, 2048))
+            self.assertEqual(
+                getattr(
+                    patcher.object_patches[final_layer.FINAL_LAYER_KEY],
+                    final_layer.SIGNATURE_MARKER,
+                ),
+                2048,
+            )
+
+    def test_foreign_final_layer_patch_is_preserved(self):
+        patcher = _Patcher()
+        foreign = lambda *_args: 'foreign'
+        patcher.object_patches[final_layer.FINAL_LAYER_KEY] = foreign
+        model = SimpleNamespace(final_layer=_Layer())
+        with mock.patch.object(
+            final_layer, 'get_minimax_h3_model', return_value=model
+        ):
+            self.assertFalse(final_layer.install(patcher, 4096))
+        self.assertIs(
+            patcher.object_patches[final_layer.FINAL_LAYER_KEY],
+            foreign,
+        )
 
     def test_real_model_patcher_attaches_and_dispatches_forward(self):
         root = torch.nn.Module()

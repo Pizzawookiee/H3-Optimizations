@@ -1,5 +1,6 @@
 '''Regression coverage for ComfyUI custom-node package loading.'''
 
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import unittest
 
 
 PACK = Path(__file__).resolve().parents[1]
+ROOT = PACK.parents[1]
 
 
 class PackageImportIdentityTests(unittest.TestCase):
@@ -69,9 +71,15 @@ class PackageImportIdentityTests(unittest.TestCase):
             sys.argv = [sys.argv[0], *test_args]
             '''
         )
+        env = os.environ.copy()
+        env['PYTHONPATH'] = os.pathsep.join(filter(None, (
+            str(ROOT),
+            env.get('PYTHONPATH'),
+        )))
         result = subprocess.run(
             [sys.executable, '-c', script, str(PACK), *sys.argv[1:]],
             cwd=PACK.parent,
+            env=env,
             text=True,
             capture_output=True,
             check=False,

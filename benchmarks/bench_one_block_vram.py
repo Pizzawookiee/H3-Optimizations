@@ -9,6 +9,11 @@ activation tensor.
 
 The script drives an already-running ComfyUI server and never imports torch.
 All GPU work belongs to the ComfyUI server.
+
+``qkv_linear_only`` is a diagnostic of projection linear regions only.  It is not a
+complete or cross-route-comparable QKV time because streamed routes can defer
+producer work beneath attention.  ``block_total`` is the authoritative speed
+boundary in this matrix.
 '''
 
 from __future__ import annotations
@@ -43,6 +48,13 @@ from bench_attention_arms import (  # noqa: E402
 
 DEFAULT_UNET = 'minimax_h3_fl2va_pruned_bf16.safetensors'
 DEFAULT_FRAMES = 243
+
+QKV_LINEAR_ONLY_WARNING = (
+    'qkv_linear_only is projection-linear-only and is not cross-route QKV timing; '
+    'streaming can move normalization, RoPE, carrier preparation, and other '
+    'producer work beneath attention_total. Compare block_total for speed. '
+    'CUDA stages can nest or overlap and are not additive.'
+)
 
 MEMORY_PATCH = (
     'H3MemoryOptimization',
@@ -129,9 +141,40 @@ ARMS = {
         'label': 'H3 BF16 Triton (30% video KV)',
         'after_memory': [sparse_patch('BF16 Triton')],
     },
+    'qkv_control_config0': {
+        'label': 'QKV optimizations Off (Comfy Kitchen Config 0 control)',
+        'before_memory': [
+            ('H3BenchmarkForceQKVConfig0', {}),
+        ],
+        'memory_patch': (
+            'H3MemoryOptimization',
+            {
+                'precision_mode': 'Preserve native',
+                'qkv_streaming_mode': 'Off',
+                'mlp_memory': 'auto',
+                'chunk_rows': 4096,
+            },
+        ),
+    },
+    'qkv_optimized': {
+        'label': 'QKV optimizations Auto (Comfy Kitchen Config 0 normalized)',
+        'before_memory': [
+            ('H3BenchmarkForceQKVConfig0', {}),
+        ],
+    },
 }
 
-DEFAULT_ARMS = ','.join(ARMS)
+DEFAULT_ARMS = ','.join((
+    'default_comfy',
+    'comfy_kitchen',
+    'sage_builtin',
+    'kj_sage',
+    'plague_sla',
+    'sparse_kitchen',
+    'sparse_sage',
+    'frost_bf16',
+    'bf16_triton',
+))
 
 
 async def add_node(graph, schemas, node_id, node_type, overrides=None, links=None):
@@ -197,7 +240,7 @@ async def build_arm_prompt(schemas, arm_name, args):
     for node_type, overrides in arm.get('before_memory', ()):
         await patch(node_type, overrides)
 
-    await patch(*MEMORY_PATCH)
+    await patch(*arm.get('memory_patch', MEMORY_PATCH))
 
     for node_type, overrides in arm.get('after_memory', ()):
         await patch(node_type, overrides)
@@ -214,7 +257,7 @@ async def build_arm_prompt(schemas, arm_name, args):
             'branch': 'conditional',
             'overwrite': False,
             'notes': (
-                'BF16 one-block VRAM benchmark; %dx%d, %d frames, AIMDO 0 blocks'
+                'one-block H3 VRAM/timing benchmark; %dx%d, %d frames, AIMDO 0 blocks'
                 % (args.width, args.height, args.frames)
             ),
         },
@@ -380,6 +423,22 @@ async def apply_free_request(
     await require_queue_idle(session, server)
 
 
+async def wait_for_unloaded_vram(session, server, limit_mib, timeout):
+    deadline = time.perf_counter() + timeout
+    last = None
+    while time.perf_counter() < deadline:
+        await require_queue_idle(session, server)
+        last = gpu_now()
+        if last['memory_used_mib'] <= limit_mib:
+            return last
+        await asyncio.sleep(1.0)
+    raise BenchError(
+        'model unload did not reduce whole-card VRAM below %.0f MiB '
+        'within %.0f s (last reading %.0f MiB)'
+        % (limit_mib, timeout, (last or {}).get('memory_used_mib', -1))
+    )
+
+
 async def server_context(session, server):
     async with session.get('%s/api/system_stats' % server) as response:
         if response.status != 200:
@@ -404,7 +463,14 @@ def write_results(path, args, context, records):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         'schema_version': 1,
-        'benchmark': 'H3 BF16 one-block VRAM consumer matrix',
+        'benchmark': 'H3 one-block VRAM and diagnostic timing matrix',
+        'timing_contract': {
+            'authoritative_speed_metric': (
+                'records[].measurement.timing.stages.block_total.gpu_ms'
+            ),
+            'qkv_linear_only_cross_route_comparable': False,
+            'warning': QKV_LINEAR_ONLY_WARNING,
+        },
         'config': {
             'unet': args.unet,
             'clip': args.clip,
@@ -419,9 +485,10 @@ def write_results(path, args, context, records):
             'captured_step': 0,
             'aimdo_residency': '0 blocks',
             'memory_precision': 'Preserve native',
-            'memory_qkv_streaming': 'Auto',
+            'memory_qkv_streaming': 'arm-specific',
             'hard_reset_each_arm': True,
             'conditioning_primed_each_arm': bool(args.prime),
+            'unloaded_vram_limit_mib': args.unloaded_vram_mib,
             'sparse_video_budget': SPARSE_COMMON['video_budget'],
             'seed': args.seed,
             'run_tag': args.run_tag,
@@ -434,12 +501,14 @@ def write_results(path, args, context, records):
 
 def render_table(records):
     lines = [
-        '| Arm | Peak total GiB | Increase GiB | Block output | Route |',
-        '| --- | ---: | ---: | --- | --- |',
+        'TIMING CONTRACT: ' + QKV_LINEAR_ONLY_WARNING,
+        '',
+        '| Arm | Peak total GiB | Increase GiB | QKV linear-only ms* | Block ms | Route |',
+        '| --- | ---: | ---: | ---: | ---: | --- |',
     ]
     for row in records:
         if row.get('error'):
-            lines.append('| %s | ERROR | - | - | %s |' % (
+            lines.append('| %s | ERROR | - | - | - | %s |' % (
                 row['label'], str(row['error']).replace('|', '\\|'),
             ))
             continue
@@ -447,15 +516,27 @@ def render_table(records):
         if len(route) > 120:
             route = route[:117] + '...'
         lines.append(
-            '| %s | %.2f | %.2f | %s | `%s` |'
+            '| %s | %.2f | %.2f | %s | %s | `%s` |'
             % (
                 row['label'], row['peak_mib'] / 1024.0,
                 row['peak_over_baseline_mib'] / 1024.0,
-                json.dumps((row.get('measurement') or {}).get('output') or {}),
+                _stage_ms(row, 'qkv_linear_only'),
+                _stage_ms(row, 'block_total'),
                 route.replace('|', '\\|'),
             )
         )
+    lines.extend((
+        '',
+        '* Diagnostic projection-linear regions only; do not use this column '
+        'for cross-route QKV or speed comparisons.',
+    ))
     return '\n'.join(lines)
+
+
+def _stage_ms(row, name):
+    timing = (row.get('measurement') or {}).get('timing') or {}
+    stage = (timing.get('stages') or {}).get(name)
+    return '-' if not stage else '%.3f' % float(stage['gpu_ms'])
 
 
 async def run_matrix(args):
@@ -495,8 +576,11 @@ async def run_matrix(args):
                     session, args.server, client_id, prime_graph,
                     args.timeout, False,
                 )
-                await asyncio.sleep(args.settle_seconds)
-                await require_queue_idle(session, args.server)
+                await unload_models(session, args.server, free_memory=False)
+                await wait_for_unloaded_vram(
+                    session, args.server, args.unloaded_vram_mib,
+                    args.unload_timeout,
+                )
             baseline = gpu_now()
             report_path = output_root / 'h3_vram' / args.run_tag / (arm_name + '.json')
             if report_path.exists():
@@ -578,6 +662,8 @@ def parse_args(argv=None):
     parser.add_argument('--vae', default=DEFAULT_VAE)
     parser.add_argument('--timeout', type=float, default=1800.0)
     parser.add_argument('--settle-seconds', type=float, default=6.0)
+    parser.add_argument('--unloaded-vram-mib', type=float, default=3000.0)
+    parser.add_argument('--unload-timeout', type=float, default=45.0)
     parser.add_argument('--sample-ms', type=int, default=50)
     parser.add_argument('--idle-watts', type=float, default=60.0)
     parser.add_argument('--run-tag', default='')
