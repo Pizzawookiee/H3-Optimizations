@@ -50,8 +50,8 @@ control.
   single full-Q invocation because their callable contract is opaque.
   Overrides that explicitly implement the streamed-H3 consumer contract below
   receive bounded Q against global K/V instead.
-  An external Comfy Kitchen selection retains global INT8 K/V while streaming
-  bounded Q and output-projection slabs for all four formats. `Off` leaves QKV
+  An external Comfy Kitchen selection retains a full INT8 Q/K/V carrier while
+  streaming bounded output-projection slabs. `Off` leaves QKV
   projection and attention entirely upstream;
   `Forced` may replace a compatible dense attention selection with the private
   full-density Kitchen path, but never replaces an unknown explicit override.
@@ -216,7 +216,8 @@ The projected native Kitchen sparse route consumes attention in 4K query
 slices and writes each output projection directly into the disposable
 normalized block input. Its full-forward output is bit-identical to the prior
 route. Non-projected fallback execution retains sequence-major output storage
-and early carrier release. Q/K chunks are quantized where they already are
+and early carrier release. The 0.2.26 hotfix retains the full INT8 Q carrier
+until a Q-only producer can preserve the global K quantization transform. Q/K chunks are quantized where they already are
 rather than being copied contiguous first. At the 124-frame production shape
 with AIMDO restrained to zero blocks, streamed output reduced incremental peak
 VRAM by 382 MiB at 0.93 percent sampler cost. FinalLayer chunking reduced it by

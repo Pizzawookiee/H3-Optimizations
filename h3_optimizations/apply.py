@@ -449,7 +449,6 @@ def _resolve_dense(plan, model, inventory, environment=None):
             ),
             strided_qk_input=True,
             stream_output=True,
-            streamed_q=True,
             v_mode=memory.attention_v_memory,
         )
     return (
