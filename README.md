@@ -7,8 +7,8 @@ longer H3 generations faster with optional sparse attention.
 
 ## Install
 
-The package is intended for installation through ComfyUI-Manager on current
-ComfyUI builds.
+The package requires **ComfyUI 0.33.0 or newer** and is intended for installation
+through ComfyUI-Manager.
 
 Manual installation is also available from the ComfyUI `custom_nodes` directory:
 
@@ -21,18 +21,28 @@ Restart ComfyUI after installing. The nodes appear under
 
 ## Which nodes should I use?
 
-There are four production nodes:
+> **For most users: add H3 Memory Optimization and leave it at default. Add H3
+> Sparse Attention only if you want more speed and accept a quality tradeoff.
+> You normally do not need the AIMDO or Advanced nodes.**
+
+The pack exposes three normal optimization nodes plus one manual AIMDO residency
+control:
 
 | Node | What it is for | Normal recommendation |
 | --- | --- | --- |
 | **H3 Memory Optimization** | Reduces peak VRAM use during H3 generation | Add it and leave the defaults alone |
-| **H3 AIMDO Residency Limiter** | Forces DynamicVRAM to keep less of the H3 model permanently resident in VRAM | Mainly for benchmarking, debugging AIMDO, or deliberately forcing very low residency |
 | **H3 Sparse Attention** | Makes H3 faster by calculating less video attention | Use it when speed matters and you accept a quality/speed tradeoff |
 | **H3 Sparse Attention (Advanced)** | Gives manual control over sparse-attention scheduling and backend selection | Use only when you know why you need the extra controls |
+| **H3 AIMDO Residency Limiter** | Manually controls how much of the H3 model DynamicVRAM keeps persistently resident in VRAM | Mainly for benchmarking, debugging AIMDO, or deliberately forcing low residency |
 
-The production nodes are **order-independent**. You do not need to worry about
-whether Memory Optimization comes before or after Sparse Attention or another
-compatible model patch.
+The **H3-Optimizations production nodes are order-independent with each other**.
+You do not need to worry about whether Memory Optimization comes before or after
+Sparse Attention.
+
+Compatible external attention and `ModelPatcher` changes are preserved where
+supported. A conflicting third-party patch can disable the corresponding H3
+sub-optimization rather than being overwritten, so order-independence should not
+be read as a guarantee about arbitrary external nodes.
 
 Unsupported model families pass through unchanged. Automatic modes keep the
 existing implementation when a specialized H3 path is not compatible with the
@@ -77,7 +87,11 @@ This node exists mainly for benchmarking, debugging AIMDO behavior, and forcing
 minimal persistent H3 model residency. It is not intended to imply that one
 particular block count is universally optimal.
 
-The default is **`0 blocks`**.
+The default is **`0 blocks`**. This is the **maximum-offload setting**: it keeps
+no H3 model blocks persistently resident. It can cause substantially more weight
+streaming and may therefore be substantially slower than allowing some residency.
+The default exists to make the node's manual/benchmarking purpose explicit, not
+because `0 blocks` is generally preferable for normal generation.
 
 - `0 blocks` keeps no H3 model blocks persistently resident in the AIMDO VBAR.
   The current weights are still staged through DynamicVRAM's temporary streaming
@@ -105,7 +119,12 @@ The default video attention budget is **30%**.
   motion, detail, composition, or other parts of the result.
 - Higher values retain more video attention and generally stay closer to dense
   attention.
-- `1.0` keeps the full video attention route.
+- `1.0` keeps full video-attention connectivity, so no video connections are
+  removed by sparsification.
+
+`1.0` does **not** necessarily mean “use the same dense backend I would have used
+without this node.” The Sparse Attention node can still resolve through its own
+backend path. Bypass the node when you want the ordinary dense baseline.
 
 Text, reference conditioning, audio, non-video queries, and mixed boundary tiles
 remain dense.
@@ -152,11 +171,24 @@ executes five sampler steps and reports the median of the four step times after
 the first; step 1 carries model initialization and is excluded. The 20-step
 columns are projections from that median, not separate wall-clock runs.
 
+Every benchmark arm also shares two controls that are **not normal user
+settings**:
+
+- `H3BenchmarkForceQKVConfig0` forces compatible ConvRot-256 INT8 QKV linears to
+  Comfy Kitchen CUTLASS config 0 so the Kitchen dispatcher cannot choose a
+  different large-sequence configuration between arms.
+- `H3 AIMDO Residency Limiter` is explicitly fixed to `0 blocks` so model-weight
+  residency cannot hide or amplify activation-memory differences between arms.
+
+Both benchmark controls come from the benchmark setup; the first is provided by
+the sibling H3-Extended pack. They should not be interpreted as recommended
+workflow settings.
+
 | configuration | 5s step | 5s 20-step | 5s peak VRAM | 10s step | 10s 20-step | 10s peak VRAM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Comfy Kitchen INT8 dense | 26.7 s | ~8m55s | 7513 MiB | 72.2 s | ~24m05s | 11729 MiB |
 | SageAttention dense | 26.5 s | ~8m50s | 7754 MiB | out of memory | - | - |
-| SageAttention + H3 Memory Optimization | 26.2 s | ~8m44s | 5901 MiB | 76.1 s | ~25m22s | 9047 MiB |
+| SageAttention + chunked QKV/MLP/FinalLayer (streaming off) | 26.2 s | ~8m44s | 5901 MiB | 76.1 s | ~25m22s | 9047 MiB |
 | H3 Memory Optimization + Sparse Attention (KV 100%) | 28.9 s | ~9m39s | 5355 MiB | 86.3 s | ~28m45s | 7315 MiB |
 | **H3 Memory Optimization + Sparse Attention (KV 30%, default)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
 
@@ -164,22 +196,23 @@ Against dense Comfy Kitchen attention, the default configuration measured
 **1.57x faster at 5 seconds and 1.69x at 10 seconds**, using 2.2 GB less VRAM at
 5 seconds and 4.4 GB less at 10 seconds.
 
-Each row differs from the one above it by one change:
+The rows isolate successive **conceptual optimization stages**, but they are not
+a ladder of untouched UI defaults. In particular, the Sage memory arm uses
+`Precision = Preserve native` and `QKV streaming = Off`, while the following
+100% KV arm enables streamed QKV and uses the normal automatic precision policy.
+The stage comparison is therefore:
 
-| change | 5s speed | 5s VRAM |
+| conceptual stage | 5s speed | 5s VRAM |
 | --- | ---: | ---: |
 | Comfy Kitchen dense to dense SageAttention | 1.01x | +241 MiB |
-| add chunked QKV, MLP and FinalLayer | 1.01x | -1853 MiB |
-| add streamed QKV and the native 64Q x 64KV kernel | 0.91x | -546 MiB |
+| add chunked QKV, MLP and FinalLayer while streaming remains off | 1.01x | -1853 MiB |
+| add streamed QKV and the native 64Q x 64KV attention path at 100% KV | 0.91x | -546 MiB |
 | reduce video KV density to 30 percent | 1.70x | -60 MiB |
 
 The measurements were taken with the NVIDIA driver's CUDA sysmem fallback
 disabled, so exceeding VRAM fails instead of silently paging to system memory.
 With fallback enabled, near-limit runs can page to system RAM and become much
 slower.
-
-The benchmark pins AIMDO residency to `0 blocks` so model-weight residency does
-not vary between test arms.
 
 ---
 
@@ -246,7 +279,9 @@ particular coherent transformer blocks remain resident.
 
 At `0 blocks`, no persistent VBAR pages are retained. The current block can still
 execute because DynamicVRAM stages required weights through temporary async
-buffers.
+buffers. This is the maximum-offload policy and can increase weight-streaming
+cost substantially; it is not asserted to be an optimal general-use residency
+level.
 
 The limiter verifies the applied watermark and fails closed if persistent pages
 remain resident above the requested cap. It is inactive when DynamicVRAM is not
@@ -258,6 +293,10 @@ The standard H3 Sparse Attention node uses automatic backend selection. It
 prefers the shipped native Kitchen sparse backend when its per-GPU self-test
 passes, then tries compatible Sparse Sage, BF16 Triton, FlexAttention, and
 finally the resolved dense H3 path.
+
+A `1.0` video budget leaves the video route fully connected but still enters this
+backend-selection path. Bypass H3 Sparse Attention when comparing against the
+ordinary dense attention route selected without the node.
 
 The Advanced node instead uses the backend explicitly selected in its dropdown.
 It does not traverse the automatic fallback chain.
@@ -365,7 +404,8 @@ overrides retain full-Q single-call behavior.
 
 ## Requirements and architecture support
 
-- Current ComfyUI with MiniMax H3 support and the `comfy_api.latest` extension API
+- ComfyUI 0.33.0 or newer with MiniMax H3 support and the `comfy_api.latest`
+  extension API
 - Python 3.10 or newer
 - Windows x64 or Linux x86-64 for the shipped native Kitchen binaries
 - Linux glibc 2.34+ and libstdc++ with `GLIBCXX_3.4.21`+ for the shipped Linux
@@ -414,8 +454,9 @@ reports persistent VBAR pages, temporary cast buffers, AIMDO usage, and
 whole-device VRAM separately.
 
 The attention benchmark is `benchmarks/bench_attention_arms.py`; it drives a
-running ComfyUI server over the prompt API and pins AIMDO to `0 blocks` so
-weight-residency behavior cannot vary between benchmark arms.
+running ComfyUI server over the prompt API. It applies the same two shared
+benchmark controls described above to every arm: `H3BenchmarkForceQKVConfig0`
+and AIMDO `0 blocks`.
 
 ## Acknowledgements
 
