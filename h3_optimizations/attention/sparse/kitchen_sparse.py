@@ -29,6 +29,7 @@ from .router import SparseRouterError, SparseTileRouter
 from ...kitchen_qkv import (
     PreparedChunkedKitchenQKV,
     PreparedStreamedKitchenQKV,
+    resolve_kitchen,
 )
 from ...qkv.streamed import create_held_qkv, project_q_hnd
 
@@ -530,6 +531,11 @@ class SparseKitchenBackend:
         if streamed:
             projected = prepared.streamed_projected
             sequence = int(projected.x.shape[0])
+            producer_kitchen = resolve_kitchen(projected.x.device)
+            if producer_kitchen is None:
+                raise SparseKitchenError(
+                    'no streamed INT8 attention producer is available'
+                )
             q_held = None
         else:
             projected = None
@@ -576,7 +582,7 @@ class SparseKitchenBackend:
                         1,
                         q_shape[3],
                     )
-                    spec = self.executor.kitchen.int8_attention_producer_spec(
+                    spec = producer_kitchen.int8_attention_producer_spec(
                         q_shape,
                         k_shape,
                         dtype=q.dtype,
@@ -589,16 +595,16 @@ class SparseKitchenBackend:
                         len(spec.k_anchor_positions),
                         k_shape[3],
                     )
-                    anchor = self.executor.kitchen.select_int8_attention_k_anchor(spec, samples)
+                    anchor = producer_kitchen.select_int8_attention_k_anchor(spec, samples)
                     del samples
-                    producer = self.executor.kitchen.create_int8_attention_producer(spec, anchor)
-                    self.executor.kitchen.quantize_int8_attention_q_chunk(
+                    producer = producer_kitchen.create_int8_attention_producer(spec, anchor)
+                    producer_kitchen.quantize_int8_attention_q_chunk(
                         producer, q, q_start=0, allow_strided_input=True
                     )
-                    self.executor.kitchen.quantize_int8_attention_v(
+                    producer_kitchen.quantize_int8_attention_v(
                         producer, q[..., :1, :]
                     )
-                    q_carrier = self.executor.kitchen.finalize_int8_attention_producer(producer)
+                    q_carrier = producer_kitchen.finalize_int8_attention_producer(producer)
                     chunk_carrier = replace(
                         q_carrier,
                         k=quantized.k,
