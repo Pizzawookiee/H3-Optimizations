@@ -1,4 +1,4 @@
-'''CPU contracts for non-BF16 ConvRot MLP routing.'''
+'''CPU contract for FP16 ConvRot two-slice MLP execution.'''
 
 import os
 from pathlib import Path
@@ -21,54 +21,68 @@ import comfy.options  # noqa: E402
 
 comfy.options.enable_args_parsing()
 
-from h3_optimizations.memory.config import (  # noqa: E402
-    MODE_CONVROT_2SLICE,
-    ActivationMemoryConfig,
-)
-import h3_optimizations.memory.forward as forward_module  # noqa: E402
+import h3_optimizations.memory.linear as linear_module  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
-class NonBF16MLPRoutingTests(unittest.TestCase):
-    @staticmethod
-    def _block():
+class FP16ConvRotTests(unittest.TestCase):
+    def test_fp16_two_slice_matches_unsliced_fake_math(self):
+        hidden = 256
+        ffn = 512
+        torch.manual_seed(75)
+        fc1_q = torch.randint(-1, 2, (ffn * 2, hidden), dtype=torch.int8)
+        fc2_q = torch.randint(-1, 2, (hidden, ffn), dtype=torch.int8)
+        fc1_scale = torch.ones(ffn * 2)
+        fc2_scale = torch.ones(hidden)
+
         mlp = type('MLP', (), {'fc1': object(), 'fc2': object()})()
-        return type('Block', (), {'mlp': mlp})()
 
-    def test_fp16_convrot_routes_directly_to_held_fallback(self):
-        block = self._block()
-        config = ActivationMemoryConfig(
-            mode=MODE_CONVROT_2SLICE,
-            strict=False,
-        )
-        sample = torch.empty((1, 8), dtype=torch.float16)
-        held = object()
+        class FakeAcquired:
+            def __init__(self):
+                self.weight = object()
+                self.bias = None
+                self.released = False
 
+            def release(self):
+                self.released = True
+
+        acquired = [FakeAcquired(), FakeAcquired()]
+
+        def fake_convrot(x, qdata, _scale, input_act=None):
+            if input_act == 'swiglu':
+                gate, up = x.chunk(2, dim=-1)
+                x = torch.nn.functional.silu(gate) * up
+            return x @ qdata.to(x.dtype).t()
+
+        x = torch.randn(3, hidden, dtype=torch.float16) * 0.01
         with patch.object(
-            forward_module,
-            '_open_generic_held',
-            return_value=(held, None),
-        ) as generic, patch.object(
-            forward_module,
-            'ConvRotTwoSliceMLP',
-        ) as convrot:
-            actual = forward_module._open_mlp(block, sample, config)
+            linear_module,
+            'acquire_linear',
+            side_effect=acquired,
+        ), patch.object(
+            linear_module,
+            '_convrot_parts',
+            side_effect=((fc1_q, fc1_scale), (fc2_q, fc2_scale)),
+        ):
+            with linear_module.ConvRotTwoSliceMLP(
+                mlp,
+                x[:1],
+                fake_convrot,
+            ) as session:
+                actual, path = session.fc1_fc2(x)
 
-        self.assertEqual(actual, (held, 'held', None))
-        generic.assert_called_once_with(block, sample, config)
-        convrot.assert_not_called()
+        gate = x @ fc1_q[:ffn].to(torch.float16).t()
+        up = x @ fc1_q[ffn:].to(torch.float16).t()
+        expected = (
+            torch.nn.functional.silu(gate) * up
+        ) @ fc2_q.to(torch.float16).t()
 
-    def test_fp16_convrot_strict_mode_still_rejects_input(self):
-        block = self._block()
-        config = ActivationMemoryConfig(
-            mode=MODE_CONVROT_2SLICE,
-            strict=True,
-        )
-        sample = torch.empty((1, 8), dtype=torch.float16)
-
-        with self.assertRaisesRegex(TypeError, 'requires BF16 input'):
-            forward_module._open_mlp(block, sample, config)
+        self.assertEqual(actual.dtype, torch.float16)
+        self.assertEqual(actual.shape, (3, hidden))
+        self.assertTrue(torch.allclose(actual, expected, atol=0.25, rtol=0.0))
+        self.assertEqual(path, 'held_convrot_2slice')
+        self.assertTrue(all(item.released for item in acquired))
 
 
 if __name__ == '__main__':
