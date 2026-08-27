@@ -7,9 +7,8 @@ native FP8 weights as BF16 Q/K/V chunks, and leaves plan application in the
 owning apply module.
 '''
 
-import torch
-
 from . import apply as _base
+from .environment import RuntimeEnvironment
 from .plan import (
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_QUANT,
@@ -25,13 +24,11 @@ _BASE_MLP_RESOLVER = _base.resolve_mlp_provider
 
 
 def _current_capability():
-    '''Best-effort NVIDIA capability for execution-policy legalization.'''
-    try:
-        if not torch.cuda.is_available() or getattr(torch.version, 'hip', None):
-            return None
-        return tuple(int(value) for value in torch.cuda.get_device_capability())
-    except Exception:
+    '''Best-effort capability for ComfyUI's selected NVIDIA device.'''
+    environment = RuntimeEnvironment.detect()
+    if not environment.cuda_available or environment.capability is None:
         return None
+    return tuple(int(value) for value in environment.capability)
 
 
 def resolve_qkv_provider(inventory, *, request, backend_kind, **kwargs):
