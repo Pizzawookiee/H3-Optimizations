@@ -349,6 +349,7 @@ def run_streamed_kitchen_qkv(
 
     routing_q_tile = int(spec.q_tile if routing_q_tile is None else routing_q_tile)
     routing_kv_tile = int(spec.k_tile if routing_kv_tile is None else routing_kv_tile)
+
     held = create_held_qkv(module, x[:1], projection_mode)
     held.__enter__()
     try:
@@ -368,19 +369,21 @@ def run_streamed_kitchen_qkv(
 
         sequence = int(x.shape[0])
         retained_v = None
-        q_summaries = []
         k_summaries = []
         chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
 
         for start in range(0, sequence, int(chunk_rows)):
             end = min(start + int(chunk_rows), sequence)
             k, v = project_kv_hnd(held, x, rope_freqs, start, end)
+
             if routing_summaries:
                 with diagnostics.stage('routing_summary_generation'):
                     k_summaries.append(_tile_mean(k, routing_kv_tile))
+
             kitchen.quantize_int8_attention_k_chunk(
                 producer, k, k_start=start, **chunk_kwargs
             )
+
             if v_staging is not None:
                 with diagnostics.stage('v_amax_update'):
                     v_staging.update(v)
@@ -391,12 +394,13 @@ def run_streamed_kitchen_qkv(
                     )
                 with diagnostics.stage('v_retention_copy'):
                     retained_v[..., start:end, :].copy_(v)
+
             del k, v
 
         if v_staging is not None:
             with diagnostics.stage('v_scale_finalize'):
                 v_staging.finalize_scale()
-            # Reuse the same full fused-QKV acquisition for V pass 2.
+
             for start in range(0, sequence, int(chunk_rows)):
                 end = min(start + int(chunk_rows), sequence)
                 with diagnostics.stage('v_reprojection'):
@@ -404,20 +408,11 @@ def run_streamed_kitchen_qkv(
                 with diagnostics.stage('v_carrier_pack'):
                     v_staging.quantize(v, start)
                 del v
+
             producer.v, producer.v_scale = v_staging.finish()
         else:
             kitchen.quantize_int8_attention_v(producer, retained_v)
             del retained_v
-
-        # Sparse routing keeps only bounded tile means. Q is intentionally
-        # reprojected again during sparse attention execution.
-        if routing_summaries:
-            for start in range(0, sequence, int(chunk_rows)):
-                end = min(start + int(chunk_rows), sequence)
-                q = project_q_hnd(held, x, rope_freqs, start, end)
-                with diagnostics.stage('routing_summary_generation'):
-                    q_summaries.append(_tile_mean(q, routing_q_tile))
-                del q
 
         carrier = kitchen.finalize_int8_attention_producer(producer)
     finally:
@@ -430,7 +425,7 @@ def run_streamed_kitchen_qkv(
         carrier=carrier,
         projection_mode=projection_mode,
         output_buffer=x,
-        q_summary=torch.cat(q_summaries, dim=-2) if q_summaries else None,
+        q_summary=None,
         k_summary=torch.cat(k_summaries, dim=-2) if k_summaries else None,
     )
 

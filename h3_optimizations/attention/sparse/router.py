@@ -303,6 +303,89 @@ class SparseTileRouter:
             video_budget,
         )
 
+    def build_lut_from_summary_range(
+        self,
+        q_summary,
+        k_summary,
+        layout,
+        video_budget,
+        *,
+        q_tile_start,
+        sink=None,
+    ):
+        if q_summary.ndim != 4 or k_summary.ndim != 4:
+            raise SparseRouterError('tile router summaries must be rank-4 HND tensors')
+        if q_summary.shape[:2] != k_summary.shape[:2]:
+            raise SparseRouterError('Q/K router summary batch and head shapes differ')
+        if q_summary.shape[-1] != k_summary.shape[-1]:
+            raise SparseRouterError('Q/K router summary dimensions differ')
+        if q_summary.device != k_summary.device:
+            raise SparseRouterError('Q/K router summary devices differ')
+        if not 0.01 <= float(video_budget) <= 1.0:
+            raise SparseRouterError('video_budget must be in [0.01, 1]')
+
+        geometry = self.geometry(layout)
+        expected_k = (geometry.kv_tiles, k_summary.shape[-1])
+        if tuple(k_summary.shape[-2:]) != expected_k:
+            raise SparseRouterError(
+                'K router summary shape %s does not match %s'
+                % (tuple(k_summary.shape[-2:]), expected_k)
+            )
+
+        q_tile_start = int(q_tile_start)
+        local_q_tiles = int(q_summary.shape[-2])
+        q_tile_stop = q_tile_start + local_q_tiles
+        if q_tile_start < 0 or local_q_tiles <= 0 or q_tile_stop > geometry.q_tiles:
+            raise SparseRouterError(
+                'Q route row range [%d, %d) is outside [0, %d)'
+                % (q_tile_start, q_tile_stop, geometry.q_tiles)
+            )
+
+        retained = self._retained(video_budget, geometry)
+        metadata = self._metadata(geometry, video_budget, retained)
+
+        batch, heads = q_summary.shape[:2]
+        dense = torch.arange(
+            geometry.kv_tiles,
+            device=q_summary.device,
+            dtype=torch.int32,
+        )
+        dense_delta = torch.cat((dense[:1], dense[1:] - dense[:-1]))
+
+        lut = dense_delta.view(1, 1, 1, -1).expand(
+            batch, heads, local_q_tiles, -1
+        ).clone()
+        valid = torch.full(
+            (batch, heads, local_q_tiles),
+            geometry.kv_tiles,
+            dtype=torch.int32,
+            device=q_summary.device,
+        )
+
+        if retained == geometry.pure_video_kv_tiles:
+            return lut.contiguous(), valid.contiguous(), metadata
+
+        sparse_global_start = max(q_tile_start, geometry.pure_video_q_start)
+        if sparse_global_start < q_tile_stop:
+            local_sparse_start = sparse_global_start - q_tile_start
+            indices = self._select_indices(
+                q_summary[..., local_sparse_start:, :],
+                k_summary[..., geometry.pure_video_kv_start:, :],
+                retained,
+            )
+            sparse_rows = self._pack_rows(indices, geometry, dense, dense_delta)
+            lut[
+                ...,
+                local_sparse_start:,
+                :sparse_rows.shape[-1],
+            ].copy_(sparse_rows)
+            valid[..., local_sparse_start:] = (
+                geometry.pure_video_kv_start + retained
+            )
+
+        return lut.contiguous(), valid.contiguous(), metadata
+
+
     def _select_indices(self, q_video, k_video, retained):
         '''Top-K video KV tiles per query tile, optionally chunk by chunk.
 
