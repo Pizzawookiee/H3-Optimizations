@@ -43,8 +43,12 @@ sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
 def qkv_inventory(*, plain_float=False, convrot=False):
+    item = SimpleNamespace(
+        logical_dtype='torch.bfloat16' if plain_float else 'unknown',
+        plain_float=bool(plain_float),
+    )
     return SimpleNamespace(
-        qkv=(object(),),
+        qkv=(item,),
         qkv_plain_float=bool(plain_float),
         qkv_convrot_int8_256=bool(convrot),
         qkv_w4a8=False,
