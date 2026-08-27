@@ -8,6 +8,7 @@ import math
 import torch
 
 from ... import diagnostics
+from ...normalized_rows import attention_output_buffer
 from ...qkv.streamed import (
     PROJECTION_NATIVE,
     create_held_qkv,
@@ -248,7 +249,7 @@ def execute_streamed_frost_bf16(module, backend, prepared):
         prepared.release()
         raise RuntimeError('streamed FROST attention module changed')
 
-    result = projected.x
+    result = attention_output_buffer(projected.x)
     sequence = int(projected.sequence)
     q_tile = int(backend.spec.q_tile)
     try:

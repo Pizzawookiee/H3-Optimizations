@@ -48,21 +48,28 @@ class SparseFusedQKVProjector:
         chunk_rows=4096,
         query_chunk_rows=4096,
         projection_mode="native",
+        v_mode=None,
     ):
         from ..attention.sparse.sparse_sage_streamed import (
             StreamedSparseSageQKVProjector as Implementation,
         )
+        from ..plan import V_MEMORY_RETAIN
 
         self.required = bool(required)
         self.chunk_rows = int(chunk_rows)
         self.query_chunk_rows = int(query_chunk_rows)
         self.projection_mode = projection_mode
+        self.requested_v_mode = V_MEMORY_RETAIN if v_mode is None else v_mode
         self._implementation = Implementation(
             spec,
             project_chunk_rows=self.chunk_rows,
             query_chunk_rows=self.query_chunk_rows,
             projection_mode=self.projection_mode,
+            v_mode=self.requested_v_mode,
         )
+        # Mirror the effective mode the implementation settled on, not the
+        # request: status reads v_mode off whichever projector is installed.
+        self.v_mode = self._implementation.v_mode
 
     @property
     def installation_signature(self):
@@ -71,6 +78,7 @@ class SparseFusedQKVProjector:
             self.qk_format,
             bool(self.required),
             self.projection_mode,
+            self.v_mode,
             self._implementation.installation_signature,
         )
 

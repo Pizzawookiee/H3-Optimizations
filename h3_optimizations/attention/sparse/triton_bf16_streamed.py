@@ -10,6 +10,7 @@ import torch
 import comfy.model_management
 
 from ... import diagnostics
+from ...normalized_rows import attention_output_buffer
 from ...qkv.streamed import (
     PROJECTION_FORCE_INT8,
     PROJECTION_NATIVE,
@@ -358,7 +359,7 @@ def execute_streamed_triton_bf16(module, backend, prepared):
         prepared.release()
         raise RuntimeError("streamed Triton attention module changed")
 
-    result = projected.x
+    result = attention_output_buffer(projected.x)
     sequence = int(projected.sequence)
     try:
         for start in range(0, sequence, projected.chunk_rows):

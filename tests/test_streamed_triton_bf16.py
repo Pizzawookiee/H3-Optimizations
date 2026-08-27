@@ -35,6 +35,7 @@ from h3_optimizations.attention.sparse.triton_bf16_streamed import (  # noqa: E4
     execute_streamed_triton_bf16,
     prepare_streamed_triton_bf16,
 )
+from h3_optimizations.normalized_rows import NormalizedRows  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -338,6 +339,49 @@ class StreamedTritonBF16Tests(unittest.TestCase):
         self.assertTrue(held.released)
         self.assertIsNone(projected.k)
         self.assertIsNone(projected.v)
+
+    def test_execute_keeps_lazy_input_separate_from_attention_output(self):
+        residual = self.x.clone()
+        source = NormalizedRows(
+            residual,
+            lambda rows: rows.clone(),
+            ((0, self.sequence, 0),),
+            None,
+            None,
+            lambda rows, _shift, _scale, _selector: rows,
+        )
+        held = FakeHeld(self.heads)
+        projected = _assemble_streamed_triton_qkv(
+            self.module,
+            source,
+            None,
+            held,
+            layer_index=3,
+            chunk_rows=64,
+        )
+        prepared = PreparedStreamedTritonBF16(
+            projected=projected,
+            route_plan=DenseRoutePlan(projected.k_summary, 3),
+            dense_q_tiles=3,
+            sparse_q_tiles=0,
+            sparse_selected=0,
+            metadata={},
+        )
+
+        with mock.patch.object(
+            triton_bf16,
+            '_launch_streamed_chunk',
+            side_effect=lambda q, *_args, **_kwargs: q.clone(),
+        ):
+            actual = execute_streamed_triton_bf16(
+                self.module,
+                SimpleNamespace(router=object()),
+                prepared,
+            )
+
+        self.assertIsNot(actual, residual)
+        torch.testing.assert_close(actual, self.x)
+        torch.testing.assert_close(residual, self.x)
 
     def test_execute_accepts_the_runtime_int8_output_projection_proxy(self):
         held = FakeHeld(self.heads)

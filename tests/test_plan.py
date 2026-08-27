@@ -36,7 +36,7 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(request.prefer_held_weights)
         self.assertFalse(request.mlp_strict)
         self.assertEqual(request.embedding_memory, EMBEDDING_MEMORY_AUTO)
-        self.assertEqual(request.kitchen_v_memory, KITCHEN_V_MEMORY_RETAIN)
+        self.assertEqual(request.attention_v_memory, KITCHEN_V_MEMORY_RETAIN)
 
     def test_embedding_memory_is_part_of_memory_identity(self):
         request = MemoryRequest(embedding_memory=EMBEDDING_MEMORY_RELEASE)
@@ -44,11 +44,11 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'embedding memory'):
             MemoryRequest(embedding_memory='unknown')
 
-    def test_kitchen_v_memory_is_explicit_and_part_of_identity(self):
-        request = MemoryRequest(kitchen_v_memory=KITCHEN_V_MEMORY_TWO_PASS)
+    def test_attention_v_memory_is_explicit_and_part_of_identity(self):
+        request = MemoryRequest(attention_v_memory=KITCHEN_V_MEMORY_TWO_PASS)
         self.assertIn(KITCHEN_V_MEMORY_TWO_PASS, request.signature)
-        with self.assertRaisesRegex(ValueError, 'Kitchen V memory'):
-            MemoryRequest(kitchen_v_memory='unknown')
+        with self.assertRaisesRegex(ValueError, 'attention V memory'):
+            MemoryRequest(attention_v_memory='unknown')
 
     def test_preserve_precision_is_a_valid_memory_request(self):
         request = MemoryRequest(mlp_memory=MLP_MEMORY_PRESERVE)

@@ -10,6 +10,7 @@ from .external_consumer import (
     consume_streamed_h3_qkv,
     get_streamed_h3_qkv_consumer,
 )
+from .normalized_rows import attention_output_buffer
 from .ordering_probe import has_ordering_observer, observe_attention
 
 
@@ -258,7 +259,7 @@ def _finish_streamed_dense_bf16_projected(
     out_projection=None,
 ):
     """Consume Q slabs against complete BF16 K/V and project each output slab."""
-    output = projected.x
+    output = attention_output_buffer(projected.x)
     external_consumer = get_streamed_h3_qkv_consumer(transformer_options)
     try:
         for start, end, q in projected.stream_q():

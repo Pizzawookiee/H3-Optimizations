@@ -53,6 +53,27 @@ def _qkv_weights_text(status):
 
 
 def format_qkv_execution(status):
+    """Describe the QKV route, marking two-pass V wherever it is active.
+
+    The marker is applied here rather than inside each branch because more
+    than one carrier family supports it now; a branch that forgot to mention
+    it would read as if V were still retained in full.
+    """
+    text = _format_qkv_execution(status)
+    qkv = status.get('fused_qkv') or {}
+    if qkv.get('v_memory') == 'two_pass' and 'two-pass V' not in text:
+        text = text.replace(
+            'retained native Sage K/V',
+            'retained native Sage K + staged native Sage V',
+        ).replace(
+            'retained Sparse Sage K/V',
+            'retained Sparse Sage K + staged Sparse Sage V',
+        )
+        return '%s; two-pass V' % text
+    return text
+
+
+def _format_qkv_execution(status):
     qkv = status.get('fused_qkv') or {}
     provider = qkv.get('provider') or 'standard_h3_qkv'
     projector = qkv.get('projector')
@@ -94,8 +115,6 @@ def format_qkv_execution(status):
         details = []
         if qkv.get('output_streamed'):
             details.append('output streamed')
-        if qkv.get('v_memory') == 'two_pass':
-            details.append('two-pass V')
         return text if not details else '%s; %s' % (text, '; '.join(details))
 
     if provider in ('chunked_bf16_qkv', 'force_bf16_qkv'):
@@ -219,8 +238,8 @@ def _mark_runtime_fallback(qkv, line):
 def _v_memory_notice(qkv):
     '''Report a Lower VRAM request the active attention path cannot honour.
 
-    Only the Kitchen INT8 projectors stage V in two passes. Every other
-    attention path retains V, so staying silent would leave the readout
+    Kitchen INT8 and compatible Sage FP8 projectors can stage V in two passes.
+    Other attention paths retain V, so staying silent would leave the readout
     implying a saving that never happened.
     '''
     if qkv.get('v_memory_requested') != 'two_pass':

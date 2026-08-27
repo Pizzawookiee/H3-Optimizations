@@ -71,7 +71,7 @@ from .plan import (
     FUSED_QKV_OFF,
     EMBEDDING_MEMORY_STOCK,
     H3OptimizationPlan,
-    KITCHEN_V_MEMORY_RETAIN,
+    V_MEMORY_RETAIN,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
@@ -409,6 +409,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
             dense.backend,
             chunk_rows=memory.chunk_rows,
             projection_mode=_streamed_projection_mode(qkv, inventory),
+            v_mode=memory.attention_v_memory,
         )
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         backend = ChunkedKitchenAttentionBackend()
@@ -449,7 +450,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
             strided_qk_input=True,
             stream_output=True,
             streamed_q=True,
-            v_mode=memory.kitchen_v_memory,
+            v_mode=memory.attention_v_memory,
         )
     return (
         ResolvedAttention(
@@ -501,6 +502,11 @@ def _resolve_sparse(plan, environment, inventory):
             required=bool(qkv.fused),
             chunk_rows=4096,
             projection_mode=_streamed_projection_mode(qkv, inventory),
+            v_mode=(
+                V_MEMORY_RETAIN
+                if plan.memory is None
+                else plan.memory.attention_v_memory
+            ),
         )
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         projector = _bounded_qkv_projector(qkv)
@@ -723,7 +729,7 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             v_mode=(
                 V_MODE_RETAIN
                 if plan.memory is None
-                else plan.memory.kitchen_v_memory
+                else plan.memory.attention_v_memory
             ),
         )
     else:
@@ -1027,9 +1033,9 @@ def _status(
             ),
             'v_memory': getattr(attention.projector, 'v_mode', None),
             'v_memory_requested': (
-                KITCHEN_V_MEMORY_RETAIN
+                V_MEMORY_RETAIN
                 if plan.memory is None
-                else plan.memory.kitchen_v_memory
+                else plan.memory.attention_v_memory
             ),
             'producer_abi': (
                 KITCHEN_PRODUCER_ABI

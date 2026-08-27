@@ -23,6 +23,7 @@ incompatible because it emits a different per-tile carrier.
 from dataclasses import dataclass, replace
 
 from ... import diagnostics
+from ...normalized_rows import attention_output_buffer
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
@@ -494,7 +495,7 @@ class SparseKitchenBackend:
 
         quantized = prepared.quantized
         route = prepared.route
-        output = prepared.output_buffer
+        output = attention_output_buffer(prepared.output_buffer)
         route_q_tile = int(route.q_tile)
         sequence = int(quantized.q.shape[-2])
         packed_q_tiles = (sequence + 127) // 128

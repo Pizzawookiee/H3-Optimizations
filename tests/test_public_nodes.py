@@ -105,7 +105,7 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.attention, ATTENTION_EXISTING)
         self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_AUTO)
-        self.assertEqual(request.kitchen_v_memory, KITCHEN_V_MEMORY_RETAIN)
+        self.assertEqual(request.attention_v_memory, KITCHEN_V_MEMORY_RETAIN)
 
     def test_two_pass_v_mode_is_explicit(self):
         request = _memory_request_for_modes(
@@ -116,7 +116,7 @@ class PublicNodeTests(unittest.TestCase):
             qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
             kitchen_v_memory_mode=KITCHEN_V_MEMORY_MODE_TWO_PASS,
         )
-        self.assertEqual(request.kitchen_v_memory, KITCHEN_V_MEMORY_TWO_PASS)
+        self.assertEqual(request.attention_v_memory, KITCHEN_V_MEMORY_TWO_PASS)
 
     def test_streaming_forced_claims_attention(self):
         request = _memory_request_for_modes(

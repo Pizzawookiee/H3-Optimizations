@@ -51,6 +51,18 @@ class SparseSageKernelSpec:
     def uses_fp8_v(self):
         return self.v_format == "fp8"
 
+    def v_staging_parameters(self):
+        """Scale bound and padding for two-pass V, or None if unsupported.
+
+        Two-pass staging quantizes chunks straight into the carrier, which is
+        only a saving when the carrier is smaller than BF16 V and only correct
+        against the Triton path whose arithmetic it reproduces. The FP16 V
+        kernels have neither property, so they opt out here.
+        """
+        if not self.uses_fp8_v or not TRITON_AVAILABLE:
+            return None
+        return (float(self.v_quant_bound), 128)
+
     def validate_lut(self, lut, valid, *, batch, heads, sequence):
         expected = (
             int(batch), int(heads),

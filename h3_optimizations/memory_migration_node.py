@@ -172,7 +172,7 @@ def _memory_request_for_modes(
             PRECISION_MODE_FORCE_QUANT,
         ),
         embedding_memory=EMBEDDING_MEMORY_AUTO,
-        kitchen_v_memory=v_memory_request,
+        attention_v_memory=v_memory_request,
     )
 
 
@@ -306,6 +306,10 @@ class H3MemoryOptimization(io.ComfyNode):
                     },
                 ),
                 io.Combo.Input(
+                    # The id keeps its original spelling because it is baked
+                    # into workflows serialized since 0.2.24; the mode is no
+                    # longer Kitchen-specific, which is why the plan field it
+                    # feeds is called attention_v_memory.
                     'kitchen_v_memory_mode',
                     display_name='Attention memory mode',
                     options=list(KITCHEN_V_MEMORY_MODE_OPTIONS),

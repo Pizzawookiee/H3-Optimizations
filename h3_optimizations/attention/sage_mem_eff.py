@@ -17,7 +17,7 @@ import logging
 import torch
 
 from . import stats
-from .sage_v_fp8 import prepare_sage_v_fp8
+from .sage_v_fp8 import TRITON_AVAILABLE, prepare_sage_v_fp8
 from .triton_i64 import per_thread_int8_i64
 
 V_OFFSET_LIMIT = (1 << 32) - 1
@@ -356,6 +356,9 @@ class SM89SageMemoryEfficientBackend:
             scale_max=self.api.v_scale_max,
         )
         return v_fp8, v_scale
+
+    def v_staging_parameters(self):
+        return (float(self.api.v_scale_max), 64) if TRITON_AVAILABLE else None
 
     def execute_rectangular(
         self,

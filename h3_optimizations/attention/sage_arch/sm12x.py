@@ -6,7 +6,7 @@ import torch
 
 from .. import stats
 from ..sage_mem_eff import EfficientSageError
-from ..sage_v_fp8 import prepare_sage_v_fp8
+from ..sage_v_fp8 import TRITON_AVAILABLE, prepare_sage_v_fp8
 from .common import (
     ArchitectureBackend,
     KernelBinding,
@@ -157,6 +157,9 @@ class SageSM12xMemoryEfficientBackend(ArchitectureBackend):
             self.api.per_channel_fp8,
             scale_max=2.25,
         )
+
+    def v_staging_parameters(self):
+        return (2.25, 64) if TRITON_AVAILABLE else None
 
     def execute_rectangular(
         self,

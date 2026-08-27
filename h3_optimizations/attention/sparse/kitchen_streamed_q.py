@@ -23,6 +23,7 @@ import torch
 import comfy.model_management
 
 from ... import diagnostics
+from ...normalized_rows import attention_output_buffer
 from ...kitchen_qkv import (
     CHUNK_ROWS,
     PRODUCER_ABI_VERSION,
@@ -480,7 +481,7 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
         producer_module = projected.producer_module
         if producer_module is None:
             raise SparseKitchenError("streamed Sparse Kitchen producer was released")
-        output = projected.output_buffer
+        output = attention_output_buffer(projected.output_buffer)
         if output is None:
             raise SparseKitchenError(
                 "streamed Sparse Kitchen requires an output-capturing projector"

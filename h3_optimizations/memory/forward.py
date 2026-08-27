@@ -20,6 +20,7 @@ from .linear import (
     module_swiglu_fc2,
     swiglu_eager,
 )
+from ..normalized_rows import NormalizedRows, NormalizedRowsUnsupported
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 from ..qkv.int8 import (
     ConvRotINT8BindingError,
@@ -27,7 +28,6 @@ from ..qkv.int8 import (
 )
 
 LOG_PREFIX = '[H3 Optimizations]'
-
 
 def _mod_row(values, selector, dtype):
     if torch.is_tensor(selector) and selector.device != values.device:
@@ -224,22 +224,34 @@ def make_forward(block, layer_index, config, original_forward=None):
         # ComfyUI's per-token noise-mask selectors are gathered in bounded slabs
         # so long masked sequences do not materialize full [tokens, hidden]
         # shift/scale/gate tensors.
-        h = block.norm1(x)
-        for start, stop, selector in iter_modulation_chunks(
+        # The attention consumers read their input only as x[start:end] row
+        # slices, so norm1 + modulation can run per slice instead of holding a
+        # full [sequence, hidden] tensor across the whole attention call.
+        h = NormalizedRows(
+            x,
+            block.norm1,
             segments,
-            config.chunk_rows,
-        ):
-            _scale_shift(
-                h[start:stop],
-                shift_msa,
-                scale_msa,
-                selector,
-            )
-        attn_out = block.attn(
-            h,
-            rope_freqs=rope_freqs,
-            transformer_options=transformer_options,
+            shift_msa,
+            scale_msa,
+            _scale_shift,
         )
+        try:
+            attn_out = block.attn(
+                h,
+                rope_freqs=rope_freqs,
+                transformer_options=transformer_options,
+            )
+        except NormalizedRowsUnsupported:
+            if not isinstance(h, NormalizedRows):
+                raise
+            # This attention consumer wants a real tensor. Materialize once and
+            # retry; attention does not mutate its input, so the retry is safe.
+            h = h.materialize()
+            attn_out = block.attn(
+                h,
+                rope_freqs=rope_freqs,
+                transformer_options=transformer_options,
+            )
         for start, stop, selector in iter_modulation_chunks(
             segments,
             config.chunk_rows,

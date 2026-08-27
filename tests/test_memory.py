@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -359,6 +359,30 @@ class MemoryTests(unittest.TestCase):
             torch.allclose(actual, expected, rtol=1e-5, atol=2e-6)
         )
         self.assertTrue(torch.isfinite(actual).all())
+
+    def test_attention_attribute_error_is_not_treated_as_row_fallback(self):
+        torch.manual_seed(33)
+        block = self._make_block()
+        block.attn.forward = Mock(
+            side_effect=AttributeError('attention implementation bug')
+        )
+        forward = make_forward(
+            block,
+            0,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=256,
+                alignment=256,
+            ),
+        )
+        with self.assertRaisesRegex(AttributeError, 'implementation bug'):
+            forward(
+                torch.randn(8, 32),
+                torch.randn(1, 24),
+                [(0, 8, 0)],
+                rope_freqs=None,
+                transformer_options={},
+            )
 
 
 if __name__ == '__main__':

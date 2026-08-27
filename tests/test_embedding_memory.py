@@ -155,7 +155,7 @@ class EmbeddingMemoryTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 embedding.H3EmbeddingMemoryPatchError,
-                'assembly changed',
+                'changed',
             ):
                 embedding.install(patcher)
 

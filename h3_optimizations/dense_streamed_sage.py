@@ -10,7 +10,19 @@ import comfy.model_management
 from . import diagnostics
 from .attention import stats
 from .attention.sage_mem_eff import EfficientSageError
-from .qkv.streamed import create_held_qkv, project_kv_hnd, project_q_hnd
+from .attention.sage_v_staging import (
+    BACKEND_TORCH as SAGE_STAGING_TORCH,
+    BACKEND_TRITON as SAGE_STAGING_TRITON,
+    TwoPassSageVCarrier,
+)
+from .normalized_rows import attention_output_buffer
+from .plan import V_MEMORY_RETAIN, V_MEMORY_TWO_PASS
+from .qkv.streamed import (
+    create_held_qkv,
+    project_kv_hnd,
+    project_q_hnd,
+    project_v_hnd,
+)
 
 
 @dataclass
@@ -29,6 +41,10 @@ class StreamedDenseSageQKV:
     query_chunk_rows: int
     projection_mode: str
     held_factory: object
+    # Set only when the projector staged V in two passes; the backend then
+    # skips its own quantization instead of re-preparing a carrier.
+    staged_v_carrier: torch.Tensor | None = None
+    staged_v_scale: torch.Tensor | None = None
 
     def release(self):
         self.module = None
@@ -37,6 +53,8 @@ class StreamedDenseSageQKV:
         self.k_int8 = None
         self.k_scale = None
         self.v = None
+        self.staged_v_carrier = None
+        self.staged_v_scale = None
         self.held_factory = None
 
 
@@ -63,12 +81,26 @@ class StreamedDenseSageQKVProjector:
         *,
         chunk_rows,
         projection_mode,
+        v_mode=V_MEMORY_RETAIN,
         held_factory=create_held_qkv,
         allow_cpu_for_tests=False,
     ):
         self.backend = backend
         self.chunk_rows = int(chunk_rows)
         self.projection_mode = projection_mode
+        if v_mode not in (V_MEMORY_RETAIN, V_MEMORY_TWO_PASS):
+            raise ValueError('unknown dense Sage V mode %r' % v_mode)
+        self.requested_v_mode = v_mode
+        # Resolve the request against what this architecture can actually do,
+        # so v_mode always names what will happen. Status reads this field, and
+        # a request the backend declined must not read back as granted.
+        parameters = getattr(backend, "v_staging_parameters", None)
+        self._staging_parameters = None if parameters is None else parameters()
+        self.v_mode = (
+            V_MEMORY_TWO_PASS
+            if v_mode == V_MEMORY_TWO_PASS and self._staging_parameters is not None
+            else V_MEMORY_RETAIN
+        )
         self.held_factory = held_factory
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
         q_tile = int(backend.projected_q_tile)
@@ -86,6 +118,7 @@ class StreamedDenseSageQKVProjector:
             self.name,
             self.chunk_rows,
             self.projection_mode,
+            self.v_mode,
             getattr(self.backend, "name", type(self.backend).__name__),
             int(self.backend.projected_q_tile),
             int(self.backend.projected_k_tile),
@@ -93,6 +126,33 @@ class StreamedDenseSageQKVProjector:
 
     def bind(self, module):
         return None
+
+    def _staging(self, sequence, heads, x):
+        """Build a two-pass V carrier, or None to keep retaining BF16 V.
+
+        The delegate decides whether a second pass can pay: an architecture
+        whose V carrier is FP16 is the same size as the BF16 source and
+        declines by returning None, so the request degrades to Standard
+        instead of costing a reprojection for nothing.
+        """
+        if self.v_mode != V_MEMORY_TWO_PASS:
+            return None
+        scale_max, pad_to = self._staging_parameters
+        return TwoPassSageVCarrier(
+            1,
+            heads,
+            sequence,
+            128,
+            scale_max=scale_max,
+            device=x.device,
+            dtype=x.dtype,
+            pad_to=pad_to,
+            backend=(
+                SAGE_STAGING_TORCH
+                if self.allow_cpu_for_tests
+                else SAGE_STAGING_TRITON
+            ),
+        )
 
     def project(self, module, x, rope_freqs, *, layer_index, transformer_options):
         del transformer_options
@@ -114,10 +174,17 @@ class StreamedDenseSageQKVProjector:
             dtype=torch.int8,
             device=x.device,
         )
-        v = torch.empty(
-            (1, heads, sequence, 128),
-            dtype=x.dtype,
-            device=x.device,
+        staging = self._staging(sequence, heads, x)
+        staged_v_carrier = None
+        staged_v_scale = None
+        v = (
+            None
+            if staging is not None
+            else torch.empty(
+                (1, heads, sequence, 128),
+                dtype=x.dtype,
+                device=x.device,
+            )
         )
         k_scales = []
         held = self.held_factory(module, x[:1], self.projection_mode)
@@ -135,8 +202,24 @@ class StreamedDenseSageQKVProjector:
                 chunk_k, chunk_scale = self.backend.quantize_projected_k(k)
                 k_int8[..., start:stop, :].copy_(chunk_k)
                 k_scales.append(chunk_scale)
-                v[..., start:stop, :].copy_(chunk_v)
+                if staging is None:
+                    v[..., start:stop, :].copy_(chunk_v)
+                else:
+                    with diagnostics.stage("v_amax_update"):
+                        staging.update(chunk_v)
                 del k, chunk_v, chunk_k, chunk_scale
+            if staging is not None:
+                # Second pass: V only. K is already packed, so this reprojects
+                # strictly the rows the carrier still needs.
+                staging.finalize_scale()
+                for start in range(0, sequence, self.chunk_rows):
+                    stop = min(start + self.chunk_rows, sequence)
+                    with diagnostics.stage("v_reprojection"):
+                        chunk_v = project_v_hnd(held, x, rope_freqs, start, stop)
+                    with diagnostics.stage("v_carrier_pack"):
+                        staging.quantize(chunk_v, start)
+                    del chunk_v
+                staged_v_carrier, staged_v_scale = staging.finish()
         finally:
             held.__exit__(None, None, None)
 
@@ -147,6 +230,8 @@ class StreamedDenseSageQKVProjector:
             k_int8=k_int8,
             k_scale=torch.cat(k_scales, dim=-1).contiguous(),
             v=v,
+            staged_v_carrier=staged_v_carrier,
+            staged_v_scale=staged_v_scale,
             output_dtype=x.dtype,
             sequence=sequence,
             heads=heads,
@@ -210,7 +295,13 @@ class StreamedDenseSageBackend:
                 % (projected.layer_index, layer_index)
             )
         stats.observe_sequence(projected.sequence)
-        v_carrier, v_scale = self.delegate.prepare_streamed_v(projected.v)
+        if projected.staged_v_carrier is not None:
+            v_carrier = projected.staged_v_carrier
+            v_scale = projected.staged_v_scale
+            projected.staged_v_carrier = None
+            projected.staged_v_scale = None
+        else:
+            v_carrier, v_scale = self.delegate.prepare_streamed_v(projected.v)
         projected.v = None
         return PreparedStreamedDenseSage(projected, v_carrier, v_scale)
 
@@ -224,7 +315,7 @@ class StreamedDenseSageBackend:
                 "streamed dense Sage module changed between prepare and execute"
             )
 
-        result = projected.x
+        result = attention_output_buffer(projected.x)
         hidden = int(result.shape[1])
         try:
             for start in range(0, projected.sequence, projected.query_chunk_rows):

@@ -26,13 +26,17 @@ import math
 import torch
 
 from ... import diagnostics
+from ...normalized_rows import attention_output_buffer
 from ...qkv.formats import describe_linear
+from ...plan import V_MEMORY_RETAIN, V_MEMORY_TWO_PASS
 from ...qkv.streamed import (
     PROJECTION_NATIVE,
     create_held_qkv,
     project_kv_hnd,
     project_q_hnd,
+    project_v_hnd,
 )
+from ..sage_v_staging import TwoPassSageVCarrier
 from . import fused_qkv as _fused_qkv_mod
 from .chunked_qkv import pack_sparse_qk_chunk_into
 from .config import resolve_video_budget
@@ -63,6 +67,10 @@ class StreamedSparseSageQKV:
     project_chunk_rows: int
     query_chunk_rows: int
     projection_mode: str
+    # Set only when the projector staged V in two passes; prepare then adopts
+    # this carrier instead of quantizing a full-sequence BF16 V.
+    staged_v_carrier: torch.Tensor | None = None
+    staged_v_scale: torch.Tensor | None = None
 
 
 @dataclass
@@ -153,15 +161,23 @@ def _validate_streamed_projected(projected, spec):
             )
         if not tensor.is_contiguous():
             raise SparseSageError("%s must be contiguous" % name)
-    if projected.v is None or tuple(projected.v.shape) != (
-        1,
-        heads,
-        sequence,
-        head_dim,
-    ):
-        raise SparseSageError("streamed Sparse Sage V projection is invalid")
-    if projected.v.dtype != projected.output_dtype:
-        raise SparseSageError("streamed Sparse Sage V dtype is invalid")
+    if projected.staged_v_carrier is None:
+        if projected.v is None or tuple(projected.v.shape) != (
+            1,
+            heads,
+            sequence,
+            head_dim,
+        ):
+            raise SparseSageError("streamed Sparse Sage V projection is invalid")
+        if projected.v.dtype != projected.output_dtype:
+            raise SparseSageError("streamed Sparse Sage V dtype is invalid")
+    elif projected.v is not None:
+        # Two-pass staging owns the carrier outright. A full-sequence BF16 V
+        # alongside it means the projector kept both, which is the exact peak
+        # this mode exists to remove.
+        raise SparseSageError(
+            "streamed Sparse Sage staged V must not retain a BF16 V tensor"
+        )
     _validate_chunk_rows(
         projected.project_chunk_rows,
         spec.q_tile,
@@ -177,6 +193,32 @@ def _validate_streamed_projected(projected, spec):
     return projected
 
 
+def _v_staging(spec, v_mode, sequence, heads, head_dim, x, project_chunk):
+    """Build a two-pass V carrier, or None to keep retaining BF16 V.
+
+    The spec declines when its V carrier is not FP8, since a second pass would
+    then cost a reprojection for no saving. The injected project_chunk seam
+    used by tests has no V-only entry point, so it also stays on one pass.
+    """
+    if v_mode != V_MEMORY_TWO_PASS or project_chunk is not None:
+        return None
+    parameters = getattr(spec, "v_staging_parameters", None)
+    parameters = None if parameters is None else parameters()
+    if parameters is None:
+        return None
+    scale_max, pad_to = parameters
+    return TwoPassSageVCarrier(
+        1,
+        heads,
+        sequence,
+        head_dim,
+        scale_max=scale_max,
+        device=x.device,
+        dtype=x.dtype,
+        pad_to=pad_to,
+    )
+
+
 def _assemble_streamed_sparse_qkv(
     module,
     x,
@@ -187,6 +229,7 @@ def _assemble_streamed_sparse_qkv(
     project_chunk_rows,
     query_chunk_rows,
     projection_mode=PROJECTION_NATIVE,
+    v_mode=V_MEMORY_RETAIN,
     packer=pack_sparse_qk_chunk_into,
     project_chunk=None,
     held_factory=create_held_qkv,
@@ -222,8 +265,15 @@ def _assemble_streamed_sparse_qkv(
     k_scale = torch.empty(
         (1, heads, k_blocks), dtype=torch.float32, device=x.device
     )
-    v = torch.empty(
-        (1, heads, sequence, head_dim), dtype=x.dtype, device=x.device
+    staging = _v_staging(spec, v_mode, sequence, heads, head_dim, x, project_chunk)
+    staged_v_carrier = None
+    staged_v_scale = None
+    v = (
+        None
+        if staging is not None
+        else torch.empty(
+            (1, heads, sequence, head_dim), dtype=x.dtype, device=x.device
+        )
     )
     k_summary = torch.empty(
         (1, heads, k_blocks, head_dim), dtype=x.dtype, device=x.device
@@ -266,9 +316,27 @@ def _assemble_streamed_sparse_qkv(
                     row_start=start,
                     block_size=spec.kv_tile,
                 )
-                v[..., start:end, :].copy_(chunk_v)
+                if staging is None:
+                    v[..., start:end, :].copy_(chunk_v)
+                else:
+                    with diagnostics.stage("v_amax_update"):
+                        staging.update(chunk_v)
             finally:
                 del k, chunk_v
+        if staging is not None:
+            # Second pass: V only. K and its summaries are already packed, so
+            # this reprojects strictly what the carrier still needs.
+            staging.finalize_scale()
+            for start in range(0, sequence, project_chunk_rows):
+                end = min(start + project_chunk_rows, sequence)
+                with diagnostics.stage("v_reprojection"):
+                    chunk_v = project_v_hnd(held, x, rope_freqs, start, end)
+                try:
+                    with diagnostics.stage("v_carrier_pack"):
+                        staging.quantize(chunk_v, start)
+                finally:
+                    del chunk_v
+            staged_v_carrier, staged_v_scale = staging.finish()
     finally:
         if held is not None:
             held.__exit__(None, None, None)
@@ -280,6 +348,8 @@ def _assemble_streamed_sparse_qkv(
         k_int8=k_int8,
         k_scale=k_scale,
         v=v,
+        staged_v_carrier=staged_v_carrier,
+        staged_v_scale=staged_v_scale,
         k_summary=k_summary,
         output_dtype=x.dtype,
         sequence=sequence,
@@ -302,6 +372,7 @@ def run_streamed_sparse_qkv(
     project_chunk_rows=DEFAULT_PROJECT_CHUNK_ROWS,
     query_chunk_rows=DEFAULT_QUERY_CHUNK_ROWS,
     projection_mode=PROJECTION_NATIVE,
+    v_mode=V_MEMORY_RETAIN,
 ):
     import comfy.model_management
 
@@ -326,6 +397,7 @@ def run_streamed_sparse_qkv(
         project_chunk_rows=project_chunk_rows,
         query_chunk_rows=query_chunk_rows,
         projection_mode=projection_mode,
+        v_mode=v_mode,
     )
 
 
@@ -341,9 +413,23 @@ class StreamedSparseSageQKVProjector:
         project_chunk_rows=DEFAULT_PROJECT_CHUNK_ROWS,
         query_chunk_rows=DEFAULT_QUERY_CHUNK_ROWS,
         projection_mode=PROJECTION_NATIVE,
+        v_mode=V_MEMORY_RETAIN,
     ):
         self.spec = spec
         self.projection_mode = projection_mode
+        if v_mode not in (V_MEMORY_RETAIN, V_MEMORY_TWO_PASS):
+            raise ValueError('unknown sparse Sage V mode %r' % v_mode)
+        self.requested_v_mode = v_mode
+        # Resolve against what the spec can do, so v_mode always names what
+        # will happen; status reads this field.
+        parameters = getattr(spec, "v_staging_parameters", None)
+        self.v_mode = (
+            V_MEMORY_TWO_PASS
+            if v_mode == V_MEMORY_TWO_PASS
+            and parameters is not None
+            and parameters() is not None
+            else V_MEMORY_RETAIN
+        )
         self.chunk_rows = _validate_chunk_rows(
             project_chunk_rows,
             spec.q_tile,
@@ -365,6 +451,7 @@ class StreamedSparseSageQKVProjector:
             self.chunk_rows,
             self.query_chunk_rows,
             self.projection_mode,
+            self.v_mode,
             self.spec.signature,
         )
 
@@ -387,6 +474,7 @@ class StreamedSparseSageQKVProjector:
             project_chunk_rows=self.chunk_rows,
             query_chunk_rows=self.query_chunk_rows,
             projection_mode=self.projection_mode,
+            v_mode=self.v_mode,
         )
 
 
@@ -489,6 +577,32 @@ def _build_streamed_lut_chunk(
     return lut.contiguous(), valid.contiguous()
 
 
+def _validate_staged_v(carrier, scale, projected):
+    """Check a projector-staged carrier the way _validate_v checks a prepared one.
+
+    The staged path bypasses the executor's own preparer, so the shape contract
+    it would have enforced has to be enforced here instead. Padding is the one
+    that can drift silently: the kernel ABI wants 128, and a spec that reported
+    a different pad_to would otherwise produce a quietly wrong carrier.
+    """
+    expected_padded = (int(projected.sequence) + 127) // 128 * 128
+    expected = (1, int(projected.heads), int(projected.head_dim), expected_padded)
+    if (
+        tuple(carrier.shape) != expected
+        or carrier.dtype != torch.float8_e4m3fn
+        or not carrier.is_contiguous()
+    ):
+        raise SparseSageError("staged V produced an invalid FP8 carrier")
+    if (
+        scale is None
+        or tuple(scale.shape) != (1, int(projected.heads), int(projected.head_dim))
+        or scale.dtype != torch.float32
+        or scale.device != carrier.device
+        or not scale.is_contiguous()
+    ):
+        raise SparseSageError("staged V produced an invalid FP8 scale")
+
+
 def prepare_streamed_sparse_sage(
     backend,
     projected,
@@ -524,13 +638,20 @@ def prepare_streamed_sparse_sage(
     # route. The projected carrier no longer owns a second reference.
     projected.k_summary = None
     with diagnostics.stage("sparse_carrier_prepare"):
-        v_carrier, v_scale = backend.executor._prepare_v(projected.v)
-        backend.executor._validate_v(
-            projected.v,
-            v_carrier,
-            v_scale,
-            projected.sequence,
-        )
+        if projected.staged_v_carrier is not None:
+            v_carrier = projected.staged_v_carrier
+            v_scale = projected.staged_v_scale
+            projected.staged_v_carrier = None
+            projected.staged_v_scale = None
+            _validate_staged_v(v_carrier, v_scale, projected)
+        else:
+            v_carrier, v_scale = backend.executor._prepare_v(projected.v)
+            backend.executor._validate_v(
+                projected.v,
+                v_carrier,
+                v_scale,
+                projected.sequence,
+            )
     projected.v = None
 
     metadata = backend._metadata(
@@ -790,7 +911,7 @@ def execute_streamed_sparse_sage(module, backend, prepared):
     q_tile = int(spec.q_tile)
     max_rows = min(int(projected.query_chunk_rows), sequence)
     max_q_tiles = (max_rows + q_tile - 1) // q_tile
-    result = projected.x
+    result = attention_output_buffer(projected.x)
 
     q_int8_buffer = torch.empty(
         (1, heads, max_rows, HEAD_DIM),

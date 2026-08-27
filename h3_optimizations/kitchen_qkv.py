@@ -11,6 +11,7 @@ import comfy.quant_ops
 
 from . import diagnostics
 from .attention_forward import project_qkv
+from .normalized_rows import attention_output_buffer
 from .qkv.bf16 import HeldBF16QKV
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
@@ -698,7 +699,7 @@ class ChunkedKitchenAttentionBackend:
         from .native.int8_attention import OUTPUT_NHD
 
         quantized = prepared.carrier
-        output = prepared.output_buffer
+        output = attention_output_buffer(prepared.output_buffer)
         streamed_q = isinstance(prepared, PreparedStreamedKitchenQKV)
         sequence = int(prepared.x.shape[0]) if streamed_q else int(quantized.q.shape[-2])
         if not streamed_q:

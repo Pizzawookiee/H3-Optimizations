@@ -16,7 +16,10 @@ control.
   chunked FP8 execution, while Force quant converts floating H3 QKV, attention
   output, and MLP weights to execution-scoped ConvRot-256 INT8. FinalLayer norm, modulation,
   and FP32 output projection also run in bounded token chunks using the same
-  activation chunk-row setting. The advanced precision selector offers four
+  activation chunk-row setting. Streamed attention normalizes and modulates
+  its input in requested row slices, then allocates its full output only after
+  input projection; incompatible attention consumers retain the normal
+  materialized input path. The advanced precision selector offers four
   policies: `Auto` chooses the best compatible path and may use FP8 conversion
   as a fallback; `BF16` materializes supported weights for BF16 execution;
   `Preserve native` never introduces a new weight conversion; and `Force quant`
@@ -38,7 +41,10 @@ control.
   format, while Q and attention output stay bounded to the configured chunk
   size. With Triton available, FP8 V routes reduce channel scales from the
   source V and write the final Sage carrier directly, without a full-size BF16
-  transpose temporary. Comfy's known built-in attention consumers retain full BF16 K/V,
+  transpose temporary. The advanced `Lower VRAM (slower)` attention-memory
+  mode uses that two-pass path for compatible dense and sparse Sage FP8 V
+  carriers as well as Kitchen INT8; Sage FP16 V and other unsupported carriers
+  retain the Standard path. Comfy's known built-in attention consumers retain full BF16 K/V,
   stream bounded BF16 Q, and write each output-projection chunk into the
   disposable block input. Unknown explicit attention overrides preserve a
   single full-Q invocation because their callable contract is opaque.

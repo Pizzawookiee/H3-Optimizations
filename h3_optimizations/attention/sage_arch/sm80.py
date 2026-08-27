@@ -134,6 +134,11 @@ class SageSM80MemoryEfficientBackend(ArchitectureBackend):
         )
         return v_fp16, None
 
+    def v_staging_parameters(self):
+        # FP16 V carrier: same size as the BF16 source, so a second pass would
+        # buy nothing. Two-pass V stays off here.
+        return None
+
     def execute_rectangular(
         self,
         q_int8,

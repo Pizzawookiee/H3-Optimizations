@@ -83,12 +83,18 @@ EMBEDDING_MEMORY_REQUESTS = (
     EMBEDDING_MEMORY_RELEASE,
 )
 
-KITCHEN_V_MEMORY_RETAIN = 'retain'
-KITCHEN_V_MEMORY_TWO_PASS = 'two_pass'
-KITCHEN_V_MEMORY_REQUESTS = (
-    KITCHEN_V_MEMORY_RETAIN,
-    KITCHEN_V_MEMORY_TWO_PASS,
+V_MEMORY_RETAIN = 'retain'
+V_MEMORY_TWO_PASS = 'two_pass'
+V_MEMORY_REQUESTS = (
+    V_MEMORY_RETAIN,
+    V_MEMORY_TWO_PASS,
 )
+# Two-pass V started out Kitchen-only. It now also covers the Sage FP8
+# carriers, so the neutral names above are canonical; these aliases keep the
+# original spelling working for callers that still use it.
+KITCHEN_V_MEMORY_RETAIN = V_MEMORY_RETAIN
+KITCHEN_V_MEMORY_TWO_PASS = V_MEMORY_TWO_PASS
+KITCHEN_V_MEMORY_REQUESTS = V_MEMORY_REQUESTS
 SPARSE_BACKEND_COMPAT_REQUESTS = (
     *SPARSE_BACKEND_REQUESTS,
     SPARSE_BACKEND_KITCHEN_LEGACY,
@@ -163,7 +169,7 @@ class MemoryRequest:
     prefer_held_weights: bool = True
     mlp_strict: bool = False
     embedding_memory: str = EMBEDDING_MEMORY_AUTO
-    kitchen_v_memory: str = KITCHEN_V_MEMORY_RETAIN
+    attention_v_memory: str = V_MEMORY_RETAIN
 
     def __post_init__(self):
         if self.attention not in ATTENTION_REQUESTS:
@@ -195,9 +201,9 @@ class MemoryRequest:
             raise ValueError(
                 'unknown embedding memory request %r' % self.embedding_memory
             )
-        if self.kitchen_v_memory not in KITCHEN_V_MEMORY_REQUESTS:
+        if self.attention_v_memory not in V_MEMORY_REQUESTS:
             raise ValueError(
-                'unknown Kitchen V memory request %r' % self.kitchen_v_memory
+                'unknown attention V memory request %r' % self.attention_v_memory
             )
         chunk_rows = int(self.chunk_rows)
         if not MIN_CHUNK_ROWS <= chunk_rows <= MAX_CHUNK_ROWS:
@@ -221,7 +227,7 @@ class MemoryRequest:
             bool(self.prefer_held_weights),
             bool(self.mlp_strict),
             self.embedding_memory,
-            self.kitchen_v_memory,
+            self.attention_v_memory,
         )
 
 

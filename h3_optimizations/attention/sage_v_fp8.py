@@ -147,6 +147,88 @@ if TRITON_AVAILABLE:
         )
 
 
+    @triton.jit
+    def _quantize_chunk_transpose_permute(
+        v,
+        amax,
+        carrier,
+        row_start,
+        heads: tl.constexpr,
+        rows: tl.constexpr,
+        padded_sequence: tl.constexpr,
+        head_dim: tl.constexpr,
+        stride_b: tl.constexpr,
+        stride_h: tl.constexpr,
+        stride_n: tl.constexpr,
+        stride_d: tl.constexpr,
+        scale_max: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        USE_I64: tl.constexpr,
+    ):
+        """Quantize one V chunk into its slice of the final permuted carrier.
+
+        Identical arithmetic to _quantize_transpose_permute, except the source
+        row index is chunk-local while the permuted destination row is global.
+        The permutation is defined within 16-row groups, so a chunk whose
+        row_start is 16-aligned lands in a disjoint span of the carrier.
+        """
+        flat_head = tl.program_id(0)
+        batch = flat_head // heads
+        head = flat_head % heads
+        n_block = tl.program_id(1)
+        n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        d = tl.arange(0, BLOCK_D)
+        if USE_I64:
+            batch = batch.to(tl.int64)
+            flat_head = flat_head.to(tl.int64)
+            head = head.to(tl.int64)
+            n = n.to(tl.int64)
+            d = d.to(tl.int64)
+        source_offsets = (
+            batch * stride_b
+            + head * stride_h
+            + n[:, None] * stride_n
+            + d[None, :] * stride_d
+        )
+        values = tl.load(
+            v + source_offsets,
+            mask=(n[:, None] < rows) & (d[None, :] < head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        channel_amax = tl.load(
+            amax + flat_head * head_dim + d,
+            mask=d < head_dim,
+            other=0.0,
+        )
+        quantized = values * (scale_max / channel_amax[None, :])
+
+        global_n = n + row_start
+        local = global_n % 16
+        permuted_n = (
+            (global_n // 16) * 16
+            + (local // 8) * 2
+            + ((local // 2) % 4) * 4
+            + local % 2
+        )
+        if USE_I64:
+            permuted_n = permuted_n.to(tl.int64)
+        destination_offsets = (
+            flat_head * head_dim * padded_sequence
+            + d[:, None] * padded_sequence
+            + permuted_n[None, :]
+        )
+        tl.store(
+            carrier + destination_offsets,
+            tl.trans(quantized),
+            mask=(
+                (d[:, None] < head_dim)
+                & (n[None, :] < rows)
+                & (permuted_n[None, :] < padded_sequence)
+            ),
+        )
+
+
 def direct_per_channel_fp8(v, *, scale_max, pad_to=64):
     if not TRITON_AVAILABLE:
         raise RuntimeError("direct Sage FP8 V conversion requires Triton")
