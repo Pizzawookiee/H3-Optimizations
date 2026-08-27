@@ -119,14 +119,6 @@ def _open_mlp(block, sample, config):
         held, error = _open_generic_held(block, sample, config)
         return held, 'held' if held is not None else 'module', error
 
-    # ConvRot two-slice is BF16-only. Turing/SM75 supplies FP16 H3
-    # activations, so this is an expected capability choice rather than a
-    # per-block failure. Select the existing format-compatible path directly
-    # unless strict mode explicitly asks us to fail instead of falling back.
-    if sample.dtype != torch.bfloat16 and not config.strict:
-        held, error = _open_generic_held(block, sample, config)
-        return held, 'held' if held is not None else 'module', error
-
     held = ConvRotTwoSliceMLP(block.mlp, sample)
     try:
         held.__enter__()
