@@ -87,6 +87,8 @@ class StageCoverageTests(unittest.TestCase):
         'anchor_projection': 'kitchen_qkv.py',
         'routing_summary_generation': 'kitchen_qkv.py',
         'v_retention_copy': 'kitchen_qkv.py',
+        'v_amax_update': 'kitchen_qkv.py',
+        'v_reprojection': 'kitchen_qkv.py',
         'carrier_finalize': 'kitchen_qkv.py',
         'producer_create': 'kitchen_qkv.py',
         'anchor_selection': 'native/producer.py',

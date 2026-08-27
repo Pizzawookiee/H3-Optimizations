@@ -24,11 +24,15 @@ from .qkv.streamed import (
     create_held_qkv,
     project_kv_hnd,
     project_q_hnd,
+    project_v_hnd,
 )
 from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 
 
 CHUNK_ROWS = 4096
+V_MODE_RETAIN = 'retain'
+V_MODE_TWO_PASS = 'two_pass'
+V_MODES = (V_MODE_RETAIN, V_MODE_TWO_PASS)
 STRIDED_QK_CAPABILITY = 'SUPPORTS_STRIDED_QK_CHUNK'
 PRODUCER_ABI_VERSION = 1
 PRODUCER_ABI = 'external_v%d' % PRODUCER_ABI_VERSION
@@ -205,6 +209,7 @@ def run_chunked_kitchen_qkv(
     routing_q_tile=None,
     routing_kv_tile=None,
     strided_qk_input=False,
+    v_mode=V_MODE_RETAIN,
 ):
     del layer_index, transformer_options
     routing_q_tile = int(
@@ -263,6 +268,13 @@ def run_chunked_kitchen_qkv(
 
         sequence = int(x.shape[0])
         chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
+        if v_mode not in V_MODES:
+            raise FusedQKVError('unknown Kitchen V mode %r' % v_mode)
+        staging = None
+        if v_mode == V_MODE_TWO_PASS:
+            from .native.v_staging import TwoPassVCarrier
+
+            staging = TwoPassVCarrier(spec)
         retained_v = None
         q_summaries = []
         k_summaries = []
@@ -276,7 +288,7 @@ def run_chunked_kitchen_qkv(
                 end,
                 projector=held,
             )
-            if retained_v is None:
+            if staging is None and retained_v is None:
                 retained_v = v.new_empty(
                     (1, int(module.heads), sequence, int(module.head_dim))
                 )
@@ -292,12 +304,27 @@ def run_chunked_kitchen_qkv(
                 k_start=start,
                 **chunk_kwargs,
             )
-            with diagnostics.stage('v_retention_copy'):
-                retained_v[:, :, start:end, :].copy_(v)
+            if staging is None:
+                with diagnostics.stage('v_retention_copy'):
+                    retained_v[:, :, start:end, :].copy_(v)
+            else:
+                with diagnostics.stage('v_amax_update'):
+                    staging.update(v)
             del q, k, v
 
-        kitchen.quantize_int8_attention_v(producer, retained_v)
-        del retained_v
+        if staging is None:
+            kitchen.quantize_int8_attention_v(producer, retained_v)
+            del retained_v
+        else:
+            staging.finalize_scale()
+            for start in range(0, sequence, int(chunk_rows)):
+                end = min(start + int(chunk_rows), sequence)
+                with diagnostics.stage('v_reprojection'):
+                    v = project_v_hnd(held, x, rope_freqs, start, end)
+                with diagnostics.stage('v_carrier_pack'):
+                    staging.quantize(v, start)
+                del v
+            producer.v, producer.v_scale = staging.finish()
         with diagnostics.stage('carrier_finalize'):
             return PreparedChunkedKitchenQKV(
                 kitchen.finalize_int8_attention_producer(producer),
@@ -324,6 +351,7 @@ def run_streamed_kitchen_qkv(
     chunk_rows,
     projection_mode,
     strided_qk_input=False,
+    v_mode=V_MODE_RETAIN,
 ):
     del layer_index, transformer_options
     kitchen = resolve_kitchen(x.device)
@@ -345,12 +373,19 @@ def run_streamed_kitchen_qkv(
         del samples
         producer = kitchen.create_int8_attention_producer(spec, anchor)
         sequence = int(x.shape[0])
+        if v_mode not in V_MODES:
+            raise FusedQKVError('unknown Kitchen V mode %r' % v_mode)
+        staging = None
+        if v_mode == V_MODE_TWO_PASS:
+            from .native.v_staging import TwoPassVCarrier
+
+            staging = TwoPassVCarrier(spec)
         retained_v = None
         chunk_kwargs = _qk_chunk_kwargs(kitchen, strided_qk_input)
         for start in range(0, sequence, int(chunk_rows)):
             end = min(start + int(chunk_rows), sequence)
             k, v = project_kv_hnd(held, x, rope_freqs, start, end)
-            if retained_v is None:
+            if staging is None and retained_v is None:
                 retained_v = v.new_empty(
                     (1, int(module.heads), sequence, int(module.head_dim))
                 )
@@ -360,11 +395,26 @@ def run_streamed_kitchen_qkv(
                 k_start=start,
                 **chunk_kwargs,
             )
-            with diagnostics.stage('v_retention_copy'):
-                retained_v[..., start:end, :].copy_(v)
+            if staging is None:
+                with diagnostics.stage('v_retention_copy'):
+                    retained_v[..., start:end, :].copy_(v)
+            else:
+                with diagnostics.stage('v_amax_update'):
+                    staging.update(v)
             del k, v
-        kitchen.quantize_int8_attention_v(producer, retained_v)
-        del retained_v
+        if staging is None:
+            kitchen.quantize_int8_attention_v(producer, retained_v)
+            del retained_v
+        else:
+            staging.finalize_scale()
+            for start in range(0, sequence, int(chunk_rows)):
+                end = min(start + int(chunk_rows), sequence)
+                with diagnostics.stage('v_reprojection'):
+                    v = project_v_hnd(held, x, rope_freqs, start, end)
+                with diagnostics.stage('v_carrier_pack'):
+                    staging.quantize(v, start)
+                del v
+            producer.v, producer.v_scale = staging.finish()
         carrier = kitchen.finalize_int8_attention_producer(producer)
     finally:
         held.__exit__(None, None, None)
@@ -394,6 +444,7 @@ class ChunkedKitchenQKVProjector:
         strided_qk_input=False,
         stream_output=False,
         streamed_q=False,
+        v_mode=V_MODE_RETAIN,
     ):
         self.chunk_rows = int(chunk_rows)
         self.force_weights_bf16 = bool(force_weights_bf16)
@@ -419,6 +470,9 @@ class ChunkedKitchenQKVProjector:
         self.strided_qk_input = bool(strided_qk_input)
         self.stream_output = bool(stream_output)
         self.streamed_q = bool(streamed_q)
+        if v_mode not in V_MODES:
+            raise ValueError('unknown Kitchen V mode %r' % v_mode)
+        self.v_mode = v_mode
         if self.streamed_q and not self.stream_output:
             raise ValueError('streamed Kitchen Q requires streamed output')
 
@@ -436,6 +490,7 @@ class ChunkedKitchenQKVProjector:
             self.strided_qk_input,
             self.stream_output,
             self.streamed_q,
+            self.v_mode,
         )
 
     def try_project(
@@ -537,6 +592,7 @@ class ChunkedKitchenQKVProjector:
                         chunk_rows=self.chunk_rows,
                         projection_mode=projection_mode,
                         strided_qk_input=self.strided_qk_input,
+                        v_mode=self.v_mode,
                     )
                 else:
                     projected = run_chunked_kitchen_qkv(
@@ -554,6 +610,7 @@ class ChunkedKitchenQKVProjector:
                         routing_q_tile=self.q_tile,
                         routing_kv_tile=self.kv_tile,
                         strided_qk_input=self.strided_qk_input,
+                        v_mode=self.v_mode,
                     )
                 if self.stream_output:
                     projected = replace(projected, output_buffer=x)
@@ -566,7 +623,11 @@ class ChunkedKitchenQKVProjector:
             TypeError,
             ValueError,
         ):
-            if self.force_weights_bf16 or self.convrot_int8_projection:
+            if (
+                self.force_weights_bf16
+                or self.convrot_int8_projection
+                or self.v_mode == V_MODE_TWO_PASS
+            ):
                 raise
             if (
                 not self.fp8_projection

@@ -85,6 +85,8 @@ STAGE_NAMES = (
     'qk_carrier_pack',
     'qk_pack_input_contiguous',
     'v_carrier_pack',
+    'v_amax_update',
+    'v_reprojection',
     'v_retention_copy',
     'carrier_finalize',
     'sparse_route',

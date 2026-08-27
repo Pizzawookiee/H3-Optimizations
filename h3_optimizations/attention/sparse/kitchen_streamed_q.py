@@ -26,6 +26,7 @@ from ... import diagnostics
 from ...kitchen_qkv import (
     CHUNK_ROWS,
     PRODUCER_ABI_VERSION,
+    V_MODE_TWO_PASS,
     ChunkedKitchenQKVProjector,
     FusedQKVError,
     _native_bf16_format,
@@ -44,6 +45,7 @@ from ...qkv.streamed import (
     create_held_qkv,
     project_kv_hnd,
     project_q_hnd,
+    project_v_hnd,
 )
 from .config import resolve_video_budget
 from .kitchen_sparse import (
@@ -223,6 +225,11 @@ def _run_streamed_sparse_kitchen_qkv(
         producer = kitchen.create_int8_attention_producer(spec, anchor)
         del anchor
 
+        staging = None
+        if projector.v_mode == V_MODE_TWO_PASS:
+            from ...native.v_staging import TwoPassVCarrier
+
+            staging = TwoPassVCarrier(spec)
         retained_v = None
         kv_tiles = (sequence + kv_tile - 1) // kv_tile
         k_summary = x.new_empty(
@@ -233,7 +240,7 @@ def _run_streamed_sparse_kitchen_qkv(
         for start in range(0, sequence, chunk_rows):
             end = min(start + chunk_rows, sequence)
             k, v = project_kv_hnd(held, x, rope_freqs, start, end)
-            if retained_v is None:
+            if staging is None and retained_v is None:
                 retained_v = v.new_empty(shape)
             kitchen.quantize_int8_attention_k_chunk(
                 producer,
@@ -246,11 +253,26 @@ def _run_streamed_sparse_kitchen_qkv(
             k_summary[
                 ..., k_start : k_start + int(k_mean.shape[-2]), :
             ].copy_(k_mean)
-            retained_v[..., start:end, :].copy_(v)
+            if staging is None:
+                retained_v[..., start:end, :].copy_(v)
+            else:
+                with diagnostics.stage("v_amax_update"):
+                    staging.update(v)
             del k_mean, k, v
 
-        kitchen.quantize_int8_attention_v(producer, retained_v)
-        del retained_v
+        if staging is None:
+            kitchen.quantize_int8_attention_v(producer, retained_v)
+            del retained_v
+        else:
+            staging.finalize_scale()
+            for start in range(0, sequence, chunk_rows):
+                end = min(start + chunk_rows, sequence)
+                with diagnostics.stage("v_reprojection"):
+                    v = project_v_hnd(held, x, rope_freqs, start, end)
+                with diagnostics.stage("v_carrier_pack"):
+                    staging.quantize(v, start)
+                del v
+            producer.v, producer.v_scale = staging.finish()
         carrier = kitchen.finalize_int8_attention_producer(producer)
     finally:
         held.__exit__(None, None, None)

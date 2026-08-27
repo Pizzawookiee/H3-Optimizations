@@ -325,6 +325,14 @@ class HeldFP8QKV:
             v.transpose(0, 1).unsqueeze(0),
         )
 
+    def project_v_hnd(self, x, rope_freqs, start, end):
+        del rope_freqs
+        inner = int(self.attention.heads) * int(self.attention.head_dim)
+        with diagnostics.stage("qkv_linear"):
+            v = self.binding.linear_range(x[start:end], inner * 2, inner * 3)
+        v = v.view(end - start, self.attention.heads, self.attention.head_dim)
+        return v.transpose(0, 1).unsqueeze(0)
+
     def project_rows(self, x, rope_freqs, rows):
         sample_x = x.index_select(0, rows)
         sample_rope = (

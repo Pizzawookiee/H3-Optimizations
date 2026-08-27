@@ -16,6 +16,8 @@ from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
     H3OptimizationPlan,
+    KITCHEN_V_MEMORY_RETAIN,
+    KITCHEN_V_MEMORY_TWO_PASS,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MLP_MEMORY_PRESERVE,
     MemoryRequest,
@@ -34,12 +36,19 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(request.prefer_held_weights)
         self.assertFalse(request.mlp_strict)
         self.assertEqual(request.embedding_memory, EMBEDDING_MEMORY_AUTO)
+        self.assertEqual(request.kitchen_v_memory, KITCHEN_V_MEMORY_RETAIN)
 
     def test_embedding_memory_is_part_of_memory_identity(self):
         request = MemoryRequest(embedding_memory=EMBEDDING_MEMORY_RELEASE)
         self.assertIn(EMBEDDING_MEMORY_RELEASE, request.signature)
         with self.assertRaisesRegex(ValueError, 'embedding memory'):
             MemoryRequest(embedding_memory='unknown')
+
+    def test_kitchen_v_memory_is_explicit_and_part_of_identity(self):
+        request = MemoryRequest(kitchen_v_memory=KITCHEN_V_MEMORY_TWO_PASS)
+        self.assertIn(KITCHEN_V_MEMORY_TWO_PASS, request.signature)
+        with self.assertRaisesRegex(ValueError, 'Kitchen V memory'):
+            MemoryRequest(kitchen_v_memory='unknown')
 
     def test_preserve_precision_is_a_valid_memory_request(self):
         request = MemoryRequest(mlp_memory=MLP_MEMORY_PRESERVE)

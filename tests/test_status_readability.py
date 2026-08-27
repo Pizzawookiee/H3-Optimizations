@@ -55,6 +55,39 @@ class QKVStatusReadabilityTests(unittest.TestCase):
         )
         self.assertNotIn('streamed_bf16_kitchen_qkv', text)
 
+    def _status_with_v_memory(self, requested, effective):
+        status = dict(self.status)
+        status['fused_qkv'] = dict(self.status['fused_qkv'])
+        status['fused_qkv']['v_memory_requested'] = requested
+        status['fused_qkv']['v_memory'] = effective
+        return SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: status},
+            }
+        )
+
+    def test_ignored_lower_vram_request_is_reported_not_silent(self):
+        model = self._status_with_v_memory('two_pass', None)
+
+        text = format_sparse_status(model)
+
+        self.assertIn('Lower VRAM requested but not available', text)
+        self.assertIn('running Standard', text)
+
+    def test_honoured_lower_vram_request_reports_no_warning(self):
+        model = self._status_with_v_memory('two_pass', 'two_pass')
+
+        text = format_sparse_status(model)
+
+        self.assertNotIn('not available', text)
+
+    def test_standard_request_reports_no_warning(self):
+        model = self._status_with_v_memory('retain', None)
+
+        text = format_sparse_status(model)
+
+        self.assertNotIn('not available', text)
+
     def test_auto_kitchen_success_is_not_labeled_as_fallback(self):
         status = dict(self.status)
         status['attention'] = {

@@ -122,6 +122,18 @@ class EmbeddingMemoryTests(unittest.TestCase):
         self.assertTrue(embedding.clear(patcher))
         self.assertNotIn(embedding.FORWARD_KEY, patcher.object_patches)
 
+    def test_install_recovers_original_from_applied_patch(self):
+        model = self._model()
+        first = Patcher(model)
+        self.assertTrue(embedding.install(first))
+        model._forward = first.object_patches[embedding.FORWARD_KEY]
+
+        rebuilt = Patcher(model)
+        self.assertTrue(embedding.install(rebuilt, force_rebuild=True))
+        installed = rebuilt.object_patches[embedding.FORWARD_KEY]
+        self.assertTrue(getattr(installed, embedding.OWNER_MARKER))
+        self.assertIsNotNone(getattr(installed, embedding.ORIGINAL_MARKER))
+
     def test_foreign_forward_patch_is_preserved(self):
         patcher = Patcher(self._model())
         foreign = lambda *args, **kwargs: None
@@ -134,16 +146,16 @@ class EmbeddingMemoryTests(unittest.TestCase):
             ]
         )
 
-    def test_changed_upstream_forward_fails_closed(self):
+    def test_incompatible_upstream_forward_fails_closed(self):
         patcher = Patcher(self._model())
         with mock.patch.object(
-            embedding,
-            '_source_digest',
-            return_value='changed',
+            embedding.inspect,
+            'getsource',
+            return_value='def _forward(self, x):\n    return x\n',
         ):
             with self.assertRaisesRegex(
                 embedding.H3EmbeddingMemoryPatchError,
-                'changed',
+                'assembly changed',
             ):
                 embedding.install(patcher)
 

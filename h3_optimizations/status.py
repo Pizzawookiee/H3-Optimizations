@@ -94,6 +94,8 @@ def format_qkv_execution(status):
         details = []
         if qkv.get('output_streamed'):
             details.append('output streamed')
+        if qkv.get('v_memory') == 'two_pass':
+            details.append('two-pass V')
         return text if not details else '%s; %s' % (text, '; '.join(details))
 
     if provider in ('chunked_bf16_qkv', 'force_bf16_qkv'):
@@ -214,6 +216,23 @@ def _mark_runtime_fallback(qkv, line):
     return line
 
 
+def _v_memory_notice(qkv):
+    '''Report a Lower VRAM request the active attention path cannot honour.
+
+    Only the Kitchen INT8 projectors stage V in two passes. Every other
+    attention path retains V, so staying silent would leave the readout
+    implying a saving that never happened.
+    '''
+    if qkv.get('v_memory_requested') != 'two_pass':
+        return None
+    if qkv.get('v_memory') == 'two_pass':
+        return None
+    return (
+        'Attention memory mode: Lower VRAM requested but not available on '
+        'this attention path; running Standard.'
+    )
+
+
 def _composition_lines(status):
     composition = status.get('composition') or {}
     lines = []
@@ -279,6 +298,9 @@ def format_memory_status(model):
         lines.append('Embedding memory: released before block 0')
     elif embedding_memory.get('selected') == 'stock':
         lines.append('Embedding memory: stock lifetime')
+    v_memory_notice = _v_memory_notice(qkv)
+    if v_memory_notice is not None:
+        lines.append(v_memory_notice)
     lines.extend(_composition_lines(status))
     return '\n'.join(lines)
 
@@ -397,5 +419,8 @@ def format_sparse_status(model):
             'MLP: %s'
             % _provider_text(mlp, 'off')
         )
+    v_memory_notice = _v_memory_notice(qkv)
+    if v_memory_notice is not None:
+        lines.append(v_memory_notice)
     lines.extend(_composition_lines(status))
     return '\n'.join(lines)

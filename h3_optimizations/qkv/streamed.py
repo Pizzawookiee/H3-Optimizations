@@ -76,6 +76,16 @@ def project_kv_hnd(held, x, rope_freqs, start, end):
     return k, v
 
 
+def project_v_hnd(held, x, rope_freqs, start, end):
+    """Project V alone; two-pass staging requires this bounded row slice."""
+    project_v = getattr(held, "project_v_hnd", None)
+    if not callable(project_v):
+        raise StreamedQKVBindingError(
+            '%s does not expose V-only projection' % type(held).__name__
+        )
+    return project_v(x, rope_freqs, start, end)
+
+
 __all__ = [
     "PROJECTION_FORCE_BF16",
     "PROJECTION_FORCE_FP8",
@@ -86,4 +96,5 @@ __all__ = [
     "create_held_qkv",
     "project_kv_hnd",
     "project_q_hnd",
+    "project_v_hnd",
 ]

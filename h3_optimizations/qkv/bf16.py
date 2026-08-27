@@ -238,6 +238,13 @@ class HeldBF16QKV:
             q = self._finish_single_qk(q, rope, self.attention.q_norm)
         return q.transpose(0, 1).unsqueeze(0)
 
+    def project_v_hnd(self, x, rope_freqs, start, end):
+        del rope_freqs
+        inner = int(self.attention.heads) * int(self.attention.head_dim)
+        v = self._project_slice(x[start:end], inner * 2, inner * 3)
+        v = v.view(end - start, self.attention.heads, self.attention.head_dim)
+        return v.transpose(0, 1).unsqueeze(0)
+
     def project_hnd(self, x, rope_freqs, start, end):
         rope = None if rope_freqs is None else rope_freqs[:, start:end]
         return self._finish(x[start:end], rope)

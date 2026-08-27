@@ -6,7 +6,7 @@ import platform
 
 # Bump when the native sources or committed binaries change. This marker is
 # also what a bug report should quote.
-NATIVE_BUILD = 'native-v6'
+NATIVE_BUILD = 'native-v7'
 
 REQUIRED_ABI = 3
 

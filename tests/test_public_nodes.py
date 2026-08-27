@@ -22,6 +22,8 @@ comfy.options.enable_args_parsing()
 from h3_optimizations.aimdo_limiter import H3AIMDOResidencyLimiter  # noqa: E402
 from h3_optimizations.memory_migration_node import (  # noqa: E402
     H3MemoryOptimization,
+    KITCHEN_V_MEMORY_MODE_RETAIN,
+    KITCHEN_V_MEMORY_MODE_TWO_PASS,
     PRECISION_MODE_ALLOW_FP8,
     PRECISION_MODE_AUTO,
     PRECISION_MODE_BF16,
@@ -55,6 +57,8 @@ from h3_optimizations.plan import (  # noqa: E402
     QKV_STREAMING_AUTO,
     QKV_STREAMING_FORCED,
     QKV_STREAMING_OFF,
+    KITCHEN_V_MEMORY_RETAIN,
+    KITCHEN_V_MEMORY_TWO_PASS,
 )
 from h3_optimizations.public_nodes import H3OptimizationsExtension  # noqa: E402
 
@@ -101,6 +105,18 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.attention, ATTENTION_EXISTING)
         self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_AUTO)
+        self.assertEqual(request.kitchen_v_memory, KITCHEN_V_MEMORY_RETAIN)
+
+    def test_two_pass_v_mode_is_explicit(self):
+        request = _memory_request_for_modes(
+            fused_qkv='auto',
+            mlp_memory='auto',
+            chunk_rows=2048,
+            precision_mode=PRECISION_MODE_PRESERVE_NATIVE,
+            qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
+            kitchen_v_memory_mode=KITCHEN_V_MEMORY_MODE_TWO_PASS,
+        )
+        self.assertEqual(request.kitchen_v_memory, KITCHEN_V_MEMORY_TWO_PASS)
 
     def test_streaming_forced_claims_attention(self):
         request = _memory_request_for_modes(
@@ -174,9 +190,11 @@ class PublicNodeTests(unittest.TestCase):
         precision_index = ids.index('precision_mode')
         streaming_index = ids.index('qkv_streaming_mode')
         embedding_index = ids.index('embedding_memory_mode')
+        v_memory_index = ids.index('kitchen_v_memory_mode')
         self.assertEqual(precision_index, legacy_index + 1)
         self.assertEqual(streaming_index, precision_index + 1)
         self.assertEqual(embedding_index, streaming_index + 1)
+        self.assertEqual(v_memory_index, embedding_index + 1)
 
         legacy = inputs[legacy_index]
         precision = inputs[precision_index]
@@ -186,6 +204,21 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(precision.default, PRECISION_MODE_AUTO)
         self.assertEqual(streaming.default, QKV_STREAMING_MODE_AUTO)
         self.assertEqual(inputs[embedding_index].default, 'Auto')
+        self.assertTrue(inputs[embedding_index].extra_dict.get('hidden'))
+        attention_memory = inputs[v_memory_index]
+        self.assertEqual(attention_memory.display_name, 'Attention memory mode')
+        self.assertEqual(
+            attention_memory.options,
+            ['Standard', 'Lower VRAM (slower)'],
+        )
+        self.assertEqual(attention_memory.default, KITCHEN_V_MEMORY_MODE_RETAIN)
+        visible_text = ' '.join(
+            [attention_memory.display_name, attention_memory.tooltip]
+            + attention_memory.options
+        ).lower()
+        self.assertNotIn('kitchen', visible_text)
+        self.assertNotIn('two-pass', visible_text)
+        self.assertNotIn('bf16 v', visible_text)
 
     def test_memory_node_accepts_legacy_precision_values(self):
         self.assertTrue(H3MemoryOptimization.validate_inputs(PRECISION_MODE_PRESERVE))

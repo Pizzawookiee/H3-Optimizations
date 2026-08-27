@@ -53,6 +53,7 @@ from .kitchen_qkv import (
     PRODUCER_ABI as KITCHEN_PRODUCER_ABI,
     ChunkedKitchenAttentionBackend,
     ChunkedKitchenQKVProjector,
+    V_MODE_RETAIN,
     producer_api_available,
 )
 from .memory.config import ActivationMemoryConfig
@@ -70,6 +71,7 @@ from .plan import (
     FUSED_QKV_OFF,
     EMBEDDING_MEMORY_STOCK,
     H3OptimizationPlan,
+    KITCHEN_V_MEMORY_RETAIN,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
@@ -447,6 +449,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
             strided_qk_input=True,
             stream_output=True,
             streamed_q=True,
+            v_mode=memory.kitchen_v_memory,
         )
     return (
         ResolvedAttention(
@@ -716,6 +719,11 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             stream_output=True,
             convrot_int8_projection=(
                 qkv.provider_id == QKV_FORCE_CONVROT_INT8_KITCHEN
+            ),
+            v_mode=(
+                V_MODE_RETAIN
+                if plan.memory is None
+                else plan.memory.kitchen_v_memory
             ),
         )
     else:
@@ -1016,6 +1024,12 @@ def _status(
             'output_streamed': bool(
                 getattr(attention.projector, 'stream_output', False)
                 or getattr(attention.backend, 'stream_output', False)
+            ),
+            'v_memory': getattr(attention.projector, 'v_mode', None),
+            'v_memory_requested': (
+                KITCHEN_V_MEMORY_RETAIN
+                if plan.memory is None
+                else plan.memory.kitchen_v_memory
             ),
             'producer_abi': (
                 KITCHEN_PRODUCER_ABI

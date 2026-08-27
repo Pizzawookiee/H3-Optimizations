@@ -35,6 +35,7 @@ from h3_optimizations.attention.sparse import kitchen_streamed_q
 from h3_optimizations.attention.sparse.router import SparseTileRouter
 from h3_optimizations.attention.sparse import kitchen_sparse
 from h3_optimizations.kitchen_qkv import ChunkedKitchenQKVProjector
+from h3_optimizations.kitchen_qkv import V_MODE_RETAIN, V_MODE_TWO_PASS
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -127,6 +128,12 @@ class StreamedSparseKitchenRoutingTests(unittest.TestCase):
     def test_dense_projector_default_is_unchanged(self):
         projector = ChunkedKitchenQKVProjector()
         self.assertFalse(projector.streamed_q)
+        self.assertEqual(projector.v_mode, V_MODE_RETAIN)
+
+    def test_two_pass_v_is_part_of_projector_identity(self):
+        projector = ChunkedKitchenQKVProjector(v_mode=V_MODE_TWO_PASS)
+        self.assertEqual(projector.v_mode, V_MODE_TWO_PASS)
+        self.assertIn(V_MODE_TWO_PASS, projector.installation_signature)
 
     def test_sparse_backend_symbol_is_upgraded(self):
         self.assertIs(kitchen_sparse.SparseKitchenBackend, StreamedSparseKitchenBackend)

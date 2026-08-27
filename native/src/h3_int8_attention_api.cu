@@ -93,6 +93,16 @@ void launch_quant_v_int8_kernel(const void *v, void *out, void *scale, int B,
                                 int64_t sh, int64_t sn, int input_dtype_code,
                                 cudaStream_t stream);
 
+void launch_v_amax_chunk(const void *v, void *amax, int B, int H, int rows,
+                         int D, int64_t sb, int64_t sh, int64_t sn,
+                         int input_dtype_code, cudaStream_t stream);
+
+void launch_quant_v_chunk_into(const void *v, void *out, const void *scale,
+                               int B, int H, int rows, int row_start, int D,
+                               int padded_N, int64_t sb, int64_t sh,
+                               int64_t sn, int input_dtype_code,
+                               cudaStream_t stream);
+
 namespace {
 
 // One slot per thread: a failed call on one stream must not overwrite the
@@ -242,6 +252,24 @@ H3_API int h3_int8_quantize_v(const void *v, void *out, void *scale, int B, int 
   H3_GUARD(launch_quant_v_int8_kernel(v, out, scale, B, H, N, D, padded_N, sb,
                                       sh, sn, input_dtype_code,
                                       reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_v_amax_chunk(const void *v, void *amax, int B, int H,
+                                int rows, int D, int64_t sb, int64_t sh,
+                                int64_t sn, int input_dtype_code,
+                                uintptr_t stream) noexcept {
+  H3_GUARD(launch_v_amax_chunk(v, amax, B, H, rows, D, sb, sh, sn,
+                               input_dtype_code,
+                               reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_quantize_v_chunk_into(
+    const void *v, void *out, const void *scale, int B, int H, int rows,
+    int row_start, int D, int padded_N, int64_t sb, int64_t sh, int64_t sn,
+    int input_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_quant_v_chunk_into(
+      v, out, scale, B, H, rows, row_start, D, padded_N, sb, sh, sn,
+      input_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
 }
 
 } // extern "C"

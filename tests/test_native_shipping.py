@@ -52,6 +52,27 @@ class NativeShippingTests(unittest.TestCase):
         linux_binary = BIN_DIR / 'libh3_int8_attention.so'
         self.assertLess(linux_binary.stat().st_size, MAX_LINUX_BINARY_BYTES)
 
+    def test_shipped_binaries_export_the_current_kernel_surface(self):
+        # BUILD_ID is a claim, not evidence: a stale binary alongside a bumped
+        # BUILD_ID passes every size and magic-number check above. Assert the
+        # entry points the Python bindings dlsym at runtime are really present.
+        required = (
+            b'h3_int8_quantize_v',
+            b'h3_int8_v_amax_chunk',
+            b'h3_int8_quantize_v_chunk_into',
+        )
+        for name in ('h3_int8_attention_v4.dll', 'libh3_int8_attention.so'):
+            contents = (BIN_DIR / name).read_bytes()
+            for symbol in required:
+                self.assertIn(symbol, contents, '%s is missing %s' % (name, symbol.decode()))
+
+    def test_v_staging_symbol_list_matches_the_shipped_binaries(self):
+        from h3_optimizations.native import v_staging
+
+        contents = (BIN_DIR / 'libh3_int8_attention.so').read_bytes()
+        for symbol in v_staging._NATIVE_SYMBOLS:
+            self.assertIn(symbol.encode(), contents, symbol)
+
     def test_obsolete_windows_binary_is_not_shipped(self):
         self.assertFalse((BIN_DIR / 'h3_int8_attention_v3.dll').exists())
 
@@ -169,14 +190,14 @@ class NativeShippingTests(unittest.TestCase):
             ),
             mock.patch(
                 'h3_optimizations.native.bootstrap.installed_build_id',
-                return_value='native-v6',
+                return_value='native-v7',
             ),
         ):
             key = selftest._cache_key('cuda')
 
         self.assertEqual(
             key,
-            'sm120|native-v6|%s|NVIDIA GeForce RTX 5070 Ti'
+            'sm120|native-v7|%s|NVIDIA GeForce RTX 5070 Ti'
             % selftest._SELFTEST_REVISION,
         )
 

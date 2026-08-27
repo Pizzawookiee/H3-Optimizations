@@ -20,6 +20,8 @@ from .plan import (
     FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
+    KITCHEN_V_MEMORY_RETAIN,
+    KITCHEN_V_MEMORY_TWO_PASS,
     MAX_CHUNK_ROWS,
     MIN_CHUNK_ROWS,
     MLP_MEMORY_AUTO,
@@ -70,6 +72,13 @@ EMBEDDING_MEMORY_MODE_OPTIONS = (
     EMBEDDING_MEMORY_MODE_RELEASE,
 )
 
+KITCHEN_V_MEMORY_MODE_RETAIN = 'Standard'
+KITCHEN_V_MEMORY_MODE_TWO_PASS = 'Lower VRAM (slower)'
+KITCHEN_V_MEMORY_MODE_OPTIONS = (
+    KITCHEN_V_MEMORY_MODE_RETAIN,
+    KITCHEN_V_MEMORY_MODE_TWO_PASS,
+)
+
 
 def _normalize_precision_mode(precision_mode):
     mode = _PRECISION_MODE_COMPATIBILITY.get(precision_mode, precision_mode)
@@ -96,6 +105,7 @@ def _memory_request_for_modes(
     precision_mode,
     qkv_streaming_mode,
     embedding_memory_mode=EMBEDDING_MEMORY_MODE_AUTO,
+    kitchen_v_memory_mode=KITCHEN_V_MEMORY_MODE_RETAIN,
 ):
     # fused_qkv is a serialized compatibility tombstone. QKV streaming is the
     # authoritative public policy now; keeping the argument preserves old
@@ -135,16 +145,20 @@ def _memory_request_for_modes(
         else mlp_memory
     )
 
-    embedding_requests = {
-        EMBEDDING_MEMORY_MODE_AUTO: EMBEDDING_MEMORY_AUTO,
-        EMBEDDING_MEMORY_MODE_STOCK: EMBEDDING_MEMORY_STOCK,
-        EMBEDDING_MEMORY_MODE_RELEASE: EMBEDDING_MEMORY_RELEASE,
+    # Serialized compatibility slot from 0.2.21. Early release is a
+    # semantics-preserving free win, so production no longer exposes a policy
+    # choice for it.
+    del embedding_memory_mode
+
+    v_memory_requests = {
+        KITCHEN_V_MEMORY_MODE_RETAIN: KITCHEN_V_MEMORY_RETAIN,
+        KITCHEN_V_MEMORY_MODE_TWO_PASS: KITCHEN_V_MEMORY_TWO_PASS,
     }
     try:
-        embedding_request = embedding_requests[embedding_memory_mode]
+        v_memory_request = v_memory_requests[kitchen_v_memory_mode]
     except KeyError as exc:
         raise ValueError(
-            'unknown embedding memory mode %r' % embedding_memory_mode
+            'unknown attention memory mode %r' % kitchen_v_memory_mode
         ) from exc
 
     return MemoryRequest(
@@ -157,7 +171,8 @@ def _memory_request_for_modes(
             PRECISION_MODE_BF16,
             PRECISION_MODE_FORCE_QUANT,
         ),
-        embedding_memory=embedding_request,
+        embedding_memory=EMBEDDING_MEMORY_AUTO,
+        kitchen_v_memory=v_memory_request,
     )
 
 
@@ -278,14 +293,27 @@ class H3MemoryOptimization(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     'embedding_memory_mode',
-                    display_name='Embedding memory',
+                    display_name='Legacy embedding memory',
                     options=list(EMBEDDING_MEMORY_MODE_OPTIONS),
                     default=EMBEDDING_MEMORY_MODE_AUTO,
                     advanced=True,
+                    extra_dict={
+                        'hidden': True,
+                        'tooltip': (
+                            'Legacy serialized workflow slot. The value is ignored; '
+                            'embedding assembly tensors are always released early.'
+                        ),
+                    },
+                ),
+                io.Combo.Input(
+                    'kitchen_v_memory_mode',
+                    display_name='Attention memory mode',
+                    options=list(KITCHEN_V_MEMORY_MODE_OPTIONS),
+                    default=KITCHEN_V_MEMORY_MODE_RETAIN,
+                    advanced=True,
                     tooltip=(
-                        'Auto releases visual and audio embedding-assembly tensors '
-                        'after they are copied into the packed hidden state. Stock '
-                        'keeps ComfyUI\'s original lifetime for comparison.'
+                        'Standard prioritizes speed. Lower VRAM uses additional '
+                        'attention work to reduce peak memory.'
                     ),
                 ),
             ],
@@ -303,6 +331,7 @@ class H3MemoryOptimization(io.ComfyNode):
         precision_mode=PRECISION_MODE_AUTO,
         qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
         embedding_memory_mode=EMBEDDING_MEMORY_MODE_AUTO,
+        kitchen_v_memory_mode=KITCHEN_V_MEMORY_MODE_RETAIN,
     ):
         del preserve_precision
         plan = read_plan(model).with_memory(
@@ -313,6 +342,7 @@ class H3MemoryOptimization(io.ComfyNode):
                 precision_mode=precision_mode,
                 qkv_streaming_mode=qkv_streaming_mode,
                 embedding_memory_mode=embedding_memory_mode,
+                kitchen_v_memory_mode=kitchen_v_memory_mode,
             )
         )
         patched = apply_plan(model, plan)

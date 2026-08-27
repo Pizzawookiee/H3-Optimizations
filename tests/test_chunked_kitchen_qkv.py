@@ -349,6 +349,106 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             ],
         )
 
+    def test_streamed_two_pass_v_reprojects_only_v_chunks(self):
+        class Held:
+            def __init__(self):
+                self.kv_calls = []
+                self.v_calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def project_rows(self, _x, _rope, rows):
+                shape = (1, 2, len(rows), 128)
+                values = torch.zeros(shape, dtype=torch.bfloat16)
+                return values, values, values
+
+            def project_kv_hnd(self, _x, _rope, start, end):
+                self.kv_calls.append((start, end))
+                values = torch.zeros(1, 2, end - start, 128, dtype=torch.bfloat16)
+                return values, values + 1
+
+            def project_v_hnd(self, _x, _rope, start, end):
+                self.v_calls.append((start, end))
+                return torch.full(
+                    (1, 2, end - start, 128),
+                    2,
+                    dtype=torch.bfloat16,
+                )
+
+        class Staging:
+            instance = None
+
+            def __init__(self, _spec):
+                Staging.instance = self
+                self.updates = []
+                self.quantized = []
+                self.output_v = object()
+                self.output_scale = object()
+
+            def update(self, value):
+                self.updates.append(value.clone())
+
+            def finalize_scale(self):
+                return None
+
+            def quantize(self, value, start):
+                self.quantized.append((start, value.clone()))
+
+            def finish(self):
+                return self.output_v, self.output_scale
+
+        class Kitchen:
+            Int8AttentionProducerUnavailableError = RuntimeError
+
+            @staticmethod
+            def select_int8_attention_k_anchor(_spec, _samples):
+                return object()
+
+            @staticmethod
+            def create_int8_attention_producer(_spec, _anchor):
+                return SimpleNamespace(v=None, v_scale=None)
+
+            @staticmethod
+            def quantize_int8_attention_k_chunk(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def finalize_int8_attention_producer(producer):
+                return producer
+
+        held = Held()
+        spec = SimpleNamespace(k_anchor_positions=(0,) * 9)
+        x = torch.zeros(5, 256, dtype=torch.bfloat16)
+        with (
+            mock.patch.object(kitchen_qkv, 'resolve_kitchen', return_value=Kitchen()),
+            mock.patch.object(kitchen_qkv, 'create_held_qkv', return_value=held),
+            mock.patch(
+                'h3_optimizations.native.v_staging.TwoPassVCarrier',
+                Staging,
+            ),
+        ):
+            projected = kitchen_qkv.run_streamed_kitchen_qkv(
+                SimpleNamespace(heads=2, head_dim=128),
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+                spec=spec,
+                chunk_rows=2,
+                projection_mode='native',
+                v_mode=kitchen_qkv.V_MODE_TWO_PASS,
+            )
+
+        self.assertEqual(held.kv_calls, [(0, 2), (2, 4), (4, 5)])
+        self.assertEqual(held.v_calls, held.kv_calls)
+        self.assertEqual(len(Staging.instance.updates), 3)
+        self.assertEqual([start for start, _ in Staging.instance.quantized], [0, 2, 4])
+        self.assertIs(projected.carrier.v, Staging.instance.output_v)
+
     def test_policy_fp8_auto_binding_does_not_override_forced_bf16(self):
         projector = apply_policy.PolicyChunkedKitchenQKVProjector(
             force_weights_bf16=True,

@@ -125,6 +125,8 @@ class PolicyChunkedKitchenQKVProjector(_BASE_KITCHEN_PROJECTOR):
                 kv_tile=self.kv_tile,
                 strided_qk_input=self.strided_qk_input,
                 stream_output=self.stream_output,
+                streamed_q=self.streamed_q,
+                v_mode=self.v_mode,
             )
             return delegate.try_project(
                 module,
