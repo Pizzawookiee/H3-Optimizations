@@ -344,7 +344,12 @@ def _launch_streamed_chunk(
     expected = (1, heads, int(sparse_lut.shape[-2]), int(sparse_selected))
     if tuple(sparse_lut.shape) != expected:
         raise TritonBF16Error('streamed BF16 Triton sparse route shape differs')
-    output = torch.empty_like(q)
+
+    # Each Triton program owns one (Q tile, head), loads that complete Q tile
+    # before entering the KV loop, and no other program reads those Q rows for
+    # that head. The store at the end can therefore safely overwrite the Q slab
+    # in place. This makes one bounded allocation serve as both Q and O.
+    output = q
 
     def launch_group(q_start, q_count, selected, use_route, lut):
         if not q_count:
@@ -538,7 +543,7 @@ class TritonBF16Backend:
                     self._streamed_q_announced = True
                     logging.info(
                         '[H3 Optimizations] streamed BF16 Triton ran: '
-                        'global K/V, bounded Q/output, chunk_rows=%d',
+                        'global K/V, aliased Q/output slab, chunk_rows=%d',
                         int(prepared.metadata['query_chunk_rows']),
                     )
                 return result
@@ -578,7 +583,7 @@ class TritonBF16Backend:
             'chunked_qkv': self.projector is not None,
             'streamed_q': bool(getattr(self.projector, 'streamed_q', False)),
             'qkv_lifetime': (
-                'global_bf16_kv_bounded_q'
+                'global_bf16_kv_bounded_q_inplace_o'
                 if getattr(self.projector, 'streamed_q', False)
                 else 'global_bf16_qkv'
             ),
