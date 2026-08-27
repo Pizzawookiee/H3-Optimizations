@@ -326,9 +326,9 @@ def prepare_streamed_triton_bf16(
             "sparse_backend": backend.name,
             "route_format": "dense_implicit_plus_sparse_absolute_int32",
             "program_shape": "one_64q_tile_x_one_head_x_full_d128",
-            "qkv_lifetime": "streamed_q_global_bf16_kv",
-            "router_lifetime": "k_summary_q_slab_selection",
-            "attention_output": "chunked_out_proj_inplace",
+            "qkv_lifetime": "streamed_q_inplace_o_global_bf16_kv",
+            "router_lifetime": "k_summary_until_final_q_route",
+            "attention_output": "q_slab_reused_then_chunked_out_proj_inplace",
             "query_chunk_rows": projected.chunk_rows,
             "out_proj_chunk_rows": OUT_PROJ_CHUNK_ROWS,
         }
@@ -374,6 +374,14 @@ def execute_streamed_triton_bf16(module, backend, prepared):
                     q_tile_start=start // Q_TILE,
                 )
             del q_summary
+
+            # After the last query slab has selected its route, the global K
+            # summary has no remaining consumer. Drop it before attention so
+            # the same-stream allocator may reuse those bytes immediately.
+            if end == sequence and prepared.route_plan is not None:
+                prepared.route_plan.release()
+                prepared.route_plan = None
+
             with diagnostics.stage("sparse_attention_kernel"):
                 output = _launch_streamed_chunk(
                     q,
