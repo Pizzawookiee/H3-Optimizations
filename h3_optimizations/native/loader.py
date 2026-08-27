@@ -27,10 +27,10 @@ import threading
 
 import torch
 
-ABI_VERSION = 3
+ABI_VERSION = 4
 
 _LIBRARY_NAMES = {
-    'Windows': 'h3_int8_attention_v4.dll',
+    'Windows': 'h3_int8_attention_v5.dll',
     'Linux': 'libh3_int8_attention.so',
     'Darwin': 'libh3_int8_attention.dylib',
 }
@@ -161,6 +161,11 @@ def _bind(library):
     library.h3_int8_quantize_qk_chunk.restype = i
     library.h3_int8_quantize_qk_chunk.argtypes = (
         [p] * 8 + [i] * 11 + [i64] * 6 + [i, sz]
+    )
+
+    library.h3_int8_quantize_q_chunk.restype = i
+    library.h3_int8_quantize_q_chunk.argtypes = (
+        [p] * 3 + [i] * 7 + [i64] * 3 + [i, sz]
     )
 
     library.h3_int8_quantize_v.restype = i

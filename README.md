@@ -216,8 +216,10 @@ The projected native Kitchen sparse route consumes attention in 4K query
 slices and writes each output projection directly into the disposable
 normalized block input. Its full-forward output is bit-identical to the prior
 route. Non-projected fallback execution retains sequence-major output storage
-and early carrier release. The 0.2.26 hotfix retains the full INT8 Q carrier
-until a Q-only producer can preserve the global K quantization transform. Q/K chunks are quantized where they already are
+and early carrier release. The 0.2.26 hotfix retained the full INT8 Q carrier.
+Version 0.2.27 restores bounded streamed Q with a native Q-only producer that
+receives the global K length and therefore uses the same quantization transform
+as the retained K/V carrier. Q/K chunks are quantized where they already are
 rather than being copied contiguous first. At the 124-frame production shape
 with AIMDO restrained to zero blocks, streamed output reduced incremental peak
 VRAM by 382 MiB at 0.93 percent sampler cost. FinalLayer chunking reduced it by
@@ -369,6 +371,11 @@ separate because it requires the matching hardware and compiled backend
 packages. Flex CPU contracts cover the NVIDIA FP8 carrier path, the ROCm native
 BF16/FP16 path, explicit Triton/FA4 selection, and first-call dense fallback in
 backend `auto`.
+
+Live SM89 gates compare whole-carrier and streamed Kitchen Q/Q-scale exactly,
+exercise 100% sparse routes at every shipped Kitchen geometry, and check dense
+Sage, Sparse Sage, FP8 FlexAttention, FROST BF16, and BF16 Triton output against
+their numerical contracts.
 
 The CPU composition matrix covers both `X -> H3` and `H3 -> X` for clone-only,
 OUTER_SAMPLE, DIFFUSION_MODEL, APPLY_MODEL, attention-override, block-forward,
