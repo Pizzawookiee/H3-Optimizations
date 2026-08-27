@@ -87,4 +87,13 @@ def __getattr__(name):
     return getattr(_load(module_name), name)
 
 
+# Sparse Kitchen is the production sparse backend and has a first-class
+# streamed-Q composition. Install its adapter explicitly when the sparse
+# package loads; optional Sage/FROST/Triton modules remain lazy.
+from .kitchen_streamed_q import install as _install_sparse_kitchen_streamed_q
+
+_install_sparse_kitchen_streamed_q()
+del _install_sparse_kitchen_streamed_q
+
+
 __all__ = list(_EXPORT_MODULES)
