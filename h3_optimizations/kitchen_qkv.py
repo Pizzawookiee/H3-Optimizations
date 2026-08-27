@@ -130,6 +130,9 @@ class PreparedStreamedKitchenQKV:
     carrier: object
     projection_mode: str
     output_buffer: torch.Tensor | None
+    owned_q_projection: object | None = None
+    q_int8_workspace: torch.Tensor | None = None
+    q_scale_workspace: torch.Tensor | None = None
     q_summary: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
 
@@ -139,6 +142,11 @@ class PreparedStreamedKitchenQKV:
         self.rope_freqs = None
         self.carrier = None
         self.output_buffer = None
+        if self.owned_q_projection is not None:
+            self.owned_q_projection.release()
+        self.owned_q_projection = None
+        self.q_int8_workspace = None
+        self.q_scale_workspace = None
         self.q_summary = None
         self.k_summary = None
 
@@ -352,6 +360,7 @@ def run_streamed_kitchen_qkv(
 
     held = create_held_qkv(module, x[:1], projection_mode)
     held.__enter__()
+    owned_q_projection = None
     try:
         with diagnostics.stage('anchor_projection'):
             samples = _project_anchor_samples(
@@ -415,8 +424,33 @@ def run_streamed_kitchen_qkv(
             del retained_v
 
         carrier = kitchen.finalize_int8_attention_producer(producer)
+
+        clone_owned_q = getattr(held, 'clone_owned_q_projection', None)
+        if callable(clone_owned_q):
+            with diagnostics.stage('owned_q_weight_clone'):
+                owned_q_projection = clone_owned_q()
+            if (
+                owned_q_projection is not None
+                and 'lora_cache' in locals()
+                and lora_cache is not None
+            ):
+                owned_q_projection.attach_sliced_lora_cache(lora_cache)
     finally:
         held.__exit__(None, None, None)
+
+    max_q_rows = min(int(chunk_rows), int(x.shape[0]))
+    q_int8_workspace = torch.empty(
+        int(module.heads) * max_q_rows * int(module.head_dim),
+        dtype=torch.int8,
+        device=x.device,
+    )
+    q_scale_workspace = torch.empty(
+        int(module.heads)
+        * ((max_q_rows + 127) // 128)
+        * 32,
+        dtype=torch.float32,
+        device=x.device,
+    )
 
     return PreparedStreamedKitchenQKV(
         module=module,
@@ -425,6 +459,9 @@ def run_streamed_kitchen_qkv(
         carrier=carrier,
         projection_mode=projection_mode,
         output_buffer=x,
+        owned_q_projection=owned_q_projection,
+        q_int8_workspace=q_int8_workspace,
+        q_scale_workspace=q_scale_workspace,
         q_summary=None,
         k_summary=torch.cat(k_summaries, dim=-2) if k_summaries else None,
     )

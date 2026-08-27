@@ -23,7 +23,7 @@ incompatible because it emits a different per-tile carrier.
 from dataclasses import dataclass, replace
 
 from ... import diagnostics
-from ...native.int8_attention import quantize_int8_attention_q
+from ...native.int8_attention import quantize_int8_attention_q_into
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
@@ -573,22 +573,30 @@ class SparseKitchenBackend:
             stop = min(start + self.query_chunk_rows, sequence)
 
             if streamed:
-                local_held = create_held_qkv(
-                    projected.module,
-                    projected.x[start:start + 1],
-                    projected.projection_mode,
-                )
-                local_held.__enter__()
-                try:
-                    q = project_q_hnd(
-                        local_held,
+                if projected.owned_q_projection is not None:
+                    q = projected.owned_q_projection.project_q_hnd(
                         projected.x,
                         projected.rope_freqs,
                         start,
                         stop,
                     )
-                finally:
-                    local_held.__exit__(None, None, None)
+                else:
+                    local_held = create_held_qkv(
+                        projected.module,
+                        projected.x[start:start + 1],
+                        projected.projection_mode,
+                    )
+                    local_held.__enter__()
+                    try:
+                        q = project_q_hnd(
+                            local_held,
+                            projected.x,
+                            projected.rope_freqs,
+                            start,
+                            stop,
+                        )
+                    finally:
+                        local_held.__exit__(None, None, None)
 
                 with diagnostics.stage('routing_summary_generation'):
                     q_summary = _tile_mean(q, route_q_tile)
@@ -613,8 +621,45 @@ class SparseKitchenBackend:
                 # Quantize this bounded Q slab using the REAL full key
                 # sequence length. This matches the known-good test2 Q-only
                 # Kitchen path while preserving the fused-QKV projection.
-                q_int8, q_scale = quantize_int8_attention_q(
+                q_rows = int(q.shape[-2])
+                q_numel = (
+                    int(q.shape[0])
+                    * int(q.shape[1])
+                    * q_rows
+                    * int(q.shape[3])
+                )
+                q_scale_len = ((q_rows + 127) // 128) * 32
+                q_scale_numel = (
+                    int(q.shape[0])
+                    * int(q.shape[1])
+                    * q_scale_len
+                )
+
+                if (
+                    projected.q_int8_workspace is None
+                    or projected.q_scale_workspace is None
+                    or projected.q_int8_workspace.numel() < q_numel
+                    or projected.q_scale_workspace.numel() < q_scale_numel
+                ):
+                    raise SparseKitchenError(
+                        'streamed Q pack workspace is missing or too small'
+                    )
+
+                q_int8 = projected.q_int8_workspace[
+                    :q_numel
+                ].view(q.shape)
+                q_scale = projected.q_scale_workspace[
+                    :q_scale_numel
+                ].view(
+                    int(q.shape[0]),
+                    int(q.shape[1]),
+                    q_scale_len,
+                )
+
+                quantize_int8_attention_q_into(
                     q,
+                    q_int8,
+                    q_scale,
                     full_k_length=sequence,
                 )
                 chunk_carrier = replace(
@@ -622,7 +667,6 @@ class SparseKitchenBackend:
                     q=q_int8,
                     q_scale=q_scale,
                 )
-                del q_int8
 
                 chunk_route = self.executor.kitchen.BlockSparseRoute(
                     indices=lut,

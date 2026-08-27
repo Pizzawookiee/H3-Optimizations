@@ -375,22 +375,21 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
     )
 
 
-def quantize_int8_attention_q(q, *, full_k_length):
-    """Quantize one bounded H3 query slab using the real full K geometry."""
+def quantize_int8_attention_q_into(
+    q,
+    q_int8,
+    q_scale,
+    *,
+    full_k_length,
+):
     if q.ndim != 4:
-        raise ValueError(
-            'q must be [batch, heads, sequence, head_dim]'
-        )
+        raise ValueError('q must be [batch, heads, sequence, head_dim]')
     if q.dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(
-            'q must be float32, float16 or bfloat16'
-        )
+        raise TypeError('q must be float32, float16 or bfloat16')
     if not q.is_cuda:
         raise ValueError('q must be a CUDA tensor')
     if q.stride(-1) != 1:
-        raise ValueError(
-            'the Q head dimension must be contiguous'
-        )
+        raise ValueError('the Q head dimension must be contiguous')
     if int(q.shape[-1]) != 128:
         raise ValueError(
             'streamed native Q quantization requires H3 head_dim 128'
@@ -399,22 +398,25 @@ def quantize_int8_attention_q(q, *, full_k_length):
     batch, heads, q_length, head_dim = q.shape
     full_k_length = int(full_k_length)
     if full_k_length <= 0:
-        raise ValueError(
-            'full_k_length must be positive'
-        )
+        raise ValueError('full_k_length must be positive')
 
-    q_int8 = torch.empty(
-        q.shape,
-        dtype=torch.int8,
-        device=q.device,
-    )
-    q_scale = torch.empty(
+    expected_scale = (
         batch,
         heads,
         ((q_length + Q_TILE - 1) // Q_TILE) * 32,
-        dtype=torch.float32,
-        device=q.device,
     )
+    if tuple(q_int8.shape) != tuple(q.shape):
+        raise ValueError('q_int8 workspace shape does not match q')
+    if q_int8.dtype != torch.int8 or q_int8.device != q.device:
+        raise TypeError('q_int8 workspace must be int8 on the Q device')
+    if not q_int8.is_contiguous():
+        raise ValueError('q_int8 workspace must be compact contiguous storage')
+    if tuple(q_scale.shape) != expected_scale:
+        raise ValueError('q_scale workspace shape does not match Q geometry')
+    if q_scale.dtype != torch.float32 or q_scale.device != q.device:
+        raise TypeError('q_scale workspace must be float32 on the Q device')
+    if not q_scale.is_contiguous():
+        raise ValueError('q_scale workspace must be compact contiguous storage')
 
     with diagnostics.stage('q_carrier_pack'):
         _check_quantize_q(
@@ -434,6 +436,24 @@ def quantize_int8_attention_q(q, *, full_k_length):
         )
 
     return q_int8, q_scale
+
+
+def quantize_int8_attention_q(q, *, full_k_length):
+    batch, heads, q_length, _ = q.shape
+    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
+    q_scale = torch.empty(
+        batch,
+        heads,
+        ((q_length + Q_TILE - 1) // Q_TILE) * 32,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    return quantize_int8_attention_q_into(
+        q,
+        q_int8,
+        q_scale,
+        full_k_length=full_k_length,
+    )
 
 
 def _attention_geometry(quantized, output_layout=OUTPUT_HND):

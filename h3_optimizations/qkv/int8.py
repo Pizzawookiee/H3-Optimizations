@@ -392,6 +392,109 @@ class HeldConvRotINT8Linear:
         return out
 
 
+
+class OwnedConvRotINT8QProjection:
+    def __init__(self, attention, weight, sliced_loras=()):
+        self.attention = attention
+        self.weight = weight
+        self.sliced_loras = tuple(sliced_loras)
+        self.prepared_sliced_lora_cache = None
+
+    def attach_sliced_lora_cache(self, cache):
+        self.prepared_sliced_lora_cache = cache
+
+    def release(self):
+        self.weight = None
+        self.sliced_loras = ()
+        self.prepared_sliced_lora_cache = None
+        self.attention = None
+
+    def _apply_lora(self, x, out, start, end):
+        if not self.sliced_loras:
+            return out
+
+        cache = self.prepared_sliced_lora_cache
+        if cache is not None:
+            entries = getattr(cache, "entries", ())
+            if len(entries) != len(self.sliced_loras):
+                raise ConvRotINT8BindingError(
+                    "owned Q LoRA cache count does not match active patches"
+                )
+            for live, prepared in zip(self.sliced_loras, entries):
+                if (
+                    live.key != prepared.key
+                    or float(live.scale) != float(prepared.scale)
+                ):
+                    raise ConvRotINT8BindingError(
+                        "owned Q LoRA cache does not match active patch semantics"
+                    )
+                out = prepared.apply(
+                    out,
+                    0,
+                    int(self.weight.shape[0]),
+                    int(start),
+                    int(end),
+                )
+            return out
+
+        rows = x[start:end]
+        for lora in self.sliced_loras:
+            out = lora.apply(
+                rows,
+                out,
+                0,
+                int(self.weight.shape[0]),
+            )
+        return out
+
+    def _finish_q(self, projected, rope):
+        seq = int(projected.shape[0])
+        projected = projected.view(
+            1,
+            seq,
+            self.attention.heads,
+            self.attention.head_dim,
+        )
+        norm = self.attention.q_norm
+        if rope is None:
+            return norm(projected[0])
+
+        scale = comfy.model_management.cast_to(
+            norm.weight,
+            device=projected.device,
+        )
+        projected = F.rms_norm(
+            projected,
+            (self.attention.head_dim,),
+            weight=scale,
+            eps=norm.eps,
+        )
+        rot_dim = int(rope.shape[-3]) * 2
+        comfy.quant_ops.ck.apply_rope_split_half1_(
+            projected[..., :rot_dim],
+            rope,
+        )
+        return projected[0]
+
+    def project_q_hnd(self, x, rope_freqs, start, end):
+        if self.weight is None:
+            raise RuntimeError("owned ConvRot INT8 Q projection was released")
+
+        start = int(start)
+        end = int(end)
+        rope = None if rope_freqs is None else rope_freqs[:, start:end]
+
+        with diagnostics.stage("qkv_linear"):
+            comfy.ops.run_every_op()
+            q = F.linear(x[start:end], self.weight, None)
+            q = self._apply_lora(x, q, start, end)
+
+        with diagnostics.stage("qk_norm_rope"):
+            q = self._finish_q(q, rope)
+
+        return q.transpose(0, 1).unsqueeze(0)
+
+
 class HeldConvRotINT8QKV:
     """Hold a ConvRot INT8 QKV weight across all projection chunks."""
 
@@ -410,6 +513,35 @@ class HeldConvRotINT8QKV:
 
     def __exit__(self, exc_type, exc, tb):
         return self.binding.__exit__(exc_type, exc, tb)
+
+    def clone_owned_q_projection(self):
+        weight = self.binding.weight
+        if weight is None:
+            raise RuntimeError("ConvRot INT8 QKV binding is not active")
+
+        inner = int(self.attention.heads) * int(self.attention.head_dim)
+        params = weight._params
+        scale = params.scale
+        if scale.numel() != 1:
+            scale = scale[:inner]
+
+        owned_qdata = weight._qdata[:inner].clone()
+        owned_scale = scale.clone()
+
+        owned_weight = QuantizedTensor(
+            owned_qdata,
+            weight._layout_cls,
+            replace(
+                params,
+                scale=owned_scale,
+                orig_shape=(inner, int(weight.shape[1])),
+            ),
+        )
+        return OwnedConvRotINT8QProjection(
+            self.attention,
+            owned_weight,
+            self.binding.sliced_loras,
+        )
 
     def _finish(self, rows, rope):
         from ..attention_forward import finish_qkv_projection, to_hnd
