@@ -380,8 +380,8 @@ class ConvRotTwoSliceMLP:
         self.tiles = None
 
     def __enter__(self):
-        if self.sample.dtype != torch.bfloat16:
-            raise TypeError("mlp_chunked_convrot_2slice requires BF16 input")
+        if self.sample.dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("mlp_chunked_convrot_2slice requires FP16 or BF16 input")
         if torch.compiler.is_compiling():
             module_id = getattr(self.mlp, "_h3_optimizations_convrot_mlp_id", None)
             if module_id is None:
