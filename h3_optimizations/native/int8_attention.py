@@ -249,6 +249,21 @@ def _check_sparse_attention_lse(*arguments):
         'sparse attention with LSE',
     )
 
+def _check_sparse_attention_tile_v(*arguments):
+    from .tile_v import sparse_symbol
+    loader.check(
+        sparse_symbol(False)(*arguments),
+        'sparse attention tile-local V',
+    )
+
+
+def _check_sparse_attention_tile_v_lse(*arguments):
+    from .tile_v import sparse_symbol
+    loader.check(
+        sparse_symbol(True)(*arguments),
+        'sparse attention tile-local V with LSE',
+    )
+
 
 def _validate_sparse_route(quantized, route):
     if not isinstance(route, BlockSparseRoute):
@@ -565,7 +580,12 @@ def block_sparse_int8_attention_from_prequantized(
     )
     kv_tiles = kernel_route.indices.shape[-1]
     with diagnostics.stage('sparse_attention_kernel'):
-        _check_sparse_attention(
+        sparse_call = (
+            _check_sparse_attention_tile_v
+            if quantized.v_scale.ndim == 4
+            else _check_sparse_attention
+        )
+        sparse_call(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
             _ptr(quantized.v_scale), _ptr(kernel_route.indices),
@@ -601,7 +621,12 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
     )
     kv_tiles = kernel_route.indices.shape[-1]
     with diagnostics.stage('sparse_attention_kernel'):
-        _check_sparse_attention_lse(
+        sparse_call = (
+            _check_sparse_attention_tile_v_lse
+            if quantized.v_scale.ndim == 4
+            else _check_sparse_attention_lse
+        )
+        sparse_call(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(lse), _ptr(quantized.q_scale),
             _ptr(quantized.k_scale), _ptr(quantized.v_scale),

@@ -373,8 +373,8 @@ def run_streamed_kitchen_qkv(
 
         v_staging = None
         if v_optimization:
-            from .native.v_staging import TwoPassVCarrier
-            v_staging = TwoPassVCarrier(spec, backend='native')
+            from .native.tile_v import TileLocalVCarrier
+            v_staging = TileLocalVCarrier(spec)
 
         sequence = int(x.shape[0])
         retained_v = None
@@ -394,8 +394,8 @@ def run_streamed_kitchen_qkv(
             )
 
             if v_staging is not None:
-                with diagnostics.stage('v_amax_update'):
-                    v_staging.update(v)
+                with diagnostics.stage('v_tile_local_pack'):
+                    v_staging.quantize(v, start)
             else:
                 if retained_v is None:
                     retained_v = v.new_empty(
@@ -407,17 +407,6 @@ def run_streamed_kitchen_qkv(
             del k, v
 
         if v_staging is not None:
-            with diagnostics.stage('v_scale_finalize'):
-                v_staging.finalize_scale()
-
-            for start in range(0, sequence, int(chunk_rows)):
-                end = min(start + int(chunk_rows), sequence)
-                with diagnostics.stage('v_reprojection'):
-                    v = project_v_hnd(held, x, rope_freqs, start, end)
-                with diagnostics.stage('v_carrier_pack'):
-                    v_staging.quantize(v, start)
-                del v
-
             producer.v, producer.v_scale = v_staging.finish()
         else:
             kitchen.quantize_int8_attention_v(producer, retained_v)

@@ -65,7 +65,8 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
-          bool fuse_fp32_probabilities = true>
+          bool fuse_fp32_probabilities = true,
+          bool tile_v_scale = false>
 __global__ void qk_int_sv_i8_sparse_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -389,6 +390,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
   // delta back into the absolute block used by the pointer seeks below.
   // whatever encoding a particular backend happened to want.
   uint32_t load_block = static_cast<uint32_t>(lut_row[0]);
+  uint32_t active_v_block = load_block;
   seek_kv_block(load_block);
 
   // load Q with predicate
@@ -527,9 +529,22 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     cp_async::wait_group<1>();
     __syncthreads();
 
-    compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+    if constexpr (tile_v_scale) {
+      const uint32_t kv_heads = num_qo_heads / num_kv_groups;
+      const uint32_t kv_head = head_id / num_kv_groups;
+      const float *tile_scale =
+          V_scale +
+          (((static_cast<uint64_t>(active_v_block) * gridDim.z + batch_id) *
+             kv_heads + kv_head) * head_dim);
+      compute_int8_sv_tile_scaled<
+          num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+          num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+          smem_V, RS, RS_u8, RO, tile_scale);
+    } else {
+      compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                      num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+          smem_V, RS, RS_u8, RO);
+    }
     __syncthreads();
     // load V
     load_int8_V_global_to_share<
@@ -538,6 +553,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
         V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
         &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
     cp_async::commit_group();
+    active_v_block = load_block;
 
   }
 
@@ -634,9 +650,22 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     cp_async::wait_group<1>();
     __syncthreads();
 
-    compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+    if constexpr (tile_v_scale) {
+      const uint32_t kv_heads = num_qo_heads / num_kv_groups;
+      const uint32_t kv_head = head_id / num_kv_groups;
+      const float *tile_scale =
+          V_scale +
+          (((static_cast<uint64_t>(active_v_block) * gridDim.z + batch_id) *
+             kv_heads + kv_head) * head_dim);
+      compute_int8_sv_tile_scaled<
+          num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+          num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+          smem_V, RS, RS_u8, RO, tile_scale);
+    } else {
+      compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                      num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+          smem_V, RS, RS_u8, RO);
+    }
 
     __syncthreads();
     // load V
@@ -646,6 +675,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
         V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
         &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
     cp_async::commit_group();
+    active_v_block = load_block;
   }
 
   // last iter, apply causal mask and out of bound mask
@@ -723,9 +753,22 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     cp_async::wait_group<0>();
     __syncthreads();
 
-    compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+    if constexpr (tile_v_scale) {
+      const uint32_t kv_heads = num_qo_heads / num_kv_groups;
+      const uint32_t kv_head = head_id / num_kv_groups;
+      const float *tile_scale =
+          V_scale +
+          (((static_cast<uint64_t>(active_v_block) * gridDim.z + batch_id) *
+             kv_heads + kv_head) * head_dim);
+      compute_int8_sv_tile_scaled<
+          num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+          num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+          smem_V, RS, RS_u8, RO, tile_scale);
+    } else {
+      compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                      num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+          smem_V, RS, RS_u8, RO);
+    }
 
     __syncthreads();
   }
@@ -760,7 +803,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
   }
 
   // ! here we just implement the case for fp32 acumulation
-  if constexpr (fuse_v_scale) {
+  if constexpr (fuse_v_scale && !tile_v_scale) {
     float v_scale[4];
     float *V_scale_base_ptr =
         V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +

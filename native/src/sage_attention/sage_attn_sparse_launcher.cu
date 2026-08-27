@@ -17,7 +17,8 @@ namespace {
 
 constexpr int SPARSE_HEAD_DIM = 128;
 
-template <int SPARSE_CTA_Q, int SPARSE_CTA_K, typename DTypeOut, bool RETURN_LSE>
+template <int SPARSE_CTA_Q, int SPARSE_CTA_K, typename DTypeOut,
+          bool RETURN_LSE, bool TILE_V_SCALE = false>
 void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
                         float *lse, float *q_scale, float *k_scale, float *v_scale,
                         const int32_t *lut, const int32_t *valid_block_num,
@@ -44,7 +45,8 @@ void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
       SPARSE_CTA_Q, SPARSE_CTA_K, WARP_Q, WARP_K, SPARSE_HEAD_DIM,
       DataType::kInt8, QuantGranularity::kPerThread,
       QuantGranularity::kPerThread, float, false, DTypeOut,
-      ComputeUnit::kCudaCore, MaskMode::kNone, RETURN_LSE, true, false, false, true>;
+      ComputeUnit::kCudaCore, MaskMode::kNone, RETURN_LSE,
+      !TILE_V_SCALE, false, false, true, TILE_V_SCALE>;
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -91,7 +93,7 @@ const char *sage_attn_sparse_route_encoding() {
   return H3_SPARSE_ROUTE_ENCODING;
 }
 
-template <bool RETURN_LSE>
+template <bool RETURN_LSE, bool TILE_V_SCALE = false>
 void launch_sparse(
     const void *q, const void *k, const void *v, void *o, void *lse,
     const void *q_scale, const void *k_scale, const void *v_scale, const void *lut,
@@ -132,7 +134,7 @@ void launch_sparse(
   auto valid_ = static_cast<const int32_t *>(valid_block_num);
 
 #define LAUNCH_SPARSE(CQ, CK, DT)                                                  \
-  launch_sparse_impl<CQ, CK, DT, RETURN_LSE>(q_, k_, v_, static_cast<DT *>(o),     \
+  launch_sparse_impl<CQ, CK, DT, RETURN_LSE, TILE_V_SCALE>(q_, k_, v_, static_cast<DT *>(o),     \
                          static_cast<float *>(lse), qs_, ks_, vs_, lut_,            \
                          valid_, lut_stride, qo_len, kv_len, num_qo_heads,     \
                          num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, \
@@ -203,5 +205,56 @@ void launch_sage_attn_sparse_kernel_lse(
       head_dim, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
+      stride_h_q_scale, sm_scale, output_dtype_code, stream);
+}
+
+void launch_sage_attn_sparse_tile_v_kernel(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, const void *lut,
+    const void *valid_block_num, int lut_stride, int cta_q, int cta_k,
+    int batch_size, int qo_len, int kv_len, int num_qo_heads, int num_kv_heads,
+    int head_dim, int stride_bz_q, int stride_seq_q, int stride_h_q,
+    int stride_bz_k, int stride_seq_k, int stride_h_k, int stride_bz_v,
+    int stride_h_v, int stride_d_v, int stride_bz_o, int stride_seq_o,
+    int stride_h_o, int stride_bz_q_scale, int stride_h_q_scale,
+    float sm_scale, int output_dtype_code, cudaStream_t stream) {
+  if (cta_k != 64) {
+    throw std::runtime_error(
+        "sage_attn_sparse_tile_v: tile-local V currently requires CTA_K=64");
+  }
+  launch_sparse<false, true>(
+      q, k, v, o, nullptr, q_scale, k_scale, v_scale, lut, valid_block_num,
+      lut_stride, cta_q, cta_k, batch_size, qo_len, kv_len, num_qo_heads,
+      num_kv_heads, head_dim, stride_bz_q, stride_seq_q, stride_h_q,
+      stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,
+      stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
+      stride_h_q_scale, sm_scale, output_dtype_code, stream);
+}
+
+void launch_sage_attn_sparse_tile_v_kernel_lse(
+    const void *q, const void *k, const void *v, void *o, void *lse,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    int cta_k, int batch_size, int qo_len, int kv_len, int num_qo_heads,
+    int num_kv_heads, int head_dim, int stride_bz_q, int stride_seq_q,
+    int stride_h_q, int stride_bz_k, int stride_seq_k, int stride_h_k,
+    int stride_bz_v, int stride_h_v, int stride_d_v, int stride_bz_o,
+    int stride_seq_o, int stride_h_o, int stride_bz_q_scale,
+    int stride_h_q_scale, float sm_scale, int output_dtype_code,
+    cudaStream_t stream) {
+  if (cta_k != 64) {
+    throw std::runtime_error(
+        "sage_attn_sparse_tile_v_lse: tile-local V currently requires CTA_K=64");
+  }
+  if (lse == nullptr) {
+    throw std::runtime_error(
+        "sage_attn_sparse_tile_v_lse: an LSE output is required");
+  }
+  launch_sparse<true, true>(
+      q, k, v, o, lse, q_scale, k_scale, v_scale, lut, valid_block_num,
+      lut_stride, cta_q, cta_k, batch_size, qo_len, kv_len, num_qo_heads,
+      num_kv_heads, head_dim, stride_bz_q, stride_seq_q, stride_h_q,
+      stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,
+      stride_d_v, stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
       stride_h_q_scale, sm_scale, output_dtype_code, stream);
 }
