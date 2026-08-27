@@ -326,9 +326,10 @@ def prepare_streamed_triton_bf16(
             "sparse_backend": backend.name,
             "route_format": "dense_implicit_plus_sparse_absolute_int32",
             "program_shape": "one_64q_tile_x_one_head_x_full_d128",
-            "qkv_lifetime": "streamed_q_inplace_o_global_bf16_kv",
+            "qkv_lifetime": "streamed_q_global_bf16_kv",
             "router_lifetime": "k_summary_until_final_q_route",
             "attention_output": "q_slab_reused_then_chunked_out_proj_inplace",
+            "q_output_alias": True,
             "query_chunk_rows": projected.chunk_rows,
             "out_proj_chunk_rows": OUT_PROJ_CHUNK_ROWS,
         }
