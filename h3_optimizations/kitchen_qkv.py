@@ -51,7 +51,7 @@ PRODUCER_API = (
 )
 STREAMED_PRODUCER_API = (
     'quantize_int8_attention_k_chunk',
-    'quantize_int8_attention_q_chunk',
+    'quantize_int8_attention_q',
 )
 H3_ATTENTION_BACKEND_KEY = 'h3_optimizations_attention_backend'
 DENSE_KITCHEN_BACKEND = 'comfy_kitchen_int8_prequantized'
@@ -430,6 +430,15 @@ def run_streamed_kitchen_qkv(
     )
 
 
+def _quantize_q_chunk(kitchen, global_carrier, q):
+    packed_q, q_scale = kitchen.quantize_int8_attention_q(
+        q,
+        full_k_length=int(global_carrier.k.shape[-2]),
+        allow_strided_input=True,
+    )
+    return replace(global_carrier, q=packed_q, q_scale=q_scale)
+
+
 class ChunkedKitchenQKVProjector:
     name = 'chunked_kitchen_qkv'
 
@@ -732,50 +741,8 @@ class ChunkedKitchenAttentionBackend:
                         )
                     finally:
                         held.__exit__(None, None, None)
-                    q_shape = tuple(q.shape)
-                    k_shape = (
-                        q_shape[0],
-                        quantized.k.shape[1],
-                        1,
-                        q_shape[3],
-                    )
-                    spec = kitchen.int8_attention_producer_spec(
-                        q_shape,
-                        k_shape,
-                        dtype=q.dtype,
-                        device=q.device,
-                        cta_k=quantized.cta_k,
-                    )
-                    samples = q.new_zeros(
-                        k_shape[0],
-                        k_shape[1],
-                        len(spec.k_anchor_positions),
-                        k_shape[3],
-                    )
-                    anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
-                    del samples
-                    producer = kitchen.create_int8_attention_producer(spec, anchor)
-                    kitchen.quantize_int8_attention_q_chunk(
-                        producer,
-                        q,
-                        q_start=0,
-                        allow_strided_input=True,
-                    )
-                    kitchen.quantize_int8_attention_v(producer, q[..., :1, :])
-                    q_carrier = kitchen.finalize_int8_attention_producer(producer)
-                    chunk_carrier = replace(
-                        q_carrier,
-                        k=quantized.k,
-                        v=quantized.v,
-                        k_scale=quantized.k_scale,
-                        v_scale=quantized.v_scale,
-                        input_dtype=quantized.input_dtype,
-                        attention_scale=quantized.attention_scale,
-                        cta_k=quantized.cta_k,
-                        anchor_indices=quantized.anchor_indices,
-                    )
-                    q_scale = q_carrier.q_scale
-                    del q_carrier
+                    chunk_carrier = _quantize_q_chunk(kitchen, quantized, q)
+                    q_scale = chunk_carrier.q_scale
                 else:
                     first_scale_tile = start // 128
                     stop_scale_tile = (stop + 127) // 128

@@ -257,6 +257,10 @@ a compatible bounded Q/K/V carrier when that consumer supports it. Known Comfy
 attention consumers can retain global K/V, stream bounded Q, and write each
 output-projection chunk into the disposable block input.
 
+An explicitly selected external Comfy Kitchen dense backend is a special case:
+it retains a full INT8 Q/K/V carrier while streaming bounded output-projection
+slabs.
+
 Unknown explicit attention overrides preserve their ordinary full-Q single-call
 contract unless they explicitly opt into the streamed-H3 consumer interface.
 
@@ -306,6 +310,11 @@ It does not traverse the automatic fallback chain.
 The shipped native Kitchen sparse path uses 64Q x 64KV routing for its production
 sparse geometry. Compatible ConvRot-256 TensorWise INT8 QKV can feed the sparse
 carrier without materializing full-sequence BF16 Q/K/V.
+
+The 0.2.26 hotfix retained the full INT8 Q carrier. Version 0.2.27 restores
+bounded streamed Q with a native Q-only producer that receives the global K
+length and therefore uses the same quantization transform as the retained K/V
+carrier.
 
 The repository ships Windows x64 and Linux x86-64 native binaries. At first
 resolution the local binary is loaded, its ABI is checked, and a cached per-GPU
@@ -441,6 +450,11 @@ and source isolation.
 
 GPU kernel validation is intentionally separate because it requires matching
 hardware and compiled backend packages.
+
+Live SM89 gates compare whole-carrier and streamed Kitchen Q/Q-scale exactly,
+exercise 100% sparse routes at every shipped Kitchen geometry, and check dense
+Sage, Sparse Sage, FP8 FlexAttention, FROST BF16, and BF16 Triton output against
+their numerical contracts.
 
 Run the CPU suite from the ComfyUI root:
 

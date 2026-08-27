@@ -48,7 +48,9 @@ nanobind, no DLPack, and therefore no Python ABI dimension: one binary per OS
 and architecture set serves every interpreter, rather than separate cp310,
 cp311 and abi3 builds.
 
-ABI 3 adds explicit sparse Q geometry and Q-scale strides. It exposes exact
+ABI 4 adds Q-only carrier packing with the global K length kept as transform
+dispatch metadata, without allocating or rewriting a dummy K carrier. ABI 3
+added explicit sparse Q geometry and Q-scale strides. It exposes exact
 128Q x 64KV and 64Q x 64KV traversal without changing Kitchen's Q128
 quantization carrier. ABI 2 added `h3_int8_sparse_attention_lse`; that output
 remains one FP32 base-2 log-sum-exp value per query row. The packaged Windows

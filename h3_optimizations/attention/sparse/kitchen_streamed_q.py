@@ -32,6 +32,7 @@ from ...kitchen_qkv import (
     FusedQKVError,
     _native_bf16_format,
     _project_anchor_samples,
+    _quantize_q_chunk as _pack_q_chunk,
     _qk_chunk_kwargs,
     _supports_streamed_producer,
     producer_api_available,
@@ -363,49 +364,7 @@ def _build_route_chunk(router, plan, q_summary, *, tile_start):
 
 
 def _quantize_q_chunk(kitchen, global_carrier, q):
-    q_shape = tuple(q.shape)
-    k_shape = (
-        q_shape[0],
-        global_carrier.k.shape[1],
-        1,
-        q_shape[3],
-    )
-    spec = kitchen.int8_attention_producer_spec(
-        q_shape,
-        k_shape,
-        dtype=q.dtype,
-        device=q.device,
-        cta_k=global_carrier.cta_k,
-    )
-    samples = q.new_zeros(
-        k_shape[0],
-        k_shape[1],
-        len(spec.k_anchor_positions),
-        k_shape[3],
-    )
-    anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
-    del samples
-    producer = kitchen.create_int8_attention_producer(spec, anchor)
-    del anchor
-    kitchen.quantize_int8_attention_q_chunk(
-        producer,
-        q,
-        q_start=0,
-        allow_strided_input=True,
-    )
-    kitchen.quantize_int8_attention_v(producer, q[..., :1, :])
-    local = kitchen.finalize_int8_attention_producer(producer)
-    return replace(
-        local,
-        k=global_carrier.k,
-        v=global_carrier.v,
-        k_scale=global_carrier.k_scale,
-        v_scale=global_carrier.v_scale,
-        input_dtype=global_carrier.input_dtype,
-        attention_scale=global_carrier.attention_scale,
-        cta_k=global_carrier.cta_k,
-        anchor_indices=global_carrier.anchor_indices,
-    )
+    return _pack_q_chunk(kitchen, global_carrier, q)
 
 
 class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):

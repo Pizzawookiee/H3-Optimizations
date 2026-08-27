@@ -1081,3 +1081,80 @@ void launch_quant_qk_per_thread_int8_into(
 #undef LAUNCH_INTO
 #undef DISPATCH_INTO
 }
+
+void launch_quant_q_per_thread_int8_into(
+    const void *q, void *q_int8, void *q_scale, int B, int H_q, int Lq,
+    int full_Lq, int q_start, int C, int full_Lk, int64_t q_stride_b,
+    int64_t q_stride_h, int64_t q_stride_n, int input_dtype_code,
+    cudaStream_t stream) {
+  if (C != 64 && C != 128 && C != 256) {
+    throw std::runtime_error(
+        "quant_q_into: padded head_dim must be 64, 128, or 256");
+  }
+  if (B <= 0 || H_q <= 0 || Lq <= 0 || full_Lq <= 0 || full_Lk <= 0 ||
+      q_start < 0 || q_start + Lq > full_Lq) {
+    throw std::runtime_error("quant_q_into: invalid shape or destination range");
+  }
+  if (q_start % 128 != 0 ||
+      (q_start + Lq < full_Lq && Lq % 128 != 0)) {
+    throw std::runtime_error("quant_q_into: chunk range is not tile aligned");
+  }
+  if (!q || !q_int8 || !q_scale) {
+    throw std::runtime_error("quant_q_into: all buffers are required");
+  }
+
+  const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(half);
+  const size_t vector_size = 4 * element_size;
+  const auto stride_ok = [](int64_t stride, int extent) {
+    return extent < 2 || (stride > 0 && stride % 4 == 0);
+  };
+  if (reinterpret_cast<uintptr_t>(q) % vector_size != 0 ||
+      !stride_ok(q_stride_b, B) || !stride_ok(q_stride_h, H_q) ||
+      !stride_ok(q_stride_n, Lq)) {
+    throw std::runtime_error(
+        "quant_q_into: Q pointer and strides must preserve 4-element alignment");
+  }
+
+  const int q_sc_per_h =
+      ((full_Lq + 127) / 128) * (C == 256 ? 64 : 32);
+
+#define LAUNCH_Q(T, NR, WQ, CT, ROT, A4)                                      \
+  do {                                                                         \
+    const int q_oblk = (Lq + 127) / 128 * (128 / WQ);                         \
+    dim3 q_grid(q_oblk, H_q, B);                                               \
+    quant_q_into_kernel<T, NR, 128, WQ, CT, ROT, A4>                          \
+        <<<q_grid, 128, 0, stream>>>(                                          \
+            static_cast<const T *>(q), static_cast<int8_t *>(q_int8),         \
+            static_cast<float *>(q_scale), Lq, full_Lq, q_start, C, H_q,      \
+            q_sc_per_h, q_stride_b, q_stride_h, q_stride_n);                  \
+    cudaError_t error = cudaGetLastError();                                    \
+    if (error != cudaSuccess)                                                  \
+      throw std::runtime_error(std::string("quant_q_into kernel launch failed: ") + \
+                               cudaGetErrorString(error));                     \
+  } while (0)
+
+#define DISPATCH_Q(T)                                                          \
+  do {                                                                         \
+    if (C == 64) {                                                             \
+      if (full_Lk <= 256)                                                      \
+        LAUNCH_Q(T, 4, 32, 1, 4, false);                                      \
+      else                                                                     \
+        LAUNCH_Q(T, 4, 32, 1, 64, false);                                     \
+    } else if (C == 128) {                                                     \
+      if (full_Lk <= 256)                                                      \
+        LAUNCH_Q(T, 4, 32, 1, 4, true);                                       \
+      else                                                                     \
+        LAUNCH_Q(T, 4, 32, 1, 128, true);                                     \
+    } else {                                                                   \
+      if (full_Lk <= 256)                                                      \
+        LAUNCH_Q(T, 2, 16, 2, 4, true);                                       \
+      else                                                                     \
+        LAUNCH_Q(T, 2, 16, 2, 129, true);                                     \
+    }                                                                          \
+  } while (0)
+
+  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] { DISPATCH_Q(T); });
+
+#undef LAUNCH_Q
+#undef DISPATCH_Q
+}

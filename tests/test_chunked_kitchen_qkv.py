@@ -102,6 +102,23 @@ class FakeKitchen:
     ):
         self.qk_chunks.append((q_start, None, q.clone(), None))
 
+    def quantize_int8_attention_q(
+        self,
+        q,
+        *,
+        full_k_length,
+        **_kwargs,
+    ):
+        self.qk_chunks.append(('q_only', int(full_k_length), q.clone(), None))
+        scales = torch.ones(
+            q.shape[0],
+            q.shape[1],
+            ((q.shape[2] + 127) // 128) * 32,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        return q.to(torch.int8), scales
+
     def quantize_int8_attention_k_chunk(
         self,
         _producer,
@@ -348,6 +365,55 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
                 ((1, 2, 128, 128), (1, 2, 1, 128), 128, 0),
             ],
         )
+
+    def test_standalone_q_packer_passes_global_k_length_to_native(self):
+        class NativeCall:
+            def __init__(self):
+                self.args = None
+
+            def __call__(self, *args):
+                self.args = args
+                return 0
+
+        call = NativeCall()
+        library = SimpleNamespace(h3_int8_quantize_q_chunk=call)
+        q = torch.zeros(1, 2, 128, 128, dtype=torch.bfloat16)
+        with (
+            mock.patch.object(native_producer.loader, 'load', return_value=library),
+            mock.patch.object(native_producer.loader, 'check'),
+            mock.patch.object(torch.Tensor, 'is_cuda', new_callable=mock.PropertyMock, return_value=True),
+            mock.patch.object(native_producer, '_stream', return_value=0),
+        ):
+            packed, scale = native_producer.quantize_int8_attention_q(
+                q,
+                full_k_length=640,
+            )
+
+        self.assertEqual(tuple(packed.shape), (1, 2, 128, 128))
+        self.assertEqual(tuple(scale.shape), (1, 2, 32))
+        self.assertEqual(call.args[9], 640)
+
+    def test_streamed_q_carrier_uses_global_k_length(self):
+        kitchen = FakeKitchen()
+        global_carrier = native_producer.PrequantizedInt8Attention(
+            q=torch.empty(1, 2, 1, 128, dtype=torch.int8),
+            q_scale=torch.empty(1, 2, 32),
+            k=torch.empty(1, 2, 640, 128, dtype=torch.int8),
+            v=torch.empty(256, 640, dtype=torch.int8),
+            k_scale=torch.empty(1, 2, 40),
+            v_scale=torch.empty(256),
+            original_head_dim=128,
+            input_dtype=torch.bfloat16,
+            attention_scale=128 ** -0.5,
+            cta_k=64,
+        )
+        q = torch.zeros(1, 2, 128, 128, dtype=torch.bfloat16)
+
+        carrier = kitchen_qkv._quantize_q_chunk(kitchen, global_carrier, q)
+
+        self.assertEqual(kitchen.qk_chunks[0][:2], ('q_only', 640))
+        self.assertEqual(tuple(carrier.q.shape), tuple(q.shape))
+        self.assertEqual(tuple(carrier.q_scale.shape), (1, 2, 32))
 
     def test_streamed_two_pass_v_reprojects_only_v_chunks(self):
         class Held:

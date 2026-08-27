@@ -35,7 +35,7 @@ MAX_LINUX_BINARY_BYTES = 50 * 1024 * 1024
 
 class NativeShippingTests(unittest.TestCase):
     def test_native_binaries_are_packaged(self):
-        windows_binary = BIN_DIR / 'h3_int8_attention_v4.dll'
+        windows_binary = BIN_DIR / 'h3_int8_attention_v5.dll'
         linux_binary = BIN_DIR / 'libh3_int8_attention.so'
 
         self.assertEqual(loader._LIBRARY_NAMES['Windows'], windows_binary.name)
@@ -57,11 +57,12 @@ class NativeShippingTests(unittest.TestCase):
         # BUILD_ID passes every size and magic-number check above. Assert the
         # entry points the Python bindings dlsym at runtime are really present.
         required = (
+            b'h3_int8_quantize_q_chunk',
             b'h3_int8_quantize_v',
             b'h3_int8_v_amax_chunk',
             b'h3_int8_quantize_v_chunk_into',
         )
-        for name in ('h3_int8_attention_v4.dll', 'libh3_int8_attention.so'):
+        for name in ('h3_int8_attention_v5.dll', 'libh3_int8_attention.so'):
             contents = (BIN_DIR / name).read_bytes()
             for symbol in required:
                 self.assertIn(symbol, contents, '%s is missing %s' % (name, symbol.decode()))
@@ -74,7 +75,7 @@ class NativeShippingTests(unittest.TestCase):
             self.assertIn(symbol.encode(), contents, symbol)
 
     def test_obsolete_windows_binary_is_not_shipped(self):
-        self.assertFalse((BIN_DIR / 'h3_int8_attention_v3.dll').exists())
+        self.assertFalse((BIN_DIR / 'h3_int8_attention_v4.dll').exists())
 
     def test_linux_binary_keeps_old_libstdcxx_compatibility(self):
         contents = (BIN_DIR / 'libh3_int8_attention.so').read_bytes()
@@ -190,14 +191,14 @@ class NativeShippingTests(unittest.TestCase):
             ),
             mock.patch(
                 'h3_optimizations.native.bootstrap.installed_build_id',
-                return_value='native-v7',
+                return_value='native-v8',
             ),
         ):
             key = selftest._cache_key('cuda')
 
         self.assertEqual(
             key,
-            'sm120|native-v7|%s|NVIDIA GeForce RTX 5070 Ti'
+            'sm120|native-v8|%s|NVIDIA GeForce RTX 5070 Ti'
             % selftest._SELFTEST_REVISION,
         )
 
