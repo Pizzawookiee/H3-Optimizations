@@ -11,6 +11,7 @@ import comfy.model_management
 import comfy.ops
 import comfy.quant_ops
 from comfy.quant_ops import QuantizedTensor
+from comfy.weight_adapter.lora import LoRAAdapter
 
 from .. import diagnostics
 from .formats import describe_linear, describe_weight
@@ -22,6 +23,119 @@ GROUP_SIZE = 256
 
 class ConvRotINT8BindingError(RuntimeError):
     pass
+
+
+class _SlicedLoRA:
+    __slots__ = ("up", "down", "scale", "key")
+    def __init__(self, up, down, scale, key):
+        self.up, self.down, self.scale, self.key = up, down, float(scale), str(key)
+    def apply(self, x, base, row_start, row_end):
+        if self.scale == 0.0:
+            return base
+        down = comfy.model_management.cast_to_device(self.down, x.device, x.dtype)
+        up = comfy.model_management.cast_to_device(self.up[int(row_start):int(row_end)], x.device, x.dtype)
+        hidden = F.linear(x, down, None)
+        delta = F.linear(hidden, up, None)
+        base.add_(delta, alpha=self.scale)
+        del hidden, delta, up, down
+        return base
+
+
+def _lowvram_patch_objects(module):
+    result, seen = [], set()
+    direct = getattr(module, "weight_lowvram_function", None)
+    if direct is not None:
+        if not getattr(direct, "is_lowvram_patch", False):
+            raise ConvRotINT8BindingError("unsupported weight_lowvram_function")
+        result.append(direct); seen.add(id(direct))
+    for fn in getattr(module, "weight_function", []) or []:
+        if getattr(fn, "is_lowvram_patch", False):
+            if id(fn) not in seen:
+                result.append(fn); seen.add(id(fn))
+        else:
+            raise ConvRotINT8BindingError("sliced-LoRA bypass does not support additional weight wrappers")
+    return result
+
+
+def _extract_plain_qkv_loras(module):
+    lows = _lowvram_patch_objects(module)
+    if not lows:
+        return ()
+    output_rows, input_cols = int(module.weight.shape[0]), int(module.weight.shape[1])
+    result = []
+    for low in lows:
+        key, patch_map = getattr(low, "key", None), getattr(low, "patches", None)
+        if key is None or patch_map is None or key not in patch_map:
+            raise ConvRotINT8BindingError("QKV LowVramPatch does not expose original patch list")
+        for patch in patch_map[key]:
+            if len(patch) != 5:
+                raise ConvRotINT8BindingError("unsupported QKV patch tuple")
+            strength, adapter, strength_model, offset, function = patch
+            if not isinstance(adapter, LoRAAdapter):
+                raise ConvRotINT8BindingError("sliced-LoRA supports only standard Comfy LoRAAdapter")
+            if float(strength_model) != 1.0 or offset is not None or function is not None:
+                raise ConvRotINT8BindingError("unsupported QKV LoRA patch semantics")
+            up, down, alpha, mid, dora_scale, reshape = adapter.weights
+            if mid is not None or dora_scale is not None or reshape is not None:
+                raise ConvRotINT8BindingError("LoCon/DoRA/reshape QKV patches are not supported")
+            if up.ndim != 2 or down.ndim != 2:
+                raise ConvRotINT8BindingError("QKV LoRA factors must be 2D")
+            rank = int(down.shape[0])
+            if rank <= 0 or int(up.shape[1]) != rank or int(up.shape[0]) != output_rows or int(down.shape[1]) != input_cols:
+                raise ConvRotINT8BindingError("QKV LoRA dimensions do not match fused QKV")
+            alpha_scale = float(alpha) / rank if alpha is not None else 1.0
+            result.append(_SlicedLoRA(up, down, float(strength) * alpha_scale, key))
+    return tuple(result)
+
+
+def _temporarily_disable_qkv_lowvram_patch(module):
+    had_low = hasattr(module, "weight_lowvram_function")
+    saved_low = getattr(module, "weight_lowvram_function", None)
+    had_functions = hasattr(module, "weight_function")
+    saved_functions = getattr(module, "weight_function", None)
+    if had_low: module.weight_lowvram_function = None
+    if had_functions: module.weight_function = []
+    return had_low, saved_low, had_functions, saved_functions
+
+
+def _restore_qkv_lowvram_patch(module, state):
+    had_low, saved_low, had_functions, saved_functions = state
+    if had_low: module.weight_lowvram_function = saved_low
+    elif hasattr(module, "weight_lowvram_function"): delattr(module, "weight_lowvram_function")
+    if had_functions: module.weight_function = saved_functions
+    elif hasattr(module, "weight_function"): delattr(module, "weight_function")
+
+
+class OwnedConvRotINT8QProjection:
+    def __init__(self, attention, weight, sliced_loras=()):
+        self.attention, self.weight, self.sliced_loras = attention, weight, tuple(sliced_loras)
+    def release(self):
+        self.weight, self.sliced_loras, self.attention = None, (), None
+    def _finish_q(self, projected, rope):
+        seq = int(projected.shape[0])
+        projected = projected.view(1, seq, self.attention.heads, self.attention.head_dim)
+        norm = self.attention.q_norm
+        if rope is None:
+            return norm(projected[0])
+        scale = comfy.model_management.cast_to(norm.weight, device=projected.device)
+        projected = F.rms_norm(projected, (self.attention.head_dim,), weight=scale, eps=norm.eps)
+        rot_dim = int(rope.shape[-3]) * 2
+        comfy.quant_ops.ck.apply_rope_split_half1_(projected[..., :rot_dim], rope)
+        return projected[0]
+    def project_q_hnd(self, x, rope_freqs, start, end):
+        if self.weight is None:
+            raise RuntimeError("owned ConvRot INT8 Q projection was released")
+        start, end = int(start), int(end)
+        rows = x[start:end]
+        rope = None if rope_freqs is None else rope_freqs[:, start:end]
+        with diagnostics.stage("qkv_linear"):
+            comfy.ops.run_every_op()
+            q = F.linear(rows, self.weight, None)
+            for lora in self.sliced_loras:
+                q = lora.apply(rows, q, 0, int(self.weight.shape[0]))
+        with diagnostics.stage("qk_norm_rope"):
+            q = self._finish_q(q, rope)
+        return q.transpose(0, 1).unsqueeze(0)
 
 
 class HeldConvRotINT8Linear:
@@ -37,6 +151,8 @@ class HeldConvRotINT8Linear:
         self.acquired_bias = None
         self.handle = None
         self.converted_from_float = False
+        self.allow_sliced_lora = False
+        self.sliced_loras = ()
 
     def _release_acquired(self):
         if self.handle is not None:
@@ -64,13 +180,19 @@ class HeldConvRotINT8Linear:
             )
 
         source = describe_linear(self.module)
-        weight, bias, handle = comfy.ops.cast_bias_weight(
-            self.module,
-            self.sample,
-            offloadable=True,
-            compute_dtype=self.sample.dtype,
-            want_requant=True,
-        )
+        bypass_state = None
+        if self.allow_sliced_lora:
+            self.sliced_loras = _extract_plain_qkv_loras(self.module)
+            if self.sliced_loras:
+                bypass_state = _temporarily_disable_qkv_lowvram_patch(self.module)
+        try:
+            weight, bias, handle = comfy.ops.cast_bias_weight(
+                self.module, self.sample, offloadable=True,
+                compute_dtype=self.sample.dtype, want_requant=True,
+            )
+        finally:
+            if bypass_state is not None:
+                _restore_qkv_lowvram_patch(self.module, bypass_state)
         self.acquired_weight = weight
         self.acquired_bias = bias
         self.handle = handle
@@ -121,6 +243,7 @@ class HeldConvRotINT8Linear:
         self.weight = None
         self.bias = None
         self.sample = None
+        self.sliced_loras = ()
 
     def __exit__(self, exc_type, exc, tb):
         self.release()
@@ -144,7 +267,10 @@ class HeldConvRotINT8Linear:
         if self.weight is None:
             raise RuntimeError("ConvRot INT8 binding is not active")
         comfy.ops.run_every_op()
-        return self._linear(x, self.weight)
+        out = self._linear(x, self.weight)
+        for lora in self.sliced_loras:
+            out = lora.apply(x, out, 0, int(self.weight.shape[0]))
+        return out
 
     def linear_range(self, x, start, end):
         if self.weight is None:
@@ -171,7 +297,10 @@ class HeldConvRotINT8Linear:
             ),
         )
         comfy.ops.run_every_op()
-        return self._linear(x, sliced)
+        out = self._linear(x, sliced)
+        for lora in self.sliced_loras:
+            out = lora.apply(x, out, start, end)
+        return out
 
 
 class HeldConvRotINT8QKV:
@@ -180,10 +309,9 @@ class HeldConvRotINT8QKV:
     def __init__(self, attention, sample, *, allow_float_conversion=False):
         self.attention = attention
         self.binding = HeldConvRotINT8Linear(
-            attention.qkv_proj,
-            sample,
-            allow_float_conversion=allow_float_conversion,
+            attention.qkv_proj, sample, allow_float_conversion=allow_float_conversion,
         )
+        self.binding.allow_sliced_lora = True
 
     def __enter__(self):
         self.binding.__enter__()
@@ -191,6 +319,23 @@ class HeldConvRotINT8QKV:
 
     def __exit__(self, exc_type, exc, tb):
         return self.binding.__exit__(exc_type, exc, tb)
+
+    def clone_owned_q_projection(self):
+        weight = self.binding.weight
+        if weight is None:
+            raise RuntimeError("ConvRot INT8 QKV binding is not active")
+        inner = int(self.attention.heads) * int(self.attention.head_dim)
+        params = weight._params
+        scale = params.scale
+        if scale.numel() != 1:
+            scale = scale[:inner]
+        owned_qdata = weight._qdata[:inner].clone()
+        owned_scale = scale.clone()
+        owned_weight = QuantizedTensor(
+            owned_qdata, weight._layout_cls,
+            replace(params, scale=owned_scale, orig_shape=(inner, int(weight.shape[1]))),
+        )
+        return OwnedConvRotINT8QProjection(self.attention, owned_weight, self.binding.sliced_loras)
 
     def _finish(self, rows, rope):
         from ..attention_forward import finish_qkv_projection, to_hnd

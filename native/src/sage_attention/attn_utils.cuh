@@ -1044,6 +1044,66 @@ compute_int8_sv(const smem_t<swizzle_mode, stride> &smem_V,
   }
 }
 
+
+template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
+          uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode,
+          uint32_t stride, typename DTypeSVAccum>
+__device__ __forceinline__ void
+compute_int8_sv_tile_scaled(
+    const smem_t<swizzle_mode, stride> &smem_V,
+    int32_t RS_scale[][num_tiles_k][8],
+    uint32_t RS_u8[][num_tiles_k / 2][4],
+    DTypeSVAccum RO[][num_tiles_v][8],
+    const float *__restrict__ V_scale_tile) {
+  static_assert(std::is_same<DTypeSVAccum, float>::value);
+  uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+  uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
+  uint32_t offsets_V[num_tiles_k / 2];
+#pragma unroll
+  for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
+    offsets_V[fk] =
+        smem_V.get_permuted_offset(smem_V_row_base, smem_V_col_base + fk * 2);
+  }
+
+  const uint32_t lane = get_lane_id();
+#pragma unroll
+  for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
+    uint32_t RV[num_tiles_k / 2][4];
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
+      smem_V.ldmatrix_m8n8x4(offsets_V[fk], RV[fk]);
+      offsets_V[fk] = smem_V.advance_offset_by_row<16>(offsets_V[fk]);
+    }
+
+    float v_scale[4];
+    const float *scale_base = V_scale_tile + (lane % 4) * 2 + fv * 16;
+    ((float2 *)v_scale)[0] = *((const float2 *)(scale_base));
+    ((float2 *)v_scale)[1] = *((const float2 *)(scale_base + 8));
+
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+      int32_t partial[8];
+      mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInit>(
+          partial, RS_u8[fq][0], RV[0]);
+#pragma unroll
+      for (uint32_t fk = 1; fk < num_tiles_k / 2; fk++) {
+        mma::mma_sync_m16n16k32_row_col_u8s8s32<
+            mma::MMAMode::kInplaceUpdate>(partial, RS_u8[fq][fk], RV[fk]);
+      }
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++) {
+        const float scale_value = v_scale[(k / 4) * 2 + (k % 2)];
+        const float probability_scale =
+            __int_as_float(RS_scale[fq][0][(k % 4) / 2]);
+        RO[fq][fv][k] =
+            fmaf(__int2float_rn(partial[k]),
+                 probability_scale * scale_value,
+                 RO[fq][fv][k]);
+      }
+    }
+  }
+}
+
 template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
           uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode,
           uint32_t stride, typename DTypeSVAccum>

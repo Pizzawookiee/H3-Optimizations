@@ -222,6 +222,10 @@ def _runtime_sparse_route(quantized, route, *, validate_geometry):
     )
 
 
+def _check_quantize_q(*arguments):
+    loader.check(loader.load().h3_int8_quantize_q(*arguments), 'quantize_q')
+
+
 def _check_quantize_qk(*arguments):
     loader.check(loader.load().h3_int8_quantize_qk(*arguments), 'quantize_qk')
 
@@ -241,6 +245,16 @@ def _check_sparse_attention_lse(*arguments):
         loader.load().h3_int8_sparse_attention_lse(*arguments),
         'sparse attention with LSE',
     )
+
+
+def _check_sparse_attention_tile_v(*arguments):
+    from .tile_v import sparse_symbol
+    loader.check(sparse_symbol(False)(*arguments), 'sparse attention tile-local V')
+
+
+def _check_sparse_attention_tile_v_lse(*arguments):
+    from .tile_v import sparse_symbol
+    loader.check(sparse_symbol(True)(*arguments), 'sparse attention tile-local V with LSE')
 
 
 def _validate_sparse_route(quantized, route):
@@ -368,6 +382,25 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
     )
 
 
+def quantize_int8_attention_q_into(q, q_int8, q_scale, *, full_k_length):
+    if q.ndim != 4 or not q.is_cuda or q.stride(-1) != 1:
+        raise ValueError('invalid streamed Q tensor')
+    if q.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError('unsupported streamed Q dtype')
+    if int(q.shape[-1]) != 128:
+        raise ValueError('streamed native Q quantization requires H3 head_dim 128')
+    batch, heads, q_length, head_dim = q.shape
+    full_k_length = int(full_k_length)
+    expected_scale = (batch, heads, ((q_length + Q_TILE - 1) // Q_TILE) * 32)
+    if tuple(q_int8.shape) != tuple(q.shape) or q_int8.dtype != torch.int8 or not q_int8.is_contiguous():
+        raise ValueError('q_int8 workspace mismatch')
+    if tuple(q_scale.shape) != expected_scale or q_scale.dtype != torch.float32 or not q_scale.is_contiguous():
+        raise ValueError('q_scale workspace mismatch')
+    with diagnostics.stage('q_carrier_pack'):
+        _check_quantize_q(_ptr(q), _ptr(q_int8), _ptr(q_scale), batch, heads, q_length, head_dim, full_k_length, q.stride(0), q.stride(1), q.stride(2), _DTYPE_TO_CODE[q.dtype], _stream())
+    return q_int8, q_scale
+
+
 def _attention_geometry(quantized, output_layout=OUTPUT_HND):
     """Allocate the output and describe every tensor to the kernel by stride.
 
@@ -477,7 +510,8 @@ def block_sparse_int8_attention_from_prequantized(
     )
     kv_tiles = kernel_route.indices.shape[-1]
     with diagnostics.stage('sparse_attention_kernel'):
-        _check_sparse_attention(
+        sparse_call = _check_sparse_attention_tile_v if quantized.v_scale.ndim == 4 else _check_sparse_attention
+        sparse_call(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
             _ptr(quantized.v_scale), _ptr(kernel_route.indices),
@@ -513,7 +547,8 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
     )
     kv_tiles = kernel_route.indices.shape[-1]
     with diagnostics.stage('sparse_attention_kernel'):
-        _check_sparse_attention_lse(
+        sparse_call = _check_sparse_attention_tile_v_lse if quantized.v_scale.ndim == 4 else _check_sparse_attention_lse
+        sparse_call(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(lse), _ptr(quantized.q_scale),
             _ptr(quantized.k_scale), _ptr(quantized.v_scale),

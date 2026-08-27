@@ -9,7 +9,7 @@
 // One thread block per (b, h, d_tile) with D_TILE=8 d-channels. Short K uses
 // 128 threads so it does not launch idle warps; longer K uses 512 threads.
 // Threads cooperate along N with vectorized 128-bit loads, warp-shuffle absmax
-// reduction, and reverse Pass 2 iteration for L2 cache reuse. Pass 1 uses 4×
+// reduction, and reverse Pass 2 iteration for L2 cache reuse. Pass 1 uses 4Ã—
 // manual unroll for memory-level parallelism at low occupancy.
 //
 // Pass 2 iterates over linear source indices (coalesced 128-bit reads) and
@@ -29,8 +29,8 @@ namespace {
 constexpr int kDTile = 8;
 
 // INT8 MMA 16-element inverse permutation.
-// Forward: fwd(j) maps bit pattern {b3,b2,b1,b0} → {b1,b3,b2,b0}.
-// Inverse: inv(s) maps {b3,b2,b1,b0} → {b2,b0,b3,b1}.
+// Forward: fwd(j) maps bit pattern {b3,b2,b1,b0} â†’ {b1,b3,b2,b0}.
+// Inverse: inv(s) maps {b3,b2,b1,b0} â†’ {b2,b0,b3,b1}.
 __device__ __forceinline__ int inv_perm16(int w) {
   return (w & 1) | (((w >> 3) & 1) << 1) | (((w >> 1) & 1) << 2) |
          (((w >> 2) & 1) << 3);
@@ -73,14 +73,14 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
   const T *base = v + b * sb + h * sh + d0;
   constexpr int WARPS = THREADS / 32;
 
-  // ── Pass 1: per-channel absmax (threads cooperate over N) ──────────
+  // â”€â”€ Pass 1: per-channel absmax (threads cooperate over N) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   float mx[kDTile];
 #pragma unroll
   for (int i = 0; i < kDTile; ++i)
     mx[i] = 0.f;
 
-  // 4× unrolled: issue 4 independent 128-bit loads per iteration
-  // so the memory controller can overlap them (critical at ≤50% occupancy).
+  // 4Ã— unrolled: issue 4 independent 128-bit loads per iteration
+  // so the memory controller can overlap them (critical at â‰¤50% occupancy).
   int n = threadIdx.x;
   const int N_body = N - 3 * THREADS;
   for (; n < N_body; n += 4 * THREADS) {
@@ -141,7 +141,7 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
   for (int di = 0; di < kDTile; ++di)
     inv_sc[di] = inv_sc_sh[di];
 
-  // ── Pass 2: quantize + permute (reverse for L2 reuse) ──────────────
+  // â”€â”€ Pass 2: quantize + permute (reverse for L2 reuse) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Iterate over LINEAR source indices (coalesced reads from v) and compute
   // the permuted destination index for the INT8 MMA layout.
   const int64_t out_row = static_cast<int64_t>((b * H + h) * D + d0);
@@ -212,5 +212,122 @@ void launch_quant_v_int8_kernel(const void *v, void *out, void *scale,
   if (error != cudaSuccess) {
     throw std::runtime_error(std::string("quant_v_int8 kernel launch failed: ") +
                              cudaGetErrorString(error));
+  }
+}
+
+template <typename T>
+__global__ void quant_v_int8_tile_local_kernel(
+    const T *__restrict__ v, int8_t *__restrict__ out,
+    float *__restrict__ scale_out, int B, int H, int N, int D,
+    int padded_N, int full_row_start, int tile_size,
+    int64_t sb, int64_t sh, int64_t sn) {
+  constexpr int D_TILE = 8;
+  constexpr int THREADS = 64;
+  constexpr int WARPS = THREADS / 32;
+
+  const int d_tiles = D / D_TILE;
+  const int tiles_in_chunk = (N + tile_size - 1) / tile_size;
+  const int d_tile = blockIdx.x % d_tiles;
+  int linear = blockIdx.x / d_tiles;
+  const int tile_in_chunk = linear % tiles_in_chunk;
+  linear /= tiles_in_chunk;
+  const int h = linear % H;
+  const int b = linear / H;
+
+  const int local_start = tile_in_chunk * tile_size;
+  const int rows = min(tile_size, N - local_start);
+  const int global_start = full_row_start + local_start;
+  const int global_tile = global_start / tile_size;
+  const int d0 = d_tile * D_TILE;
+
+  const T *base = v + b * sb + h * sh +
+                  static_cast<int64_t>(local_start) * sn + d0;
+
+  float mx[D_TILE];
+#pragma unroll
+  for (int i = 0; i < D_TILE; ++i) mx[i] = 0.f;
+
+  for (int n = threadIdx.x; n < rows; n += THREADS) {
+    float tmp[D_TILE];
+    load_tile(base + static_cast<int64_t>(n) * sn, tmp);
+#pragma unroll
+    for (int di = 0; di < D_TILE; ++di)
+      mx[di] = fmaxf(mx[di], fabsf(tmp[di]));
+  }
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int di = 0; di < D_TILE; ++di)
+    mx[di] = comfy::warp_reduce_fmax(mx[di]);
+
+  __shared__ float warp_mx[D_TILE][WARPS];
+  __shared__ float inv_sc_sh[D_TILE];
+
+  if (lane == 0) {
+#pragma unroll
+    for (int di = 0; di < D_TILE; ++di)
+      warp_mx[di][warp] = mx[di];
+  }
+  __syncthreads();
+
+  if (threadIdx.x < D_TILE) {
+    float val = fmaxf(
+        warp_mx[threadIdx.x][0],
+        warp_mx[threadIdx.x][1]);
+    float sc = fmaxf(val * (1.f / 127.f), 1e-12f);
+    const int64_t scale_index =
+        (((static_cast<int64_t>(global_tile) * B + b) * H + h) * D +
+         d0 + threadIdx.x);
+    scale_out[scale_index] = sc;
+    inv_sc_sh[threadIdx.x] = 1.f / sc;
+  }
+  __syncthreads();
+
+  const int64_t out_row = static_cast<int64_t>((b * H + h) * D + d0);
+  for (int src = threadIdx.x; src < rows; src += THREADS) {
+    const int dst_local = (src & ~15) | inv_perm16(src & 15);
+    const int dst = global_start + dst_local;
+    float tmp[D_TILE];
+    load_tile(base + static_cast<int64_t>(src) * sn, tmp);
+#pragma unroll
+    for (int di = 0; di < D_TILE; ++di) {
+      out[(out_row + di) * padded_N + dst] =
+          comfy::float_to_int8_rn(tmp[di] * inv_sc_sh[di]);
+    }
+  }
+}
+
+void launch_quant_v_int8_tile_local(
+    const void *v, void *out, void *scale, int B, int H, int N, int D,
+    int padded_N, int full_row_start, int tile_size, int64_t sb, int64_t sh,
+    int64_t sn, int input_dtype_code, cudaStream_t stream) {
+  if (tile_size != 64) {
+    throw std::runtime_error(
+        "quant_v_tile_local: only 64-row V tiles are implemented");
+  }
+  if (full_row_start < 0 || full_row_start % tile_size) {
+    throw std::runtime_error(
+        "quant_v_tile_local: row start must be 64-row aligned");
+  }
+  if (N <= 0 || D <= 0 || D % 8) {
+    throw std::runtime_error(
+        "quant_v_tile_local: invalid V chunk geometry");
+  }
+
+  const int tiles = (N + tile_size - 1) / tile_size;
+  const int blocks = B * H * tiles * (D / 8);
+  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+    quant_v_int8_tile_local_kernel<T><<<blocks, 64, 0, stream>>>(
+        static_cast<const T *>(v), static_cast<int8_t *>(out),
+        static_cast<float *>(scale), B, H, N, D, padded_N, full_row_start,
+        tile_size, sb, sh, sn);
+  });
+
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("quant_v_tile_local kernel launch failed: ") +
+        cudaGetErrorString(error));
   }
 }

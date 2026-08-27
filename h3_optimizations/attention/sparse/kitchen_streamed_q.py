@@ -68,8 +68,16 @@ class StreamedSparseKitchenQKV:
     k_summary: torch.Tensor | None
     projection_mode: str
     output_buffer: torch.Tensor | None
+    owned_q_projection: object | None = None
+    q_int8_workspace: torch.Tensor | None = None
+    q_scale_workspace: torch.Tensor | None = None
 
     def release(self):
+        if self.owned_q_projection is not None:
+            self.owned_q_projection.release()
+        self.owned_q_projection = None
+        self.q_int8_workspace = None
+        self.q_scale_workspace = None
         self.module = None
         self.producer_module = None
         self.x = None
@@ -226,10 +234,18 @@ def _run_streamed_sparse_kitchen_qkv(
         del anchor
 
         staging = None
+        tile_local_v = False
         if projector.v_mode == V_MODE_TWO_PASS:
-            from ...native.v_staging import TwoPassVCarrier
-
-            staging = TwoPassVCarrier(spec)
+            if int(spec.cta_k) == 64:
+                try:
+                    from ...native.tile_v import TileLocalVCarrier
+                    staging = TileLocalVCarrier(spec)
+                    tile_local_v = True
+                except Exception:
+                    staging = None
+            if staging is None:
+                from ...native.v_staging import TwoPassVCarrier
+                staging = TwoPassVCarrier(spec)
         retained_v = None
         kv_tiles = (sequence + kv_tile - 1) // kv_tile
         k_summary = x.new_empty(
@@ -255,6 +271,9 @@ def _run_streamed_sparse_kitchen_qkv(
             ].copy_(k_mean)
             if staging is None:
                 retained_v[..., start:end, :].copy_(v)
+            elif tile_local_v:
+                with diagnostics.stage("v_tile_local_pack"):
+                    staging.quantize(v, start)
             else:
                 with diagnostics.stage("v_amax_update"):
                     staging.update(v)
@@ -263,6 +282,8 @@ def _run_streamed_sparse_kitchen_qkv(
         if staging is None:
             kitchen.quantize_int8_attention_v(producer, retained_v)
             del retained_v
+        elif tile_local_v:
+            producer.v, producer.v_scale = staging.finish()
         else:
             staging.finalize_scale()
             for start in range(0, sequence, chunk_rows):
@@ -274,6 +295,11 @@ def _run_streamed_sparse_kitchen_qkv(
                 del v
             producer.v, producer.v_scale = staging.finish()
         carrier = kitchen.finalize_int8_attention_producer(producer)
+        owned_q_projection = None
+        clone_owned_q = getattr(held, "clone_owned_q_projection", None)
+        if callable(clone_owned_q):
+            with diagnostics.stage("owned_q_weight_clone"):
+                owned_q_projection = clone_owned_q()
     finally:
         held.__exit__(None, None, None)
 
@@ -286,6 +312,9 @@ def _run_streamed_sparse_kitchen_qkv(
         k_summary=k_summary,
         projection_mode=_projection_mode(projector),
         output_buffer=x,
+        owned_q_projection=owned_q_projection,
+        q_int8_workspace=(torch.empty(int(module.heads) * min(int(projector.chunk_rows), sequence) * int(module.head_dim), dtype=torch.int8, device=x.device) if hasattr(kitchen, "quantize_int8_attention_q_into") else None),
+        q_scale_workspace=(torch.empty(int(module.heads) * ((min(int(projector.chunk_rows), sequence) + 127) // 128) * 32, dtype=torch.float32, device=x.device) if hasattr(kitchen, "quantize_int8_attention_q_into") else None),
     )
 
 
@@ -361,7 +390,17 @@ def _build_route_chunk(router, plan, q_summary, *, tile_start):
     return lut.contiguous(), valid.contiguous()
 
 
-def _quantize_q_chunk(kitchen, global_carrier, q):
+def _quantize_q_chunk(kitchen, global_carrier, q, q_int8_workspace=None, q_scale_workspace=None):
+    direct = getattr(kitchen, "quantize_int8_attention_q_into", None)
+    if callable(direct) and q_int8_workspace is not None and q_scale_workspace is not None:
+        batch, heads, rows, head_dim = map(int, q.shape)
+        q_elems = batch * heads * rows * head_dim
+        s_elems = batch * heads * ((rows + 127) // 128) * 32
+        if q_elems <= int(q_int8_workspace.numel()) and s_elems <= int(q_scale_workspace.numel()):
+            qi = q_int8_workspace[:q_elems].view(batch, heads, rows, head_dim)
+            qs = q_scale_workspace[:s_elems].view(batch, heads, ((rows + 127) // 128) * 32)
+            direct(q, qi, qs, full_k_length=int(global_carrier.k.shape[2]))
+            return replace(global_carrier, q=qi, q_scale=qs)
     q_shape = tuple(q.shape)
     k_shape = (
         q_shape[0],
@@ -497,22 +536,15 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
         try:
             for start in range(0, sequence, query_rows):
                 stop = min(start + query_rows, sequence)
-                held = create_held_qkv(
-                    projected.module,
-                    projected.x[start : start + 1],
-                    projected.projection_mode,
-                )
-                held.__enter__()
-                try:
-                    q = project_q_hnd(
-                        held,
-                        projected.x,
-                        projected.rope_freqs,
-                        start,
-                        stop,
-                    )
-                finally:
-                    held.__exit__(None, None, None)
+                if projected.owned_q_projection is not None:
+                    q = projected.owned_q_projection.project_q_hnd(projected.x, projected.rope_freqs, start, stop)
+                else:
+                    held = create_held_qkv(projected.module, projected.x[start : start + 1], projected.projection_mode)
+                    held.__enter__()
+                    try:
+                        q = project_q_hnd(held, projected.x, projected.rope_freqs, start, stop)
+                    finally:
+                        held.__exit__(None, None, None)
 
                 tile_start = start // q_tile
                 with diagnostics.stage("sparse_route"):
@@ -526,9 +558,8 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                     del q_summary
 
                 chunk_carrier = _quantize_q_chunk(
-                    producer_module,
-                    projected.carrier,
-                    q,
+                    producer_module, projected.carrier, q,
+                    projected.q_int8_workspace, projected.q_scale_workspace,
                 )
                 route = kitchen.BlockSparseRoute(
                     indices=lut,

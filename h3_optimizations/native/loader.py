@@ -153,6 +153,11 @@ def _bind(library):
         [p, p, p, p, p, p] + [i] * 10 + [i64] * 6 + [i, p, sz]
     )
 
+    library.h3_int8_quantize_q.restype = i
+    library.h3_int8_quantize_q.argtypes = (
+        [p, p, p] + [i] * 5 + [i64] * 3 + [i, sz]
+    )
+
     library.h3_int8_select_k_anchor.restype = i
     library.h3_int8_select_k_anchor.argtypes = (
         [p, ctypes.POINTER(i), p, p] + [i] * 4 + [i64] * 3 + [i, sz]
