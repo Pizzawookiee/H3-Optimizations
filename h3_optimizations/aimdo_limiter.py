@@ -12,7 +12,7 @@ from .model import get_h3_blocks, is_minimax_h3
 PAGE_SIZE = 32 * 1024 * 1024
 CALLBACK_KEY = 'h3_optimizations_aimdo_residency_limiter'
 RESIDENCY_OPTIONS = ('stock', '0 blocks', '1 block', '2 blocks', '4 blocks')
-DEFAULT_RESIDENCY = '2 blocks'
+DEFAULT_RESIDENCY = '0 blocks'
 RESIDENCY_BLOCKS = {
     '0 blocks': 0,
     '1 block': 1,
@@ -149,10 +149,10 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
             display_name='H3 AIMDO Residency Limiter',
             category='H3-Optimizations/Model Patches',
             description=(
-                'Caps persistent MiniMax H3 AIMDO VBAR residency once after each '
-                'dynamic model load. Higher-address weights use ComfyUI\'s normal '
-                'streaming buffers. This does not cap activations, temporary '
-                'streaming buffers, force-loaded weights, or total GPU memory.'
+                'Controls how much of the H3 model DynamicVRAM keeps resident in '
+                'VRAM. It is mainly useful for benchmarking, debugging AIMDO, or '
+                'forcing minimal persistent model residency on tight VRAM budgets. '
+                'It does not cap total GPU memory use.'
             ),
             search_aliases=[
                 'AIMDO Limiter',
@@ -167,13 +167,12 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
                     options=list(RESIDENCY_OPTIONS),
                     default=DEFAULT_RESIDENCY,
                     tooltip=(
-                        'stock leaves AIMDO residency management unchanged. The '
-                        'numeric choices cap the low-address VBAR prefix to that '
-                        'many largest H3 block page footprints. They are block-'
-                        'equivalent byte budgets, not guaranteed coherent blocks. '
-                        '0 blocks retains no persistent VBAR pages; the current '
-                        'block is still staged through temporary async buffers. '
-                        'Requires DynamicVRAM and async weight offloading.'
+                        '0 blocks keeps no H3 model blocks persistently resident and '
+                        'is the default for benchmarking and lowest-residency use. '
+                        'Higher values allow more model weight residency and may '
+                        'trade VRAM for less weight streaming. stock leaves ComfyUI '
+                        'AIMDO residency management unchanged. Numeric choices '
+                        'require DynamicVRAM and async weight offloading.'
                     ),
                 ),
             ],
