@@ -110,7 +110,7 @@ jobs:
       - name: Install ComfyUI and test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r ComfyUI/requirements.txt pytest
+          python -m pip install -r ComfyUI/requirements.txt pytest tomli
 
       - name: Run CPU correctness suite
         working-directory: ComfyUI/custom_nodes/H3-Optimizations
