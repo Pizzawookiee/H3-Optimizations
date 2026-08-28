@@ -21,6 +21,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 import comfy.ops  # noqa: E402
+from comfy.ldm.minimax import model as minimax  # noqa: E402
 from comfy.ldm.minimax.model import MiniMaxH3Model  # noqa: E402
 from h3_optimizations.memory import embedding  # noqa: E402
 
@@ -115,24 +116,50 @@ class EmbeddingMemoryTests(unittest.TestCase):
 
     def test_install_is_guarded_idempotent_and_clearable(self):
         patcher = Patcher(self._model())
-        self.assertTrue(embedding.install(patcher))
-        installed = patcher.object_patches[embedding.FORWARD_KEY]
-        self.assertFalse(embedding.install(patcher))
-        self.assertIs(patcher.object_patches[embedding.FORWARD_KEY], installed)
-        self.assertTrue(embedding.clear(patcher))
+        with mock.patch.object(embedding, '_validate_upstream_forward'):
+            self.assertTrue(embedding.install(patcher))
+            installed = patcher.object_patches[embedding.FORWARD_KEY]
+            self.assertFalse(embedding.install(patcher))
+            self.assertIs(patcher.object_patches[embedding.FORWARD_KEY], installed)
+            self.assertTrue(embedding.clear(patcher))
         self.assertNotIn(embedding.FORWARD_KEY, patcher.object_patches)
 
     def test_install_recovers_original_from_applied_patch(self):
         model = self._model()
         first = Patcher(model)
-        self.assertTrue(embedding.install(first))
-        model._forward = first.object_patches[embedding.FORWARD_KEY]
+        with mock.patch.object(embedding, '_validate_upstream_forward'):
+            self.assertTrue(embedding.install(first))
+            model._forward = first.object_patches[embedding.FORWARD_KEY]
 
-        rebuilt = Patcher(model)
-        self.assertTrue(embedding.install(rebuilt, force_rebuild=True))
+            rebuilt = Patcher(model)
+            self.assertTrue(embedding.install(rebuilt, force_rebuild=True))
         installed = rebuilt.object_patches[embedding.FORWARD_KEY]
         self.assertTrue(getattr(installed, embedding.OWNER_MARKER))
         self.assertIsNotNone(getattr(installed, embedding.ORIGINAL_MARKER))
+
+    def test_real_upstream_auto_policy_matches_supported_comfy_generation(self):
+        patcher = Patcher(self._model())
+        installed = embedding.install(patcher)
+
+        # Per-row mask support arrived with the Comfy H3 forward we currently
+        # ship the static early-release implementation for. Older 0.33-era H3
+        # implementations are intentionally recognized as stock-lifetime only.
+        if hasattr(minimax, 'mask_row_values'):
+            self.assertTrue(installed)
+            self.assertTrue(embedding.is_installed(patcher))
+            self.assertNotIn(
+                embedding.FALLBACK_REASON_KEY,
+                patcher.model_options['transformer_options'],
+            )
+        else:
+            self.assertFalse(installed)
+            self.assertFalse(embedding.is_installed(patcher))
+            self.assertIn(
+                'changed',
+                patcher.model_options['transformer_options'][
+                    embedding.FALLBACK_REASON_KEY
+                ],
+            )
 
     def test_foreign_forward_patch_is_preserved(self):
         patcher = Patcher(self._model())
