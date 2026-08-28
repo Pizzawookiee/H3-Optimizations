@@ -130,6 +130,11 @@ class Module:
 
 
 class DenseStreamedSageTests(unittest.TestCase):
+    def test_status_reports_the_wrapped_backend(self):
+        backend = StreamedDenseSageBackend(FakeSage(FakeHeldFactory()))
+
+        self.assertEqual(backend.as_status()['backend'], 'sage_mem_eff_test')
+
     def test_global_kv_and_bounded_q_output_use_the_architecture_adapter(self):
         factory = FakeHeldFactory()
         sage = FakeSage(factory)

@@ -379,6 +379,7 @@ class StreamedDenseSageBackend:
         data = {} if status is None else dict(status())
         data.update(
             {
+                "backend": self.name,
                 "streamed_q": True,
                 "streamed_attention_output": True,
             }
