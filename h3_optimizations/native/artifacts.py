@@ -6,9 +6,9 @@ import platform
 
 # Bump when the native sources or committed binaries change. This marker is
 # also what a bug report should quote.
-NATIVE_BUILD = 'native-v7'
+NATIVE_BUILD = 'native-v8'
 
-REQUIRED_ABI = 3
+REQUIRED_ABI = 4
 
 
 def platform_key():

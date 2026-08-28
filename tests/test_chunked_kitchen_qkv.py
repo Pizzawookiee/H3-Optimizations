@@ -102,6 +102,23 @@ class FakeKitchen:
     ):
         self.qk_chunks.append((q_start, None, q.clone(), None))
 
+    def quantize_int8_attention_q(
+        self,
+        q,
+        *,
+        full_k_length,
+        **_kwargs,
+    ):
+        self.qk_chunks.append(('q_only', int(full_k_length), q.clone(), None))
+        scales = torch.ones(
+            q.shape[0],
+            q.shape[1],
+            ((q.shape[2] + 127) // 128) * 32,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        return q.to(torch.int8), scales
+
     def quantize_int8_attention_k_chunk(
         self,
         _producer,
@@ -203,6 +220,86 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
         self.assertIsNone(prepared.q_summary)
         self.assertIsNone(prepared.k_summary)
 
+    def test_streamed_kitchen_projection_keeps_global_kv_but_no_global_q(self):
+        class Held:
+            def __init__(self):
+                self.kv_calls = []
+                self.released = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.released = True
+                return False
+
+            def project_rows(self, x, _rope, rows):
+                values = x.index_select(0, rows)[:, :256].reshape(-1, 2, 128)
+                hnd = values.transpose(0, 1).unsqueeze(0)
+                return hnd, hnd + 10, hnd + 20
+
+            def project_kv_hnd(self, x, _rope, start, stop):
+                self.kv_calls.append((start, stop))
+                values = x[start:stop, :256].reshape(-1, 2, 128)
+                hnd = values.transpose(0, 1).unsqueeze(0)
+                return hnd + 10, hnd + 20
+
+        class Kitchen:
+            def __init__(self):
+                self.k_starts = []
+                self.v = None
+
+            @staticmethod
+            def select_int8_attention_k_anchor(_spec, _samples):
+                return object()
+
+            @staticmethod
+            def create_int8_attention_producer(_spec, _anchor):
+                return object()
+
+            def quantize_int8_attention_k_chunk(
+                self, _producer, _k, *, k_start, **_kwargs
+            ):
+                self.k_starts.append(k_start)
+
+            def quantize_int8_attention_v(self, _producer, v):
+                self.v = v.clone()
+
+            @staticmethod
+            def finalize_int8_attention_producer(_producer):
+                return SimpleNamespace(q=torch.empty(1, 2, 1, 128, dtype=torch.int8))
+
+        held = Held()
+        kitchen = Kitchen()
+        spec = SimpleNamespace(k_anchor_positions=(0, 0, 1, 1, 2, 2, 3, 3, 4))
+        x = (torch.arange(5 * 256).reshape(5, 256) % 100).to(torch.float16)
+        with mock.patch.object(
+            kitchen_qkv,
+            'resolve_kitchen',
+            return_value=kitchen,
+        ), mock.patch.object(
+            kitchen_qkv,
+            'create_held_qkv',
+            return_value=held,
+        ):
+            projected = kitchen_qkv.run_streamed_kitchen_qkv(
+                SimpleNamespace(heads=2, head_dim=128),
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+                spec=spec,
+                chunk_rows=2,
+                projection_mode='native',
+            )
+
+        self.assertEqual(held.kv_calls, [(0, 2), (2, 4), (4, 5)])
+        self.assertTrue(held.released)
+        self.assertEqual(kitchen.k_starts, [0, 2, 4])
+        self.assertEqual(tuple(kitchen.v.shape), (1, 2, 5, 128))
+        self.assertEqual(projected.carrier.q.shape[-2], 1)
+        self.assertIs(projected.output_buffer, x)
+
     def test_native_split_packers_keep_only_a_one_row_companion(self):
         with mock.patch.object(
             native_producer,
@@ -268,6 +365,155 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
                 ((1, 2, 128, 128), (1, 2, 1, 128), 128, 0),
             ],
         )
+
+    def test_standalone_q_packer_passes_global_k_length_to_native(self):
+        class NativeCall:
+            def __init__(self):
+                self.args = None
+
+            def __call__(self, *args):
+                self.args = args
+                return 0
+
+        call = NativeCall()
+        library = SimpleNamespace(h3_int8_quantize_q_chunk=call)
+        q = torch.zeros(1, 2, 128, 128, dtype=torch.bfloat16)
+        with (
+            mock.patch.object(native_producer.loader, 'load', return_value=library),
+            mock.patch.object(native_producer.loader, 'check'),
+            mock.patch.object(torch.Tensor, 'is_cuda', new_callable=mock.PropertyMock, return_value=True),
+            mock.patch.object(native_producer, '_stream', return_value=0),
+        ):
+            packed, scale = native_producer.quantize_int8_attention_q(
+                q,
+                full_k_length=640,
+            )
+
+        self.assertEqual(tuple(packed.shape), (1, 2, 128, 128))
+        self.assertEqual(tuple(scale.shape), (1, 2, 32))
+        self.assertEqual(call.args[9], 640)
+
+    def test_streamed_q_carrier_uses_global_k_length(self):
+        kitchen = FakeKitchen()
+        global_carrier = native_producer.PrequantizedInt8Attention(
+            q=torch.empty(1, 2, 1, 128, dtype=torch.int8),
+            q_scale=torch.empty(1, 2, 32),
+            k=torch.empty(1, 2, 640, 128, dtype=torch.int8),
+            v=torch.empty(256, 640, dtype=torch.int8),
+            k_scale=torch.empty(1, 2, 40),
+            v_scale=torch.empty(256),
+            original_head_dim=128,
+            input_dtype=torch.bfloat16,
+            attention_scale=128 ** -0.5,
+            cta_k=64,
+        )
+        q = torch.zeros(1, 2, 128, 128, dtype=torch.bfloat16)
+
+        carrier = kitchen_qkv._quantize_q_chunk(kitchen, global_carrier, q)
+
+        self.assertEqual(kitchen.qk_chunks[0][:2], ('q_only', 640))
+        self.assertEqual(tuple(carrier.q.shape), tuple(q.shape))
+        self.assertEqual(tuple(carrier.q_scale.shape), (1, 2, 32))
+
+    def test_streamed_two_pass_v_reprojects_only_v_chunks(self):
+        class Held:
+            def __init__(self):
+                self.kv_calls = []
+                self.v_calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def project_rows(self, _x, _rope, rows):
+                shape = (1, 2, len(rows), 128)
+                values = torch.zeros(shape, dtype=torch.bfloat16)
+                return values, values, values
+
+            def project_kv_hnd(self, _x, _rope, start, end):
+                self.kv_calls.append((start, end))
+                values = torch.zeros(1, 2, end - start, 128, dtype=torch.bfloat16)
+                return values, values + 1
+
+            def project_v_hnd(self, _x, _rope, start, end):
+                self.v_calls.append((start, end))
+                return torch.full(
+                    (1, 2, end - start, 128),
+                    2,
+                    dtype=torch.bfloat16,
+                )
+
+        class Staging:
+            instance = None
+
+            def __init__(self, _spec):
+                Staging.instance = self
+                self.updates = []
+                self.quantized = []
+                self.output_v = object()
+                self.output_scale = object()
+
+            def update(self, value):
+                self.updates.append(value.clone())
+
+            def finalize_scale(self):
+                return None
+
+            def quantize(self, value, start):
+                self.quantized.append((start, value.clone()))
+
+            def finish(self):
+                return self.output_v, self.output_scale
+
+        class Kitchen:
+            Int8AttentionProducerUnavailableError = RuntimeError
+
+            @staticmethod
+            def select_int8_attention_k_anchor(_spec, _samples):
+                return object()
+
+            @staticmethod
+            def create_int8_attention_producer(_spec, _anchor):
+                return SimpleNamespace(v=None, v_scale=None)
+
+            @staticmethod
+            def quantize_int8_attention_k_chunk(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def finalize_int8_attention_producer(producer):
+                return producer
+
+        held = Held()
+        spec = SimpleNamespace(k_anchor_positions=(0,) * 9)
+        x = torch.zeros(5, 256, dtype=torch.bfloat16)
+        with (
+            mock.patch.object(kitchen_qkv, 'resolve_kitchen', return_value=Kitchen()),
+            mock.patch.object(kitchen_qkv, 'create_held_qkv', return_value=held),
+            mock.patch(
+                'h3_optimizations.native.v_staging.TwoPassVCarrier',
+                Staging,
+            ),
+        ):
+            projected = kitchen_qkv.run_streamed_kitchen_qkv(
+                SimpleNamespace(heads=2, head_dim=128),
+                x,
+                None,
+                layer_index=0,
+                transformer_options={},
+                spec=spec,
+                chunk_rows=2,
+                projection_mode='native',
+                v_mode=kitchen_qkv.V_MODE_TWO_PASS,
+            )
+
+        self.assertEqual(held.kv_calls, [(0, 2), (2, 4), (4, 5)])
+        self.assertEqual(held.v_calls, held.kv_calls)
+        self.assertEqual(len(Staging.instance.updates), 3)
+        self.assertEqual([start for start, _ in Staging.instance.quantized], [0, 2, 4])
+        self.assertIs(projected.carrier.v, Staging.instance.output_v)
 
     def test_policy_fp8_auto_binding_does_not_override_forced_bf16(self):
         projector = apply_policy.PolicyChunkedKitchenQKVProjector(
@@ -438,6 +684,9 @@ class ChunkedKitchenQKVTests(unittest.TestCase):
             }
         )
         self.assertTrue(kitchen_qkv.producer_api_available(legacy))
+        self.assertFalse(
+            kitchen_qkv._supports_streamed_producer(legacy, None)
+        )
         incomplete = SimpleNamespace(
             **{
                 name: object()

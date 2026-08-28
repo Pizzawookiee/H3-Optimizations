@@ -117,10 +117,10 @@ class AIMDOLimiterTests(unittest.TestCase):
             residency.options,
             ['stock', '0 blocks', '1 block', '2 blocks', '4 blocks'],
         )
-        self.assertEqual(residency.default, '2 blocks')
-        self.assertIn('block-equivalent', residency.tooltip)
-        self.assertIn('0 blocks retains no persistent VBAR pages', residency.tooltip)
-        self.assertIn('current block is still staged', residency.tooltip)
+        self.assertEqual(residency.default, '0 blocks')
+        self.assertIn('default for benchmarking', residency.tooltip)
+        self.assertIn('keeps no H3 model blocks persistently resident', residency.tooltip)
+        self.assertIn('require DynamicVRAM', residency.tooltip)
 
     def test_block_budget_uses_page_footprints(self):
         vbar = FakeVBAR()

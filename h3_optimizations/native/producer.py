@@ -363,6 +363,60 @@ def quantize_int8_attention_q_chunk(
         producer._k_ranges.append((0, 1))
 
 
+def quantize_int8_attention_q(q, *, full_k_length, allow_strided_input=False):
+    """Pack a standalone Q slab with the transform selected by global K."""
+    full_k_length = int(full_k_length)
+    if full_k_length <= 0:
+        raise ValueError('full_k_length must be positive')
+    shape = _shape4('q_shape', q.shape)
+    if q.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError('q must have dtype float32, float16 or bfloat16')
+    if not q.is_cuda:
+        raise ValueError('q must be a CUDA tensor')
+    kernel_head_dim = _kernel_head_dim(shape[3])
+    q = _prepare_chunk_input(q, kernel_head_dim, allow_strided_input)
+    batch, heads, sequence, _ = q.shape
+    q_int8 = torch.empty(
+        batch,
+        heads,
+        sequence,
+        kernel_head_dim,
+        dtype=torch.int8,
+        device=q.device,
+    )
+    q_scales_per_tile = 64 if kernel_head_dim == 256 else 32
+    q_scale = torch.empty(
+        batch,
+        heads,
+        ((sequence + Q_TILE - 1) // Q_TILE) * q_scales_per_tile,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    library = loader.load()
+    with diagnostics.stage('qk_carrier_pack'):
+        loader.check(
+            library.h3_int8_quantize_q_chunk(
+                _ptr(q),
+                _ptr(q_int8),
+                _ptr(q_scale),
+                batch,
+                heads,
+                sequence,
+                sequence,
+                0,
+                kernel_head_dim,
+                full_k_length,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                _DTYPE_TO_CODE[q.dtype],
+                _stream(),
+            ),
+            'quantize_q_chunk',
+        )
+    return q_int8, q_scale
+
+
 def quantize_int8_attention_k_chunk(
     producer, k, *, k_start, allow_strided_input=False
 ):
