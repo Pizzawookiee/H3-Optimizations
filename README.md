@@ -496,3 +496,6 @@ and AIMDO `0 blocks`.
   [Comfy Kitchen](https://github.com/Comfy-Org/comfy-kitchen) for quantization,
   ConvRot execution, and the kernel foundations used by the native attention
   backend.
+
+  ## Kofi
+  https://ko-fi.com/zironic
