@@ -53,8 +53,8 @@ class NodeTests(unittest.TestCase):
                 'layer_video_budgets',
             ],
         )
-        self.assertEqual(input_by_id(sparse, 'video_budget').default, 0.3)
-        self.assertFalse(
+        self.assertEqual(input_by_id(sparse, 'video_budget').default, 0.15)
+        self.assertTrue(
             input_by_id(sparse, 'denser_early_late_steps').default
         )
         layer_budgets = input_by_id(sparse, 'layer_video_budgets')
@@ -129,10 +129,10 @@ class NodeTests(unittest.TestCase):
             H3SparseAttentionAdvanced.validate_inputs('not a backend'),
             str,
         )
-        self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.3)
-        self.assertEqual(input_by_id(advanced, 'early_steps').default, 2)
+        self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.15)
+        self.assertEqual(input_by_id(advanced, 'early_steps').default, 4)
         self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)
-        self.assertEqual(input_by_id(advanced, 'late_steps').default, 2)
+        self.assertEqual(input_by_id(advanced, 'late_steps').default, 4)
         self.assertEqual(input_by_id(advanced, 'late_kv').default, 0.5)
         self.assertNotIn('Experimental', sparse.display_name)
         self.assertNotIn('Experimental', advanced.display_name)

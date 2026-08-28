@@ -12,8 +12,8 @@ MODE_SAGE128_FUSED_QKV = 'sage128_fused_qkv'
 IMPLEMENTED_MODES = (MODE_SAGE128, MODE_SAGE128_FUSED_QKV)
 DENSITY_FIXED = 'fixed'
 
-DENSER_EARLY_LATE_STEP_COUNT = 2
-DENSER_EARLY_LATE_BONUS = 0.30
+DENSER_EARLY_LATE_FRACTION = 0.20
+DENSER_EARLY_LATE_KV = 0.50
 
 
 def _validate_budget(name, value):
@@ -62,7 +62,7 @@ class HybridSparseConfig:
             if not all(value is not None for value in values):
                 raise ValueError('explicit early/late sparse schedule is incomplete')
             if self.denser_early_late_steps:
-                raise ValueError('legacy and explicit early/late schedules cannot be combined')
+                raise ValueError('simple and explicit early/late schedules cannot be combined')
             for name, value in (
                 ('early_steps', self.early_steps),
                 ('late_steps', self.late_steps),
@@ -122,9 +122,10 @@ def resolve_video_budget(config, step_index, total_steps, layer_index=None):
 
     if not config.denser_early_late_steps:
         return budget
+    edge_steps = math.ceil(total_steps * DENSER_EARLY_LATE_FRACTION)
     if (
-        step_index < DENSER_EARLY_LATE_STEP_COUNT
-        or step_index >= total_steps - DENSER_EARLY_LATE_STEP_COUNT
+        step_index < edge_steps
+        or step_index >= total_steps - edge_steps
     ):
-        return min(1.0, budget + DENSER_EARLY_LATE_BONUS)
+        return max(budget, DENSER_EARLY_LATE_KV)
     return budget

@@ -148,9 +148,10 @@ def test_node_schema_and_request():
     denser = input_by_id(schema, 'denser_early_late_steps')
     check(
         denser.display_name == 'Denser Early/Late steps'
-        and denser.default is False
-        and '30 percentage points' in denser.tooltip,
-        'legacy density toggle is explicit and defaults off',
+        and denser.default is True
+        and 'first and last 20%' in denser.tooltip
+        and 'at least 50%' in denser.tooltip,
+        'simple density schedule is described and defaults on',
     )
 
     model = SimpleNamespace(model_options={})
@@ -162,7 +163,6 @@ def test_node_schema_and_request():
         result = H3SparseAttention.execute(
             model,
             video_budget=0.5,
-            denser_early_late_steps=True,
         )
     request = apply.call_args.args[1].sparse
     check(
@@ -171,7 +171,7 @@ def test_node_schema_and_request():
         and request.backend == 'auto'
         and request.denser_early_late_steps is True
         and request.advanced_schedule is False,
-        'standard node carries the legacy denser-step policy',
+        'standard node carries the simple denser-step policy',
     )
 
     layer_budgets = ','.join(['0.1'] * 25 + ['0.3'] * 25)
@@ -182,6 +182,7 @@ def test_node_schema_and_request():
         H3SparseAttention.execute(
             model,
             video_budget=0.2,
+            denser_early_late_steps=False,
             layer_video_budgets=layer_budgets,
         )
     request = apply.call_args.args[1].sparse
@@ -222,9 +223,10 @@ def test_advanced_node_schema_and_request():
         'advanced backend selector exposes the supported sparse backends',
     )
     check(
-        input_by_id(schema, 'early_steps').default == 2
+        input_by_id(schema, 'video_budget').default == 0.15
+        and input_by_id(schema, 'early_steps').default == 4
         and input_by_id(schema, 'early_kv').default == 0.5
-        and input_by_id(schema, 'late_steps').default == 2
+        and input_by_id(schema, 'late_steps').default == 4
         and input_by_id(schema, 'late_kv').default == 0.5,
         'advanced early and late defaults match the public contract',
     )
@@ -259,21 +261,21 @@ def test_advanced_node_schema_and_request():
 
 
 def test_step_budgets():
-    print('H3 Sparse Attention legacy step budgets')
+    print('H3 Sparse Attention percentage edge budgets')
     config = HybridSparseConfig(
-        video_budget=0.5,
+        video_budget=0.15,
         denser_early_late_steps=True,
     )
     backend = make_backend(config)
     q = k = v = TensorStub()
     expected = {
-        -1: 0.5,
-        0: 0.8,
-        1: 0.8,
-        2: 0.5,
-        17: 0.5,
-        18: 0.8,
-        19: 0.8,
+        -1: 0.15,
+        0: 0.5,
+        3: 0.5,
+        4: 0.15,
+        15: 0.15,
+        16: 0.5,
+        19: 0.5,
     }
     for step_index, budget in expected.items():
         prepared = backend.prepare(
@@ -302,10 +304,10 @@ def test_step_budgets():
     prepared = backend.prepare_projected(
         projected,
         layer_index=0,
-        transformer_options=options(18),
+        transformer_options=options(16),
     )
     check(
-        prepared.sparse.metadata['requested_video_budget'] == 0.8,
+        prepared.sparse.metadata['requested_video_budget'] == 0.5,
         'fused projected-QKV routing uses the same late-step policy',
     )
     check(
@@ -317,13 +319,18 @@ def test_step_budgets():
             0,
             20,
         )
-        == 1.0,
-        'legacy early/late video budget is capped at 100%',
+        == 0.85,
+        'simple edge policy does not reduce an already denser middle budget',
     )
     check(
-        resolve_video_budget(HybridSparseConfig(video_budget=0.5), 0, 20)
-        == 0.5,
-        'disabled legacy policy preserves the configured budget',
+        resolve_video_budget(config, 2, 11) == 0.5
+        and resolve_video_budget(config, 8, 11) == 0.5,
+        '20% edge windows round up symmetrically to whole steps',
+    )
+    check(
+        resolve_video_budget(HybridSparseConfig(video_budget=0.15), 0, 20)
+        == 0.15,
+        'disabled simple policy preserves the configured budget',
     )
 
 

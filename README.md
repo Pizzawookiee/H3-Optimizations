@@ -84,14 +84,15 @@ control.
   memory rather than setting a hard limit on all GPU memory use.
 - H3 Sparse Attention enables fixed-density sparse attention while keeping text,
   reference conditioning, audio, non-video queries, and mixed boundary tiles
-  dense. Its default video KV budget is 30 percent. The optional legacy
-  early/late policy adds 30 percentage points to the first two and last two
-  sampler steps, capped at 100 percent.
+  dense. Its default video KV budget is 15 percent. Its early/late policy is
+  enabled by default and uses at least 50 percent KV for the first and last 20
+  percent of sampler steps, rounded up to whole steps.
 - H3 Sparse Attention (Advanced) exposes explicit early and late density
   windows plus a sparse-backend selector. Video KV budget controls the middle
   steps; Early steps/Early KV and Late steps/Late KV independently control the
-  edges. The defaults are two early steps at 50 percent KV and two late steps at
-  50 percent KV. If the two windows overlap, the denser of the two requested
+  edges. The defaults are four early steps at 50 percent KV and four late steps
+  at 50 percent KV, matching a 20-step schedule; adjust the step counts to suit
+  the sampler's sigma schedule. If the two windows overlap, the denser of the two requested
   edge budgets is used. The backend choices are Kitchen INT8, FROST BF16,
   Sparse Sage, BF16 Triton, and FP8 FlexAttention. Kitchen INT8 is the default
   and uses the shipped native 64Q x 64KV path. FROST BF16 is an explicit
@@ -139,9 +140,9 @@ columns are projections from that median, not separate wall-clock runs.
 | SageAttention dense | 26.5 s | ~8m50s | 7754 MiB | out of memory | - | - |
 | SageAttention + H3 Memory Optimization | 26.2 s | ~8m44s | 5901 MiB | 76.1 s | ~25m22s | 9047 MiB |
 | H3 Memory Optimization + Sparse Attention (KV 100%) | 28.9 s | ~9m39s | 5355 MiB | 86.3 s | ~28m45s | 7315 MiB |
-| **H3 Memory Optimization + Sparse Attention (KV 30%, default)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
+| **H3 Memory Optimization + Sparse Attention (KV 30%, measured)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
 
-Against dense Comfy Kitchen attention, the default configuration measured
+Against dense Comfy Kitchen attention, the measured 30 percent configuration
 **1.57x faster at 5 seconds and 1.69x at 10 seconds**, using 2.2 GB less VRAM at
 5 seconds and 4.4 GB less at 10 seconds. The advantage grows with sequence
 length, so a single speedup figure understates long clips and overstates short
@@ -172,6 +173,9 @@ rather than fail, which on this card cost roughly a further 2x in step time.
 Treat 10-second timings as plus or minus 10 percent: arms running near the
 12282 MiB limit vary noticeably between sessions. The 5-second column and all
 VRAM figures are stable.
+
+These measurements predate the 15 percent middle-step and 50 percent edge-step
+defaults; they should not be read as performance evidence for the new schedule.
 
 Reproduce with `benchmarks/bench_attention_arms.py`, which drives a running
 ComfyUI server over its prompt API. Install and enable the sibling

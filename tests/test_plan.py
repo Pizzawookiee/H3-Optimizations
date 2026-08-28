@@ -78,9 +78,9 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(request.prefer_held_weights)
         self.assertTrue(request.mlp_strict)
 
-    def test_sparse_request_defaults_to_thirty_percent_video_budget(self):
+    def test_sparse_request_defaults_to_fifteen_percent_video_budget(self):
         request = SparseRequest()
-        self.assertEqual(request.video_budget, 0.3)
+        self.assertEqual(request.video_budget, 0.15)
         self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
         self.assertFalse(request.advanced_schedule)
 

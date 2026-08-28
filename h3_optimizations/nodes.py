@@ -73,10 +73,10 @@ class H3SparseAttention(io.ComfyNode):
                 io.Boolean.Input(
                     'denser_early_late_steps',
                     display_name='Denser Early/Late steps',
-                    default=False,
+                    default=True,
                     tooltip=(
-                        'Adds 30 percentage points to the video attention budget '
-                        'for the first 2 and last 2 sampling steps, capped at 100%. '
+                        'Uses at least 50% video attention for the first and last '
+                        '20% of sampling steps, rounded up to whole steps. '
                         'H3 is especially sensitive to reduced attention in early '
                         'denoising, so this can preserve prompt/timeline adherence '
                         'better than using the same low budget throughout.'
@@ -103,7 +103,7 @@ class H3SparseAttention(io.ComfyNode):
         cls,
         model,
         video_budget=DEFAULT_VIDEO_BUDGET,
-        denser_early_late_steps=False,
+        denser_early_late_steps=True,
         layer_video_budgets='',
     ):
         plan = read_plan(model).with_sparse(
@@ -160,7 +160,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     step=1,
                     tooltip=(
                         'Number of first sampling steps that use Early KV. H3 is '
-                        'especially sensitive to reduced attention early in denoising.'
+                        'especially sensitive to reduced attention early in denoising. '
+                        'The default assumes 20 steps; adjust it to suit the sampler\'s '
+                        'sigma schedule.'
                     ),
                 ),
                 io.Float.Input(
@@ -183,7 +185,10 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     min=0,
                     max=1000,
                     step=1,
-                    tooltip='Number of final sampling steps that use Late KV.',
+                    tooltip=(
+                        'Number of final sampling steps that use Late KV. The default '
+                        'assumes 20 steps; adjust it to suit the sampler\'s sigma schedule.'
+                    ),
                 ),
                 io.Float.Input(
                     'late_kv',
