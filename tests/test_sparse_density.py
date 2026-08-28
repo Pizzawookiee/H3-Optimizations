@@ -147,11 +147,11 @@ def test_node_schema_and_request():
     )
     denser = input_by_id(schema, 'denser_early_late_steps')
     check(
-        denser.display_name == 'Denser Early/Late steps'
+        denser.display_name == 'Denser Early steps'
         and denser.default is True
-        and 'first and last 20%' in denser.tooltip
+        and 'first 20%' in denser.tooltip
         and 'at least 50%' in denser.tooltip,
-        'simple density schedule is described and defaults on',
+        'simple early density schedule is described and defaults on',
     )
 
     model = SimpleNamespace(model_options={})
@@ -226,7 +226,7 @@ def test_advanced_node_schema_and_request():
         input_by_id(schema, 'video_budget').default == 0.15
         and input_by_id(schema, 'early_steps').default == 4
         and input_by_id(schema, 'early_kv').default == 0.5
-        and input_by_id(schema, 'late_steps').default == 4
+        and input_by_id(schema, 'late_steps').default == 0
         and input_by_id(schema, 'late_kv').default == 0.5,
         'advanced early and late defaults match the public contract',
     )
@@ -274,8 +274,8 @@ def test_step_budgets():
         3: 0.5,
         4: 0.15,
         15: 0.15,
-        16: 0.5,
-        19: 0.5,
+        16: 0.15,
+        19: 0.15,
     }
     for step_index, budget in expected.items():
         prepared = backend.prepare(
@@ -304,11 +304,11 @@ def test_step_budgets():
     prepared = backend.prepare_projected(
         projected,
         layer_index=0,
-        transformer_options=options(16),
+        transformer_options=options(3),
     )
     check(
         prepared.sparse.metadata['requested_video_budget'] == 0.5,
-        'fused projected-QKV routing uses the same late-step policy',
+        'fused projected-QKV routing uses the same early-step policy',
     )
     check(
         resolve_video_budget(
@@ -324,8 +324,8 @@ def test_step_budgets():
     )
     check(
         resolve_video_budget(config, 2, 11) == 0.5
-        and resolve_video_budget(config, 8, 11) == 0.5,
-        '20% edge windows round up symmetrically to whole steps',
+        and resolve_video_budget(config, 8, 11) == 0.15,
+        '20% early window rounds up to whole steps without a late override',
     )
     check(
         resolve_video_budget(HybridSparseConfig(video_budget=0.15), 0, 20)

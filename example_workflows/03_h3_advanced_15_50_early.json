@@ -23,10 +23,10 @@
       "title": "H3 Optimizations advanced example",
       "properties": {},
       "widgets_values": [
-        "## H3 Optimizations — Advanced example\n\nFlattened version of ComfyUI's stock MiniMax H3 workflow so the optimization path is visible.\n\nH3 settings in this example:\n- H3 Memory Optimization: production defaults\n- Video attention budget: 15%\n- Early: 4 steps at 50%\n- Late: 4 steps at 50%\n- Sparse backend: Kitchen INT8 (explicit Advanced-node default)\n\nThe H3 nodes sit after the normal model/Lightning-LoRA switch and feed both the scheduler and guider."
+        "## H3 Optimizations — Advanced example\n\nFlattened version of ComfyUI's stock MiniMax H3 workflow so the optimization path is visible.\n\nH3 settings in this example:\n- H3 Memory Optimization: production defaults\n- Video attention budget: 15%\n- Early: 4 steps at 50%\n- Late: disabled\n- Sparse backend: Kitchen INT8 (explicit Advanced-node default)\n\nThe H3 nodes sit after the normal model/Lightning-LoRA switch and feed both the scheduler and guider."
       ],
       "widgets_values_named": {
-        "text": "## H3 Optimizations — Advanced example\n\nFlattened version of ComfyUI's stock MiniMax H3 workflow so the optimization path is visible.\n\nH3 settings in this example:\n- H3 Memory Optimization: production defaults\n- Video attention budget: 15%\n- Early: 4 steps at 50%\n- Late: 4 steps at 50%\n- Sparse backend: Kitchen INT8 (explicit Advanced-node default)\n\nThe H3 nodes sit after the normal model/Lightning-LoRA switch and feed both the scheduler and guider."
+        "text": "## H3 Optimizations — Advanced example\n\nFlattened version of ComfyUI's stock MiniMax H3 workflow so the optimization path is visible.\n\nH3 settings in this example:\n- H3 Memory Optimization: production defaults\n- Video attention budget: 15%\n- Early: 4 steps at 50%\n- Late: disabled\n- Sparse backend: Kitchen INT8 (explicit Advanced-node default)\n\nThe H3 nodes sit after the normal model/Lightning-LoRA switch and feed both the scheduler and guider."
       },
       "color": "#222",
       "bgcolor": "#000"
@@ -519,7 +519,7 @@
         0.15,
         4,
         0.5,
-        4,
+        0,
         0.5,
         "Kitchen INT8"
       ],
@@ -527,7 +527,7 @@
         "video_budget": 0.15,
         "early_steps": 4,
         "early_kv": 0.5,
-        "late_steps": 4,
+        "late_steps": 0,
         "late_kv": 0.5,
         "backend": "Kitchen INT8"
       }
@@ -1597,7 +1597,7 @@
         "video_budget": 0.15,
         "early_steps": 4,
         "early_kv": 0.5,
-        "late_steps": 4,
+        "late_steps": 0,
         "late_kv": 0.5,
         "backend": "Kitchen INT8"
       }

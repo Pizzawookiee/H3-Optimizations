@@ -132,7 +132,7 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.15)
         self.assertEqual(input_by_id(advanced, 'early_steps').default, 4)
         self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)
-        self.assertEqual(input_by_id(advanced, 'late_steps').default, 4)
+        self.assertEqual(input_by_id(advanced, 'late_steps').default, 0)
         self.assertEqual(input_by_id(advanced, 'late_kv').default, 0.5)
         self.assertNotIn('Experimental', sparse.display_name)
         self.assertNotIn('Experimental', advanced.display_name)

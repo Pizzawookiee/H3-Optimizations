@@ -57,7 +57,7 @@ def decode(lut, valid):
 
 
 class RouterTests(unittest.TestCase):
-    def test_optional_early_late_budget_is_bounded(self):
+    def test_optional_early_budget_is_bounded(self):
         config = HybridSparseConfig(
             video_budget=0.15,
             denser_early_late_steps=True,
@@ -66,8 +66,8 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(resolve_video_budget(config, 1, 10), 0.5)
         self.assertEqual(resolve_video_budget(config, 2, 10), 0.15)
         self.assertEqual(resolve_video_budget(config, 7, 10), 0.15)
-        self.assertEqual(resolve_video_budget(config, 8, 10), 0.5)
-        self.assertEqual(resolve_video_budget(config, 9, 10), 0.5)
+        self.assertEqual(resolve_video_budget(config, 8, 10), 0.15)
+        self.assertEqual(resolve_video_budget(config, 9, 10), 0.15)
         self.assertEqual(resolve_video_budget(config, -1, 10), 0.15)
         already_denser = HybridSparseConfig(
             video_budget=0.85,
@@ -75,7 +75,7 @@ class RouterTests(unittest.TestCase):
         )
         self.assertEqual(resolve_video_budget(already_denser, 0, 10), 0.85)
         self.assertEqual(resolve_video_budget(config, 2, 11), 0.5)
-        self.assertEqual(resolve_video_budget(config, 8, 11), 0.5)
+        self.assertEqual(resolve_video_budget(config, 8, 11), 0.15)
 
     def test_per_head_top_k_and_dense_context(self):
         q, k = routed_inputs()

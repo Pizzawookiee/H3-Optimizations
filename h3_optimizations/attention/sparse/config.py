@@ -12,8 +12,8 @@ MODE_SAGE128_FUSED_QKV = 'sage128_fused_qkv'
 IMPLEMENTED_MODES = (MODE_SAGE128, MODE_SAGE128_FUSED_QKV)
 DENSITY_FIXED = 'fixed'
 
-DENSER_EARLY_LATE_FRACTION = 0.20
-DENSER_EARLY_LATE_KV = 0.50
+DENSER_EARLY_FRACTION = 0.20
+DENSER_EARLY_KV = 0.50
 
 
 def _validate_budget(name, value):
@@ -122,10 +122,7 @@ def resolve_video_budget(config, step_index, total_steps, layer_index=None):
 
     if not config.denser_early_late_steps:
         return budget
-    edge_steps = math.ceil(total_steps * DENSER_EARLY_LATE_FRACTION)
-    if (
-        step_index < edge_steps
-        or step_index >= total_steps - edge_steps
-    ):
-        return max(budget, DENSER_EARLY_LATE_KV)
+    early_steps = math.ceil(total_steps * DENSER_EARLY_FRACTION)
+    if step_index < early_steps:
+        return max(budget, DENSER_EARLY_KV)
     return budget

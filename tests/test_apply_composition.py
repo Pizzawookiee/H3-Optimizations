@@ -21,13 +21,18 @@ import comfy.options  # noqa: E402
 
 comfy.options.enable_args_parsing()
 
+import comfy.ldm.modules.attention as comfy_attention  # noqa: E402
+from comfy.model_patcher import ModelPatcher  # noqa: E402
 import comfy.patcher_extension  # noqa: E402
+from comfy_extras.nodes_model_advanced import ModelAttentionBackend  # noqa: E402
 import h3_optimizations.apply as apply_module  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
+    FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     H3OptimizationPlan,
     MemoryRequest,
     QKV_STREAMING_OFF,
+    SPARSE_BACKEND_KITCHEN,
     SparseRequest,
     STATUS_KEY,
     PLAN_KEY,
@@ -35,7 +40,9 @@ from h3_optimizations.plan import (  # noqa: E402
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
     MLPProviderResolution,
+    QKV_DENSE_KITCHEN_CHUNKED,
     QKVProviderResolution,
+    QKV_STANDARD,
 )
 from h3_optimizations.status import format_sparse_status  # noqa: E402
 
@@ -67,6 +74,9 @@ class FakeModel:
 
     def add_wrapper_with_key(self, wrapper_type, key, wrapper):
         self.wrappers.setdefault(wrapper_type, {})[key] = [wrapper]
+
+    def set_model_optimized_attention(self, attention):
+        ModelPatcher.set_model_optimized_attention(self, attention)
 
 
 def resolved_attention(plan):
@@ -211,6 +221,102 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertIsNone(attention.backend)
         self.assertEqual(qkv.provider_id, 'standard_h3_qkv')
         self.assertIn('explicit external attention override', attention.reason)
+
+    def test_actual_kitchen_backend_node_composes_with_sparse(self):
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN),
+        )
+        sparse_resolution = (object(), object())
+        inventory = object()
+        environment = object()
+
+        # CPU startup hides the Kitchen choice, so expose the real registered
+        # callable without executing its CUDA attention implementation.
+        with mock.patch.object(
+            comfy_attention,
+            'COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE',
+            True,
+        ), mock.patch.dict(
+            comfy_attention.REGISTERED_ATTENTION_FUNCTIONS,
+            {
+                'comfy_kitchen_int8': (
+                    comfy_attention.attention_comfy_kitchen_int8
+                ),
+            },
+        ):
+            choices = ModelAttentionBackend.INPUT_TYPES()[
+                'required'
+            ]['attention'][0]
+            self.assertIn('comfy kitchen attention', choices)
+            model, = ModelAttentionBackend().patch(
+                FakeModel({'transformer_options': {}}),
+                'comfy kitchen attention',
+            )
+            options = model.model_options['transformer_options']
+            self.assertTrue(
+                apply_module.is_comfy_kitchen_dense_attention(options)
+            )
+            with mock.patch.object(
+                apply_module,
+                '_resolve_kitchen_sparse',
+                return_value=sparse_resolution,
+            ) as kitchen:
+                actual = apply_module._resolve_attention(
+                    plan,
+                    model,
+                    inventory,
+                    environment,
+                )
+
+        kitchen.assert_called_once_with(plan, environment, inventory)
+        self.assertEqual(actual, sparse_resolution)
+
+    def test_sparse_only_dense_fallback_disables_memory_qkv(self):
+        plan = H3OptimizationPlan(sparse=SparseRequest())
+        inventory = SimpleNamespace(
+            qkv=(object(),),
+            qkv_convrot_int8_256=True,
+            qkv_w4a8=False,
+            qkv_fp8=False,
+            qkv_plain_float=False,
+            homogeneous=lambda name: name == 'qkv',
+            labels=lambda _name: ('TensorWiseINT8Layout+convrot256',),
+        )
+        auto_qkv = apply_module.resolve_qkv_provider(
+            inventory,
+            request=FUSED_QKV_AUTO,
+            backend_kind='comfy_kitchen_int8',
+            kitchen_producer_available=True,
+        )
+        self.assertEqual(auto_qkv.provider_id, QKV_DENSE_KITCHEN_CHUNKED)
+        dense = SimpleNamespace(
+            requested='existing',
+            selected='comfy_kitchen_int8',
+            backend=None,
+            reason='preserved external Kitchen',
+            backend_kind='comfy_kitchen_int8',
+        )
+
+        with mock.patch.object(
+            apply_module,
+            'producer_api_available',
+            return_value=True,
+        ), mock.patch.object(
+            apply_module,
+            'preserve_dense_attention',
+            return_value=dense,
+        ):
+            attention, qkv = apply_module._resolve_dense(
+                plan,
+                FakeModel(),
+                inventory,
+                SimpleNamespace(cuda_available=False),
+            )
+
+        self.assertIsNone(attention.backend)
+        self.assertIsNone(attention.projector)
+        self.assertEqual(qkv.provider_id, QKV_STANDARD)
+        self.assertIn('disabled', qkv.reason)
 
     def test_streaming_off_disables_qkv_carriers_with_sparse_present(self):
         plan = H3OptimizationPlan(

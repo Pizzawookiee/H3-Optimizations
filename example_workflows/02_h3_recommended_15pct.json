@@ -114,10 +114,10 @@
       "title": "H3 Optimizations example",
       "properties": {},
       "widgets_values": [
-        "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early/Late steps is enabled, giving at least **50%** video KV for the first and last **20%** of sampling steps."
+        "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early steps is enabled, giving at least **50%** video KV for the first **20%** of sampling steps."
       ],
       "widgets_values_named": {
-        "text": "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early/Late steps is enabled, giving at least **50%** video KV for the first and last **20%** of sampling steps."
+        "text": "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early steps is enabled, giving at least **50%** video KV for the first **20%** of sampling steps."
       },
       "color": "#222",
       "bgcolor": "#000"

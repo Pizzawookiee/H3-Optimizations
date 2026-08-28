@@ -138,9 +138,9 @@ remain dense.
 > prompt. H3 is especially sensitive to reducing attention in the early sampling
 > steps.
 
-The **Denser Early/Late steps** setting is enabled by default. It uses at least
-50% video attention for the first and last 20% of sampler steps, rounded up to
-whole steps. This keeps the edges denser while allowing a lower middle budget.
+The **Denser Early steps** setting is enabled by default. It uses at least 50%
+video attention for the first 20% of sampler steps, rounded up to whole steps.
+H3 is especially sensitive to reduced attention during these opening steps.
 
 ## H3 Sparse Attention (Advanced)
 
@@ -158,9 +158,11 @@ and end of sampling, plus an explicit sparse-backend selector.
 - **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
   Sparse Sage, BF16 Triton, or FP8 FlexAttention.
 
-The defaults use four early steps at 50%, a 15% middle budget, and four late
-steps at 50%, matching a 20-step schedule. Adjust the step counts for other
-sampler schedules.
+The defaults use four early steps at 50%, a 15% middle budget, and no late
+override, matching a 20-step schedule. Late controls remain available for
+experiments, but denser late steps have not shown enough benefit to justify
+their compute cost as a default. Adjust the step counts for other sampler
+schedules.
 
 Explicit backend choices are hard requirements: if you select a backend that is
 not available on the current system, the node errors instead of silently
@@ -200,7 +202,7 @@ Against dense Comfy Kitchen attention, the measured 30% configuration achieved
 **1.57x faster at 5 seconds and 1.69x at 10 seconds**, using 2.2 GB less VRAM at
 5 seconds and 4.4 GB less at 10 seconds.
 
-These measurements predate the 15% middle-step and 50% edge-step defaults; they
+These measurements predate the 15% middle-step and 50% early-step defaults; they
 should not be read as performance evidence for the new schedule.
 
 The rows isolate successive **conceptual optimization stages**, but they are not

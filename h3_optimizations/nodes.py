@@ -7,6 +7,7 @@ from .node_constants import NODE_CATEGORY
 from .plan import (
     DEFAULT_EDGE_KV,
     DEFAULT_EDGE_STEPS,
+    DEFAULT_LATE_STEPS,
     DEFAULT_VIDEO_BUDGET,
     SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN,
@@ -72,11 +73,11 @@ class H3SparseAttention(io.ComfyNode):
                 _video_budget_input(),
                 io.Boolean.Input(
                     'denser_early_late_steps',
-                    display_name='Denser Early/Late steps',
+                    display_name='Denser Early steps',
                     default=True,
                     tooltip=(
-                        'Uses at least 50% video attention for the first and last '
-                        '20% of sampling steps, rounded up to whole steps. '
+                        'Uses at least 50% video attention for the first 20% of '
+                        'sampling steps, rounded up to whole steps. '
                         'H3 is especially sensitive to reduced attention in early '
                         'denoising, so this can preserve prompt/timeline adherence '
                         'better than using the same low budget throughout.'
@@ -91,7 +92,7 @@ class H3SparseAttention(io.ComfyNode):
                     tooltip=(
                         'Optional comma-separated budget fractions for all 50 H3 '
                         'layers. Applies at every sampling step and cannot be '
-                        'combined with Denser Early/Late steps.'
+                        'combined with Denser Early steps.'
                     ),
                 ),
             ],
@@ -181,13 +182,14 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 io.Int.Input(
                     'late_steps',
                     display_name='Late steps',
-                    default=DEFAULT_EDGE_STEPS,
+                    default=DEFAULT_LATE_STEPS,
                     min=0,
                     max=1000,
                     step=1,
                     tooltip=(
                         'Number of final sampling steps that use Late KV. The default '
-                        'assumes 20 steps; adjust it to suit the sampler\'s sigma schedule.'
+                        'is 0 because denser late steps have not shown enough benefit '
+                        'to justify their compute cost.'
                     ),
                 ),
                 io.Float.Input(
@@ -231,7 +233,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         video_budget=DEFAULT_VIDEO_BUDGET,
         early_steps=DEFAULT_EDGE_STEPS,
         early_kv=DEFAULT_EDGE_KV,
-        late_steps=DEFAULT_EDGE_STEPS,
+        late_steps=DEFAULT_LATE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
         backend=SPARSE_BACKEND_KITCHEN,
     ):

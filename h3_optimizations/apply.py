@@ -42,6 +42,7 @@ from .dense_resolver import (
     ATTENTION_EXISTING_FULL_Q,
     ATTENTION_SAGE_PREFIX,
     ATTENTION_SAGE_SM89,
+    is_comfy_kitchen_dense_attention,
     is_installed_dense_attention,
     install_dense_attention,
     preserve_dense_attention,
@@ -386,7 +387,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
         )
     qkv = resolve_qkv_provider(
         inventory,
-        request=_qkv_request(plan),
+        request=(FUSED_QKV_OFF if memory is None else _qkv_request(plan)),
         backend_kind=dense.backend_kind,
         kitchen_producer_available=producer_api_available(
             device=getattr(environment, 'device_index', None)
@@ -772,6 +773,7 @@ def _resolve_attention(plan, model, inventory, environment):
         plan.sparse is not None
         and explicit_override is not None
         and not is_installed_dense_attention(options)
+        and not is_comfy_kitchen_dense_attention(options)
     ):
         if plan.memory is None:
             dense = resolve_current_dense_attention(model, environment)

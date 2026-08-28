@@ -430,7 +430,7 @@ def format_sparse_status(model):
         )
         lines.insert(
             budget_index + 1,
-            'First and last 20% of steps use at least 50% KV (rounded up).',
+            'First 20% of steps use at least 50% KV (rounded up).',
         )
 
     if mlp.get('provider') not in (None, 'off'):

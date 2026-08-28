@@ -114,6 +114,7 @@ CHUNK_ALIGNMENT = 256
 DENSITY_FIXED = 'fixed'
 DEFAULT_VIDEO_BUDGET = 0.15
 DEFAULT_EDGE_STEPS = 4
+DEFAULT_LATE_STEPS = 0
 DEFAULT_EDGE_KV = 0.5
 H3_LAYER_COUNT = 50
 
@@ -273,7 +274,7 @@ class SparseRequest:
         if self.advanced_schedule and self.denser_early_late_steps:
             raise ValueError(
                 'explicit early/late budgets cannot be combined with the '
-                'simple denser early/late schedule'
+                'simple denser early schedule'
             )
         if self.layer_video_budgets is not None and (
             self.denser_early_late_steps or self.advanced_schedule
