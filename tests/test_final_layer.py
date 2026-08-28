@@ -22,7 +22,11 @@ comfy.options.enable_args_parsing()
 
 from h3_optimizations.memory import final_layer
 import h3_optimizations.apply as apply_module
-from h3_optimizations.plan import H3OptimizationPlan, MemoryRequest
+from h3_optimizations.plan import (
+    EMBEDDING_MEMORY_RELEASE,
+    H3OptimizationPlan,
+    MemoryRequest,
+)
 from h3_optimizations.qkv.providers import MLPProviderResolution
 from comfy.model_patcher import ModelPatcher
 
@@ -183,6 +187,26 @@ class FinalLayerTests(unittest.TestCase):
         install_embedding.assert_called_once_with(patcher)
         self.assertIs(resolution, disabled)
         self.assertEqual(patched_blocks, 0)
+
+    def test_explicit_embedding_release_is_strict(self):
+        patcher = _Patcher()
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(
+                mlp_memory='off',
+                embedding_memory=EMBEDDING_MEMORY_RELEASE,
+            )
+        )
+        disabled = MLPProviderResolution('off', 'off', 'disabled')
+        with mock.patch.object(
+            apply_module, 'install_final_layer'
+        ), mock.patch.object(
+            apply_module, 'install_embedding_memory'
+        ) as install_embedding, mock.patch.object(
+            apply_module, 'resolve_mlp_provider', return_value=disabled
+        ):
+            apply_module._install_mlp(patcher, plan, object(), object())
+
+        install_embedding.assert_called_once_with(patcher, strict=True)
 
 
 if __name__ == '__main__':

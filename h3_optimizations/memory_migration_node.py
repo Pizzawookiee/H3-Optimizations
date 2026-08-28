@@ -145,9 +145,9 @@ def _memory_request_for_modes(
         else mlp_memory
     )
 
-    # Serialized compatibility slot from 0.2.21. Early release is a
-    # semantics-preserving free win, so production no longer exposes a policy
-    # choice for it.
+    # Serialized compatibility slot from 0.2.21. Auto releases compatible
+    # embedding implementations early and preserves the stock lifetime for
+    # unrecognized implementations.
     del embedding_memory_mode
 
     v_memory_requests = {
@@ -301,7 +301,8 @@ class H3MemoryOptimization(io.ComfyNode):
                         'hidden': True,
                         'tooltip': (
                             'Legacy serialized workflow slot. The value is ignored; '
-                            'embedding assembly tensors are always released early.'
+                            'compatible embedding assembly tensors are released early, '
+                            'otherwise ComfyUI\'s stock lifetime is preserved.'
                         ),
                     },
                 ),

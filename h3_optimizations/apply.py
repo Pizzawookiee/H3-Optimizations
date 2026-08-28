@@ -60,6 +60,7 @@ from .memory.config import ActivationMemoryConfig
 from .memory.final_layer import install as install_final_layer
 from .memory.embedding import clear as clear_embedding_memory
 from .memory.embedding import install as install_embedding_memory
+from .memory.embedding import is_installed as is_embedding_memory_installed
 from .memory.patch import install as install_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import clear_backend, configure_backend
@@ -69,6 +70,7 @@ from .plan import (
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
+    EMBEDDING_MEMORY_RELEASE,
     EMBEDDING_MEMORY_STOCK,
     H3OptimizationPlan,
     V_MEMORY_RETAIN,
@@ -913,6 +915,8 @@ def _install_mlp(
     rebuild_kwargs = {'force_rebuild': True} if force_rebuild else {}
     if memory.embedding_memory == EMBEDDING_MEMORY_STOCK:
         clear_embedding_memory(model_patcher)
+    elif memory.embedding_memory == EMBEDDING_MEMORY_RELEASE:
+        install_embedding_memory(model_patcher, strict=True, **rebuild_kwargs)
     else:
         install_embedding_memory(model_patcher, **rebuild_kwargs)
     install_final_layer(
@@ -979,6 +983,7 @@ def _status(
     mlp_blocks,
     runtime_installed,
     inventory,
+    embedding_memory_selected,
 ):
     return {
         'plan_version': int(plan.version),
@@ -1076,11 +1081,7 @@ def _status(
             if plan.memory is None
             else {
                 'requested': plan.memory.embedding_memory,
-                'selected': (
-                    'stock'
-                    if plan.memory.embedding_memory == EMBEDDING_MEMORY_STOCK
-                    else 'release'
-                ),
+                'selected': embedding_memory_selected,
             }
         ),
         'weight_formats': _inventory_status(inventory),
@@ -1296,6 +1297,9 @@ def _reconcile_plan(
         environment,
         **rebuild_kwargs,
     )
+    embedding_memory_selected = (
+        'release' if is_embedding_memory_installed(patched) else 'stock'
+    )
     runtime_installed = False
     if sparse_execution_selected:
         _session, _created = _ensure_sparse_runtime(patched)
@@ -1321,6 +1325,7 @@ def _reconcile_plan(
         mlp_blocks=mlp_blocks,
         runtime_installed=runtime_installed,
         inventory=inventory,
+        embedding_memory_selected=embedding_memory_selected,
     )
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
     session = options.get(RUNTIME_SESSION_KEY)
@@ -1380,8 +1385,7 @@ def _reconcile_plan(
                     and not preserved['final_layer']
                 )
                 or (
-                    plan.memory is not None
-                    and plan.memory.embedding_memory != EMBEDDING_MEMORY_STOCK
+                    embedding_memory_selected == 'release'
                     and not preserved['embedding']
                 )
             )
@@ -1429,12 +1433,7 @@ def _reconcile_plan(
             else 'checkpoint_native'
         ),
         mlp.provider_id,
-        (
-            'stock'
-            if plan.memory is None
-            or plan.memory.embedding_memory == EMBEDDING_MEMORY_STOCK
-            else 'release'
-        ),
+        embedding_memory_selected,
         describe_memory_options(attention),
         environment.device_name,
     )

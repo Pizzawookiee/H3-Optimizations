@@ -146,7 +146,41 @@ class EmbeddingMemoryTests(unittest.TestCase):
             ]
         )
 
-    def test_incompatible_upstream_forward_fails_closed(self):
+    def test_incompatible_upstream_forward_uses_stock_lifetime(self):
+        patcher = Patcher(self._model())
+        with mock.patch.object(
+            embedding.inspect,
+            'getsource',
+            return_value='def _forward(self, x):\n    return x\n',
+        ):
+            self.assertFalse(embedding.install(patcher))
+
+        self.assertNotIn(embedding.FORWARD_KEY, patcher.object_patches)
+        self.assertIn(
+            'changed',
+            patcher.model_options['transformer_options'][
+                embedding.FALLBACK_REASON_KEY
+            ],
+        )
+
+    def test_uninspectable_upstream_forward_uses_stock_lifetime(self):
+        patcher = Patcher(self._model())
+        with mock.patch.object(
+            embedding.inspect,
+            'getsource',
+            side_effect=OSError('source unavailable'),
+        ):
+            self.assertFalse(embedding.install(patcher))
+
+        self.assertNotIn(embedding.FORWARD_KEY, patcher.object_patches)
+        self.assertIn(
+            'cannot inspect',
+            patcher.model_options['transformer_options'][
+                embedding.FALLBACK_REASON_KEY
+            ],
+        )
+
+    def test_explicit_release_rejects_incompatible_upstream_forward(self):
         patcher = Patcher(self._model())
         with mock.patch.object(
             embedding.inspect,
@@ -157,7 +191,7 @@ class EmbeddingMemoryTests(unittest.TestCase):
                 embedding.H3EmbeddingMemoryPatchError,
                 'changed',
             ):
-                embedding.install(patcher)
+                embedding.install(patcher, strict=True)
 
 
 if __name__ == '__main__':

@@ -24,10 +24,10 @@ control.
   as a fallback; `BF16` materializes supported weights for BF16 execution;
   `Preserve native` never introduces a new weight conversion; and `Force quant`
   retains supported native quantized checkpoint formats.
-  visual, audio, and source-row embedding tensors are released immediately after
-  the packed hidden state is assembled, before block 0. This changes tensor
-  lifetime without changing model math; the advanced `Stock` embedding-memory
-  option retains ComfyUI's original lifetime for comparisons. With BF16 Triton,
+  On recognized compatible ComfyUI versions, visual, audio, and source-row
+  embedding tensors are released immediately after the packed hidden state is
+  assembled, before block 0. Unrecognized implementations retain ComfyUI's
+  stock embedding lifetime. With BF16 Triton,
   native BF16 QKV and Force quant both retain global BF16 K/V, stream bounded
   BF16 Q and attention output slabs, and write output projection directly into
   the disposable block input. With sparse Kitchen,
