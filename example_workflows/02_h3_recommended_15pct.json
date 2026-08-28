@@ -114,10 +114,10 @@
       "title": "H3 Optimizations example",
       "properties": {},
       "widgets_values": [
-        "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early steps is enabled, giving at least **50%** video KV for the first **20%** of sampling steps."
+        "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early ramp is enabled: it starts at **50%** video KV and gradually returns to **15%**, spending **12 additional percentage points per sampler step on average**."
       ],
       "widgets_values_named": {
-        "text": "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early steps is enabled, giving at least **50%** video KV for the first **20%** of sampling steps."
+        "text": "## H3 Optimizations — Recommended\n\nComfyUI stock MiniMax H3 workflow with **H3 Memory Optimization** plus **H3 Sparse Attention**. The only H3 setting exposed here is **Video attention budget**, set to its **15%** default. Denser Early ramp is enabled: it starts at **50%** video KV and gradually returns to **15%**, spending **12 additional percentage points per sampler step on average**."
       },
       "color": "#222",
       "bgcolor": "#000"
@@ -1717,13 +1717,11 @@
             },
             "widgets_values": [
               0.15,
-              true,
-              ""
+              true
             ],
             "widgets_values_named": {
               "video_budget": 0.15,
-              "denser_early_late_steps": true,
-              "layer_video_budgets": ""
+              "denser_early_late_steps": true
             }
           }
         ],

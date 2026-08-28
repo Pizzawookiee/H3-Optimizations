@@ -175,7 +175,7 @@ class StreamedFrostBF16Tests(unittest.TestCase):
                 early_kv=None,
                 late_steps=None,
                 late_kv=None,
-                layer_video_budgets=None,
+                step_video_budgets=None,
             ),
             router=SparseTileRouter(q_tile=64, kv_tile=64),
             _snapshot=lambda _options, _sequence: SimpleNamespace(

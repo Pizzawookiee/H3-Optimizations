@@ -116,7 +116,12 @@ DEFAULT_VIDEO_BUDGET = 0.15
 DEFAULT_EDGE_STEPS = 4
 DEFAULT_LATE_STEPS = 0
 DEFAULT_EDGE_KV = 0.5
-H3_LAYER_COUNT = 50
+EARLY_SCHEDULE_HOLD = 'Hold'
+EARLY_SCHEDULE_RAMP = 'Ramp'
+EARLY_SCHEDULE_OPTIONS = (
+    EARLY_SCHEDULE_HOLD,
+    EARLY_SCHEDULE_RAMP,
+)
 
 
 def _validate_sparse_budget(name, value):
@@ -141,21 +146,6 @@ def _validate_edge_schedule(early_steps, early_kv, late_steps, late_kv):
             raise ValueError('%s must be a non-negative integer' % name)
     _validate_sparse_budget('early_kv', early_kv)
     _validate_sparse_budget('late_kv', late_kv)
-
-
-def parse_layer_video_budgets(value):
-    text = str(value).strip()
-    if not text:
-        return None
-    budgets = tuple(float(item.strip()) for item in text.split(','))
-    if len(budgets) != H3_LAYER_COUNT:
-        raise ValueError(
-            'layer_video_budgets must contain exactly %d comma-separated values'
-            % H3_LAYER_COUNT
-        )
-    for layer_index, budget in enumerate(budgets):
-        _validate_sparse_budget('layer_video_budgets[%d]' % layer_index, budget)
-    return budgets
 
 
 @dataclass(frozen=True)
@@ -243,7 +233,8 @@ class SparseRequest:
     late_steps: int | None = None
     late_kv: float | None = None
     backend: str = SPARSE_BACKEND_AUTO
-    layer_video_budgets: tuple[float, ...] | None = None
+    early_schedule: str = EARLY_SCHEDULE_HOLD
+    step_video_budgets: tuple[float, ...] | None = None
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
         if self.backend == SPARSE_BACKEND_KITCHEN_LEGACY:
@@ -252,35 +243,35 @@ class SparseRequest:
             object.__setattr__(self, 'backend', SPARSE_BACKEND_TRITON)
         if self.backend not in SPARSE_BACKEND_REQUESTS:
             raise ValueError('unknown sparse backend request %r' % self.backend)
+        if self.early_schedule not in EARLY_SCHEDULE_OPTIONS:
+            raise ValueError('unknown early schedule %r' % self.early_schedule)
         _validate_edge_schedule(
             self.early_steps,
             self.early_kv,
             self.late_steps,
             self.late_kv,
         )
-        if self.layer_video_budgets is not None:
-            budgets = tuple(float(value) for value in self.layer_video_budgets)
-            if len(budgets) != H3_LAYER_COUNT:
-                raise ValueError(
-                    'layer_video_budgets must contain exactly %d values'
-                    % H3_LAYER_COUNT
-                )
-            for layer_index, budget in enumerate(budgets):
+        if self.step_video_budgets is not None:
+            budgets = tuple(float(value) for value in self.step_video_budgets)
+            if not budgets:
+                raise ValueError('step_video_budgets must not be empty')
+            for step_index, budget in enumerate(budgets):
                 _validate_sparse_budget(
-                    'layer_video_budgets[%d]' % layer_index,
+                    'step_video_budgets[%d]' % step_index,
                     budget,
                 )
-            object.__setattr__(self, 'layer_video_budgets', budgets)
+            object.__setattr__(self, 'step_video_budgets', budgets)
         if self.advanced_schedule and self.denser_early_late_steps:
             raise ValueError(
                 'explicit early/late budgets cannot be combined with the '
                 'simple denser early schedule'
             )
-        if self.layer_video_budgets is not None and (
-            self.denser_early_late_steps or self.advanced_schedule
+        if self.step_video_budgets is not None and (
+            self.denser_early_late_steps
+            or self.advanced_schedule
         ):
             raise ValueError(
-                'static per-layer budgets cannot be combined with early/late schedules'
+                'per-step budgets cannot be combined with other sparse schedules'
             )
 
     @property
@@ -294,11 +285,12 @@ class SparseRequest:
             DENSITY_FIXED,
             bool(self.denser_early_late_steps),
             self.backend,
+            self.early_schedule,
             None if self.early_steps is None else int(self.early_steps),
             None if self.early_kv is None else float(self.early_kv),
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
-            self.layer_video_budgets,
+            self.step_video_budgets,
         )
 
 

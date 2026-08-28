@@ -9,11 +9,12 @@ from .plan import (
     DEFAULT_EDGE_STEPS,
     DEFAULT_LATE_STEPS,
     DEFAULT_VIDEO_BUDGET,
+    EARLY_SCHEDULE_HOLD,
+    EARLY_SCHEDULE_OPTIONS,
     SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
-    parse_layer_video_budgets,
     read_plan,
 )
 from .status import (
@@ -73,26 +74,13 @@ class H3SparseAttention(io.ComfyNode):
                 _video_budget_input(),
                 io.Boolean.Input(
                     'denser_early_late_steps',
-                    display_name='Denser Early steps',
+                    display_name='Denser Early ramp',
                     default=True,
                     tooltip=(
-                        'Uses at least 50% video attention for the first 20% of '
-                        'sampling steps, rounded up to whole steps. '
-                        'H3 is especially sensitive to reduced attention in early '
-                        'denoising, so this can preserve prompt/timeline adherence '
-                        'better than using the same low budget throughout.'
-                    ),
-                ),
-                io.String.Input(
-                    'layer_video_budgets',
-                    display_name='Per-layer video KV budgets',
-                    default='',
-                    optional=True,
-                    advanced=True,
-                    tooltip=(
-                        'Optional comma-separated budget fractions for all 50 H3 '
-                        'layers. Applies at every sampling step and cannot be '
-                        'combined with Denser Early steps.'
+                        'Starts at no less than 50% video attention, then gradually '
+                        'reduces toward the selected budget. The ramp targets 12 '
+                        'additional percentage points per sampler step on '
+                        'average. Budgets already at or above 50% are unchanged.'
                     ),
                 ),
             ],
@@ -105,15 +93,11 @@ class H3SparseAttention(io.ComfyNode):
         model,
         video_budget=DEFAULT_VIDEO_BUDGET,
         denser_early_late_steps=True,
-        layer_video_budgets='',
     ):
         plan = read_plan(model).with_sparse(
             SparseRequest(
                 video_budget=float(video_budget),
                 denser_early_late_steps=bool(denser_early_late_steps),
-                layer_video_budgets=parse_layer_video_budgets(
-                    layer_video_budgets
-                ),
             )
         )
         patched = apply_plan(model, plan)
@@ -124,7 +108,7 @@ class H3SparseAttention(io.ComfyNode):
 
 
 class H3SparseAttentionAdvanced(io.ComfyNode):
-    '''Sparse attention with explicit backend and edge KV budgets.'''
+    '''Sparse attention with explicit backend and sampling-step schedules.'''
 
     @classmethod
     def define_schema(cls):
@@ -134,8 +118,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
             category=NODE_CATEGORY,
             description=(
                 'Advanced fixed-density sparse attention for MiniMax H3. '
-                'Video attention budget controls middle sampling steps; Early KV '
-                'and Late KV override the first and last configured step counts. '
+                'Video attention budget controls middle sampling steps. Early KV '
+                'can be held or ramped toward that budget; Late KV overrides the '
+                'final configured step count. '
                 'Lower budgets are faster but can change the generated result, and '
                 'the quality cost depends on the prompt and where attention is '
                 'removed in the denoising schedule. Kitchen INT8 64x64 is the '
@@ -160,10 +145,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     max=1000,
                     step=1,
                     tooltip=(
-                        'Number of first sampling steps that use Early KV. H3 is '
-                        'especially sensitive to reduced attention early in denoising. '
-                        'The default assumes 20 steps; adjust it to suit the sampler\'s '
-                        'sigma schedule.'
+                        'Hold uses Early KV for this many opening steps. Ramp '
+                        'moves from Early KV toward Video attention budget over '
+                        'this many steps. Set 0 to disable the early schedule.'
                     ),
                 ),
                 io.Float.Input(
@@ -174,9 +158,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     max=1.0,
                     step=0.01,
                     tooltip=(
-                        'Video attention budget used during the early-step window. '
-                        'Increasing this can preserve prompt/timeline adherence at '
-                        'the cost of speed; lowering it is especially risky for H3.'
+                        'Hold uses this budget throughout the early window. Ramp '
+                        'uses it as the starting budget. Increasing it can preserve '
+                        'prompt/timeline adherence at the cost of speed.'
                     ),
                 ),
                 io.Int.Input(
@@ -222,6 +206,18 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'Bypass this node to force dense attention.'
                     ),
                 ),
+                io.Combo.Input(
+                    'early_schedule',
+                    display_name='Early schedule',
+                    options=list(EARLY_SCHEDULE_OPTIONS),
+                    default=EARLY_SCHEDULE_HOLD,
+                    tooltip=(
+                        'Hold keeps Early KV constant for Early steps, matching '
+                        'existing Advanced workflows. Ramp starts at Early KV and '
+                        'moves linearly toward Video attention budget over Early '
+                        'steps. Set Early steps to 0 to disable either schedule.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -236,6 +232,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         late_steps=DEFAULT_LATE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
         backend=SPARSE_BACKEND_KITCHEN,
+        early_schedule=EARLY_SCHEDULE_HOLD,
     ):
         plan = read_plan(model).with_sparse(
             SparseRequest(
@@ -245,6 +242,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 late_steps=int(late_steps),
                 late_kv=float(late_kv),
                 backend=backend,
+                early_schedule=early_schedule,
             )
         )
         patched = apply_plan(model, plan)
@@ -254,7 +252,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, backend):
-        if backend in SPARSE_BACKEND_COMPAT_REQUESTS:
-            return True
-        return 'unknown sparse backend %r' % backend
+    def validate_inputs(cls, backend, early_schedule=EARLY_SCHEDULE_HOLD):
+        if backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
+            return 'unknown sparse backend %r' % backend
+        if early_schedule not in EARLY_SCHEDULE_OPTIONS:
+            return 'unknown early schedule %r' % early_schedule
+        return True

@@ -57,25 +57,32 @@ def decode(lut, valid):
 
 
 class RouterTests(unittest.TestCase):
-    def test_optional_early_budget_is_bounded(self):
+    def test_optional_early_ramp_is_bounded(self):
         config = HybridSparseConfig(
             video_budget=0.15,
             denser_early_late_steps=True,
         )
-        self.assertEqual(resolve_video_budget(config, 0, 10), 0.5)
-        self.assertEqual(resolve_video_budget(config, 1, 10), 0.5)
-        self.assertEqual(resolve_video_budget(config, 2, 10), 0.15)
-        self.assertEqual(resolve_video_budget(config, 7, 10), 0.15)
-        self.assertEqual(resolve_video_budget(config, 8, 10), 0.15)
-        self.assertEqual(resolve_video_budget(config, 9, 10), 0.15)
+        budgets = [resolve_video_budget(config, step, 10) for step in range(10)]
+        self.assertEqual(budgets[0], 0.5)
+        self.assertTrue(
+            all(left >= right for left, right in zip(budgets, budgets[1:]))
+        )
+        self.assertAlmostEqual(sum(value - 0.15 for value in budgets), 1.2)
+        self.assertEqual(budgets[6:], [0.15] * 4)
         self.assertEqual(resolve_video_budget(config, -1, 10), 0.15)
         already_denser = HybridSparseConfig(
             video_budget=0.85,
             denser_early_late_steps=True,
         )
         self.assertEqual(resolve_video_budget(already_denser, 0, 10), 0.85)
-        self.assertEqual(resolve_video_budget(config, 2, 11), 0.5)
-        self.assertEqual(resolve_video_budget(config, 8, 11), 0.15)
+        eleven_steps = [
+            resolve_video_budget(config, step, 11) for step in range(11)
+        ]
+        self.assertEqual(eleven_steps[0], 0.5)
+        self.assertAlmostEqual(
+            sum(value - 0.15 for value in eleven_steps),
+            1.32,
+        )
 
     def test_per_head_top_k_and_dense_context(self):
         q, k = routed_inputs()

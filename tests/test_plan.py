@@ -12,6 +12,8 @@ from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_EXISTING,
     EMBEDDING_MEMORY_AUTO,
     EMBEDDING_MEMORY_RELEASE,
+    EARLY_SCHEDULE_HOLD,
+    EARLY_SCHEDULE_RAMP,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
@@ -25,7 +27,6 @@ from h3_optimizations.plan import (  # noqa: E402
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_TRITON,
     SparseRequest,
-    parse_layer_video_budgets,
 )
 
 
@@ -82,6 +83,7 @@ class PlanTests(unittest.TestCase):
         request = SparseRequest()
         self.assertEqual(request.video_budget, 0.15)
         self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
+        self.assertEqual(request.early_schedule, EARLY_SCHEDULE_HOLD)
         self.assertFalse(request.advanced_schedule)
 
     def test_legacy_sparse_request_positional_shape_is_preserved(self):
@@ -110,19 +112,12 @@ class PlanTests(unittest.TestCase):
             early_kv=0.5,
             late_steps=2,
             late_kv=0.5,
+            early_schedule=EARLY_SCHEDULE_RAMP,
         )
         self.assertTrue(request.advanced_schedule)
         self.assertIn(SPARSE_BACKEND_TRITON, request.signature)
+        self.assertIn(EARLY_SCHEDULE_RAMP, request.signature)
         self.assertEqual(request.signature[-5:-1], (2, 0.5, 2, 0.5))
-
-    def test_static_layer_budgets_are_parsed_and_part_of_identity(self):
-        text = ','.join(['0.2'] * 7 + ['0.4'] + ['0.2'] * 42)
-        budgets = parse_layer_video_budgets(text)
-        request = SparseRequest(layer_video_budgets=budgets)
-        self.assertEqual(len(request.layer_video_budgets), 50)
-        self.assertEqual(request.layer_video_budgets[7], 0.4)
-        self.assertEqual(request.signature[-1], request.layer_video_budgets)
-        self.assertIsNone(parse_layer_video_budgets(''))
 
     def test_node_order_does_not_change_the_plan(self):
         memory = MemoryRequest()
@@ -169,6 +164,8 @@ class PlanTests(unittest.TestCase):
                 SparseRequest(video_budget=budget)
         with self.assertRaisesRegex(ValueError, 'unknown sparse backend'):
             SparseRequest(backend='dense')
+        with self.assertRaisesRegex(ValueError, 'unknown early schedule'):
+            SparseRequest(early_schedule='Curve')
         SparseRequest(
             early_steps=0,
             early_kv=0.01,
@@ -183,15 +180,6 @@ class PlanTests(unittest.TestCase):
                 early_kv=0.5,
                 late_steps=2,
                 late_kv=0.5,
-            )
-        with self.assertRaisesRegex(ValueError, 'exactly 50'):
-            parse_layer_video_budgets('0.2,0.3')
-        with self.assertRaisesRegex(ValueError, r'layer_video_budgets\[4\]'):
-            SparseRequest(layer_video_budgets=[0.2] * 4 + [0.0] + [0.2] * 45)
-        with self.assertRaisesRegex(ValueError, 'cannot be combined'):
-            SparseRequest(
-                denser_early_late_steps=True,
-                layer_video_budgets=[0.2] * 50,
             )
         with self.assertRaises(ValueError):
             SparseRequest(

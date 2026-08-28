@@ -297,7 +297,8 @@ def _sparse_config_kwargs(plan):
         'early_kv': sparse.early_kv,
         'late_steps': sparse.late_steps,
         'late_kv': sparse.late_kv,
-        'layer_video_budgets': sparse.layer_video_budgets,
+        'early_schedule': sparse.early_schedule,
+        'step_video_budgets': sparse.step_video_budgets,
         'strict': True,
     }
 
@@ -1014,10 +1015,11 @@ def _status(
                 'early_kv': plan.sparse.early_kv,
                 'late_steps': plan.sparse.late_steps,
                 'late_kv': plan.sparse.late_kv,
-                'layer_video_budgets': (
+                'early_schedule': plan.sparse.early_schedule,
+                'step_video_budgets': (
                     None
-                    if plan.sparse.layer_video_budgets is None
-                    else list(plan.sparse.layer_video_budgets)
+                    if plan.sparse.step_video_budgets is None
+                    else list(plan.sparse.step_video_budgets)
                 ),
             }
         ),

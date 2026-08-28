@@ -138,9 +138,14 @@ remain dense.
 > prompt. H3 is especially sensitive to reducing attention in the early sampling
 > steps.
 
-The **Denser Early steps** setting is enabled by default. It uses at least 50%
-video attention for the first 20% of sampler steps, rounded up to whole steps.
-H3 is especially sensitive to reduced attention during these opening steps.
+The **Denser Early ramp** setting is enabled by default. It starts sampling at
+no less than 50% video attention, then gradually reduces attention toward the
+selected budget. For ordinary sparse budgets it targets 12 additional percentage
+points per sampler step on average. Budgets already at or above 50% are
+unchanged; on unusually short samplers, the 50% first-step minimum takes
+precedence over the target average. H3 is especially sensitive to reduced
+attention while the scene is being established, and the ramp avoids an abrupt
+drop from a short dense prefix to the low budget.
 
 ## H3 Sparse Attention (Advanced)
 
@@ -148,21 +153,24 @@ H3 is especially sensitive to reduced attention during these opening steps.
 on.**
 
 The Advanced node exposes separate attention budgets for the beginning, middle,
-and end of sampling, plus an explicit sparse-backend selector.
+and end of sampling, an early-schedule shape, and an explicit sparse-backend
+selector.
 
 - **Video attention budget** controls the middle steps.
-- **Early steps / Early KV** control how many opening steps receive a different
-  budget and what that budget is.
+- **Early schedule** selects **Hold** or **Ramp**. Hold keeps Early KV fixed for
+  the configured Early steps. Ramp starts at Early KV and moves linearly toward
+  Video attention budget over those steps. Set Early steps to `0` to disable it.
+- **Early steps / Early KV** control the duration and held or starting budget.
 - **Late steps / Late KV** do the same for the final steps.
 - If the early and late windows overlap, the denser requested budget wins.
 - **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
   Sparse Sage, BF16 Triton, or FP8 FlexAttention.
 
-The defaults use four early steps at 50%, a 15% middle budget, and no late
-override, matching a 20-step schedule. Late controls remain available for
-experiments, but denser late steps have not shown enough benefit to justify
-their compute cost as a default. Adjust the step counts for other sampler
-schedules.
+The defaults preserve the existing **Hold** behavior: four early steps at 50%,
+a 15% middle budget, and no late override, matching a 20-step schedule. Choose
+**Ramp** for a gradual transition and increase Early steps for a longer ramp.
+Late controls remain available for experiments, but denser late steps have not
+shown enough benefit to justify their compute cost as a default.
 
 Explicit backend choices are hard requirements: if you select a backend that is
 not available on the current system, the node errors instead of silently
