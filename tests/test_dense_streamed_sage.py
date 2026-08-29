@@ -28,6 +28,7 @@ from h3_optimizations.dense_streamed_sage import (  # noqa: E402
 )
 from h3_optimizations.attention_forward import _AttentionOutProjectionProxy  # noqa: E402
 from h3_optimizations.attention.sage_v_staging import _permuted_rows  # noqa: E402
+from h3_optimizations.normalized_rows import NormalizedRows  # noqa: E402
 from h3_optimizations.plan import V_MEMORY_TWO_PASS  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -180,6 +181,51 @@ class DenseStreamedSageTests(unittest.TestCase):
         self.assertTrue(all(not binding.active for binding in factory.bindings))
         self.assertIsNone(prepared.projected.k_int8)
         self.assertIsNone(prepared.v_carrier)
+
+    def test_lazy_normalized_rows_remain_the_streamed_q_source(self):
+        factory = FakeHeldFactory()
+        sage = FakeSage(factory)
+        projector = StreamedDenseSageQKVProjector(
+            sage,
+            chunk_rows=2,
+            projection_mode="native",
+            held_factory=factory,
+            allow_cpu_for_tests=True,
+        )
+        backend = StreamedDenseSageBackend(sage)
+        module = Module()
+        residual = (
+            torch.arange(5 * 256).reshape(5, 256) % 100
+        ).to(torch.float16)
+        expected = residual.clone()
+        source = NormalizedRows(
+            residual,
+            lambda rows: rows.clone(),
+            ((0, 5, 0),),
+            None,
+            None,
+            lambda rows, _shift, _scale, _selector: rows,
+        )
+
+        projected = projector.project(
+            module,
+            source,
+            None,
+            layer_index=7,
+            transformer_options={},
+        )
+        source.output_buffer().fill_(-7)
+        prepared = backend.prepare_projected(
+            projected,
+            layer_index=7,
+            transformer_options={},
+        )
+        proxy = _AttentionOutProjectionProxy(module, lambda value: value)
+        actual = backend.execute_projected(proxy, prepared)
+
+        self.assertIsNot(actual, residual)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(residual, expected))
 
 
 class StagingHeld(FakeHeld):

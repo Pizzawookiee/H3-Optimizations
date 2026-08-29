@@ -475,9 +475,12 @@ GPU kernel validation is intentionally separate because it requires matching
 hardware and compiled backend packages.
 
 Live SM89 gates compare whole-carrier and streamed Kitchen Q/Q-scale exactly,
-exercise 100% sparse routes at every shipped Kitchen geometry, and check dense
-Sage, Sparse Sage, FP8 FlexAttention, FROST BF16, and BF16 Triton output against
-their numerical contracts.
+exercise every shipped Kitchen geometry, and check the declared SM89
+attention-backend matrix against dense or explicitly masked SDPA references.
+The matrix requires finite output plus route-specific relative-L2 and maximum
+absolute-error limits. Its streamed dense Sage row runs lazy normalized input
+through the real Sage kernel and chunked output projection, covering the full
+source/output lifetime boundary rather than only a prepared carrier.
 
 Run the CPU suite from the ComfyUI root:
 

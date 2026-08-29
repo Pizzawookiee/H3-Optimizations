@@ -322,14 +322,14 @@ class StreamedDenseSageBackend:
                 stop = min(start + projected.query_chunk_rows, projected.sequence)
                 held = projected.held_factory(
                     module,
-                    result[start:start + 1],
+                    projected.x[start:start + 1],
                     projected.projection_mode,
                 )
                 held.__enter__()
                 try:
                     q = project_q_hnd(
                         held,
-                        result,
+                        projected.x,
                         projected.rope_freqs,
                         start,
                         stop,
