@@ -20,7 +20,7 @@ from .linear import (
     module_swiglu_fc2,
     swiglu_eager,
 )
-from ..normalized_rows import NormalizedRows, NormalizedRowsUnsupported
+from ..normalized_rows import NORM1_SOURCE_KEY, NormalizedRows
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 from ..qkv.int8 import (
     ConvRotINT8BindingError,
@@ -28,7 +28,6 @@ from ..qkv.int8 import (
 )
 
 LOG_PREFIX = '[H3 Optimizations]'
-_ATTENTION_FALLBACK_LOGGED = set()
 _MLP_FALLBACK_LOGGED = set()
 
 
@@ -53,6 +52,16 @@ def _gate_add(x, other, gate, selector):
     x.addcmul_(other, gate_rows)
     del gate_rows
     return x
+
+
+def _attention_supports_lazy_norm(attention):
+    forward = getattr(attention, 'forward', None)
+    if forward is None:
+        return False
+    function = getattr(forward, '__func__', forward)
+    return bool(
+        getattr(function, '_h3_optimizations_lazy_norm_source', False)
+    )
 
 
 def _open_generic_held(block, sample, config):
@@ -239,13 +248,10 @@ def make_forward(block, layer_index, config, original_forward=None):
             )
         )
 
-        # Scalar modulation keeps the original whole-segment fast path. Only
-        # ComfyUI's per-token noise-mask selectors are gathered in bounded slabs
-        # so long masked sequences do not materialize full [tokens, hidden]
-        # shift/scale/gate tensors.
-        # The attention consumers read their input only as x[start:end] row
-        # slices, so norm1 + modulation can run per slice instead of holding a
-        # full [sequence, hidden] tensor across the whole attention call.
+        # Keep lazy Norm1 below the attention abstraction boundary. The block
+        # always calls attention with a real Tensor; only a package-owned
+        # projected-QKV forward receives the private row source. Unknown or
+        # standard attention forwards get the ordinary materialized Norm1 path.
         h = NormalizedRows(
             x,
             block.norm1,
@@ -254,29 +260,15 @@ def make_forward(block, layer_index, config, original_forward=None):
             scale_msa,
             _scale_shift,
         )
-        try:
+        if _attention_supports_lazy_norm(block.attn):
+            attention_options = dict(transformer_options or {})
+            attention_options[NORM1_SOURCE_KEY] = h
             attn_out = block.attn(
-                h,
+                x,
                 rope_freqs=rope_freqs,
-                transformer_options=transformer_options,
+                transformer_options=attention_options,
             )
-        except NormalizedRowsUnsupported as exc:
-            if not isinstance(h, NormalizedRows):
-                raise
-            # This attention forward cannot consume lazy normalized rows. Fall
-            # back to standard materialized Norm1; output remains correct, but
-            # the Norm1 fusion memory saving is unavailable for this path.
-            reason = str(exc)
-            if reason not in _ATTENTION_FALLBACK_LOGGED:
-                logging.info(
-                    '%s Norm1 fusion is unavailable for this attention forward '
-                    '(first seen in block %d); using standard Norm1 instead. '
-                    'This only uses slightly more VRAM. Detail: %s',
-                    LOG_PREFIX,
-                    layer_index,
-                    reason,
-                )
-                _ATTENTION_FALLBACK_LOGGED.add(reason)
+        else:
             h = h.materialize()
             attn_out = block.attn(
                 h,
