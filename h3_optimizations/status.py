@@ -1,6 +1,12 @@
 '''Compact UI summaries for resolved H3 optimization plans.'''
 
-from .plan import PLAN_KEY, SPARSE_BACKEND_AUTO, STATUS_KEY
+from .plan import (
+    EARLY_SCHEDULE_HOLD,
+    EARLY_SCHEDULE_RAMP,
+    PLAN_KEY,
+    SPARSE_BACKEND_AUTO,
+    STATUS_KEY,
+)
 
 
 def _model_options(model):
@@ -367,16 +373,12 @@ def format_sparse_status(model):
         lines.insert(1, 'Requested sparse backend: %s' % backend_request)
     elif selected != 'sparse_kitchen_int8' and reason:
         lines.insert(1, 'Sparse fallback: %s' % reason)
-    layer_budgets = sparse.get('layer_video_budgets')
-    if layer_budgets:
+    step_budgets = sparse.get('step_video_budgets')
+    if step_budgets:
         lines.insert(
             2,
-            'Static layer table: %d layers, %.1f%%-%.1f%% KV'
-            % (
-                len(layer_budgets),
-                min(layer_budgets) * 100.0,
-                max(layer_budgets) * 100.0,
-            ),
+            'Per-step benchmark schedule: %s'
+            % ', '.join('%.0f%%' % (value * 100.0) for value in step_budgets),
         )
     qkv_index = next(
         index for index, line in enumerate(lines) if line.startswith('QKV:')
@@ -407,11 +409,33 @@ def format_sparse_status(model):
             late_steps = getattr(plan_sparse, 'late_steps', 0)
         if late_kv is None:
             late_kv = getattr(plan_sparse, 'late_kv', budget)
+        early_schedule = sparse.get('early_schedule')
+        if early_schedule is None:
+            early_schedule = getattr(
+                plan_sparse,
+                'early_schedule',
+                EARLY_SCHEDULE_HOLD,
+            )
+        if int(early_steps) == 0:
+            early_text = 'Early: disabled'
+        elif early_schedule == EARLY_SCHEDULE_RAMP:
+            early_text = (
+                'Early ramp: %.1f%% -> %.1f%% KV over %d steps'
+                % (
+                    float(early_kv) * 100.0,
+                    float(budget) * 100.0,
+                    int(early_steps),
+                )
+            )
+        else:
+            early_text = (
+                'Early hold: first %d steps at %.1f%% KV'
+                % (int(early_steps), float(early_kv) * 100.0)
+            )
         schedule_line = (
-            'Early: first %d steps at %.1f%% KV; Late: last %d steps at %.1f%% KV.'
+            '%s; Late: last %d steps at %.1f%% KV.'
             % (
-                int(early_steps),
-                float(early_kv) * 100.0,
+                early_text,
                 int(late_steps),
                 float(late_kv) * 100.0,
             )
@@ -430,7 +454,7 @@ def format_sparse_status(model):
         )
         lines.insert(
             budget_index + 1,
-            'First 2 and last 2 steps add 30 percentage points, capped at 100%.',
+            'Early ramp: starts at 50% KV or higher; targets +12 points/step on average.',
         )
 
     if mlp.get('provider') not in (None, 'off'):

@@ -1,10 +1,16 @@
 '''Lazily normalized attention input rows.
 
-The attention consumers only ever read their input as ``x[start:end]`` row
-slices, plus ``shape``/``dtype``/``device``/``new_empty``. That lets the
-pre-attention ``norm1`` + modulation run per requested slice instead of
-materializing a full ``[sequence, hidden]`` tensor that stays resident for the
-whole block.
+The QKV producers only ever read their input as ``x[start:end]`` row slices,
+plus ``shape``/``dtype``/``device``/``new_empty``. That lets the pre-attention
+``norm1`` + modulation run per requested slice instead of materializing a full
+``[sequence, hidden]`` tensor that stays resident for the whole block.
+
+The lazy row source is private to the package-owned attention/QKV transaction.
+The DiT block still calls attention with an ordinary Tensor; the optimized
+attention forward extracts this row source from its private transformer option
+and hands it only to a projector that explicitly owns the projected-QKV path.
+Foreign or standard attention forwards therefore never have to emulate a new
+Tensor protocol.
 
 The trade is recomputation: a route that walks the sequence more than once
 (streamed Kitchen projects K/V and Q in separate passes, and two-pass V adds a
@@ -12,16 +18,19 @@ third) normalizes those rows once per pass. RMSNorm at H3 shapes is bandwidth
 bound, so this is close to even on time and removes one full-sequence BF16
 tensor from the block's peak.
 
-Consumers that need a real tensor can call ``materialize()``; the block forward
-uses that as its compatibility fallback. Streamed attention consumers call
-``attention_output_buffer()`` when they are ready to overwrite the disposable
-normalized input. For lazy rows that allocates a distinct output tensor at that
-late point, because the wrapped tensor is still the block residual.
+Consumers that need a real tensor can call ``materialize()``. Streamed
+attention consumers call ``attention_output_buffer()`` when they are ready to
+overwrite the disposable normalized input. For lazy rows that allocates a
+distinct output tensor at that late point, because the wrapped tensor is still
+the block residual.
 '''
 
 from __future__ import annotations
 
 import torch
+
+
+NORM1_SOURCE_KEY = 'h3_optimizations_norm1_source'
 
 
 class NormalizedRowsUnsupported(AttributeError):
@@ -32,8 +41,8 @@ class NormalizedRows:
     '''A read-only ``[sequence, hidden]`` row source with fused norm + modulation.
 
     Only the surface the QKV producers actually use is implemented. Anything
-    else is deliberately absent so an unsupported consumer fails loudly at bind
-    time rather than silently reading unnormalized rows.
+    else is deliberately absent so an unsupported projector fails loudly
+    instead of silently reading unnormalized rows.
     '''
 
     __slots__ = (

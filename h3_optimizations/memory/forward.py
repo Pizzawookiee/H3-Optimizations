@@ -20,7 +20,7 @@ from .linear import (
     module_swiglu_fc2,
     swiglu_eager,
 )
-from ..normalized_rows import NormalizedRows, NormalizedRowsUnsupported
+from ..normalized_rows import NORM1_SOURCE_KEY, NormalizedRows
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 from ..qkv.int8 import (
     ConvRotINT8BindingError,
@@ -28,6 +28,8 @@ from ..qkv.int8 import (
 )
 
 LOG_PREFIX = '[H3 Optimizations]'
+_MLP_FALLBACK_LOGGED = set()
+
 
 def _mod_row(values, selector, dtype):
     if torch.is_tensor(selector) and selector.device != values.device:
@@ -50,6 +52,21 @@ def _gate_add(x, other, gate, selector):
     x.addcmul_(other, gate_rows)
     del gate_rows
     return x
+
+
+def _attention_supports_lazy_norm(attention):
+    forward = getattr(attention, 'forward', None)
+    if forward is None:
+        return False
+    function = getattr(forward, '__func__', forward)
+    # Identity, not truthiness: mocks and __getattr__ proxies can synthesize a
+    # truthy value for arbitrary attributes. A false positive here would pass
+    # the raw unnormalized residual to a foreign attention forward.
+    return getattr(
+        function,
+        '_h3_optimizations_lazy_norm_source',
+        False,
+    ) is True
 
 
 def _open_generic_held(block, sample, config):
@@ -131,6 +148,22 @@ def _open_mlp(block, sample, config):
         if generic_error is not None:
             detail += '; held fallback unavailable: %s' % generic_error
         return held, 'held' if held is not None else 'module', detail
+
+
+def _log_mlp_fallback(layer_index, reason):
+    reason = str(reason)
+    if reason in _MLP_FALLBACK_LOGGED:
+        return
+    logging.info(
+        '%s preferred MLP optimization is unavailable for this model path '
+        '(first seen in block %d); using a compatible fallback instead. '
+        'Output is unaffected, but VRAM use or speed may be slightly worse. '
+        'Detail: %s',
+        LOG_PREFIX,
+        layer_index,
+        reason,
+    )
+    _MLP_FALLBACK_LOGGED.add(reason)
 
 
 def _run_mlp(block, h, held, mlp_path, config):
@@ -220,13 +253,10 @@ def make_forward(block, layer_index, config, original_forward=None):
             )
         )
 
-        # Scalar modulation keeps the original whole-segment fast path. Only
-        # ComfyUI's per-token noise-mask selectors are gathered in bounded slabs
-        # so long masked sequences do not materialize full [tokens, hidden]
-        # shift/scale/gate tensors.
-        # The attention consumers read their input only as x[start:end] row
-        # slices, so norm1 + modulation can run per slice instead of holding a
-        # full [sequence, hidden] tensor across the whole attention call.
+        # Keep lazy Norm1 below the attention abstraction boundary. The block
+        # always calls attention with a real Tensor; only a package-owned
+        # projected-QKV forward receives the private row source. Unknown or
+        # standard attention forwards get the ordinary materialized Norm1 path.
         h = NormalizedRows(
             x,
             block.norm1,
@@ -235,17 +265,15 @@ def make_forward(block, layer_index, config, original_forward=None):
             scale_msa,
             _scale_shift,
         )
-        try:
+        if _attention_supports_lazy_norm(block.attn):
+            attention_options = dict(transformer_options or {})
+            attention_options[NORM1_SOURCE_KEY] = h
             attn_out = block.attn(
-                h,
+                x,
                 rope_freqs=rope_freqs,
-                transformer_options=transformer_options,
+                transformer_options=attention_options,
             )
-        except NormalizedRowsUnsupported:
-            if not isinstance(h, NormalizedRows):
-                raise
-            # This attention consumer wants a real tensor. Materialize once and
-            # retry; attention does not mutate its input, so the retry is safe.
+        else:
             h = h.materialize()
             attn_out = block.attn(
                 h,
@@ -266,12 +294,7 @@ def make_forward(block, layer_index, config, original_forward=None):
 
         held, mlp_path, held_error = _open_mlp(block, x[:1], config)
         if held_error is not None:
-            logging.warning(
-                '%s block %d selected a format-compatible MLP fallback: %s',
-                LOG_PREFIX,
-                layer_index,
-                held_error,
-            )
+            _log_mlp_fallback(layer_index, held_error)
 
         try:
             for chunk in chunks:

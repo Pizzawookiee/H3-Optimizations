@@ -122,6 +122,26 @@ class QKVStatusReadabilityTests(unittest.TestCase):
 
         self.assertIn('Sparse fallback: Kitchen INT8 unavailable: synthetic', text)
 
+    def test_advanced_ramp_describes_its_peak_floor_and_duration(self):
+        status = dict(self.status)
+        status['sparse'] = {
+            'video_budget': 0.15,
+            'early_steps': 8,
+            'early_kv': 0.5,
+            'late_steps': 0,
+            'late_kv': 0.5,
+            'early_schedule': 'Ramp',
+        }
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: status},
+            }
+        )
+
+        text = format_sparse_status(model)
+
+        self.assertIn('Early ramp: 50.0% -> 15.0% KV over 8 steps', text)
+
     def test_sparse_preview_reports_runtime_int8_output_projection(self):
         self.status['fused_qkv']['out_proj_runtime_convrot_int8'] = True
         model = SimpleNamespace(

@@ -141,16 +141,16 @@ def test_node_schema_and_request():
             'model',
             'video_budget',
             'denser_early_late_steps',
-            'layer_video_budgets',
         ],
-        'standard schema appends the optional static layer table',
+        'standard schema exposes only its production controls',
     )
     denser = input_by_id(schema, 'denser_early_late_steps')
     check(
-        denser.display_name == 'Denser Early/Late steps'
-        and denser.default is False
-        and '30 percentage points' in denser.tooltip,
-        'legacy density toggle is explicit and defaults off',
+        denser.display_name == 'Denser Early ramp'
+        and denser.default is True
+        and 'targets 12 additional percentage points' in denser.tooltip
+        and 'no less than 50%' in denser.tooltip,
+        'simple early density ramp is described and defaults on',
     )
 
     model = SimpleNamespace(model_options={})
@@ -162,7 +162,6 @@ def test_node_schema_and_request():
         result = H3SparseAttention.execute(
             model,
             video_budget=0.5,
-            denser_early_late_steps=True,
         )
     request = apply.call_args.args[1].sparse
     check(
@@ -171,26 +170,8 @@ def test_node_schema_and_request():
         and request.backend == 'auto'
         and request.denser_early_late_steps is True
         and request.advanced_schedule is False,
-        'standard node carries the legacy denser-step policy',
+        'standard node carries the simple denser-step policy',
     )
-
-    layer_budgets = ','.join(['0.1'] * 25 + ['0.3'] * 25)
-    with mock.patch(
-        'h3_optimizations.nodes.apply_plan',
-        return_value=patched,
-    ) as apply:
-        H3SparseAttention.execute(
-            model,
-            video_budget=0.2,
-            layer_video_budgets=layer_budgets,
-        )
-    request = apply.call_args.args[1].sparse
-    check(
-        request.layer_video_budgets[:25] == (0.1,) * 25
-        and request.layer_video_budgets[25:] == (0.3,) * 25,
-        'standard node parses exactly 50 static layer budgets',
-    )
-
 
 def test_advanced_node_schema_and_request():
     print('H3 Sparse Attention Advanced node policy')
@@ -205,6 +186,7 @@ def test_advanced_node_schema_and_request():
             'late_steps',
             'late_kv',
             'backend',
+            'early_schedule',
         ],
         'advanced schema exposes only production sparse controls',
     )
@@ -222,10 +204,13 @@ def test_advanced_node_schema_and_request():
         'advanced backend selector exposes the supported sparse backends',
     )
     check(
-        input_by_id(schema, 'early_steps').default == 2
+        input_by_id(schema, 'video_budget').default == 0.15
+        and input_by_id(schema, 'early_steps').default == 4
         and input_by_id(schema, 'early_kv').default == 0.5
-        and input_by_id(schema, 'late_steps').default == 2
-        and input_by_id(schema, 'late_kv').default == 0.5,
+        and input_by_id(schema, 'late_steps').default == 0
+        and input_by_id(schema, 'late_kv').default == 0.5
+        and input_by_id(schema, 'early_schedule').default == 'Hold'
+        and input_by_id(schema, 'early_schedule').options == ['Hold', 'Ramp'],
         'advanced early and late defaults match the public contract',
     )
 
@@ -243,6 +228,7 @@ def test_advanced_node_schema_and_request():
             late_steps=4,
             late_kv=0.7,
             backend='BF16 Triton',
+            early_schedule='Ramp',
         )
     request = apply.call_args.args[1].sparse
     check(
@@ -253,29 +239,35 @@ def test_advanced_node_schema_and_request():
         and request.early_kv == 0.6
         and request.late_steps == 4
         and request.late_kv == 0.7
+        and request.early_schedule == 'Ramp'
         and request.denser_early_late_steps is False,
         'advanced node carries the explicit schedule and production TopK routing',
     )
 
 
 def test_step_budgets():
-    print('H3 Sparse Attention legacy step budgets')
+    print('H3 Sparse Attention smart early ramp')
     config = HybridSparseConfig(
-        video_budget=0.5,
+        video_budget=0.1,
         denser_early_late_steps=True,
     )
     backend = make_backend(config)
     q = k = v = TensorStub()
-    expected = {
-        -1: 0.5,
-        0: 0.8,
-        1: 0.8,
-        2: 0.5,
-        17: 0.5,
-        18: 0.8,
-        19: 0.8,
-    }
-    for step_index, budget in expected.items():
+    budgets = [resolve_video_budget(config, step, 20) for step in range(20)]
+    check(abs(budgets[0] - 0.5) < 1e-9, 'the first step uses 50% video KV')
+    check(
+        all(left >= right for left, right in zip(budgets, budgets[1:])),
+        'the early schedule declines monotonically',
+    )
+    check(
+        all(abs(value - 0.1) < 1e-9 for value in budgets[11:]),
+        'the 20-step ramp returns to the configured floor after step 11',
+    )
+    check(
+        abs(sum(value - 0.1 for value in budgets) - 2.4) < 1e-9,
+        'the ramp spends 12 average percentage points of extra KV',
+    )
+    for step_index in (-1, 0, 5, 10, 11, 19):
         prepared = backend.prepare(
             q,
             k,
@@ -286,11 +278,10 @@ def test_step_budgets():
         check(
             abs(
                 prepared.sparse.metadata['requested_video_budget']
-                - budget
+                - (0.1 if step_index < 0 else budgets[step_index])
             )
             < 1e-9,
-            'step %d resolves to %.0f%% video budget'
-            % (step_index, budget * 100.0),
+            'step %d uses the resolved ramp budget' % step_index,
         )
 
     projected = SimpleNamespace(
@@ -302,11 +293,13 @@ def test_step_budgets():
     prepared = backend.prepare_projected(
         projected,
         layer_index=0,
-        transformer_options=options(18),
+        transformer_options=options(5),
     )
     check(
-        prepared.sparse.metadata['requested_video_budget'] == 0.8,
-        'fused projected-QKV routing uses the same late-step policy',
+        abs(
+            prepared.sparse.metadata['requested_video_budget'] - budgets[5]
+        ) < 1e-9,
+        'fused projected-QKV routing uses the same early ramp',
     )
     check(
         resolve_video_budget(
@@ -317,14 +310,58 @@ def test_step_budgets():
             0,
             20,
         )
-        == 1.0,
-        'legacy early/late video budget is capped at 100%',
+        == 0.85,
+        'simple ramp does not alter an already denser base budget',
+    )
+    short_budgets = [resolve_video_budget(config, step, 8) for step in range(8)]
+    check(
+        abs(short_budgets[0] - 0.5) < 1e-9
+        and abs(sum(value - 0.1 for value in short_budgets) - 0.96) < 1e-9
+        and all(left >= right for left, right in zip(short_budgets, short_budgets[1:])),
+        'the normalized ramp preserves its area and shape at eight steps',
     )
     check(
-        resolve_video_budget(HybridSparseConfig(video_budget=0.5), 0, 20)
-        == 0.5,
-        'disabled legacy policy preserves the configured budget',
+        resolve_video_budget(HybridSparseConfig(video_budget=0.15), 0, 20)
+        == 0.15,
+        'disabled simple ramp preserves the configured budget',
     )
+    all_ramps_bounded = True
+    all_areas_exact = True
+    for total_steps in range(1, 33):
+        for base_budget in (0.01, 0.1, 0.15, 0.3, 0.49, 0.5, 0.85, 1.0):
+            varied = HybridSparseConfig(
+                video_budget=base_budget,
+                denser_early_late_steps=True,
+            )
+            resolved = [
+                resolve_video_budget(varied, step, total_steps)
+                for step in range(total_steps)
+            ]
+            all_ramps_bounded = all_ramps_bounded and (
+                all(
+                    base_budget <= value <= 1.0
+                    for value in resolved
+                )
+                and all(
+                    left >= right
+                    for left, right in zip(resolved, resolved[1:])
+                )
+            )
+            peak_extra = max(0.0, 0.5 - base_budget)
+            expected_extra = 0.0
+            if peak_extra:
+                expected_extra = max(
+                    min(0.12 * total_steps, peak_extra * total_steps),
+                    peak_extra,
+                )
+            all_areas_exact = all_areas_exact and (
+                abs(
+                    sum(value - base_budget for value in resolved)
+                    - expected_extra
+                ) < 1e-9
+            )
+    check(all_ramps_bounded, 'ramps remain bounded and monotonic across step counts')
+    check(all_areas_exact, 'ramps preserve normalized area across step counts')
 
 
 def test_advanced_step_budgets():
@@ -384,59 +421,69 @@ def test_advanced_step_budgets():
         'overlapping early and late windows use the denser requested budget',
     )
 
+    ramp = HybridSparseConfig(
+        video_budget=0.3,
+        early_steps=4,
+        early_kv=0.7,
+        late_steps=0,
+        late_kv=0.7,
+        early_schedule='Ramp',
+    )
+    ramp_budgets = [
+        resolve_video_budget(ramp, step, 20) for step in range(6)
+    ]
+    check(
+        all(
+            abs(actual - expected) < 1e-9
+            for actual, expected in zip(
+                ramp_budgets,
+                [0.7, 0.6, 0.5, 0.4, 0.3, 0.3],
+            )
+        ),
+        'advanced ramp moves linearly from Early KV to the base budget',
+    )
+    overlap = HybridSparseConfig(
+        video_budget=0.3,
+        early_steps=3,
+        early_kv=0.9,
+        late_steps=2,
+        late_kv=0.8,
+        early_schedule='Ramp',
+    )
+    check(
+        resolve_video_budget(overlap, 1, 3) == 0.8,
+        'late KV wins when it is denser than an overlapping early ramp',
+    )
 
-def test_static_layer_budgets():
-    print('H3 Sparse Attention static layer budgets')
-    budgets = tuple(0.1 + layer_index * 0.01 for layer_index in range(50))
+
+def test_explicit_per_step_budgets():
+    print('H3 Sparse Attention benchmark per-step budgets')
+    budgets = (0.5, 0.5, 0.4, 0.4, 0.3, 0.3, 0.3, 0.3, 0.2, 0.2) + (0.1,) * 10
     config = HybridSparseConfig(
-        video_budget=0.2,
-        layer_video_budgets=budgets,
+        video_budget=0.1,
+        step_video_budgets=budgets,
     )
     check(
-        resolve_video_budget(config, 3, 20, 0) == 0.1
-        and resolve_video_budget(config, 3, 20, 49) == 0.59,
-        'static table resolves budgets by transformer layer',
+        [resolve_video_budget(config, step, 20) for step in range(20)]
+        == list(budgets),
+        'per-step schedule resolves every sampler step exactly',
     )
-
-    backend = make_backend(config)
-    q = k = v = TensorStub()
-    backend.prepare(
-        q,
-        k,
-        v,
-        layer_index=7,
-        transformer_options=options(3),
-    )
-    projected = SimpleNamespace(
-        sequence=384,
-        q_summary=object(),
-        k_summary=object(),
-        heads=2,
-    )
-    backend.prepare_projected(
-        projected,
-        layer_index=31,
-        transformer_options=options(3),
-    )
-    check(
-        backend.router.budgets == [0.17, 0.41000000000000003],
-        'normal and projected routing both use the current layer budget',
-    )
+    try:
+        resolve_video_budget(config, 0, 19)
+    except ValueError as exc:
+        check('19 steps' in str(exc), 'sampler length mismatch fails clearly')
+    else:
+        raise AssertionError('sampler length mismatch should fail')
     try:
         HybridSparseConfig(
+            video_budget=0.1,
             denser_early_late_steps=True,
-            layer_video_budgets=budgets,
+            step_video_budgets=budgets,
         )
     except ValueError as exc:
-        check('cannot be combined' in str(exc), 'step and layer schedules conflict clearly')
+        check('cannot be combined' in str(exc), 'per-step schedule is exclusive')
     else:
-        raise AssertionError('step and layer schedules should conflict')
-    try:
-        resolve_video_budget(config, 3, 20)
-    except ValueError as exc:
-        check('layer_index is required' in str(exc), 'missing layer index fails clearly')
-    else:
-        raise AssertionError('missing layer index should fail')
+        raise AssertionError('combined schedules should fail')
 
 
 def test_runtime_step_resolution():
@@ -488,7 +535,7 @@ def main():
     test_advanced_node_schema_and_request()
     test_step_budgets()
     test_advanced_step_budgets()
-    test_static_layer_budgets()
+    test_explicit_per_step_budgets()
     test_runtime_step_resolution()
     print('\nall H3 sparse density tests passed')
 

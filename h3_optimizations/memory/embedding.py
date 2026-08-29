@@ -18,6 +18,7 @@ FORWARD_KEY = 'diffusion_model._forward'
 OWNER_MARKER = '_h3_optimizations_embedding_memory'
 SIGNATURE_MARKER = '_h3_optimizations_embedding_memory_signature'
 ORIGINAL_MARKER = '_h3_optimizations_embedding_memory_original'
+FALLBACK_REASON_KEY = 'h3_optimizations_embedding_memory_fallback'
 UPSTREAM_FORWARD_SHA256 = '14bdfccd6860f252005b8d43ab446aa9a938a13dc819061724b8f914218f5fd1'
 
 
@@ -233,7 +234,7 @@ def make_forward(model, original_forward):
     return forward
 
 
-def install(model_patcher, *, force_rebuild=False):
+def install(model_patcher, *, force_rebuild=False, strict=False):
     model = get_minimax_h3_model(model_patcher)
     if model is None:
         raise H3EmbeddingMemoryPatchError(
@@ -262,18 +263,47 @@ def install(model_patcher, *, force_rebuild=False):
                 raise H3EmbeddingMemoryPatchError(
                     'installed embedding-memory patch has no recoverable original'
                 )
-    _validate_upstream_forward(original)
+    try:
+        _validate_upstream_forward(original)
+    except H3EmbeddingMemoryPatchError as exc:
+        if strict:
+            raise
+        if existing is not None and getattr(existing, OWNER_MARKER, False):
+            model_patcher.object_patches.pop(FORWARD_KEY)
+        options = model_patcher.model_options['transformer_options'] = (
+            model_patcher.model_options.get('transformer_options', {}).copy()
+        )
+        reason = str(exc)
+        if options.get(FALLBACK_REASON_KEY) != reason:
+            logging.warning(
+                '[H3 Optimizations] embedding-memory release is unavailable; '
+                'using ComfyUI stock lifetime: %s',
+                reason,
+            )
+        options[FALLBACK_REASON_KEY] = reason
+        options['h3_optimizations_preserved_embedding_patch'] = False
+        return False
     model_patcher.add_object_patch(FORWARD_KEY, make_forward(model, original))
     options = model_patcher.model_options['transformer_options'] = (
         model_patcher.model_options.get('transformer_options', {}).copy()
     )
+    options.pop(FALLBACK_REASON_KEY, None)
     options['h3_optimizations_preserved_embedding_patch'] = False
     return True
+
+
+def is_installed(model_patcher):
+    current = getattr(model_patcher, 'object_patches', {}).get(FORWARD_KEY)
+    return bool(current is not None and getattr(current, OWNER_MARKER, False))
 
 
 def clear(model_patcher):
     patches = getattr(model_patcher, 'object_patches', {})
     current = patches.get(FORWARD_KEY)
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    options.pop(FALLBACK_REASON_KEY, None)
     if current is not None and getattr(current, OWNER_MARKER, False):
         patches.pop(FORWARD_KEY)
         return True

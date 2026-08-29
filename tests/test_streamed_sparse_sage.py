@@ -24,6 +24,7 @@ comfy.options.enable_args_parsing()
 
 from h3_optimizations.attention.sparse.router import SparseTileRouter  # noqa: E402
 import h3_optimizations.attention.sparse.sparse_sage_streamed as streamed  # noqa: E402
+from h3_optimizations.normalized_rows import NormalizedRows  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -214,6 +215,134 @@ class StreamedSparseSageTests(unittest.TestCase):
             [('factory', 'native'), 'enter', ('project', 0, 64), 'exit'],
         )
         self.assertEqual(tuple(q_int8.shape), (1, 2, 64, 128))
+
+    def test_execute_keeps_lazy_input_separate_from_attention_output(self):
+        sequence = 128
+        heads = 2
+        hidden = heads * 128
+        residual = torch.ones((sequence, hidden), dtype=torch.float32)
+        source = NormalizedRows(
+            residual,
+            lambda rows: rows.clone(),
+            ((0, sequence, 0),),
+            None,
+            None,
+            lambda rows, _shift, _scale, _selector: rows,
+        )
+        module = SimpleNamespace(
+            heads=heads,
+            head_dim=128,
+            qkv_proj=object(),
+            out_proj=lambda rows: rows,
+        )
+        projected = streamed.StreamedSparseSageQKV(
+            module=module,
+            x=source,
+            rope_freqs=None,
+            k_int8=torch.zeros(1, heads, sequence, 128, dtype=torch.int8),
+            k_scale=torch.ones(1, heads, 2),
+            v=None,
+            k_summary=None,
+            output_dtype=torch.float32,
+            sequence=sequence,
+            heads=heads,
+            head_dim=128,
+            layer_index=0,
+            project_chunk_rows=128,
+            query_chunk_rows=128,
+            projection_mode='native',
+        )
+        route_plan = streamed.StreamedRoutePlan(
+            geometry=SimpleNamespace(q_tiles=1),
+            retained=1,
+            k_summary=None,
+            batch=1,
+            heads=heads,
+        )
+        prepared = streamed.PreparedStreamedSparseSage(
+            projected=projected,
+            route_plan=route_plan,
+            v_carrier=torch.empty(1),
+            v_scale=torch.empty(1),
+            metadata={},
+        )
+
+        class Held:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def project_q_hnd(rows, _rope, start, stop):
+                count = stop - start
+                return (
+                    rows[start:stop]
+                    .reshape(count, heads, 128)
+                    .transpose(0, 1)
+                    .unsqueeze(0)
+                    .contiguous()
+                )
+
+        def held_factory(_module, _sample, _mode):
+            return Held()
+
+        def dispatch(
+            q_int8,
+            _k_int8,
+            _v,
+            output,
+            _lut,
+            _valid,
+            _threshold,
+            q_scale,
+            _k_scale,
+            _v_scale,
+            _dtype,
+        ):
+            output.copy_(
+                q_int8.float() * q_scale[..., 0].unsqueeze(-1).unsqueeze(-1)
+            )
+
+        spec = SimpleNamespace(q_tile=128, dispatch=dispatch)
+        backend = SimpleNamespace(
+            executor=SimpleNamespace(spec=spec),
+            router=object(),
+        )
+        project_q = streamed._project_streamed_q_into
+
+        def project_with_cpu_fakes(*args, **kwargs):
+            return project_q(
+                *args,
+                **kwargs,
+                held_factory=held_factory,
+                packer=cpu_packer,
+            )
+
+        source.output_buffer().fill_(-7)
+        with mock.patch.object(
+            streamed,
+            '_project_streamed_q_into',
+            side_effect=project_with_cpu_fakes,
+        ), mock.patch.object(
+            streamed,
+            'describe_linear',
+            return_value=SimpleNamespace(convrot_int8_256=False),
+        ), mock.patch.object(
+            streamed,
+            '_build_streamed_lut_chunk',
+            return_value=(torch.zeros(1), torch.ones(1)),
+        ):
+            actual = streamed.execute_streamed_sparse_sage(
+                module,
+                backend,
+                prepared,
+            )
+
+        self.assertIs(actual, source.output_buffer())
+        self.assertTrue(torch.equal(residual, source.materialize()))
+        torch.testing.assert_close(actual, residual, rtol=2e-5, atol=2e-5)
 
 
 if __name__ == '__main__':

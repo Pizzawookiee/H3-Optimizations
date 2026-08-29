@@ -25,7 +25,11 @@ from h3_optimizations.nodes import (  # noqa: E402
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
-from h3_optimizations.plan import H3OptimizationPlan  # noqa: E402
+from h3_optimizations.plan import (  # noqa: E402
+    EARLY_SCHEDULE_HOLD,
+    EARLY_SCHEDULE_RAMP,
+    H3OptimizationPlan,
+)
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -50,17 +54,12 @@ class NodeTests(unittest.TestCase):
                 'model',
                 'video_budget',
                 'denser_early_late_steps',
-                'layer_video_budgets',
             ],
         )
-        self.assertEqual(input_by_id(sparse, 'video_budget').default, 0.3)
-        self.assertFalse(
+        self.assertEqual(input_by_id(sparse, 'video_budget').default, 0.15)
+        self.assertTrue(
             input_by_id(sparse, 'denser_early_late_steps').default
         )
-        layer_budgets = input_by_id(sparse, 'layer_video_budgets')
-        self.assertEqual(layer_budgets.default, '')
-        self.assertTrue(layer_budgets.optional)
-
         self.assertEqual(advanced.node_id, 'H3SparseAttentionAdvanced')
         self.assertEqual(
             advanced.display_name,
@@ -80,6 +79,7 @@ class NodeTests(unittest.TestCase):
                 'late_steps',
                 'late_kv',
                 'backend',
+                'early_schedule',
             ],
         )
         self.assertEqual(
@@ -113,6 +113,12 @@ class NodeTests(unittest.TestCase):
         )
         self.assertIn('FROST BF16 uses 64Q x 64KV', backend.tooltip)
         self.assertNotIn('experimental', ' '.join(backend.options).lower())
+        early_schedule = input_by_id(advanced, 'early_schedule')
+        self.assertEqual(early_schedule.default, EARLY_SCHEDULE_HOLD)
+        self.assertEqual(
+            early_schedule.options,
+            [EARLY_SCHEDULE_HOLD, EARLY_SCHEDULE_RAMP],
+        )
         self.assertTrue(H3SparseAttentionAdvanced.validate_inputs('auto'))
         self.assertIsInstance(
             H3SparseAttentionAdvanced.validate_inputs(
@@ -129,10 +135,17 @@ class NodeTests(unittest.TestCase):
             H3SparseAttentionAdvanced.validate_inputs('not a backend'),
             str,
         )
-        self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.3)
-        self.assertEqual(input_by_id(advanced, 'early_steps').default, 2)
+        self.assertIsInstance(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8',
+                'Curve',
+            ),
+            str,
+        )
+        self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.15)
+        self.assertEqual(input_by_id(advanced, 'early_steps').default, 4)
         self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)
-        self.assertEqual(input_by_id(advanced, 'late_steps').default, 2)
+        self.assertEqual(input_by_id(advanced, 'late_steps').default, 0)
         self.assertEqual(input_by_id(advanced, 'late_kv').default, 0.5)
         self.assertNotIn('Experimental', sparse.display_name)
         self.assertNotIn('Experimental', advanced.display_name)

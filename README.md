@@ -5,6 +5,11 @@ Production optimization nodes for MiniMax H3 in ComfyUI.
 The pack focuses on two things: reducing the amount of VRAM H3 needs and making
 longer H3 generations faster with optional sparse attention.
 
+# How does it affect quality?
+
+You can see my test videos here 
+https://huggingface.co/datasets/Zironic/h3-attention-breakpoint-10s
+
 ## Install
 
 The package requires **ComfyUI 0.33.0 or newer** and is intended for installation
@@ -60,6 +65,10 @@ For normal use, add the node and leave its settings at their defaults. It will
 choose compatible optimizations for the current checkpoint, attention backend,
 and GPU.
 
+On recognized compatible ComfyUI versions, embedding assembly tensors are
+released before block 0. Unrecognized implementations retain ComfyUI's stock
+embedding lifetime instead of failing the workflow.
+
 This is different from Sparse Attention: Memory Optimization is primarily about
 how the same H3 work is executed and stored, rather than deliberately removing
 video attention connections for speed.
@@ -113,7 +122,7 @@ memory use.
 Sparse Attention reduces the amount of video-to-video attention H3 calculates.
 The lower the **Video attention budget**, the less video attention work is done.
 
-The default video attention budget is **30%**.
+The default video attention budget is **15%**.
 
 - Lower values are faster, but are more likely to affect prompt adherence,
   motion, detail, composition, or other parts of the result.
@@ -134,10 +143,14 @@ remain dense.
 > prompt. H3 is especially sensitive to reducing attention in the early sampling
 > steps.
 
-The optional **Denser Early/Late steps** setting adds 30 percentage points to
-the first two and last two sampler steps, capped at 100%. This is useful when a
-low middle budget is fast enough but the beginning or end of the denoising
-schedule needs more exact attention.
+The **Denser Early ramp** setting is enabled by default. It starts sampling at
+no less than 50% video attention, then gradually reduces attention toward the
+selected budget. For ordinary sparse budgets it targets 12 additional percentage
+points per sampler step on average. Budgets already at or above 50% are
+unchanged; on unusually short samplers, the 50% first-step minimum takes
+precedence over the target average. H3 is especially sensitive to reduced
+attention while the scene is being established, and the ramp avoids an abrupt
+drop from a short dense prefix to the low budget.
 
 ## H3 Sparse Attention (Advanced)
 
@@ -145,18 +158,24 @@ schedule needs more exact attention.
 on.**
 
 The Advanced node exposes separate attention budgets for the beginning, middle,
-and end of sampling, plus an explicit sparse-backend selector.
+and end of sampling, an early-schedule shape, and an explicit sparse-backend
+selector.
 
 - **Video attention budget** controls the middle steps.
-- **Early steps / Early KV** control how many opening steps receive a different
-  budget and what that budget is.
+- **Early schedule** selects **Hold** or **Ramp**. Hold keeps Early KV fixed for
+  the configured Early steps. Ramp starts at Early KV and moves linearly toward
+  Video attention budget over those steps. Set Early steps to `0` to disable it.
+- **Early steps / Early KV** control the duration and held or starting budget.
 - **Late steps / Late KV** do the same for the final steps.
 - If the early and late windows overlap, the denser requested budget wins.
 - **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
   Sparse Sage, BF16 Triton, or FP8 FlexAttention.
 
-The defaults use two early steps at 50%, a 30% middle budget, and two late steps
-at 50%.
+The defaults preserve the existing **Hold** behavior: four early steps at 50%,
+a 15% middle budget, and no late override, matching a 20-step schedule. Choose
+**Ramp** for a gradual transition and increase Early steps for a longer ramp.
+Late controls remain available for experiments, but denser late steps have not
+shown enough benefit to justify their compute cost as a default.
 
 Explicit backend choices are hard requirements: if you select a backend that is
 not available on the current system, the node errors instead of silently
@@ -190,11 +209,14 @@ workflow settings.
 | SageAttention dense | 26.5 s | ~8m50s | 7754 MiB | out of memory | - | - |
 | SageAttention + chunked QKV/MLP/FinalLayer (streaming off) | 26.2 s | ~8m44s | 5901 MiB | 76.1 s | ~25m22s | 9047 MiB |
 | H3 Memory Optimization + Sparse Attention (KV 100%) | 28.9 s | ~9m39s | 5355 MiB | 86.3 s | ~28m45s | 7315 MiB |
-| **H3 Memory Optimization + Sparse Attention (KV 30%, default)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
+| **H3 Memory Optimization + Sparse Attention (KV 30%, measured)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
 
-Against dense Comfy Kitchen attention, the default configuration measured
+Against dense Comfy Kitchen attention, the measured 30% configuration achieved
 **1.57x faster at 5 seconds and 1.69x at 10 seconds**, using 2.2 GB less VRAM at
 5 seconds and 4.4 GB less at 10 seconds.
+
+These measurements predate the 15% middle-step and 50% early-step defaults; they
+should not be read as performance evidence for the new schedule.
 
 The rows isolate successive **conceptual optimization stages**, but they are not
 a ladder of untouched UI defaults. In particular, the Sage memory arm uses
@@ -234,9 +256,10 @@ node can stream bounded Q chunks while retaining the K/V representation required
 by the backend. MLP and FinalLayer work are also processed in bounded token
 chunks.
 
-Visual, audio, and source-row embedding tensors are released immediately after
-the packed hidden state is assembled, before block 0. This changes tensor
-lifetime without intentionally changing model math.
+On recognized compatible ComfyUI versions, visual, audio, and source-row
+embedding tensors are released immediately after the packed hidden state is
+assembled, before block 0. Unrecognized implementations retain ComfyUI's stock
+embedding lifetime.
 
 The advanced precision selector exposes four policies:
 
@@ -452,9 +475,12 @@ GPU kernel validation is intentionally separate because it requires matching
 hardware and compiled backend packages.
 
 Live SM89 gates compare whole-carrier and streamed Kitchen Q/Q-scale exactly,
-exercise 100% sparse routes at every shipped Kitchen geometry, and check dense
-Sage, Sparse Sage, FP8 FlexAttention, FROST BF16, and BF16 Triton output against
-their numerical contracts.
+exercise every shipped Kitchen geometry, and check the declared SM89
+attention-backend matrix against dense or explicitly masked SDPA references.
+The matrix requires finite output plus route-specific relative-L2 and maximum
+absolute-error limits. Its streamed dense Sage row runs lazy normalized input
+through the real Sage kernel and chunked output projection, covering the full
+source/output lifetime boundary rather than only a prepared carrier.
 
 Run the CPU suite from the ComfyUI root:
 
@@ -486,3 +512,6 @@ and AIMDO `0 blocks`.
   [Comfy Kitchen](https://github.com/Comfy-Org/comfy-kitchen) for quantization,
   ConvRot execution, and the kernel foundations used by the native attention
   backend.
+
+  ## Kofi
+  https://ko-fi.com/zironic

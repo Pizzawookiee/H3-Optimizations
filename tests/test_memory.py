@@ -32,6 +32,10 @@ from h3_optimizations.memory.config import (  # noqa: E402
     ActivationMemoryConfig,
 )
 from h3_optimizations.memory.forward import make_forward  # noqa: E402
+from h3_optimizations.normalized_rows import (  # noqa: E402
+    NORM1_SOURCE_KEY,
+    NormalizedRows,
+)
 import h3_optimizations.memory.linear as linear_module  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -383,6 +387,77 @@ class MemoryTests(unittest.TestCase):
                 rope_freqs=None,
                 transformer_options={},
             )
+
+    def test_foreign_attention_receives_materialized_norm1_tensor(self):
+        torch.manual_seed(34)
+        block = self._make_block()
+        calls = []
+
+        def attention(value, **kwargs):
+            calls.append((value, kwargs['transformer_options']))
+            self.assertTrue(torch.is_tensor(value))
+            return torch.zeros_like(value)
+
+        block.attn.forward = Mock(side_effect=attention)
+        forward = make_forward(
+            block,
+            7,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=256,
+                alignment=256,
+            ),
+        )
+        forward(
+            torch.randn(8, 32),
+            torch.randn(1, 24),
+            [(0, 8, 0)],
+            rope_freqs=None,
+            transformer_options={'foreign': True},
+        )
+
+        self.assertEqual(len(calls), 1)
+        value, options = calls[0]
+        self.assertTrue(torch.is_tensor(value))
+        self.assertNotIn(NORM1_SOURCE_KEY, options)
+        self.assertTrue(options['foreign'])
+
+    def test_owned_attention_gets_real_tensor_and_private_lazy_source(self):
+        torch.manual_seed(35)
+        block = self._make_block()
+        calls = []
+
+        def attention(value, **kwargs):
+            calls.append((value, kwargs['transformer_options']))
+            return torch.zeros_like(value)
+
+        replacement = Mock(side_effect=attention)
+        replacement._h3_optimizations_lazy_norm_source = True
+        block.attn.forward = replacement
+        forward = make_forward(
+            block,
+            8,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=256,
+                alignment=256,
+            ),
+        )
+        forward(
+            torch.randn(8, 32),
+            torch.randn(1, 24),
+            [(0, 8, 0)],
+            rope_freqs=None,
+            transformer_options={'owned': True},
+        )
+
+        self.assertEqual(len(calls), 1)
+        value, options = calls[0]
+        self.assertTrue(torch.is_tensor(value))
+        source = options[NORM1_SOURCE_KEY]
+        self.assertIsInstance(source, NormalizedRows)
+        self.assertEqual(source.shape, value.shape)
+        self.assertTrue(options['owned'])
 
 
 if __name__ == '__main__':
