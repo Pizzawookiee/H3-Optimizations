@@ -117,7 +117,7 @@ def _apply_residency_cap(patcher, block_equivalents):
             % len(resident_above)
         )
 
-    logging.info(
+    logging.debug(
         '%s AIMDO residency limited to %d block-equivalent(s), %d pages, %d MiB',
         LOG_PREFIX,
         block_equivalents,
