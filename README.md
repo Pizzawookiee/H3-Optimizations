@@ -5,6 +5,11 @@ Production optimization nodes for MiniMax H3 in ComfyUI.
 The pack focuses on two things: reducing the amount of VRAM H3 needs and making
 longer H3 generations faster with optional sparse attention.
 
+# How does it affect quality?
+
+You can see my test videos here 
+https://huggingface.co/datasets/Zironic/h3-attention-breakpoint-10s
+
 ## Install
 
 The package requires **ComfyUI 0.33.0 or newer** and is intended for installation
