@@ -76,7 +76,7 @@ class MemoryTests(unittest.TestCase):
                 (chunk.start, chunk.stop, chunk.mod_row)
                 for chunk in result
             ],
-            [(0, 5, 0), (5, 13, 1), (13, 19, 2 if False else 1)],
+            [(0, 5, 0), (5, 13, 1), (13, 19, 1)],
         )
         with self.assertRaisesRegex(ValueError, 'gap'):
             chunks.validate_mod_segments(
