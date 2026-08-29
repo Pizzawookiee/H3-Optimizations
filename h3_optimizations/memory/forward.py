@@ -29,6 +29,7 @@ from ..qkv.int8 import (
 
 LOG_PREFIX = '[H3 Optimizations]'
 _ATTENTION_FALLBACK_LOGGED = set()
+_MLP_FALLBACK_LOGGED = set()
 
 
 def _mod_row(values, selector, dtype):
@@ -133,6 +134,22 @@ def _open_mlp(block, sample, config):
         if generic_error is not None:
             detail += '; held fallback unavailable: %s' % generic_error
         return held, 'held' if held is not None else 'module', detail
+
+
+def _log_mlp_fallback(layer_index, reason):
+    reason = str(reason)
+    if reason in _MLP_FALLBACK_LOGGED:
+        return
+    logging.info(
+        '%s preferred MLP optimization is unavailable for this model path '
+        '(first seen in block %d); using a compatible fallback instead. '
+        'Output is unaffected, but VRAM use or speed may be slightly worse. '
+        'Detail: %s',
+        LOG_PREFIX,
+        layer_index,
+        reason,
+    )
+    _MLP_FALLBACK_LOGGED.add(reason)
 
 
 def _run_mlp(block, h, held, mlp_path, config):
@@ -280,12 +297,7 @@ def make_forward(block, layer_index, config, original_forward=None):
 
         held, mlp_path, held_error = _open_mlp(block, x[:1], config)
         if held_error is not None:
-            logging.warning(
-                '%s block %d selected a format-compatible MLP fallback: %s',
-                LOG_PREFIX,
-                layer_index,
-                held_error,
-            )
+            _log_mlp_fallback(layer_index, held_error)
 
         try:
             for chunk in chunks:

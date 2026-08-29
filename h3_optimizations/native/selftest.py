@@ -334,10 +334,18 @@ def _load_result(device=None, *, force=False):
                 if not ok
             ]
             if failed:
-                logging.warning(
-                    '%s native production path passed but sparse geometries %s '
-                    'failed; they will be skipped independently. Detail: %s',
-                    LOG_PREFIX, ', '.join(failed), detail,
+                logging.info(
+                    '%s native sparse self-test disabled geometry %s on %s; '
+                    'a validated fallback geometry remains available.',
+                    LOG_PREFIX,
+                    ', '.join(failed),
+                    key,
+                )
+                logging.debug(
+                    '%s native sparse self-test detail for %s: %s',
+                    LOG_PREFIX,
+                    key,
+                    detail,
                 )
         return _result, _detail_result
 
