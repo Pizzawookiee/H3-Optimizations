@@ -10,7 +10,11 @@ from .external_consumer import (
     consume_streamed_h3_qkv,
     get_streamed_h3_qkv_consumer,
 )
-from .normalized_rows import attention_output_buffer
+from .normalized_rows import (
+    NORM1_SOURCE_KEY,
+    NormalizedRowsUnsupported,
+    attention_output_buffer,
+)
 from .ordering_probe import has_ordering_observer, observe_attention
 
 
@@ -123,6 +127,10 @@ def _project_or_none(
         layer_index=layer_index,
         transformer_options=transformer_options,
     )
+
+
+def _materialize_norm1_source(x, norm1_source):
+    return norm1_source.materialize() if norm1_source is not None else x
 
 
 def flatten_attention_output(module, out, source):
@@ -345,16 +353,41 @@ def make_forward(
         transformer_options = (
             transformer_options if transformer_options is not None else {}
         )
+        norm1_source = transformer_options.get(NORM1_SOURCE_KEY)
+        if norm1_source is not None:
+            # The lazy source is an implementation detail of our QKV projector.
+            # Do not leak it to attention backends, observers, or foreign hooks.
+            transformer_options = transformer_options.copy()
+            transformer_options.pop(NORM1_SOURCE_KEY, None)
+
         ordering_probe = has_ordering_observer(transformer_options)
         if projector is not None and not ordering_probe:
-            projected = _project_or_none(
-                projector,
-                module,
-                x,
-                rope_freqs,
-                layer_index=layer_index,
-                transformer_options=transformer_options,
-            )
+            projection_input = norm1_source if norm1_source is not None else x
+            try:
+                projected = _project_or_none(
+                    projector,
+                    module,
+                    projection_input,
+                    rope_freqs,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+            except NormalizedRowsUnsupported:
+                if norm1_source is None:
+                    raise
+                # A projector may still require a concrete tensor for one
+                # internal operation. Materialize only at this boundary and
+                # retry the same optimized QKV route rather than exposing the
+                # lazy row object to the rest of attention.
+                projection_input = norm1_source.materialize()
+                projected = _project_or_none(
+                    projector,
+                    module,
+                    projection_input,
+                    rope_freqs,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
             if projected is not None:
                 from .qkv.bf16 import (
                     PreparedBF16QKV,
@@ -396,12 +429,13 @@ def make_forward(
                     del prepared
             if fallback_forward is not None:
                 return fallback_forward(
-                    x,
+                    _materialize_norm1_source(x, norm1_source),
                     rope_freqs=rope_freqs,
                     transformer_options=transformer_options,
                 )
 
-        q, k, v = project_qkv(module, x, rope_freqs)
+        qkv_input = _materialize_norm1_source(x, norm1_source)
+        q, k, v = project_qkv(module, qkv_input, rope_freqs)
         q, k, v = to_hnd(q, k, v)
         if ordering_probe:
             observe_attention(
@@ -473,6 +507,7 @@ def make_forward(
     forward._h3_optimizations_layer_index = int(layer_index)
     forward._h3_optimizations_backend = getattr(backend, 'name', None)
     forward._h3_optimizations_projector = getattr(projector, 'name', None)
+    forward._h3_optimizations_lazy_norm_source = projector is not None
     forward._h3_optimizations_force_out_proj_int8 = bool(
         force_out_proj_int8
     )

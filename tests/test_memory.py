@@ -32,8 +32,10 @@ from h3_optimizations.memory.config import (  # noqa: E402
     ActivationMemoryConfig,
 )
 from h3_optimizations.memory.forward import make_forward  # noqa: E402
-import h3_optimizations.memory.forward as forward_module  # noqa: E402
-from h3_optimizations.normalized_rows import NormalizedRowsUnsupported  # noqa: E402
+from h3_optimizations.normalized_rows import (  # noqa: E402
+    NORM1_SOURCE_KEY,
+    NormalizedRows,
+)
 import h3_optimizations.memory.linear as linear_module  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -386,56 +388,76 @@ class MemoryTests(unittest.TestCase):
                 transformer_options={},
             )
 
-    def test_attention_row_fallback_is_logged_once_across_blocks_and_retried(self):
+    def test_foreign_attention_receives_materialized_norm1_tensor(self):
         torch.manual_seed(34)
-        attention_inputs = []
-        reason = 'test consumer requires a tensor'
-        forward_module._ATTENTION_FALLBACK_LOGGED.discard(reason)
+        block = self._make_block()
+        calls = []
 
-        def make_attention_block():
-            block = self._make_block()
+        def attention(value, **kwargs):
+            calls.append((value, kwargs['transformer_options']))
+            self.assertTrue(torch.is_tensor(value))
+            return torch.zeros_like(value)
 
-            def attention(value, **_kwargs):
-                if not torch.is_tensor(value):
-                    raise NormalizedRowsUnsupported(reason)
-                attention_inputs.append(value)
-                return torch.zeros_like(value)
+        block.attn.forward = Mock(side_effect=attention)
+        forward = make_forward(
+            block,
+            7,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=256,
+                alignment=256,
+            ),
+        )
+        forward(
+            torch.randn(8, 32),
+            torch.randn(1, 24),
+            [(0, 8, 0)],
+            rope_freqs=None,
+            transformer_options={'foreign': True},
+        )
 
-            block.attn.forward = Mock(side_effect=attention)
-            return block
+        self.assertEqual(len(calls), 1)
+        value, options = calls[0]
+        self.assertTrue(torch.is_tensor(value))
+        self.assertNotIn(NORM1_SOURCE_KEY, options)
+        self.assertTrue(options['foreign'])
 
-        forwards = [
-            make_forward(
-                make_attention_block(),
-                layer,
-                ActivationMemoryConfig(
-                    mode=MODE_NATIVE,
-                    chunk_rows=256,
-                    alignment=256,
-                ),
-            )
-            for layer in (7, 8)
-        ]
-        with self.assertLogs(level='INFO') as captured:
-            for forward in forwards:
-                forward(
-                    torch.randn(8, 32),
-                    torch.randn(1, 24),
-                    [(0, 8, 0)],
-                    rope_freqs=None,
-                    transformer_options={},
-                )
+    def test_owned_attention_gets_real_tensor_and_private_lazy_source(self):
+        torch.manual_seed(35)
+        block = self._make_block()
+        calls = []
 
-        messages = [
-            message for message in captured.output
-            if 'Norm1 fusion is unavailable' in message
-        ]
-        self.assertEqual(len(messages), 1)
-        self.assertIn('block 7', messages[0])
-        self.assertIn('slightly more VRAM', messages[0])
-        self.assertIn(reason, messages[0])
-        self.assertEqual(len(attention_inputs), 2)
-        self.assertTrue(all(torch.is_tensor(value) for value in attention_inputs))
+        def attention(value, **kwargs):
+            calls.append((value, kwargs['transformer_options']))
+            return torch.zeros_like(value)
+
+        replacement = Mock(side_effect=attention)
+        replacement._h3_optimizations_lazy_norm_source = True
+        block.attn.forward = replacement
+        forward = make_forward(
+            block,
+            8,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=256,
+                alignment=256,
+            ),
+        )
+        forward(
+            torch.randn(8, 32),
+            torch.randn(1, 24),
+            [(0, 8, 0)],
+            rope_freqs=None,
+            transformer_options={'owned': True},
+        )
+
+        self.assertEqual(len(calls), 1)
+        value, options = calls[0]
+        self.assertTrue(torch.is_tensor(value))
+        source = options[NORM1_SOURCE_KEY]
+        self.assertIsInstance(source, NormalizedRows)
+        self.assertEqual(source.shape, value.shape)
+        self.assertTrue(options['owned'])
 
 
 if __name__ == '__main__':
