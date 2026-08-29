@@ -78,9 +78,15 @@ def resolve_qkv_provider(inventory, *, request, backend_kind, **kwargs):
 
 
 def resolve_mlp_provider(inventory, *, request, **kwargs):
-    '''Use Turing's executable INT8+FP16 MLP route for floating Auto weights.'''
+    '''Prefer ConvRot INT8 for floating Auto MLPs on NVIDIA.
+
+    Checkpoint-native quantization remains authoritative: native FP8, W4A8 and
+    ConvRot checkpoints keep their existing providers. Only plain floating H3
+    MLP weights are runtime-quantized, using the Kitchen-backed ConvRot INT8
+    execution path. Non-NVIDIA backends keep the ordinary provider policy.
+    '''
     if (
-        _current_capability() == (7, 5)
+        _current_capability() is not None
         and request == MLP_MEMORY_AUTO
         and getattr(inventory, 'mlp_plain_float', False)
     ):
