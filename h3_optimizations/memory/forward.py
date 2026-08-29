@@ -59,9 +59,14 @@ def _attention_supports_lazy_norm(attention):
     if forward is None:
         return False
     function = getattr(forward, '__func__', forward)
-    return bool(
-        getattr(function, '_h3_optimizations_lazy_norm_source', False)
-    )
+    # Identity, not truthiness: mocks and __getattr__ proxies can synthesize a
+    # truthy value for arbitrary attributes. A false positive here would pass
+    # the raw unnormalized residual to a foreign attention forward.
+    return getattr(
+        function,
+        '_h3_optimizations_lazy_norm_source',
+        False,
+    ) is True
 
 
 def _open_generic_held(block, sample, config):
