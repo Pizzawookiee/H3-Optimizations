@@ -20,6 +20,10 @@ import bench_attention_arms as benchmark
 
 benchmark.WORKLOADS = {'5f': 5}
 benchmark.DEFAULT_PROMPT = ''
+benchmark.COMMON_SUFFIX = [
+    entry for entry in benchmark.COMMON_SUFFIX
+    if entry[0] != 'H3AIMDOResidencyLimiter'
+]
 benchmark.ARMS = {
     'aimdo_stock': [
         ('H3AIMDOResidencyLimiter', {'residency': 'stock'}),

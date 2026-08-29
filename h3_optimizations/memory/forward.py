@@ -181,6 +181,7 @@ def make_forward(block, layer_index, config, original_forward=None):
     '''Build an unbound replacement for one MiniMax H3 DiT block.'''
 
     original_forward = original_forward or block.forward
+    attention_fallback_logged = False
     if config.convrot_2slice and isinstance(block.mlp, torch.nn.Module):
         bind_convrot_mlp(block.mlp)
 
@@ -191,6 +192,7 @@ def make_forward(block, layer_index, config, original_forward=None):
         rope_freqs,
         transformer_options={},
     ):
+        nonlocal attention_fallback_logged
         if comfy.model_management.in_training:
             raise RuntimeError(
                 'H3 Memory Optimization is inference-only; training requires '
@@ -241,11 +243,20 @@ def make_forward(block, layer_index, config, original_forward=None):
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,
             )
-        except NormalizedRowsUnsupported:
+        except NormalizedRowsUnsupported as exc:
             if not isinstance(h, NormalizedRows):
                 raise
             # This attention consumer wants a real tensor. Materialize once and
             # retry; attention does not mutate its input, so the retry is safe.
+            if not attention_fallback_logged:
+                logging.warning(
+                    '%s block %d materialized lazy Norm1 rows for its attention '
+                    'consumer: %s',
+                    LOG_PREFIX,
+                    layer_index,
+                    exc,
+                )
+                attention_fallback_logged = True
             h = h.materialize()
             attn_out = block.attn(
                 h,

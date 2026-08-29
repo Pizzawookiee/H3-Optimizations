@@ -51,6 +51,9 @@ class StubSchemas(bench.Schemas):
                     '2 blocks',
                 ),
             }}},
+            'H3BenchmarkForceQKVConfig0': {'input': {'required': {
+                'model': ['MODEL', {}],
+            }}},
             'BasicGuider': {'input': {'required': {
                 'model': ['MODEL', {}],
                 'conditioning': ['CONDITIONING', {}],
@@ -126,12 +129,12 @@ class AIMDOH3ResidencyBenchmarkTests(unittest.TestCase):
         self.assertEqual(graph['cond']['inputs']['prompt'], '')
         self.assertEqual(graph['cond']['inputs']['length'], 5)
         self.assertEqual(
-            graph['patch0_H3AIMDOResidencyLimiter']['inputs']['residency'],
+            graph['patch1_H3AIMDOResidencyLimiter']['inputs']['residency'],
             '2 blocks',
         )
         self.assertEqual(
             graph['guider']['inputs']['model'],
-            ['patch0_H3AIMDOResidencyLimiter', 0],
+            ['patch1_H3AIMDOResidencyLimiter', 0],
         )
         self.assertEqual(graph['sample']['inputs']['latent_image'], ['cond', 1])
         self.assertEqual(graph['sink']['class_type'], 'PreviewAny')

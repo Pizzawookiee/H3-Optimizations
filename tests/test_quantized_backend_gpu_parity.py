@@ -503,7 +503,11 @@ class QuantizedBackendGPUParityTests(unittest.TestCase):
 
 class AttentionBackendMatrixContractTests(unittest.TestCase):
     def test_every_declared_sm89_backend_has_a_live_numerical_gate(self):
-        methods = set(dir(QuantizedBackendGPUParityTests))
+        methods = {
+            name
+            for name in dir(QuantizedBackendGPUParityTests)
+            if name.startswith("test_")
+        }
         self.assertEqual(
             set(SM89_ATTENTION_MATRIX),
             {
@@ -520,6 +524,7 @@ class AttentionBackendMatrixContractTests(unittest.TestCase):
         for backend, method in SM89_ATTENTION_MATRIX.items():
             with self.subTest(backend=backend):
                 self.assertIn(method, methods)
+        self.assertEqual(methods, set(SM89_ATTENTION_MATRIX.values()))
 
     def test_delta_routes_round_trip_for_the_compared_sparse_rows(self):
         absolute, counts = _absolute_route(

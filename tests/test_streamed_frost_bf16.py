@@ -35,6 +35,7 @@ from h3_optimizations.attention.sparse.frost_route import (  # noqa: E402
     prepare_full_absolute_route_chunks,
 )
 from h3_optimizations.attention.sparse.router import SparseTileRouter  # noqa: E402
+from h3_optimizations.normalized_rows import NormalizedRows  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -262,6 +263,66 @@ class StreamedFrostBF16Tests(unittest.TestCase):
         self.assertTrue(all(not binding.active for binding in factory.bindings))
         self.assertIsNone(projected.k)
         self.assertIsNone(projected.v)
+
+    def test_execute_keeps_lazy_input_separate_from_attention_output(self):
+        residual = torch.randn(
+            self.sequence,
+            self.hidden,
+            dtype=torch.bfloat16,
+        )
+        source = NormalizedRows(
+            residual,
+            lambda rows: rows.clone(),
+            ((0, self.sequence, 0),),
+            None,
+            None,
+            lambda rows, _shift, _scale, _selector: rows,
+        )
+        factory = FakeHeldFactory()
+        projected = _assemble_streamed_frost_qkv(
+            self.module,
+            source,
+            None,
+            spec=self.spec,
+            layer_index=3,
+            chunk_rows=64,
+            held_factory=factory,
+        )
+        source.output_buffer().fill_(-7)
+        router = SparseTileRouter(q_tile=64, kv_tile=64)
+        prepared = PreparedStreamedFrostBF16(
+            projected=projected,
+            route_plan=prepare_full_absolute_route_chunks(
+                router,
+                projected.k_summary,
+                packed_layout(),
+                0.5,
+            ),
+            metadata={},
+        )
+
+        class Executor:
+            @staticmethod
+            def prepare(q, _k, _v, _route, _counts, **_kwargs):
+                return q
+
+            @staticmethod
+            def execute(q):
+                return q
+
+        actual = execute_streamed_frost_bf16(
+            self.module,
+            SimpleNamespace(
+                spec=self.spec,
+                router=router,
+                executor=Executor(),
+            ),
+            prepared,
+        )
+
+        self.assertIs(actual, source.output_buffer())
+        self.assertTrue(torch.equal(residual, source.materialize()))
+        torch.testing.assert_close(actual, residual)
 
 
 if __name__ == '__main__':

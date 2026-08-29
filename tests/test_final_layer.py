@@ -33,16 +33,35 @@ from comfy.model_patcher import ModelPatcher
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
+class _Projection(torch.nn.Module):
+    comfy_cast_weights = False
+    weight_function = ()
+    bias_function = ()
+
+    def __init__(self, weight, bias, out_features):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.bias = torch.nn.Parameter(bias, requires_grad=False)
+        self.out_features = out_features
+
+    def forward(self, value):
+        return torch.nn.functional.linear(value, self.weight, self.bias)
+
+
 class _Layer:
     norm = staticmethod(lambda value: value * 0.5)
-    video_out = staticmethod(
-        lambda value: value
-        @ torch.arange(12, dtype=torch.float32).reshape(4, 3)
-    )
-    audio_out = staticmethod(
-        lambda value: value
-        @ torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    )
+
+    def __init__(self):
+        self.video_out = _Projection(
+            torch.arange(12, dtype=torch.float32).reshape(4, 3).T,
+            torch.zeros(3, dtype=torch.float32),
+            3,
+        )
+        self.audio_out = _Projection(
+            torch.arange(8, dtype=torch.float32).reshape(4, 2).T,
+            torch.zeros(2, dtype=torch.float32),
+            2,
+        )
 
     @staticmethod
     def adaln_proj(_t_emb):
@@ -67,6 +86,41 @@ class _Layer:
 
         return project(video_seg, self.video_out), project(
             audio_seg, self.audio_out
+        )
+
+
+class _PDDLayer(_Layer):
+    def __init__(self):
+        super().__init__()
+        video_rows = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        audio_rows = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        self.video_out = _Projection(
+            torch.cat(
+                (video_rows, video_rows + 2, video_rows + 6, video_rows + 12)
+            ),
+            torch.cat(
+                (
+                    torch.tensor([0.0, 1.0, 2.0]),
+                    torch.tensor([2.0, 4.0, 6.0]),
+                    torch.tensor([6.0, 8.0, 10.0]),
+                    torch.tensor([12.0, 14.0, 16.0]),
+                )
+            ),
+            3,
+        )
+        self.audio_out = _Projection(
+            torch.cat(
+                (audio_rows, audio_rows + 1, audio_rows + 3, audio_rows + 7)
+            ),
+            torch.cat(
+                (
+                    torch.tensor([0.0, 1.0]),
+                    torch.tensor([1.0, 3.0]),
+                    torch.tensor([3.0, 5.0]),
+                    torch.tensor([7.0, 9.0]),
+                )
+            ),
+            2,
         )
 
 
@@ -102,6 +156,92 @@ class FinalLayerTests(unittest.TestCase):
     def test_empty_stream_matches_stock(self):
         self._assert_matches_stock(((0, 11, 0), (11, 11, 1)))
 
+    def test_forward_supports_legacy_four_argument_contract(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        segments = ((0, 7, 0), (7, 11, 1))
+        expected = layer.forward(x, None, *segments)
+        actual = final_layer.make_forward(layer, 3)(x, None, *segments)
+        self.assertTrue(torch.allclose(expected[0], actual[0], atol=1e-4, rtol=0))
+        self.assertTrue(torch.allclose(expected[1], actual[1], atol=1e-4, rtol=0))
+
+    def test_forward_supports_current_seven_argument_contract(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        segments = ((0, 7, 0), (7, 11, 1))
+        expected = layer.forward(x, None, *segments)
+        actual = final_layer.make_forward(layer, 3)(
+            x,
+            None,
+            *segments,
+            torch.tensor(0.75),
+            torch.tensor([1.0, 0.75, 0.25, 0.0]),
+            (12.0, 3.0),
+        )
+        self.assertTrue(torch.allclose(expected[0], actual[0], atol=1e-4, rtol=0))
+        self.assertTrue(torch.allclose(expected[1], actual[1], atol=1e-4, rtol=0))
+
+    def test_pdd_head_bank_matches_schedule_weighted_blend(self):
+        layer = _PDDLayer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        video_seg = (0, 7, 0)
+        audio_seg = (7, 11, 1)
+        actual = final_layer.make_forward(layer, 3)(
+            x,
+            None,
+            video_seg,
+            audio_seg,
+            torch.tensor(0.75),
+            torch.tensor([1.0, 0.75, 0.25, 0.0]),
+            (1.0, 2.0),
+        )
+
+        shift, scale = layer.adaln_proj(None)
+
+        def expected(segment, output, blend):
+            first, last, row = segment
+            value = (
+                layer.norm(x[first:last]) * (1.0 + scale[row]) + shift[row]
+            ).float()
+            weights = output.weight.reshape(4, -1, 4)
+            biases = output.bias.reshape(4, -1)
+            return torch.nn.functional.linear(
+                value,
+                weights[0] + blend[0] * weights[1] + blend[1] * weights[2],
+                biases[0] + blend[0] * biases[1] + blend[1] * biases[2],
+            )
+
+        self.assertTrue(
+            torch.allclose(
+                expected(video_seg, layer.video_out, (0.5, 0.5)),
+                actual[0],
+                atol=1e-4,
+                rtol=0,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                expected(audio_seg, layer.audio_out, (5.0 / 12.0, 7.0 / 12.0)),
+                actual[1],
+                atol=1e-4,
+                rtol=0,
+            )
+        )
+
+    def test_pdd_head_bank_requires_sample_sigmas(self):
+        layer = _PDDLayer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        with self.assertRaisesRegex(ValueError, "sampler's sigma schedule"):
+            final_layer.make_forward(layer, 3)(
+                x,
+                None,
+                (0, 7, 0),
+                (7, 11, 1),
+                torch.tensor(0.75),
+                None,
+                (1.0, 1.0),
+            )
+
     def test_install_is_owned_and_idempotent(self):
         patcher = _Patcher()
         model = SimpleNamespace(final_layer=_Layer())
@@ -133,7 +273,7 @@ class FinalLayerTests(unittest.TestCase):
             foreign,
         )
 
-    def test_real_model_patcher_attaches_and_dispatches_forward(self):
+    def test_real_model_patcher_dispatches_current_forward_contract(self):
         root = torch.nn.Module()
         root.diffusion_model = torch.nn.Module()
         layer = torch.nn.Module()
@@ -160,6 +300,9 @@ class FinalLayerTests(unittest.TestCase):
                 None,
                 (0, 7, 0),
                 (7, 11, 1),
+                torch.tensor(0.75),
+                torch.tensor([1.0, 0.75, 0.25, 0.0]),
+                (12.0, 3.0),
             )
         patcher.unpatch_model(unpatch_weights=False)
 

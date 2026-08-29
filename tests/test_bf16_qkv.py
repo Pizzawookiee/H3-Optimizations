@@ -39,6 +39,7 @@ from h3_optimizations.attention_forward import (  # noqa: E402
 from h3_optimizations.kitchen_qkv import (  # noqa: E402
     ChunkedKitchenAttentionBackend,
 )
+from h3_optimizations.normalized_rows import NormalizedRows  # noqa: E402
 import h3_optimizations.qkv.bf16 as bf16_module  # noqa: E402
 from h3_optimizations.qkv.fp8 import HeldFP8QKV  # noqa: E402
 from h3_optimizations.qkv.w4a8 import HeldW4A8QKV  # noqa: E402
@@ -418,6 +419,58 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
 
         self.assertIs(actual, actual_buffer)
         self.assertEqual(calls, [(3, 7, 7), (3, 7, 7), (1, 7, 7)])
+        torch.testing.assert_close(actual, expected)
+
+    def test_dense_streaming_keeps_lazy_input_separate_from_output(self):
+        module = self._module()
+        residual = torch.randn((7, 8), dtype=torch.bfloat16)
+        source = NormalizedRows(
+            residual,
+            lambda rows: rows.clone(),
+            ((0, 7, 0),),
+            None,
+            None,
+            lambda rows, _shift, _scale, _selector: rows,
+        )
+        source.output_buffer().fill_(-7)
+        projector = StreamedDenseBF16QKVProjector(
+            chunk_rows=3,
+            allow_cpu_for_tests=True,
+        )
+
+        def attention(q, _k, _v, _heads, **_kwargs):
+            return q
+
+        forward = make_forward(
+            module,
+            0,
+            backend=ChunkedKitchenAttentionBackend(),
+            projector=projector,
+        )
+        with mock.patch.object(
+            bf16_module,
+            'HeldBF16QKV',
+            self._fake_held(),
+        ), mock.patch(
+            'h3_optimizations.attention_forward.h3_model.optimized_attention',
+            side_effect=attention,
+        ):
+            actual = forward(source, transformer_options={})
+
+        expected_q = torch.cat(
+            [
+                finish_qkv_projection(
+                    module,
+                    module.qkv_proj(residual[start:end]),
+                    None,
+                )[0]
+                for start, end in ((0, 3), (3, 6), (6, 7))
+            ],
+            dim=0,
+        )
+        expected = module.out_proj(expected_q.reshape(7, 8))
+        self.assertIs(actual, source.output_buffer())
+        self.assertTrue(torch.equal(residual, source.materialize()))
         torch.testing.assert_close(actual, expected)
 
     def test_dense_streaming_uses_opted_in_external_consumer(self):

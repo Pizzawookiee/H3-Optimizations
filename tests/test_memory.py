@@ -32,6 +32,7 @@ from h3_optimizations.memory.config import (  # noqa: E402
     ActivationMemoryConfig,
 )
 from h3_optimizations.memory.forward import make_forward  # noqa: E402
+from h3_optimizations.normalized_rows import NormalizedRowsUnsupported  # noqa: E402
 import h3_optimizations.memory.linear as linear_module  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -383,6 +384,47 @@ class MemoryTests(unittest.TestCase):
                 rope_freqs=None,
                 transformer_options={},
             )
+
+    def test_attention_row_fallback_is_logged_once_and_retried(self):
+        torch.manual_seed(34)
+        block = self._make_block()
+        attention_inputs = []
+
+        def attention(value, **_kwargs):
+            if not torch.is_tensor(value):
+                raise NormalizedRowsUnsupported('test consumer requires a tensor')
+            attention_inputs.append(value)
+            return torch.zeros_like(value)
+
+        block.attn.forward = Mock(side_effect=attention)
+        forward = make_forward(
+            block,
+            7,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=256,
+                alignment=256,
+            ),
+        )
+        with self.assertLogs(level='WARNING') as captured:
+            for _ in range(2):
+                forward(
+                    torch.randn(8, 32),
+                    torch.randn(1, 24),
+                    [(0, 8, 0)],
+                    rope_freqs=None,
+                    transformer_options={},
+                )
+
+        messages = [
+            message for message in captured.output
+            if 'materialized lazy Norm1 rows' in message
+        ]
+        self.assertEqual(len(messages), 1)
+        self.assertIn('block 7', messages[0])
+        self.assertIn('test consumer requires a tensor', messages[0])
+        self.assertEqual(len(attention_inputs), 2)
+        self.assertTrue(all(torch.is_tensor(value) for value in attention_inputs))
 
 
 if __name__ == '__main__':
