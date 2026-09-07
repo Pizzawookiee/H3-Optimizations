@@ -357,11 +357,19 @@ def format_sparse_status(model):
         attention_line = 'Attention: FP8 FlexAttention'
     elif selected == 'frost_bf16_sm89':
         attention_line = 'Attention: FROST BF16 (SM89)'
+    elif selected == 'sparse_kitchen_int8':
+        attention_line = 'Attention: Comfy Kitchen INT8 Sparse'
+    elif selected == 'existing_dense_sparse':
+        attention_line = 'Attention: Existing Dense Sparse'
     else:
         attention_line = 'Attention: %s' % selected
 
     lines = [
         attention_line,
+        'Video token order: %s' % (
+            sparse.get('video_token_order')
+            or getattr(plan_sparse, 'video_token_order', 'unknown')
+        ),
         'Requested video KV budget: %.1f%%' % (float(budget) * 100.0),
         'QKV: %s' % format_qkv_execution(status),
         (
@@ -375,8 +383,13 @@ def format_sparse_status(model):
         lines.insert(1, 'Sparse fallback: %s' % reason)
     step_budgets = sparse.get('step_video_budgets')
     if step_budgets:
+        budget_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith('Requested video KV budget:')
+        )
         lines.insert(
-            2,
+            budget_index + 1,
             'Per-step benchmark schedule: %s'
             % ', '.join('%.0f%%' % (value * 100.0) for value in step_budgets),
         )

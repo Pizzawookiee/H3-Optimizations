@@ -25,8 +25,11 @@ from h3_optimizations.plan import (  # noqa: E402
     MemoryRequest,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
     SPARSE_BACKEND_TRITON,
     SparseRequest,
+    VIDEO_TOKEN_ORDER_1X8X8,
+    VIDEO_TOKEN_ORDER_RASTER,
 )
 
 
@@ -84,11 +87,13 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.video_budget, 0.15)
         self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
         self.assertEqual(request.early_schedule, EARLY_SCHEDULE_HOLD)
+        self.assertEqual(request.video_token_order, VIDEO_TOKEN_ORDER_1X8X8)
         self.assertFalse(request.advanced_schedule)
 
     def test_legacy_sparse_request_positional_shape_is_preserved(self):
         request = SparseRequest(0.3, False, 2, 0.5, 2, 0.5)
         self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
+        self.assertEqual(request.video_token_order, VIDEO_TOKEN_ORDER_1X8X8)
         self.assertEqual(
             (
                 request.early_steps,
@@ -104,6 +109,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN)
         self.assertIn(SPARSE_BACKEND_KITCHEN, request.signature)
 
+    def test_rectangular_kitchen_geometry_is_an_explicit_request(self):
+        request = SparseRequest(backend=SPARSE_BACKEND_KITCHEN_64X128)
+        self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN_64X128)
+        self.assertIn(SPARSE_BACKEND_KITCHEN_64X128, request.signature)
+
     def test_explicit_sparse_schedule_is_part_of_request_identity(self):
         request = SparseRequest(
             video_budget=0.3,
@@ -117,7 +127,13 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(request.advanced_schedule)
         self.assertIn(SPARSE_BACKEND_TRITON, request.signature)
         self.assertIn(EARLY_SCHEDULE_RAMP, request.signature)
-        self.assertEqual(request.signature[-5:-1], (2, 0.5, 2, 0.5))
+        self.assertEqual(request.signature[-6:-2], (2, 0.5, 2, 0.5))
+
+    def test_video_token_order_is_validated_and_part_of_identity(self):
+        request = SparseRequest(video_token_order=VIDEO_TOKEN_ORDER_RASTER)
+        self.assertEqual(request.signature[-1], VIDEO_TOKEN_ORDER_RASTER)
+        with self.assertRaisesRegex(ValueError, 'unknown video token order'):
+            SparseRequest(video_token_order='2x4x8')
 
     def test_node_order_does_not_change_the_plan(self):
         memory = MemoryRequest()
@@ -154,12 +170,20 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different H3 Sparse'):
             plan.with_sparse(SparseRequest(video_budget=0.4))
     def test_validation_boundaries(self):
-        MemoryRequest(chunk_rows=256)
-        MemoryRequest(chunk_rows=65_536)
-        for chunk_rows in (255, 257, 65_792):
+        for chunk_rows in (1, 255, 257, 65_536, 65_792):
+            self.assertEqual(
+                MemoryRequest(chunk_rows=chunk_rows).chunk_rows,
+                chunk_rows,
+            )
+        for chunk_rows in (0, -1, 1.5, True):
             with self.assertRaises(ValueError):
                 MemoryRequest(chunk_rows=chunk_rows)
-        for budget in (0.0, 1.01, math.inf, math.nan):
+        for budget in (-1.0, 0.0, 1.01, 2.0):
+            self.assertEqual(
+                SparseRequest(video_budget=budget).video_budget,
+                budget,
+            )
+        for budget in (math.inf, -math.inf, math.nan):
             with self.assertRaises(ValueError):
                 SparseRequest(video_budget=budget)
         with self.assertRaisesRegex(ValueError, 'unknown sparse backend'):
@@ -168,9 +192,9 @@ class PlanTests(unittest.TestCase):
             SparseRequest(early_schedule='Curve')
         SparseRequest(
             early_steps=0,
-            early_kv=0.01,
-            late_steps=1000,
-            late_kv=1.0,
+            early_kv=0.0,
+            late_steps=1001,
+            late_kv=1.01,
         )
         with self.assertRaises(ValueError):
             SparseRequest(early_steps=2)
@@ -181,13 +205,12 @@ class PlanTests(unittest.TestCase):
                 late_steps=2,
                 late_kv=0.5,
             )
-        with self.assertRaises(ValueError):
-            SparseRequest(
-                early_steps=2,
-                early_kv=0.0,
-                late_steps=2,
-                late_kv=0.5,
-            )
+        SparseRequest(
+            early_steps=2,
+            early_kv=-0.5,
+            late_steps=2000,
+            late_kv=1.5,
+        )
         with self.assertRaises(ValueError):
             SparseRequest(
                 denser_early_late_steps=True,

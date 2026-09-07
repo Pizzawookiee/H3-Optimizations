@@ -5,6 +5,15 @@ Production optimization nodes for MiniMax H3 in ComfyUI.
 The pack focuses on two things: reducing the amount of VRAM H3 needs and making
 longer H3 generations faster with optional sparse attention.
 
+> **Experimental AMD branch:** On ROCm gfx11/gfx12 GPUs, the normal H3 Sparse
+> Attention node tries the shipped AMD Sparse Kitchen INT8 backend first. On
+> RDNA 2 gfx103x it skips sparse backends that require unavailable matrix/kernel
+> support, then tries ROCm FlexAttention when usable and finally a probed
+> sparse-over-existing-dense adapter. Adapter failures fail open to the same full
+> dense ComfyUI attention consumer. This path is intended for hardware testing;
+> the shipped gfx11/gfx12 native libraries have not yet passed a live AMD run.
+> See [Experimental AMD Sparse Kitchen](#experimental-amd-sparse-kitchen).
+
 # How does it affect quality?
 
 You can see my test videos here 
@@ -37,12 +46,12 @@ control:
 | --- | --- | --- |
 | **H3 Memory Optimization** | Reduces peak VRAM use during H3 generation | Add it and leave the defaults alone |
 | **H3 Sparse Attention** | Makes H3 faster by calculating less video attention | Use it when speed matters and you accept a quality/speed tradeoff |
-| **H3 Sparse Attention (Advanced)** | Gives manual control over sparse-attention scheduling and backend selection | Use only when you know why you need the extra controls |
+| **H3 Sparse Attention (Advanced)** | Gives manual control over sparse scheduling, backend, and token order | Use only when you know why you need the extra controls |
 | **H3 AIMDO Residency Limiter** | Manually controls how much of the H3 model DynamicVRAM keeps persistently resident in VRAM | Mainly for benchmarking, debugging AIMDO, or deliberately forcing low residency |
 
-The **H3-Optimizations production nodes are order-independent with each other**.
-You do not need to worry about whether Memory Optimization comes before or after
-Sparse Attention.
+H3 Memory Optimization, AIMDO Residency Limiter, and Sparse Attention are
+order-independent with each other. Sparse Attention owns its target-video token
+order and composes it with the selected embedding-memory path automatically.
 
 Compatible external attention and `ModelPatcher` changes are preserved where
 supported. A conflicting third-party patch can disable the corresponding H3
@@ -82,7 +91,10 @@ video attention connections for speed.
 - **Attention memory mode: Standard** — prioritizes speed. `Lower VRAM (slower)`
   is available when you need to squeeze peak memory further.
 - **Activation chunk rows** is an advanced control. Larger chunks can be faster
-  but use more temporary memory.
+  but use more temporary memory. The UI range and 256-row step are editing
+  recommendations; saved workflows may use any positive integer. A value at or
+  above the current packed input length uses the ordinary unsliced MLP for that
+  invocation instead of entering an effectively unchunked two-slice mode.
 
 The advanced precision and streaming controls are mainly useful for debugging,
 benchmarking, or deliberately forcing a particular execution policy.
@@ -90,7 +102,7 @@ benchmarking, or deliberately forcing a particular execution policy.
 ## H3 AIMDO Residency Limiter
 
 **Use this when you specifically want to control how much H3 model weight
-DynamicVRAM keeps resident on the GPU.**
+DynamicVRAM keeps persistently resident on the GPU.**
 
 This node exists mainly for benchmarking, debugging AIMDO behavior, and forcing
 minimal persistent H3 model residency. It is not intended to imply that one
@@ -135,8 +147,28 @@ The default video attention budget is **15%**.
 without this node.” The Sparse Attention node can still resolve through its own
 backend path. Bypass the node when you want the ordinary dense baseline.
 
+The displayed `0.01` to `1.0` budget range is the recommended editing range,
+not a server-side execution limit. Finite values below it retain at least one
+whole video KV tile, while values above it saturate at the full video route.
+
 Text, reference conditioning, audio, non-video queries, and mixed boundary tiles
 remain dense.
+
+The normal node uses the measured **1x8x8** target-video order. It groups real
+tokens into router-aligned 64-token spatial tiles through every H3 DiT block and
+restores raster order at the model output. This is backend-neutral and needs no
+separate token-order node.
+
+For native ConvRot-256 INT8 H3 checkpoints on SM80 or newer, the standard
+Kitchen 64x64 path now uses the H3-owned exact 128x256 fused-Q producer by
+default. The 128x256 dimensions describe the Q projection kernel, not the
+attention route: routing and sparse attention remain 64Q x 64KV. Its measured
+production boundary was approximately speed-neutral while reducing the active
+allocator peak when two-pass V was enabled. Older GPUs, other weight formats,
+older native binaries, and devices that fail the one-time fused-Q parity
+self-test keep the established Q projection and packing path.
+The implementation and its CUTLASS build headers ship in this repository; it
+does not require H3-Extended or a patched Comfy Kitchen checkout.
 
 > **Sparse attention changes model computation. It is not free acceleration.**
 > There is no attention percentage that is guaranteed to be lossless for every
@@ -158,8 +190,8 @@ drop from a short dense prefix to the low budget.
 on.**
 
 The Advanced node exposes separate attention budgets for the beginning, middle,
-and end of sampling, an early-schedule shape, and an explicit sparse-backend
-selector.
+and end of sampling, an early-schedule shape, an explicit sparse-backend
+selector, and target-video token order.
 
 - **Video attention budget** controls the middle steps.
 - **Early schedule** selects **Hold** or **Ramp**. Hold keeps Early KV fixed for
@@ -167,9 +199,17 @@ selector.
   Video attention budget over those steps. Set Early steps to `0` to disable it.
 - **Early steps / Early KV** control the duration and held or starting budget.
 - **Late steps / Late KV** do the same for the final steps.
+- Step counts above the displayed `1000` editing limit remain valid; only
+  negative step counts are rejected.
 - If the early and late windows overlap, the denser requested budget wins.
 - **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
   Sparse Sage, BF16 Triton, or FP8 FlexAttention.
+- **Video token order** defaults to **1x8x8**. The measured **1x16x4** and
+  **4x4x4** geometries remain available as comparison arms, and **Raster (stock
+  H3 order)** provides the unchanged H3 ordering baseline.
+- **Kitchen INT8 64x128 (experimental)** is an explicit image-quality arm that
+  keeps 64-row query routing while selecting 128-row KV tiles. Ordinary
+  Kitchen INT8 remains the 64x64 default.
 
 The defaults preserve the existing **Hold** behavior: four early steps at 50%,
 a 15% middle budget, and no late override, matching a 20-step schedule. Choose
@@ -186,9 +226,21 @@ want automatic backend selection.
 
 MiniMax H3 text-to-video at 1376x768 (1.0 MP, 16:9) on an RTX 4070 12 GB,
 `res_multistep`/`simple`, measured end to end through a real sampler. Each cell
-executes five sampler steps and reports the median of the four step times after
-the first; step 1 carries model initialization and is excluded. The 20-step
-columns are projections from that median, not separate wall-clock runs.
+executes five sampler steps and reports the median of the last three; step 1
+carries model initialization and the step after it is a discarded warmup. The
+20-step columns are projections from that median, not separate wall-clock runs.
+
+The card was capped to **160 W** of its 200 W stock board power for these runs,
+which is quieter and holds a steadier clock than the stock limit. A stock-power
+card is faster than every row below, but not uniformly: the cap costs each
+configuration in proportion to how power-saturated it already was, and dense
+INT8 attention at 10 seconds is the most saturated cell in the matrix. The
+Comfy Kitchen baseline is therefore the row that transfers least well to a
+stock-power card, and the speedups below are, if anything, flattered by it.
+
+Benchmark-only synthetic Qwen states and an empty native latent stand in for
+the text encoder and VAE, so neither is loaded and neither contributes to the
+timings or the memory figures.
 
 Every benchmark arm also shares two controls that are **not normal user
 settings**:
@@ -203,33 +255,53 @@ Both benchmark controls come from the benchmark setup; the first is provided by
 the sibling H3-Extended pack. They should not be interpreted as recommended
 workflow settings.
 
-| configuration | 5s step | 5s 20-step | 5s peak VRAM | 10s step | 10s 20-step | 10s peak VRAM |
+The VRAM columns are the **ComfyUI process's own dedicated GPU memory**, read
+from the Windows GPU Process Memory counters that Task Manager reports. This
+replaces the whole-GPU `nvidia-smi` figure used in earlier revisions of this
+table, which carried the desktop compositor and every other application on the
+card. That baseline is not a constant: measured here it sat near 2.9 GB during
+the 5-second arms and collapsed to roughly 1.0 GB during the 10-second ones, as
+Windows evicted desktop surfaces under pressure. Whole-GPU peaks from the two
+durations were therefore never comparable with each other. Arm-to-arm
+differences within one duration were much less affected, since the baseline
+largely cancels.
+
+| configuration | 5s step | 5s 20-step | 5s VRAM | 10s step | 10s 20-step | 10s VRAM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Comfy Kitchen INT8 dense | 26.7 s | ~8m55s | 7513 MiB | 72.2 s | ~24m05s | 11729 MiB |
-| SageAttention dense | 26.5 s | ~8m50s | 7754 MiB | out of memory | - | - |
-| SageAttention + chunked QKV/MLP/FinalLayer (streaming off) | 26.2 s | ~8m44s | 5901 MiB | 76.1 s | ~25m22s | 9047 MiB |
-| H3 Memory Optimization + Sparse Attention (KV 100%) | 28.9 s | ~9m39s | 5355 MiB | 86.3 s | ~28m45s | 7315 MiB |
-| **H3 Memory Optimization + Sparse Attention (KV 30%, measured)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
+| Comfy Kitchen INT8 dense | 28.2 s | ~9m24s | 6193 MiB | 89.0 s | ~29m40s | 10849 MiB |
+| SageAttention dense | 27.7 s | ~9m13s | 6737 MiB | out of memory | - | - |
+| SageAttention + streamed QKV, chunked MLP/FinalLayer | 28.0 s | ~9m19s | 2801 MiB | 77.9 s | ~25m58s | 4787 MiB |
+| H3 Memory Optimization + Sparse Attention (KV 100%) | 29.5 s | ~9m50s | 2963 MiB | 91.5 s | ~30m30s | 4595 MiB |
+| **H3 Memory Optimization + Sparse Attention (KV 30%, measured)** | **18.7 s** | **~6m14s** | **2963 MiB** | **46.1 s** | **~15m21s** | **4563 MiB** |
 
 Against dense Comfy Kitchen attention, the measured 30% configuration achieved
-**1.57x faster at 5 seconds and 1.69x at 10 seconds**, using 2.2 GB less VRAM at
-5 seconds and 4.4 GB less at 10 seconds.
+**1.51x faster at 5 seconds and 1.93x at 10 seconds**, using 3.2 GB less VRAM at
+5 seconds and 6.1 GB less at 10 seconds.
 
 These measurements predate the 15% middle-step and 50% early-step defaults; they
 should not be read as performance evidence for the new schedule.
 
 The rows isolate successive **conceptual optimization stages**, but they are not
-a ladder of untouched UI defaults. In particular, the Sage memory arm uses
-`Precision = Preserve native` and `QKV streaming = Off`, while the following
-100% KV arm enables streamed QKV and uses the normal automatic precision policy.
-The stage comparison is therefore:
+a ladder of untouched UI defaults. The Sage memory arm pins
+`Precision = Preserve native`, while the following 100% KV arm uses the normal
+automatic precision policy. Both leave `QKV streaming = Auto`, and both stream:
+the Sage memory arm projects ConvRot INT8 QKV straight into the dense Sage
+carrier (`streamed_dense_sage_qkv`), which the benchmark verifies per arm with a
+route assertion. Streaming is therefore not what separates those two rows; the
+attention path and the precision policy are. The stage comparison is:
 
 | conceptual stage | 5s speed | 5s VRAM |
 | --- | ---: | ---: |
-| Comfy Kitchen dense to dense SageAttention | 1.01x | +241 MiB |
-| add chunked QKV, MLP and FinalLayer while streaming remains off | 1.01x | -1853 MiB |
-| add streamed QKV and the native 64Q x 64KV attention path at 100% KV | 0.91x | -546 MiB |
-| reduce video KV density to 30 percent | 1.70x | -60 MiB |
+| Comfy Kitchen dense to dense SageAttention | 1.02x | +544 MiB |
+| stream ConvRot INT8 QKV into the dense Sage carrier, chunk MLP and FinalLayer | 0.99x | -3936 MiB |
+| swap that carrier for the native 64Q x 64KV path at 100% KV, precision on the automatic policy | 0.95x | +162 MiB |
+| reduce video KV density to 30 percent | 1.58x | +0 MiB |
+
+The native 64Q x 64KV path costs 162 MiB at 5 seconds rather than saving memory,
+and pays it back at 10 seconds, where it sits below the dense Sage carrier
+(4595 MiB against 4787 MiB, and 4563 MiB once KV drops to 30%). Dense Sage with
+streamed QKV is the more memory-efficient choice until the sequence grows long
+enough to invert that.
 
 The measurements were taken with the NVIDIA driver's CUDA sysmem fallback
 disabled, so exceeding VRAM fails instead of silently paging to system memory.
@@ -316,10 +388,13 @@ enabled and requires asynchronous weight offloading for numeric limits.
 
 ## Sparse routing and backends
 
-The standard H3 Sparse Attention node uses automatic backend selection. It
-prefers the shipped native Kitchen sparse backend when its per-GPU self-test
-passes, then tries compatible Sparse Sage, BF16 Triton, FlexAttention, and
-finally the resolved dense H3 path.
+The standard H3 Sparse Attention node uses automatic backend selection. On
+NVIDIA it prefers the shipped native Kitchen sparse backend when its per-GPU
+self-test passes, then tries compatible Sparse Sage, BF16 Triton, FlexAttention,
+and finally the resolved dense H3 path. On RDNA2 gfx103x, Auto skips Kitchen
+INT8, Sparse Sage, and BF16 Triton because those paths are known incompatible;
+it tries ROCm FlexAttention when available, then the probed sparse-over-existing-
+dense adapter, and finally ordinary dense attention.
 
 A `1.0` video budget leaves the video route fully connected but still enters this
 backend-selection path. Bypass H3 Sparse Attention when comparing against the
@@ -348,6 +423,53 @@ The shipped CUDA targets are SM75, SM80, SM89, and SM120 on Windows, with SM90a
 also included on Linux. Each target ships real SASS and one SM89 PTX fallback is
 retained for forward compatibility.
 
+### Experimental AMD Sparse Kitchen
+
+This branch adapts the exact INT8 stage from Comfy Kitchen's HIP Sol-Attn work
+to H3's existing 64Q x 64KV sparse route. H3 still chooses every KV block; the
+Sol router, approximate tail, and fused QKV producer are not used. Supported
+native targets are gfx11 (RDNA 3/3.5) and gfx12 (RDNA 4).
+
+RDNA 2 gfx103x does not enter the native Kitchen path and does not try BF16
+Triton: the latter requires BF16 matrix multiply that RDNA2 does not provide.
+Sparse Sage is likewise skipped because it is an NVIDIA CUDA extension. RDNA2
+Auto therefore tries ROCm FlexAttention when the installed stack can lower it;
+otherwise it probes the existing ComfyUI dense attention consumer for 64Q x
+64KV and then 128Q x 128KV packed sparse execution. If the adapter later meets
+an unprobed route, shape, batch, or consumer restriction, it fails open to full
+dense attention for the affected invocation or streamed Q chunk.
+
+Credit to Deluxa for the RDNA3+ Sol exact HIP kernel adapted by this branch.
+
+The branch ships prebuilt Linux x86-64 and Windows x64 libraries in
+`native/hip/bin`, compiled with ROCm 7.2.1 for the supported gfx11/gfx12 targets. Testers do
+not need CMake, a compiler, or the ROCm development SDK; they need only their
+normal ROCm ComfyUI runtime and a supported GPU.
+
+The loader searches `native/hip/bin`, `native/hip/lib`, `native/hip/build`, and
+`native/hip/build/Release`. If the build emits the library elsewhere, place its
+absolute path in the ignored `native/hip/library_path.txt` file.
+
+Automatic sparse selection on gfx11/gfx12 AMD hardware tries AMD Sparse Kitchen
+before the ordinary sparse fallback chain. The first resolution runs cached,
+per-device full-route and genuinely sparse numerical comparisons against
+PyTorch attention. These checks use a non-64-divisible sequence, production-
+shaped strided HND inputs, NHD output, varying per-head/query-block routes, and
+delta route conversion. A missing library, unsupported architecture, or failed
+self-test retires AMD Sparse Kitchen and leaves the existing automatic fallback
+behavior in control. Explicitly selecting `Kitchen INT8` remains a hard
+requirement and reports the failure instead.
+
+RDNA2 uses a different fail-open adapter path and is not evidence for the native
+HIP kernel. The adapter's architecture-neutral routing, packing, probe, and
+fallback contracts can be exercised on CUDA, but only live gfx103x hardware can
+validate the actual ROCm dense consumer and runtime behavior.
+
+This is an experimental tester branch. The shipped gfx11/gfx12 libraries have
+been compiled and ABI-export checked in CI on Ubuntu 24.04 and Windows Server
+2022, but have not been executed on AMD hardware. A live gfx11 or gfx12 run is
+still required to establish numerical correctness and performance.
+
 ### FROST BF16
 
 FROST BF16 is an explicit SM89-only 64Q x 64KV backend. It uses the packaged
@@ -370,7 +492,8 @@ The package BF16 Triton backend is available on supported Triton runtimes and
 uses the same 64Q x 64KV routing geometry as the native Kitchen default. It can
 stream projection chunks from supported BF16, ConvRot-256, W4A8, and FP8
 checkpoints into its BF16 attention carrier without retaining a full fused
-projection temporary.
+projection temporary. RDNA2 gfx103x is explicitly excluded because it lacks the
+BF16 matrix multiply required by this backend.
 
 ### FlexAttention
 
@@ -445,7 +568,12 @@ overrides retain full-Q single-call behavior.
 - Any backend supported by ComfyUI's MiniMax H3 implementation for the final
   dense fallback
 - NVIDIA SM75 or newer for the shipped native Kitchen default
-- NVIDIA SM80 or newer with Triton for the BF16 Triton sparse fallback
+- AMD gfx11 (RDNA 3/3.5) or gfx12 (RDNA 4) and a compatible ROCm PyTorch runtime for
+  the shipped experimental AMD Sparse Kitchen library
+- NVIDIA SM80 or newer with Triton for the BF16 Triton sparse fallback; RDNA2
+  gfx103x is explicitly unsupported by that backend
+- A ROCm-capable PyTorch build with a working existing H3 dense attention
+  consumer for the RDNA2 sparse-over-dense adapter
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the NVIDIA Flex path
 - A ROCm-capable PyTorch build with FlexAttention/Triton for the AMD sparse Flex
   path
@@ -469,10 +597,16 @@ composition, backend classification, streamed and chunked projection contracts,
 FROST ABI behavior, native shipping contracts, explicit sparse-backend
 selection, chunk boundaries and RoPE slices, non-H3 no-op behavior, sparse route
 geometry, runtime step/layout publication, early/middle/late density schedules,
-and source isolation.
+cube-order permutations, plan composition, and source isolation. RDNA2 CPU
+contracts additionally verify that known-dead
+Auto backends are skipped and that adapter preparation/execution failures fail
+open to the existing dense consumer.
 
 GPU kernel validation is intentionally separate because it requires matching
-hardware and compiled backend packages.
+hardware and compiled backend packages. A CUDA contract test also exercises the
+architecture-neutral RDNA2 adapter with an unknown dense consumer that passes the
+probe and later rejects an unprobed packed shape; this validates fail-open control
+flow on real GPU tensors but does not validate ROCm execution.
 
 Live SM89 gates compare whole-carrier and streamed Kitchen Q/Q-scale exactly,
 exercise every shipped Kitchen geometry, and check the declared SM89

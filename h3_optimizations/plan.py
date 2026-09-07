@@ -64,6 +64,7 @@ SPARSE_BACKEND_TRITON_LEGACY = 'INT8 Triton'
 SPARSE_BACKEND_FLEX = 'FP8 FlexAttention'
 SPARSE_BACKEND_FROST = 'FROST BF16 (SM89)'
 SPARSE_BACKEND_KITCHEN = 'Kitchen INT8'
+SPARSE_BACKEND_KITCHEN_64X128 = 'Kitchen INT8 64x128 (experimental)'
 SPARSE_BACKEND_KITCHEN_LEGACY = 'Kitchen INT8 (experimental)'
 SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_AUTO,
@@ -72,6 +73,7 @@ SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
 )
 
 EMBEDDING_MEMORY_AUTO = 'auto'
@@ -102,6 +104,7 @@ SPARSE_BACKEND_COMPAT_REQUESTS = (
 )
 SPARSE_BACKEND_PUBLIC_REQUESTS = (
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
@@ -116,6 +119,17 @@ DEFAULT_VIDEO_BUDGET = 0.15
 DEFAULT_EDGE_STEPS = 4
 DEFAULT_LATE_STEPS = 0
 DEFAULT_EDGE_KV = 0.5
+VIDEO_TOKEN_ORDER_1X8X8 = '1x8x8'
+VIDEO_TOKEN_ORDER_1X16X4 = '1x16x4'
+VIDEO_TOKEN_ORDER_4X4X4 = '4x4x4'
+VIDEO_TOKEN_ORDER_RASTER = 'Raster (stock H3 order)'
+DEFAULT_VIDEO_TOKEN_ORDER = VIDEO_TOKEN_ORDER_1X8X8
+VIDEO_TOKEN_ORDER_REQUESTS = (
+    VIDEO_TOKEN_ORDER_1X8X8,
+    VIDEO_TOKEN_ORDER_1X16X4,
+    VIDEO_TOKEN_ORDER_4X4X4,
+    VIDEO_TOKEN_ORDER_RASTER,
+)
 EARLY_SCHEDULE_HOLD = 'Hold'
 EARLY_SCHEDULE_RAMP = 'Ramp'
 EARLY_SCHEDULE_OPTIONS = (
@@ -126,8 +140,8 @@ EARLY_SCHEDULE_OPTIONS = (
 
 def _validate_sparse_budget(name, value):
     budget = float(value)
-    if not math.isfinite(budget) or not 0.01 <= budget <= 1.0:
-        raise ValueError('%s must be finite and in [0.01, 1]' % name)
+    if not math.isfinite(budget):
+        raise ValueError('%s must be finite' % name)
 
 
 def _validate_edge_schedule(early_steps, early_kv, late_steps, late_kv):
@@ -197,15 +211,12 @@ class MemoryRequest:
                 'unknown attention V memory request %r' % self.attention_v_memory
             )
         chunk_rows = int(self.chunk_rows)
-        if not MIN_CHUNK_ROWS <= chunk_rows <= MAX_CHUNK_ROWS:
-            raise ValueError(
-                'chunk_rows must be between %d and %d'
-                % (MIN_CHUNK_ROWS, MAX_CHUNK_ROWS)
-            )
-        if chunk_rows % CHUNK_ALIGNMENT:
-            raise ValueError(
-                'chunk_rows must be a multiple of %d' % CHUNK_ALIGNMENT
-            )
+        if (
+            isinstance(self.chunk_rows, bool)
+            or chunk_rows != self.chunk_rows
+            or chunk_rows <= 0
+        ):
+            raise ValueError('chunk_rows must be a positive integer')
 
     @property
     def signature(self):
@@ -235,6 +246,8 @@ class SparseRequest:
     backend: str = SPARSE_BACKEND_AUTO
     early_schedule: str = EARLY_SCHEDULE_HOLD
     step_video_budgets: tuple[float, ...] | None = None
+    video_token_order: str = DEFAULT_VIDEO_TOKEN_ORDER
+
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
         if self.backend == SPARSE_BACKEND_KITCHEN_LEGACY:
@@ -245,6 +258,10 @@ class SparseRequest:
             raise ValueError('unknown sparse backend request %r' % self.backend)
         if self.early_schedule not in EARLY_SCHEDULE_OPTIONS:
             raise ValueError('unknown early schedule %r' % self.early_schedule)
+        if self.video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:
+            raise ValueError(
+                'unknown video token order %r' % self.video_token_order
+            )
         _validate_edge_schedule(
             self.early_steps,
             self.early_kv,
@@ -291,6 +308,7 @@ class SparseRequest:
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
             self.step_video_budgets,
+            self.video_token_order,
         )
 
 

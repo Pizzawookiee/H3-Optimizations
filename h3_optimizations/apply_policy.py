@@ -8,12 +8,20 @@ owning apply module.
 '''
 
 from . import apply as _base
+from .attention.sparse.frost_bf16 import FrostBF16Error
 from .environment import RuntimeEnvironment
 from .plan import (
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_QUANT,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_FORCE_QUANT,
+    SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_FLEX,
+    SPARSE_BACKEND_FROST,
+    SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
+    SPARSE_BACKEND_SAGE,
+    SPARSE_BACKEND_TRITON,
 )
 from .qkv.formats import describe_linear
 from .qkv import policy as _qkv_policy
@@ -21,6 +29,23 @@ from .qkv import providers as _providers
 
 _BASE_KITCHEN_PROJECTOR = _base.ChunkedKitchenQKVProjector
 _BASE_MLP_RESOLVER = _base.resolve_mlp_provider
+_BASE_RESOLVE_ATTENTION = _base._resolve_attention
+
+_BACKEND_LABELS = {
+    SPARSE_BACKEND_KITCHEN: 'Kitchen INT8',
+    SPARSE_BACKEND_KITCHEN_64X128: 'Kitchen INT8 64x128 (experimental)',
+    SPARSE_BACKEND_FROST: 'FROST BF16 (SM89)',
+    SPARSE_BACKEND_SAGE: 'Sparse Sage',
+    SPARSE_BACKEND_TRITON: 'BF16 Triton',
+    SPARSE_BACKEND_FLEX: 'FP8 FlexAttention',
+}
+_BACKEND_ERRORS = (
+    _base.SparseKitchenError,
+    _base.SparseSageError,
+    _base.TritonSparseError,
+    _base.FP8FlexError,
+    FrostBF16Error,
+)
 
 
 def _current_capability():
@@ -29,6 +54,107 @@ def _current_capability():
     if not environment.cuda_available or environment.capability is None:
         return None
     return tuple(int(value) for value in environment.capability)
+
+
+def _probe_sparse_backend(backend, environment):
+    '''Run only the backend's existing availability preflight.
+
+    This intentionally does not install or select the backend. The probe exists
+    only to make an explicit-backend failure actionable without maintaining a
+    second architecture compatibility table beside the real preflight code.
+    '''
+    cuda_available = lambda: bool(getattr(environment, 'cuda_available', False))
+    capability_getter = lambda: getattr(environment, 'capability', None)
+
+    if backend in (SPARSE_BACKEND_KITCHEN, SPARSE_BACKEND_KITCHEN_64X128):
+        q_tile, kv_tile = (
+            (64, 128)
+            if backend == SPARSE_BACKEND_KITCHEN_64X128
+            else (_base.KITCHEN_Q_TILE, _base.KITCHEN_KV_TILE)
+        )
+        return _base.preflight_sparse_kitchen(
+            cuda_available=cuda_available,
+            capability_getter=capability_getter,
+            q_tile=q_tile,
+            kv_tile=kv_tile,
+        )
+    if backend == SPARSE_BACKEND_SAGE:
+        return _base.preflight_sparse_sage(
+            cuda_available=cuda_available,
+            capability_getter=capability_getter,
+        )
+    if backend == SPARSE_BACKEND_TRITON:
+        return _base.preflight_triton_sparse(
+            cuda_available=cuda_available,
+            capability_getter=capability_getter,
+        )
+    if backend == SPARSE_BACKEND_FLEX:
+        return _base.preflight_fp8_flex(
+            cuda_available=cuda_available,
+            capability_getter=capability_getter,
+            device=getattr(environment, 'device_index', None),
+        )
+    if backend == SPARSE_BACKEND_FROST:
+        return _base.preflight_frost_bf16(
+            cuda_available=cuda_available,
+            capability_getter=capability_getter,
+        )
+    raise ValueError('unknown sparse backend request %r' % backend)
+
+
+def _available_sparse_alternatives(selected, environment):
+    alternatives = []
+    for backend in (
+        SPARSE_BACKEND_KITCHEN,
+        SPARSE_BACKEND_KITCHEN_64X128,
+        SPARSE_BACKEND_FROST,
+        SPARSE_BACKEND_SAGE,
+        SPARSE_BACKEND_TRITON,
+        SPARSE_BACKEND_FLEX,
+    ):
+        if backend == selected:
+            continue
+        try:
+            _probe_sparse_backend(backend, environment)
+        except Exception:
+            continue
+        alternatives.append(_BACKEND_LABELS[backend])
+    return alternatives
+
+
+def _explicit_backend_error(backend, error, environment):
+    alternatives = _available_sparse_alternatives(backend, environment)
+    architecture = getattr(environment, 'architecture', None)
+    system = architecture or getattr(environment, 'backend', None) or 'this system'
+    message = '%s is unavailable on %s: %s.' % (
+        _BACKEND_LABELS.get(backend, str(backend)),
+        system,
+        error,
+    )
+    if alternatives:
+        message += ' Available sparse backends detected on this system: %s.' % (
+            ', '.join(alternatives)
+        )
+    else:
+        message += ' No compatible alternative sparse backend was detected.'
+    message += (
+        ' Use H3 Sparse Attention instead of H3 Sparse Attention (Advanced) '
+        'to select a compatible backend automatically or fall back to dense attention.'
+    )
+    return message
+
+
+def resolve_attention(plan, model, inventory, environment):
+    '''Preserve explicit backend strictness while making failures actionable.'''
+    sparse = getattr(plan, 'sparse', None)
+    backend = None if sparse is None else sparse.backend
+    if backend in (None, SPARSE_BACKEND_AUTO):
+        return _BASE_RESOLVE_ATTENTION(plan, model, inventory, environment)
+    try:
+        return _BASE_RESOLVE_ATTENTION(plan, model, inventory, environment)
+    except _BACKEND_ERRORS as error:
+        message = _explicit_backend_error(backend, error, environment)
+        raise type(error)(message) from error
 
 
 def resolve_qkv_provider(inventory, *, request, backend_kind, **kwargs):
@@ -155,6 +281,7 @@ class PolicyChunkedKitchenQKVProjector(_BASE_KITCHEN_PROJECTOR):
 _base.resolve_qkv_provider = resolve_qkv_provider
 _base.resolve_mlp_provider = resolve_mlp_provider
 _base.ChunkedKitchenQKVProjector = PolicyChunkedKitchenQKVProjector
+_base._resolve_attention = resolve_attention
 
 
 def apply_plan(model, plan):

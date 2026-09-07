@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from dataclasses import dataclass, replace
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
@@ -36,6 +37,7 @@ from h3_optimizations.attention.sparse.router import SparseTileRouter
 from h3_optimizations.attention.sparse import kitchen_sparse
 from h3_optimizations.kitchen_qkv import ChunkedKitchenQKVProjector
 from h3_optimizations.kitchen_qkv import V_MODE_RETAIN, V_MODE_TWO_PASS
+from h3_optimizations.normalized_rows import NormalizedRows
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -54,6 +56,120 @@ class _Layout:
 
 
 class StreamedSparseKitchenRoutingTests(unittest.TestCase):
+    def test_short_video_route_plan_stays_dense(self):
+        class NoSelectionRouter(SparseTileRouter):
+            def _select_indices(self, *_args, **_kwargs):
+                raise AssertionError('dense boundary must not run Top-K')
+
+        video_start = 5263
+        cases = (
+            (64, 64, 5312),
+            (64, 128, 5312),
+            (64, 128, 5313),
+            (128, 64, 5313),
+        )
+        for q_tile, kv_tile, sequence in cases:
+            with self.subTest(
+                q_tile=q_tile,
+                kv_tile=kv_tile,
+                sequence=sequence,
+            ):
+                router = NoSelectionRouter(q_tile=q_tile, kv_tile=kv_tile)
+                current_layout = _Layout(sequence, video_start)
+                geometry = router.geometry(current_layout)
+                k_summary = torch.zeros(1, 2, geometry.kv_tiles, 4)
+                plan, metadata = _prepare_route_plan(
+                    router,
+                    k_summary,
+                    current_layout,
+                    0.15,
+                )
+                lut, counts = _build_route_chunk(
+                    router,
+                    plan,
+                    torch.zeros(1, 2, geometry.q_tiles, 4),
+                    tile_start=0,
+                )
+
+                self.assertTrue(torch.all(counts == geometry.kv_tiles))
+                self.assertTrue(
+                    torch.equal(
+                        torch.cumsum(lut, dim=-1, dtype=torch.int32),
+                        torch.arange(geometry.kv_tiles, dtype=torch.int32)
+                        .view(1, 1, 1, -1)
+                        .expand_as(lut),
+                    )
+                )
+                self.assertEqual(metadata.actual_video_tile_density, 1.0)
+                self.assertEqual(metadata.full_mask_density, 1.0)
+                self.assertEqual(metadata.sparse_q_tiles, 0)
+                self.assertEqual(metadata.dense_q_tiles, geometry.q_tiles)
+
+    def test_exact_fused_q_eligibility_receives_a_tensor_from_lazy_norm(self):
+        class StopAfterEligibility(Exception):
+            pass
+
+        def modulate(rows, _shift, _scale, _selector):
+            rows.add_(0.25)
+
+        source = NormalizedRows(
+            torch.zeros(64, 256, dtype=torch.bfloat16),
+            lambda rows: rows.clone(),
+            ((0, 64, 0),),
+            None,
+            None,
+            modulate,
+        )
+        source.is_cuda = True
+        projector = SimpleNamespace(
+            force_weights_bf16=False,
+            fp8_projection=False,
+            convrot_int8_projection=False,
+            q_tile=64,
+            kv_tile=64,
+            chunk_rows=64,
+        )
+        module = SimpleNamespace(qkv_proj=object())
+        rope = torch.zeros(1, 64, 1, 48, 2, 2, dtype=torch.bfloat16)
+
+        with (
+            mock.patch.object(kitchen_streamed_q, "resolve_kitchen", return_value=object()),
+            mock.patch.object(
+                kitchen_streamed_q, "_supports_streamed_producer", return_value=True
+            ),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "describe_linear",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(kitchen_streamed_q, "_format_supported", return_value=True),
+            mock.patch.object(
+                kitchen_streamed_q, "producer_api_available", return_value=True
+            ),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "fused_h3_q_supported",
+                side_effect=StopAfterEligibility,
+            ) as supported,
+        ):
+            with self.assertRaises(StopAfterEligibility):
+                kitchen_streamed_q._run_streamed_sparse_kitchen_qkv(
+                    projector,
+                    module,
+                    source,
+                    rope,
+                    layer_index=0,
+                    transformer_options={},
+                )
+
+        sample = supported.call_args.args[1]
+        self.assertIsInstance(sample, torch.Tensor)
+        self.assertEqual(tuple(sample.shape), (1, 256))
+        torch.testing.assert_close(
+            sample,
+            torch.full((1, 256), 0.25, dtype=torch.bfloat16),
+        )
+
     def test_query_chunks_use_the_carrier_producer_not_the_sparse_executor(self):
         class Held:
             def __enter__(self):
@@ -124,6 +240,97 @@ class StreamedSparseKitchenRoutingTests(unittest.TestCase):
             stream_output=True,
         )
         self.assertTrue(projector.streamed_q)
+
+    def test_exact_fused_q_replaces_only_the_query_carrier_and_summary(self):
+        @dataclass
+        class Carrier:
+            q: object
+            k: torch.Tensor
+            q_scale: object
+
+        class Fused:
+            def __init__(self):
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def project(self, x, rope, start, stop, full_k_length):
+                self.calls.append((x, rope, start, stop, full_k_length))
+                return (
+                    torch.zeros(1, 1, stop - start, 1, dtype=torch.int8),
+                    torch.ones(1, 1, 32),
+                    torch.zeros(1, 1, 1, 1),
+                )
+
+        class Kitchen:
+            BlockSparseRoute = staticmethod(lambda **kwargs: SimpleNamespace(**kwargs))
+
+            @staticmethod
+            def block_sparse_int8_attention_from_prequantized(
+                carrier, _route, *, output_layout
+            ):
+                self.assertEqual(output_layout, kitchen_streamed_q.OUTPUT_NHD)
+                self.assertEqual(carrier.q.dtype, torch.int8)
+                return carrier.q.to(torch.float32)
+
+        module = SimpleNamespace(heads=1, head_dim=1, out_proj=lambda rows: rows)
+        source = torch.zeros(64, 1)
+        rope = torch.zeros(1, 64, 1, 1)
+        projected = StreamedSparseKitchenQKV(
+            module=module,
+            producer_module=object(),
+            x=source,
+            rope_freqs=rope,
+            carrier=Carrier(
+                q=object(),
+                k=torch.zeros(1, 1, 64, 1),
+                q_scale=object(),
+            ),
+            k_summary=None,
+            projection_mode="native",
+            output_buffer=source,
+            fused_q=True,
+        )
+        prepared = PreparedStreamedSparseKitchen(
+            projected=projected,
+            route_plan=SimpleNamespace(release=lambda: None),
+            metadata={},
+        )
+        backend = StreamedSparseKitchenBackend.__new__(StreamedSparseKitchenBackend)
+        backend.executor = SimpleNamespace(kitchen=Kitchen(), q_tile=64, kv_tile=64)
+        backend.query_chunk_rows = 64
+        backend.router = object()
+        fused = Fused()
+
+        with (
+            mock.patch.object(
+                kitchen_streamed_q, "HeldExactH3FusedQ", return_value=fused
+            ),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "_build_route_chunk",
+                return_value=(torch.zeros(1, 1, 1, 1), torch.ones(1, 1, 1)),
+            ),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "_quantize_q_chunk",
+                side_effect=AssertionError("generic Q pack must not run"),
+            ),
+            mock.patch.object(
+                kitchen_streamed_q,
+                "create_held_qkv",
+                side_effect=AssertionError("generic Q projection must not run"),
+            ),
+        ):
+            actual = backend.execute_projected(module, prepared)
+
+        self.assertTrue(torch.equal(actual, source))
+        self.assertEqual(len(fused.calls), 1)
+        self.assertEqual(fused.calls[0][2:], (0, 64, 64))
 
     def test_dense_projector_default_is_unchanged(self):
         projector = ChunkedKitchenQKVProjector()

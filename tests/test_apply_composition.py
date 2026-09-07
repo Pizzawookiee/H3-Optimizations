@@ -1,6 +1,7 @@
 '''Apply-plan composition through Memory then Sparse and the reverse.'''
 
 from copy import deepcopy
+import logging
 import os
 from pathlib import Path
 import sys
@@ -26,6 +27,7 @@ from comfy.model_patcher import ModelPatcher  # noqa: E402
 import comfy.patcher_extension  # noqa: E402
 from comfy_extras.nodes_model_advanced import ModelAttentionBackend  # noqa: E402
 import h3_optimizations.apply as apply_module  # noqa: E402
+from h3_optimizations.cube_order import TOKEN_ORDER_SHAPES  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
@@ -33,9 +35,12 @@ from h3_optimizations.plan import (  # noqa: E402
     MemoryRequest,
     QKV_STREAMING_OFF,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
     STATUS_KEY,
     PLAN_KEY,
+    VIDEO_TOKEN_ORDER_REQUESTS,
+    VIDEO_TOKEN_ORDER_RASTER,
     read_plan,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
@@ -107,7 +112,27 @@ def apply_in_order(base, first_request, second_request):
     return apply_module.apply_plan(first, plan)
 
 
+def run_prepare_wrappers(model):
+    wrapper_type = comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING
+    wrappers = model.wrappers[wrapper_type][
+        apply_module.PREPARE_WRAPPER_KEY
+    ]
+    return comfy.patcher_extension.WrapperExecutor.new_executor(
+        lambda patcher, *_args, **_kwargs: patcher,
+        wrappers,
+    ).execute(model)
+
+
 class ApplyCompositionTests(unittest.TestCase):
+    def setUp(self):
+        cube_install = mock.patch.object(
+            apply_module,
+            'install_cube_order',
+            return_value=True,
+        )
+        self.install_cube_order = cube_install.start()
+        self.addCleanup(cube_install.stop)
+
     def test_live_option_sync_is_a_no_op_for_the_patcher_options_object(self):
         wrapper = lambda executor, *args, **kwargs: executor(*args, **kwargs)
         model = FakeModel({
@@ -339,7 +364,7 @@ class ApplyCompositionTests(unittest.TestCase):
         qkv = QKVProviderResolution(
             'standard_h3_qkv',
             False,
-            'synthetic',
+            'Comfy Kitchen external producer API is unavailable',
         )
         mlp = MLPProviderResolution(
             'generic_chunked_quantized',
@@ -400,14 +425,68 @@ class ApplyCompositionTests(unittest.TestCase):
             apply_module,
             '_ensure_sparse_runtime',
             return_value=(object(), True),
-        ), self.assertLogs(level='INFO') as logs:
-            left = apply_in_order(FakeModel(), memory, sparse)
-            right = apply_in_order(FakeModel(), sparse, memory)
+        ):
+            with self.assertLogs(level='DEBUG') as provisional_logs:
+                memory_only = apply_module.apply_plan(
+                    FakeModel(),
+                    H3OptimizationPlan(memory=memory),
+                )
+                sparse_only = apply_module.apply_plan(
+                    FakeModel(),
+                    H3OptimizationPlan(sparse=sparse),
+                )
+                left = apply_in_order(FakeModel(), memory, sparse)
+                right = apply_in_order(FakeModel(), sparse, memory)
+                apply_module._reconcile_plan(
+                    left,
+                    read_plan(left),
+                    phase='clone',
+                    force_rebuild=True,
+                )
+
+            self.assertFalse(any(
+                record.levelno >= logging.INFO
+                for record in provisional_logs.records
+            ))
+            with self.assertLogs(level='DEBUG') as logs:
+                run_prepare_wrappers(memory_only)
+                run_prepare_wrappers(sparse_only)
+                run_prepare_wrappers(left)
+                run_prepare_wrappers(right)
 
         applied_logs = [
             line for line in logs.output if ' applied plan: ' in line
         ]
-        self.assertTrue(applied_logs)
+        self.assertEqual(len(applied_logs), 4)
+        self.assertTrue(all('phase=prepare' in line for line in applied_logs))
+        self.assertTrue(all(line.startswith('DEBUG:') for line in applied_logs))
+        final_logs = [
+            line for line in logs.output if ' final plan: ' in line
+        ]
+        self.assertEqual(len(final_logs), 4)
+        self.assertTrue(all(line.startswith('INFO:') for line in final_logs))
+        self.assertEqual(sum(
+            'final plan: Memory Optimization; attention: Comfy Kitchen INT8.'
+            in line for line in final_logs
+        ), 1)
+        self.assertEqual(sum(
+            'final plan: Sparse Attention; attention: Sparse Sage.'
+            in line for line in final_logs
+        ), 1)
+        self.assertEqual(sum(
+            'final plan: Memory Optimization + Sparse Attention; '
+            'attention: Sparse Sage.' in line for line in final_logs
+        ), 2)
+        self.assertFalse(any('qkv_provider=' in line for line in final_logs))
+        warning_logs = [
+            record.getMessage()
+            for record in logs.records
+            if record.levelno == logging.WARNING
+        ]
+        self.assertEqual(len(warning_logs), 4)
+        self.assertTrue(all(
+            'FUSED QKV IS NOT RUNNING' in line for line in warning_logs
+        ))
         self.assertTrue(all(
             'qkv_weights=TensorWiseINT8Layout+convrot256 qkv_layers=50' in line
             for line in applied_logs
@@ -416,9 +495,8 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertTrue(any(
             'features=memory+sparse' in line for line in applied_logs
         ))
-        self.assertTrue(any(
-            'replaces_attention=comfy_kitchen_int8' in line
-            for line in applied_logs
+        self.assertFalse(any(
+            'replaces_attention=' in line for line in applied_logs
         ))
         self.assertFalse(any(' armed: ' in line for line in logs.output))
         self.assertEqual(
@@ -438,6 +516,91 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertTrue(
             left_status['sparse']['denser_early_late_steps']
         )
+
+    def test_public_backends_share_token_order_installation_contract(self):
+        inventory = SimpleNamespace(
+            labels=lambda _name: (),
+            out_proj_plain_float=False,
+        )
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(8, 9),
+            device_name='fake SM89',
+            backend='nvidia_cuda',
+            architecture='sm89',
+        )
+        attention = apply_module.ResolvedAttention(
+            requested='synthetic',
+            selected=apply_module.ATTENTION_SPARSE,
+            backend=SimpleNamespace(
+                name=apply_module.ATTENTION_SPARSE,
+                as_status=lambda: {},
+            ),
+            reason='synthetic sparse backend',
+            backend_kind=apply_module.ATTENTION_SPARSE,
+        )
+        qkv = QKVProviderResolution(
+            QKV_STANDARD,
+            False,
+            'standard projection',
+        )
+        mlp = MLPProviderResolution('off', 'off', 'disabled')
+
+        with mock.patch.object(
+            apply_module,
+            'is_minimax_h3',
+            return_value=True,
+        ), mock.patch.object(
+            apply_module,
+            'get_h3_blocks',
+            return_value=(object(),),
+        ), mock.patch.object(
+            apply_module,
+            'inspect_h3_linears',
+            return_value=inventory,
+        ), mock.patch.object(
+            apply_module.RuntimeEnvironment,
+            'detect',
+            return_value=environment,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_attention',
+            return_value=(attention, qkv),
+        ), mock.patch.object(
+            apply_module,
+            'configure_backend',
+            return_value=(object(), 1),
+        ), mock.patch.object(
+            apply_module,
+            '_install_mlp',
+            return_value=(mlp, 0),
+        ), mock.patch.object(
+            apply_module,
+            '_ensure_sparse_runtime',
+            return_value=(object(), True),
+        ):
+            for backend in SPARSE_BACKEND_PUBLIC_REQUESTS:
+                for token_order in VIDEO_TOKEN_ORDER_REQUESTS:
+                    with self.subTest(
+                        backend=backend,
+                        token_order=token_order,
+                    ):
+                        self.install_cube_order.reset_mock()
+                        patched = apply_module.apply_plan(
+                            FakeModel(),
+                            H3OptimizationPlan(sparse=SparseRequest(
+                                backend=backend,
+                                video_token_order=token_order,
+                            )),
+                        )
+                        cube_shape = TOKEN_ORDER_SHAPES[token_order]
+                        if cube_shape is None:
+                            self.install_cube_order.assert_not_called()
+                        else:
+                            self.install_cube_order.assert_called_once_with(
+                                patched,
+                                cube_shape,
+                            )
 
     def test_missing_sparse_backend_preserves_dense_h3(self):
         inventory = SimpleNamespace(labels=lambda _name: ())
@@ -463,6 +626,9 @@ class ApplyCompositionTests(unittest.TestCase):
             architecture='cpu',
         )
         plan = H3OptimizationPlan().with_sparse(SparseRequest())
+        raster_plan = H3OptimizationPlan().with_sparse(SparseRequest(
+            video_token_order=VIDEO_TOKEN_ORDER_RASTER,
+        ))
 
         with mock.patch.object(
             apply_module,
@@ -508,6 +674,10 @@ class ApplyCompositionTests(unittest.TestCase):
             '_ensure_sparse_runtime',
         ) as sparse_runtime:
             patched = apply_module.apply_plan(FakeModel(), plan)
+            raster_patched = apply_module.apply_plan(
+                FakeModel(),
+                raster_plan,
+            )
 
         status = patched.model_options['transformer_options'][STATUS_KEY]
         self.assertEqual(status['attention']['requested'], 'sparse_sage')
@@ -517,6 +687,12 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertFalse(status['runtime_installed'])
         self.assertIn('Attention: existing', format_sparse_status(patched))
         self.assertIn('Sparse fallback:', format_sparse_status(patched))
+        self.assertIn('Video token order: 1x8x8', format_sparse_status(patched))
+        self.install_cube_order.assert_called_once_with(patched, (1, 8, 8))
+        self.assertIn(
+            'Video token order: Raster (stock H3 order)',
+            format_sparse_status(raster_patched),
+        )
         configure.assert_not_called()
         sparse_runtime.assert_not_called()
 
