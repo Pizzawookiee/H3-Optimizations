@@ -223,12 +223,18 @@ def make_forward(block, layer_index, config, original_forward=None):
         mod_segments,
         rope_freqs,
         transformer_options={},
+        attention=None,
     ):
         if comfy.model_management.in_training:
             raise RuntimeError(
                 'H3 Memory Optimization is inference-only; training requires '
                 'the original block forward'
             )
+
+        # Old ComfyUI does not pass an attention override. Newer ComfyUI may
+        # inject one through MiniMax H3 patches_replace (for example sparse/VSA
+        # attention), so preserve the old path while honoring the new contract.
+        attention = block.attn if attention is None else attention
 
         (
             shift_msa,
@@ -256,17 +262,17 @@ def make_forward(block, layer_index, config, original_forward=None):
             scale_msa,
             _scale_shift,
         )
-        if _attention_supports_lazy_norm(block.attn):
+        if _attention_supports_lazy_norm(attention):
             attention_options = dict(transformer_options or {})
             attention_options[NORM1_SOURCE_KEY] = h
-            attn_out = block.attn(
+            attn_out = attention(
                 x,
                 rope_freqs=rope_freqs,
                 transformer_options=attention_options,
             )
         else:
             h = h.materialize()
-            attn_out = block.attn(
+            attn_out = attention(
                 h,
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,
