@@ -21,6 +21,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_optimizations.memory import final_layer
+from h3_optimizations.cube_order import CubeOrderState, CubeOrderTopology
 import h3_optimizations.apply as apply_module
 from h3_optimizations.plan import (
     EMBEDDING_MEMORY_RELEASE,
@@ -122,6 +123,24 @@ class _PDDLayer(_Layer):
             ),
             2,
         )
+
+
+class _CurrentIdentityLayer:
+    def __init__(self):
+        self.received = None
+
+    def forward(
+        self,
+        x,
+        _t_emb,
+        video_seg,
+        audio_seg,
+        sigma,
+        sample_sigmas,
+        shifts,
+    ):
+        self.received = (sigma, sample_sigmas, shifts)
+        return x[video_seg[0]:video_seg[1]], x[audio_seg[0]:audio_seg[1]]
 
 
 class _Patcher:
@@ -272,6 +291,91 @@ class FinalLayerTests(unittest.TestCase):
             patcher.object_patches[final_layer.FINAL_LAYER_KEY],
             foreign,
         )
+
+    def test_cube_restore_composes_with_chunking(self):
+        layer = _Layer()
+        state = CubeOrderState()
+        topology = CubeOrderTopology(
+            (1, 2, 2),
+            (2, 0, 3, 1),
+            (1, 3, 0, 2),
+        )
+        token = state.enter(topology)
+        state.leave(token, topology, True)
+        raster_video = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        audio = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 100
+        cube_video = raster_video.index_select(0, torch.tensor(topology.forward))
+
+        actual = final_layer.make_forward(layer, 2, cube_state=state)(
+            torch.cat((audio, cube_video)),
+            None,
+            (2, 6, 0),
+            (0, 2, 1),
+        )
+        expected = layer.forward(
+            torch.cat((audio, raster_video)),
+            None,
+            (2, 6, 0),
+            (0, 2, 1),
+        )
+
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+
+    def test_clearing_cube_state_retains_owned_chunking(self):
+        patcher = _Patcher()
+        model = SimpleNamespace(final_layer=_Layer())
+        state = CubeOrderState()
+        with mock.patch.object(
+            final_layer, 'get_minimax_h3_model', return_value=model
+        ):
+            self.assertTrue(final_layer.install(patcher, 3))
+            self.assertTrue(final_layer.install(patcher, 3, cube_state=state))
+            self.assertTrue(final_layer.clear_cube_state(patcher, state))
+
+        current = patcher.object_patches[final_layer.FINAL_LAYER_KEY]
+        self.assertEqual(getattr(current, final_layer.SIGNATURE_MARKER), 3)
+        self.assertIsNone(getattr(current, final_layer.CUBE_STATE_MARKER))
+
+    def test_clearing_order_only_patch_restores_native_forward(self):
+        patcher = _Patcher()
+        model = SimpleNamespace(final_layer=_Layer())
+        state = CubeOrderState()
+        with mock.patch.object(
+            final_layer, 'get_minimax_h3_model', return_value=model
+        ):
+            self.assertTrue(final_layer.install(patcher, cube_state=state))
+            self.assertTrue(final_layer.clear_cube_state(patcher, state))
+
+        self.assertNotIn(final_layer.FINAL_LAYER_KEY, patcher.object_patches)
+
+    def test_order_only_wrapper_preserves_the_current_forward_contract(self):
+        layer = _CurrentIdentityLayer()
+        state = CubeOrderState()
+        topology = CubeOrderTopology(
+            (1, 2, 2),
+            (2, 0, 3, 1),
+            (1, 3, 0, 2),
+        )
+        token = state.enter(topology)
+        state.leave(token, topology, True)
+        sigma = torch.tensor(0.5)
+        sample_sigmas = torch.tensor([1.0, 0.5, 0.0])
+        shifts = (3.0, 4.0)
+
+        final_layer.make_forward(layer, cube_state=state)(
+            torch.arange(6).unsqueeze(1),
+            None,
+            (2, 6, 0),
+            (0, 2, 0),
+            sigma,
+            sample_sigmas,
+            shifts,
+        )
+
+        self.assertIs(layer.received[0], sigma)
+        self.assertIs(layer.received[1], sample_sigmas)
+        self.assertIs(layer.received[2], shifts)
 
     def test_real_model_patcher_dispatches_current_forward_contract(self):
         root = torch.nn.Module()

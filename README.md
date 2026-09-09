@@ -525,6 +525,17 @@ and FinalLayer patches are preserved per conflicting key; the conflicting H3
 sub-optimization is disabled and reported in status instead of overwriting the
 other patch.
 
+### Spectrum forecast output
+
+Version 0.2.42 restores cube-ordered video rows at FinalLayer, including
+Spectrum forecast steps that bypass the normal H3 forward. Sparse Attention
+and Spectrum can therefore keep the selected cube geometry without scrambling
+the video output. Audio rows are unchanged, and FinalLayer chunking still
+applies. A foreign FinalLayer patch keeps raster order instead.
+
+Use a current Spectrum version for current ComfyUI and PDD checkpoints; older
+Spectrum versions omit the sigma schedule required by PDD output heads.
+
 ## External streamed-H3 attention consumers
 
 An `optimized_attention_override` can opt into the Memory node's bounded-Q

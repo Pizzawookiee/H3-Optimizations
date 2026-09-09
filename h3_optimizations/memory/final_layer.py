@@ -1,5 +1,6 @@
 '''Bounded MiniMax H3 FinalLayer execution.'''
 
+import inspect
 import logging
 
 import torch
@@ -13,6 +14,9 @@ from ..model import get_minimax_h3_model
 FINAL_LAYER_KEY = 'diffusion_model.final_layer.forward'
 OWNER_MARKER = '_h3_optimizations_final_layer'
 SIGNATURE_MARKER = '_h3_optimizations_final_layer_signature'
+ORIGINAL_MARKER = '_h3_optimizations_final_layer_original'
+CUBE_STATE_MARKER = '_h3_optimizations_cube_order_state'
+_CURRENT_FORWARD_PARAMETERS = frozenset({'sigma', 'sample_sigmas', 'shifts'})
 
 
 class H3FinalLayerPatchError(RuntimeError):
@@ -124,14 +128,83 @@ def _chunk_count(rows, chunk_rows):
     return (int(rows) + int(chunk_rows) - 1) // int(chunk_rows)
 
 
-def make_forward(layer, chunk_rows):
-    signature = int(chunk_rows)
-    # One line the first time the patched forward actually executes. The
-    # install-time message only proves the patch was attached; it stays silent
-    # when routing sends the forward somewhere else, which is exactly the case
-    # that has to be visible. Reporting the chunk counts also separates real
-    # chunking from a segment that fits in one chunk and is therefore bounded
-    # in name only.
+def _accepts_current_contract(forward):
+    parameters = inspect.signature(forward).parameters.values()
+    if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+        return True
+    return _CURRENT_FORWARD_PARAMETERS.issubset(
+        parameter.name for parameter in parameters
+    )
+
+
+def _call_original(
+    original_forward,
+    current_contract,
+    x,
+    t_emb,
+    video_seg,
+    audio_seg,
+    sigma,
+    sample_sigmas,
+    shifts,
+):
+    if current_contract:
+        return original_forward(
+            x,
+            t_emb,
+            video_seg,
+            audio_seg,
+            sigma,
+            sample_sigmas,
+            shifts,
+        )
+    return original_forward(x, t_emb, video_seg, audio_seg)
+
+
+def _ordered_selector(video_seg, topology):
+    start, stop, row = video_seg
+    rows = int(stop) - int(start)
+    if not torch.is_tensor(row) or row.ndim == 0:
+        return video_seg
+    if int(row.shape[0]) != rows:
+        raise H3FinalLayerPatchError(
+            'per-token FinalLayer selector does not match the target-video rows'
+        )
+    index = torch.tensor(topology.forward, dtype=torch.long, device=row.device)
+    return (start, stop, row.index_select(0, index))
+
+
+def _restore_video_output(output, topology):
+    if not isinstance(output, (list, tuple)) or len(output) != 2:
+        raise H3FinalLayerPatchError(
+            'MiniMax H3 FinalLayer returned an unexpected output contract'
+        )
+    video = output[0]
+    if not torch.is_tensor(video) or video.ndim < 1:
+        raise H3FinalLayerPatchError(
+            'MiniMax H3 FinalLayer returned an invalid video projection'
+        )
+    if int(video.shape[0]) != len(topology.inverse):
+        raise H3FinalLayerPatchError(
+            'FinalLayer video projection does not match the cube-order topology'
+        )
+    index = torch.tensor(topology.inverse, dtype=torch.long, device=video.device)
+    restored = video.index_select(0, index)
+    return (restored, output[1]) if isinstance(output, tuple) else [restored, output[1]]
+
+
+def make_forward(
+    layer,
+    chunk_rows=None,
+    *,
+    original_forward=None,
+    cube_state=None,
+):
+    signature = None if chunk_rows is None else int(chunk_rows)
+    if signature is not None and signature <= 0:
+        raise ValueError('chunk_rows must be positive')
+    original_forward = original_forward or layer.forward
+    current_contract = _accepts_current_contract(original_forward)
     announced = []
 
     def forward(
@@ -143,44 +216,98 @@ def make_forward(layer, chunk_rows):
         sample_sigmas=None,
         shifts=None,
     ):
-        if not announced:
-            announced.append(True)
-            video_rows = int(video_seg[1]) - int(video_seg[0])
-            audio_rows = int(audio_seg[1]) - int(audio_seg[0])
-            logging.debug(
-                '[H3 Optimizations] chunked FinalLayer ran: %d rows, '
-                'video %d in %d chunk(s), audio %d in %d chunk(s), '
-                'chunk_rows=%d',
-                int(x.shape[0]),
-                video_rows,
-                _chunk_count(video_rows, signature),
-                audio_rows,
-                _chunk_count(audio_rows, signature),
+        topology = None
+        active = False
+        local_video_seg = video_seg
+        if cube_state is not None:
+            topology, active = cube_state.resolve(int(video_seg[1]) - int(video_seg[0]))
+            if not active:
+                local_video_seg = _ordered_selector(video_seg, topology)
+
+        if signature is not None:
+            if not announced:
+                announced.append(True)
+                video_rows = int(video_seg[1]) - int(video_seg[0])
+                audio_rows = int(audio_seg[1]) - int(audio_seg[0])
+                logging.debug(
+                    '[H3 Optimizations] chunked FinalLayer ran: %d rows, '
+                    'video %d in %d chunk(s), audio %d in %d chunk(s), '
+                    'chunk_rows=%d',
+                    int(x.shape[0]),
+                    video_rows,
+                    _chunk_count(video_rows, signature),
+                    audio_rows,
+                    _chunk_count(audio_rows, signature),
+                    signature,
+                )
+            output = chunked_final_layer(
+                layer,
+                x,
+                t_emb,
+                local_video_seg,
+                audio_seg,
                 signature,
+                sigma,
+                sample_sigmas,
+                shifts,
             )
-        return chunked_final_layer(
-            layer,
-            x,
-            t_emb,
-            video_seg,
-            audio_seg,
-            signature,
-            sigma,
-            sample_sigmas,
-            shifts,
-        )
+        else:
+            output = _call_original(
+                original_forward,
+                current_contract,
+                x,
+                t_emb,
+                local_video_seg,
+                audio_seg,
+                sigma,
+                sample_sigmas,
+                shifts,
+            )
+
+        return output if topology is None else _restore_video_output(output, topology)
 
     setattr(forward, OWNER_MARKER, True)
     setattr(forward, SIGNATURE_MARKER, signature)
+    setattr(forward, ORIGINAL_MARKER, original_forward)
+    setattr(forward, CUBE_STATE_MARKER, cube_state)
     return forward
 
 
-def install(model_patcher, chunk_rows, *, force_rebuild=False):
-    '''Patch FinalLayer once; identical installation is idempotent.'''
+def _set_preserved_flag(model_patcher, value):
+    options = model_patcher.model_options['transformer_options'] = (
+        model_patcher.model_options.get('transformer_options', {}).copy()
+    )
+    options['h3_optimizations_preserved_final_layer_patch'] = bool(value)
 
-    chunk_rows = int(chunk_rows)
-    if chunk_rows <= 0:
-        raise ValueError('chunk_rows must be positive')
+
+def _restore_original(model_patcher, layer, original_forward):
+    patches = model_patcher.object_patches
+    if (
+        getattr(original_forward, '__self__', None) is layer
+        and getattr(original_forward, '__func__', None)
+        is getattr(layer.forward, '__func__', None)
+    ) or original_forward is layer.forward:
+        patches.pop(FINAL_LAYER_KEY, None)
+    else:
+        patches[FINAL_LAYER_KEY] = original_forward
+
+
+def install(
+    model_patcher,
+    chunk_rows=None,
+    *,
+    cube_state=None,
+    force_rebuild=False,
+):
+    '''Compose H3-owned FinalLayer behavior without wrapping foreign patches.'''
+
+    if chunk_rows is not None:
+        chunk_rows = int(chunk_rows)
+        if chunk_rows <= 0:
+            raise ValueError('chunk_rows must be positive')
+    if chunk_rows is None and cube_state is None:
+        raise ValueError('FinalLayer installation has no requested behavior')
+
     model = get_minimax_h3_model(model_patcher)
     if model is None:
         raise H3FinalLayerPatchError(
@@ -191,32 +318,76 @@ def install(model_patcher, chunk_rows, *, force_rebuild=False):
         raise H3FinalLayerPatchError('MiniMax H3 has no final layer')
 
     existing = getattr(model_patcher, 'object_patches', {}).get(FINAL_LAYER_KEY)
+    original_forward = layer.forward
     if existing is not None:
         if not getattr(existing, OWNER_MARKER, False):
-            options = model_patcher.model_options['transformer_options'] = (
-                model_patcher.model_options.get('transformer_options', {}).copy()
-            )
-            options['h3_optimizations_preserved_final_layer_patch'] = True
+            _set_preserved_flag(model_patcher, True)
             logging.debug(
-                '[H3 Optimizations] preserved foreign %s; FinalLayer chunking '
-                'is disabled',
+                '[H3 Optimizations] preserved foreign %s; H3 FinalLayer '
+                'optimizations are disabled',
                 FINAL_LAYER_KEY,
             )
             return False
-        installed = getattr(existing, SIGNATURE_MARKER, None)
-        if installed == chunk_rows and not force_rebuild:
+        original_forward = getattr(existing, ORIGINAL_MARKER, None)
+        if original_forward is None:
+            raise H3FinalLayerPatchError(
+                'installed H3 FinalLayer patch has no recoverable original'
+            )
+        if (
+            getattr(existing, SIGNATURE_MARKER, None) == chunk_rows
+            and getattr(existing, CUBE_STATE_MARKER, None) is cube_state
+            and not force_rebuild
+        ):
             return False
 
     model_patcher.add_object_patch(
         FINAL_LAYER_KEY,
-        make_forward(layer, chunk_rows),
+        make_forward(
+            layer,
+            chunk_rows,
+            original_forward=original_forward,
+            cube_state=cube_state,
+        ),
     )
-    options = model_patcher.model_options['transformer_options'] = (
-        model_patcher.model_options.get('transformer_options', {}).copy()
-    )
-    options['h3_optimizations_preserved_final_layer_patch'] = False
-    logging.debug(
-        '[H3 Optimizations] patched FinalLayer: chunk_rows=%d',
-        chunk_rows,
-    )
+    _set_preserved_flag(model_patcher, False)
+    if chunk_rows is not None:
+        logging.debug(
+            '[H3 Optimizations] patched FinalLayer: chunk_rows=%d',
+            chunk_rows,
+        )
+    return True
+
+
+def clear_cube_state(model_patcher, cube_state):
+    '''Remove one cube-order owner while retaining FinalLayer chunking.'''
+
+    existing = getattr(model_patcher, 'object_patches', {}).get(FINAL_LAYER_KEY)
+    if (
+        existing is None
+        or not getattr(existing, OWNER_MARKER, False)
+        or getattr(existing, CUBE_STATE_MARKER, None) is not cube_state
+    ):
+        return False
+    original_forward = getattr(existing, ORIGINAL_MARKER, None)
+    if original_forward is None:
+        raise H3FinalLayerPatchError(
+            'installed H3 FinalLayer patch has no recoverable original'
+        )
+    model = get_minimax_h3_model(model_patcher)
+    layer = getattr(model, 'final_layer', None) if model is not None else None
+    if layer is None:
+        raise H3FinalLayerPatchError('MiniMax H3 has no final layer')
+
+    chunk_rows = getattr(existing, SIGNATURE_MARKER, None)
+    if chunk_rows is None:
+        _restore_original(model_patcher, layer, original_forward)
+    else:
+        model_patcher.add_object_patch(
+            FINAL_LAYER_KEY,
+            make_forward(
+                layer,
+                chunk_rows,
+                original_forward=original_forward,
+            ),
+        )
     return True
