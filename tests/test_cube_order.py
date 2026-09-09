@@ -26,10 +26,12 @@ from comfy.ldm.minimax.model import (  # noqa: E402
     MiniMaxH3Model,
     PackedLayout,
     patchify_video,
+    unpatchify_video,
 )
 from h3_optimizations.cube_order import (  # noqa: E402
     CUBE_SHAPE,
     CUBE_SHAPES,
+    CubeOrderState,
     FORWARD_KEY,
     H3CubeOrderPatchError,
     TOKEN_ORDER_SHAPES,
@@ -41,6 +43,7 @@ from h3_optimizations.cube_order import (  # noqa: E402
     reorder_video_patches,
     tile_aligned_cube_major_indices,
 )
+from h3_optimizations.memory import final_layer  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     VIDEO_TOKEN_ORDER_1X16X4,
     VIDEO_TOKEN_ORDER_1X8X8,
@@ -92,11 +95,18 @@ class _FakePatcher:
         self.object_patches[name] = value
 
 
+class _PassthroughFinalLayer:
+    @staticmethod
+    def forward(x, _t_emb, video_seg, audio_seg):
+        return x[video_seg[0]:video_seg[1]], x[audio_seg[0]:audio_seg[1]]
+
+
 def _model():
     model = MiniMaxH3Model.__new__(MiniMaxH3Model)
     torch.nn.Module.__init__(model)
     model.patch_size = (1, 2, 2)
     model._forward = lambda *args, **kwargs: None
+    model.final_layer = _PassthroughFinalLayer()
     return model
 
 
@@ -165,6 +175,41 @@ class CubeOrderTests(unittest.TestCase):
             )
         )
         self.assertEqual(layout.h3_cube_order["cube_shape"], CUBE_SHAPE)
+
+    def test_installed_path_restores_at_final_layer_without_a_second_permutation(self):
+        patch_size = (1, 2, 2)
+        video = _raster_video(5, 10, 14)
+        audio = torch.zeros(1, 2, 2, 4)
+        context = torch.zeros(1, 3, 8)
+        model = type("Model", (), {"patch_size": patch_size})()
+        state = CubeOrderState()
+        output_head = final_layer.make_forward(
+            _PassthroughFinalLayer(),
+            cube_state=state,
+        )
+
+        def original(x, timestep, context, transformer_options, minimax_payload=None, **kwargs):
+            rows = patchify_video(x[0], patch_size)
+            projected, _audio = output_head(
+                rows,
+                None,
+                (0, rows.shape[0], 0),
+                (0, 0, 0),
+            )
+            return [
+                unpatchify_video(projected, 5, 5, 7, 1, patch_size),
+                x[1],
+            ]
+
+        output = make_forward(model, original, state=state)(
+            [video, audio],
+            torch.tensor([500.0]),
+            context,
+            {},
+            minimax_payload={},
+        )
+
+        torch.testing.assert_close(output[0], video)
 
     def test_all_geometries_preserve_padding_masks_and_mixed_layout(self):
         patch_size = (1, 2, 2)
@@ -431,12 +476,51 @@ class CubeOrderTests(unittest.TestCase):
         model = _model()
         patcher = _FakePatcher(model)
         self.assertTrue(install(patcher))
+        state = patcher.object_patches[FORWARD_KEY]._h3_cube_order_state
+        self.assertIs(
+            getattr(
+                patcher.object_patches[final_layer.FINAL_LAYER_KEY],
+                final_layer.CUBE_STATE_MARKER,
+            ),
+            state,
+        )
         self.assertFalse(install(patcher))
         with self.assertRaises(H3CubeOrderPatchError):
             install(patcher, (4, 4, 4))
         self.assertTrue(clear(patcher))
         self.assertNotIn(FORWARD_KEY, patcher.object_patches)
         self.assertFalse(clear(patcher))
+
+    def test_foreign_final_layer_patch_disables_cube_order_without_wrapping_it(self):
+        model = _model()
+        patcher = _FakePatcher(model)
+        foreign = lambda *args, **kwargs: None
+        patcher.object_patches[final_layer.FINAL_LAYER_KEY] = foreign
+
+        self.assertFalse(install(patcher))
+
+        self.assertIs(patcher.object_patches[final_layer.FINAL_LAYER_KEY], foreign)
+        self.assertNotIn(FORWARD_KEY, patcher.object_patches)
+
+    def test_clearing_a_shallow_clone_does_not_mutate_parent_wrapper_state(self):
+        model = _model()
+        parent = _FakePatcher(model)
+        self.assertTrue(install(parent))
+        parent_forward = parent.object_patches[FORWARD_KEY]
+        parent_final = parent.object_patches[final_layer.FINAL_LAYER_KEY]
+
+        child = _FakePatcher(model)
+        child.object_patches = parent.object_patches.copy()
+        child.model_options = parent.model_options.copy()
+        self.assertTrue(clear(child))
+
+        self.assertIs(parent.object_patches[FORWARD_KEY], parent_forward)
+        self.assertIs(
+            parent.object_patches[final_layer.FINAL_LAYER_KEY],
+            parent_final,
+        )
+        self.assertNotIn(FORWARD_KEY, child.object_patches)
+        self.assertNotIn(final_layer.FINAL_LAYER_KEY, child.object_patches)
 
 
 if __name__ == "__main__":
