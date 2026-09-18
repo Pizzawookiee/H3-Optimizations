@@ -18,6 +18,7 @@ from .loader import (
     unavailable_reason,
 )
 from .int8_attention import (
+    h3v_smooth_is_available,
     BlockSparseRoute,
     PrequantizedInt8Attention,
     SPARSE_GEOMETRIES,
@@ -32,6 +33,7 @@ from .convrot import (
     quantize_int8_rowwise_convrot256,
 )
 from .fused_q import fused_h3_q_from_int8, fused_h3_q_is_available
+from .fused_kv import fused_h3_kv_from_int8, fused_h3_kv_is_available
 from .producer import (
     INT8_ATTENTION_PRODUCER_ABI_VERSION,
     SUPPORTS_STRIDED_QK_CHUNK,
@@ -45,6 +47,7 @@ from .producer import (
     int8_attention_producer_is_available,
     int8_attention_producer_spec,
     quantize_int8_attention_k_chunk,
+    record_prepacked_int8_attention_k_chunk,
     quantize_int8_attention_q,
     quantize_int8_attention_q_chunk,
     quantize_int8_attention_qk_chunk,
@@ -55,6 +58,7 @@ from .producer import (
 __all__ = [
     'SUPPORTS_STRIDED_QK_CHUNK',
     'ABI_VERSION',
+    'h3v_smooth_is_available',
     'BlockSparseRoute',
     'INT8_ATTENTION_PRODUCER_ABI_VERSION',
     'Int8AttentionKAnchor',
@@ -72,6 +76,8 @@ __all__ = [
     'finalize_int8_attention_producer',
     'fused_h3_q_from_int8',
     'fused_h3_q_is_available',
+    'fused_h3_kv_from_int8',
+    'fused_h3_kv_is_available',
     'int8_attention_from_prequantized',
     'int8_attention_is_available',
     'int8_attention_k_anchor_positions',
@@ -83,6 +89,7 @@ __all__ = [
     'prequantize_int8_attention',
     'quantize_int8_rowwise_convrot256',
     'quantize_int8_attention_k_chunk',
+    'record_prepacked_int8_attention_k_chunk',
     'quantize_int8_attention_q',
     'quantize_int8_attention_q_chunk',
     'quantize_int8_attention_qk_chunk',

@@ -13,6 +13,8 @@ import comfy.quant_ops
 from comfy.quant_ops import QuantizedTensor
 
 from .. import diagnostics
+from ..native.convrot import quantize_int8_rowwise_convrot256
+from ..native.fused_kv import fused_h3_kv_from_int8, fused_h3_kv_is_available
 from .formats import describe_linear, describe_weight
 
 
@@ -173,6 +175,48 @@ class HeldConvRotINT8Linear:
         comfy.ops.run_every_op()
         return self._linear(x, sliced)
 
+    def linear_ranges(self, x, ranges):
+        """Execute disjoint output-channel ranges in one native INT8 GEMM.
+
+        H3V-Smooth needs one K-head slice and one V-head slice for the same
+        gathered activation rows.  Concatenating the already-quantized weight
+        rows lets Kitchen perform ConvRot + dynamic activation quantization only
+        once instead of once for K and again for V.
+        """
+        if self.weight is None:
+            raise RuntimeError("ConvRot INT8 binding is not active")
+        if self.bias is not None:
+            raise ConvRotINT8BindingError(
+                "ConvRot INT8 multi-range slicing requires a bias-free linear"
+            )
+        normalized = [(int(start), int(end)) for start, end in ranges]
+        if not normalized or any(
+            not 0 <= start < end <= int(self.weight.shape[0])
+            for start, end in normalized
+        ):
+            raise ConvRotINT8BindingError("ConvRot INT8 output ranges are invalid")
+        params = self.weight._params
+        qdata = torch.cat(
+            [self.weight._qdata[start:end] for start, end in normalized], dim=0
+        ).contiguous()
+        scale = params.scale
+        if scale.numel() != 1:
+            scale = torch.cat(
+                [scale[start:end] for start, end in normalized], dim=0
+            ).contiguous()
+        rows = sum(end - start for start, end in normalized)
+        sliced = QuantizedTensor(
+            qdata,
+            self.weight._layout_cls,
+            replace(
+                params,
+                scale=scale,
+                orig_shape=(rows, int(self.weight.shape[1])),
+            ),
+        )
+        comfy.ops.run_every_op()
+        return self._linear(x, sliced)
+
 
 class HeldConvRotINT8QKV:
     """Hold a ConvRot INT8 QKV weight across all projection chunks."""
@@ -271,6 +315,146 @@ class HeldConvRotINT8QKV:
             v = self.binding.linear_range(x[start:end], inner * 2, inner * 3)
         v = v.view(end - start, self.attention.heads, self.attention.head_dim)
         return v.transpose(0, 1).unsqueeze(0)
+
+
+    def _finish_k_head(self, projected, rope):
+        seq = int(projected.shape[0])
+        projected = projected.view(1, seq, 1, self.attention.head_dim)
+        norm = self.attention.k_norm
+        if rope is None:
+            return norm(projected[0])[:, 0, :]
+        scale = comfy.model_management.cast_to(
+            norm.weight,
+            device=projected.device,
+        )
+        projected = F.rms_norm(
+            projected,
+            (self.attention.head_dim,),
+            weight=scale,
+            eps=norm.eps,
+        )
+        rot_dim = int(rope.shape[-3]) * 2
+        comfy.quant_ops.ck.apply_rope_split_half1_(
+            projected[..., :rot_dim],
+            rope,
+        )
+        return projected[0, :, 0, :]
+
+    def project_grouped_kv_into_carrier(
+        self, x, rope_freqs, rows, *, producer, k_start, k_summary, cta_k
+    ):
+        """Direct grouped K -> Kitchen carrier, materializing only BF16 V.
+
+        This is the faithful H3V-Smooth hot path for native ConvRot INT8. Each
+        head has its own row permutation, so we still execute one GEMM per
+        head, but its CUTLASS epilogue performs K RMSNorm/RoPE, routing-summary
+        reduction and Kitchen INT8 packing before K ever reaches global BF16.
+        """
+        if not fused_h3_kv_is_available(x.device):
+            return None
+        if x.dtype != torch.bfloat16 or rope_freqs is None:
+            return None
+        heads, count = int(rows.shape[0]), int(rows.shape[1])
+        dim = int(self.attention.head_dim)
+        if heads != int(self.attention.heads) or dim != 128:
+            return None
+        weight = self.binding.weight
+        if not isinstance(weight, QuantizedTensor):
+            return None
+        params = weight._params
+        if not getattr(params, 'convrot', False) or int(getattr(params, 'convrot_groupsize', 0)) != 256:
+            return None
+        scales = params.scale.to(torch.float32).reshape(-1)
+        if int(scales.numel()) != int(weight._qdata.shape[0]):
+            return None
+        inner = heads * dim
+        norm = comfy.model_management.cast_to(
+            self.attention.k_norm.weight, dtype=torch.bfloat16, device=x.device
+        ).contiguous()
+        v_out = x.new_empty((1, heads, count, dim))
+        for head in range(heads):
+            head_rows = rows[head].to(dtype=torch.long)
+            sample_x = x.index_select(0, head_rows).contiguous()
+            freqs = rope_freqs[0, :, 0].index_select(0, head_rows).contiguous()
+            with diagnostics.stage('h3v_kv_activation_quant'):
+                activation, activation_scale = quantize_int8_rowwise_convrot256(sample_x)
+            k0 = inner + head * dim
+            v0 = inner * 2 + head * dim
+            with diagnostics.stage('h3v_fused_kv_weight_pack'):
+                kv_weight = torch.cat(
+                    (weight._qdata[k0:k0 + dim], weight._qdata[v0:v0 + dim]), dim=0
+                ).contiguous()
+                kv_scale = torch.cat(
+                    (scales[k0:k0 + dim], scales[v0:v0 + dim]), dim=0
+                ).contiguous()
+            with diagnostics.stage('h3v_fused_kv_projection'):
+                v_head = fused_h3_kv_from_int8(
+                    activation, kv_weight, activation_scale, kv_scale, norm, freqs,
+                    producer.anchor.values[0, head].contiguous(),
+                    producer.anchor.indices[0, head:head + 1].contiguous(),
+                    producer.k[0, head], producer.k_scale[0, head],
+                    k_summary[0, head], full_rows=int(producer.spec.k_input_shape[2]),
+                    k_start=int(k_start), cta_k=int(cta_k),
+                    full_k_length=int(producer.spec.k_input_shape[2]),
+                    epsilon=float(self.attention.k_norm.eps),
+                )
+            v_out[0, head].copy_(v_head)
+            del sample_x, activation, activation_scale, kv_weight, kv_scale, v_head
+        return v_out
+
+
+    def project_grouped_kv_hnd(self, x, rope_freqs, rows):
+        """Grouped K/V with one gather + one native INT8 GEMM per head."""
+        heads, count = int(rows.shape[0]), int(rows.shape[1])
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if heads != int(self.attention.heads):
+            raise ConvRotINT8BindingError('grouped row-map head count mismatch')
+        k_out = x.new_empty((1, heads, count, dim))
+        v_out = x.new_empty((1, heads, count, dim))
+        for head in range(heads):
+            head_rows = rows[head].to(dtype=torch.long)
+            sample_x = x.index_select(0, head_rows)
+            rope = None if rope_freqs is None else rope_freqs.index_select(1, head_rows)
+            k_start = inner + head * dim
+            v_start = inner * 2 + head * dim
+            with diagnostics.stage('qkv_linear'):
+                projected = self.binding.linear_ranges(
+                    sample_x,
+                    ((k_start, k_start + dim), (v_start, v_start + dim)),
+                )
+            k_head, v_head = projected.split(dim, dim=-1)
+            with diagnostics.stage('qk_norm_rope'):
+                k_head = self._finish_k_head(k_head, rope)
+            k_out[0, head].copy_(k_head)
+            v_out[0, head].copy_(v_head)
+        return k_out, v_out
+
+    def project_k_head_rows(self, x, rope_freqs, rows, head):
+        head = int(head)
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if not 0 <= head < int(self.attention.heads):
+            raise ConvRotINT8BindingError('K head index is out of range')
+        sample_x = x.index_select(0, rows)
+        rope = None if rope_freqs is None else rope_freqs.index_select(1, rows)
+        start = inner + head * dim
+        with diagnostics.stage('qkv_linear'):
+            projected = self.binding.linear_range(sample_x, start, start + dim)
+        with diagnostics.stage('qk_norm_rope'):
+            return self._finish_k_head(projected, rope)
+
+    def project_v_head_rows(self, x, rope_freqs, rows, head):
+        del rope_freqs
+        head = int(head)
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if not 0 <= head < int(self.attention.heads):
+            raise ConvRotINT8BindingError('V head index is out of range')
+        sample_x = x.index_select(0, rows)
+        start = inner * 2 + head * dim
+        with diagnostics.stage('qkv_linear'):
+            return self.binding.linear_range(sample_x, start, start + dim)
 
     def project_rows(self, x, rope_freqs, rows):
         sample_x = x.index_select(0, rows)

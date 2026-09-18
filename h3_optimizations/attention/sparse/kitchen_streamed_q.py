@@ -38,6 +38,8 @@ from ...kitchen_qkv import (
     resolve_kitchen,
 )
 from ...qkv.formats import describe_linear
+from ...plan import V_SMOOTH_H3
+from ...native.producer import record_prepacked_int8_attention_k_chunk
 from ...qkv.fused_q import HeldExactH3FusedQ, fused_h3_q_supported
 from ...qkv.streamed import (
     PROJECTION_FORCE_BF16,
@@ -45,8 +47,12 @@ from ...qkv.streamed import (
     PROJECTION_FORCE_INT8,
     PROJECTION_NATIVE,
     create_held_qkv,
+    project_grouped_kv_hnd,
+    project_grouped_v_hnd,
+    project_k_head_rows,
     project_kv_hnd,
     project_q_hnd,
+    project_v_head_rows,
     project_v_hnd,
 )
 from .config import resolve_video_budget
@@ -58,6 +64,12 @@ from .kitchen_sparse import (
     snapshot_for,
 )
 from .router import SparseRouterError
+from .v_smoothing import (
+    demean_v_blocks_,
+    h3v_smooth_active,
+    normalized_v_means,
+    resolve_h3v_grouping,
+)
 
 
 @dataclass
@@ -71,6 +83,7 @@ class StreamedSparseKitchenQKV:
     projection_mode: str
     output_buffer: torch.Tensor | None
     fused_q: bool = False
+    grouping_metadata: dict | None = None
 
     def release(self):
         self.module = None
@@ -81,6 +94,7 @@ class StreamedSparseKitchenQKV:
         self.k_summary = None
         self.output_buffer = None
         self.fused_q = False
+        self.grouping_metadata = None
 
 
 @dataclass
@@ -162,6 +176,39 @@ def _format_supported(projector, fmt):
     )
 
 
+def _iter_kv_chunks(sequence, chunk_rows, group_start=None):
+    """Yield aligned physical carrier slabs without crossing group_start."""
+    boundaries = [0]
+    if group_start is not None and 0 < int(group_start) < int(sequence):
+        boundaries.append(int(group_start))
+    boundaries.append(int(sequence))
+    for segment_start, segment_stop in zip(boundaries, boundaries[1:]):
+        for start in range(segment_start, segment_stop, int(chunk_rows)):
+            yield start, min(start + int(chunk_rows), segment_stop)
+
+
+def _project_grouped_kv_hnd(
+    held, x, rope_freqs, permutation, *, group_start, start, end,
+):
+    """Project one packed K/V slab using a distinct row order per head."""
+    relative_start = int(start) - int(group_start)
+    relative_end = int(end) - int(group_start)
+    if relative_start < 0 or relative_end > int(permutation.shape[-1]):
+        raise SparseKitchenError('H3V-Smooth grouped K/V slice is out of range')
+    rows = permutation[:, relative_start:relative_end].contiguous()
+    return project_grouped_kv_hnd(held, x, rope_freqs, rows)
+
+def _project_grouped_v_hnd(
+    held, x, rope_freqs, permutation, *, group_start, start, end,
+):
+    """Re-project one packed V slab for two-pass V production."""
+    relative_start = int(start) - int(group_start)
+    relative_end = int(end) - int(group_start)
+    if relative_start < 0 or relative_end > int(permutation.shape[-1]):
+        raise SparseKitchenError('H3V-Smooth grouped V slice is out of range')
+    rows = permutation[:, relative_start:relative_end].contiguous()
+    return project_grouped_v_hnd(held, x, rope_freqs, rows)
+
 def _run_streamed_sparse_kitchen_qkv(
     projector,
     module,
@@ -171,7 +218,6 @@ def _run_streamed_sparse_kitchen_qkv(
     layer_index,
     transformer_options,
 ):
-    del layer_index
     kitchen = resolve_kitchen(x.device)
     if kitchen is None or not _supports_streamed_producer(kitchen, x.device):
         return None
@@ -195,6 +241,16 @@ def _run_streamed_sparse_kitchen_qkv(
         return None
 
     sequence = int(x.shape[0])
+    snapshot = snapshot_for(transformer_options, sequence)
+    h3v_enabled = projector.v_smoothing == V_SMOOTH_H3
+    smoothing_active = bool(h3v_enabled and h3v_smooth_active(snapshot))
+    if h3v_enabled and (
+        not callable(getattr(kitchen, 'h3v_smooth_is_available', None))
+        or not kitchen.h3v_smooth_is_available()
+    ):
+        raise SparseKitchenError(
+            'H3V-Smooth requires the vendored rebuilt Kitchen sparse backend'
+        )
     projection_mode = _projection_mode(projector)
     fused_q = bool(
         q_tile == 64
@@ -234,6 +290,33 @@ def _run_streamed_sparse_kitchen_qkv(
         producer = kitchen.create_int8_attention_producer(spec, anchor)
         del anchor
 
+        grouping = None
+        grouping_permutation = None
+        group_start = None
+        if h3v_enabled:
+            with diagnostics.stage('h3v_grouping'):
+                grouping = resolve_h3v_grouping(
+                    module,
+                    snapshot,
+                    snapshot.layout,
+                    block_rows=kv_tile,
+                    heads=int(module.heads),
+                    head_dim=int(module.head_dim),
+                    device=x.device,
+                    project_v_head_rows=lambda head, rows: project_v_head_rows(
+                        held, x, rope_freqs, rows, head
+                    ),
+                    project_v_rows=lambda start, end: project_v_hnd(
+                        held, x, rope_freqs, start, end
+                    ),
+                )
+            group_start = int(grouping.group_start)
+            if group_start % alignment:
+                raise SparseKitchenError(
+                    'H3V-Smooth pure-video grouping boundary is not Kitchen aligned'
+                )
+            grouping_permutation = grouping.to_device(x.device)
+
         staging = None
         if projector.v_mode == V_MODE_TWO_PASS:
             from ...native.v_staging import TwoPassVCarrier
@@ -241,50 +324,132 @@ def _run_streamed_sparse_kitchen_qkv(
             staging = TwoPassVCarrier(spec)
         retained_v = None
         kv_tiles = (sequence + kv_tile - 1) // kv_tile
+        v_means = None
+        if smoothing_active:
+            v_means = torch.empty(
+                1, int(module.heads), kv_tiles, int(module.head_dim),
+                dtype=torch.float32, device=x.device,
+            )
         k_summary = x.new_empty(
             (1, int(module.heads), kv_tiles, int(module.head_dim))
         )
         chunk_kwargs = _qk_chunk_kwargs(kitchen, projector.strided_qk_input)
 
-        for start in range(0, sequence, chunk_rows):
-            end = min(start + chunk_rows, sequence)
-            k, v = project_kv_hnd(held, x, rope_freqs, start, end)
+        for start, end in _iter_kv_chunks(
+            sequence,
+            chunk_rows,
+            group_start if h3v_enabled else None,
+        ):
+            grouped = bool(h3v_enabled and start >= group_start)
+            direct_k = False
+            if grouped:
+                direct = getattr(held, 'project_grouped_kv_into_carrier', None)
+                if callable(direct):
+                    with diagnostics.stage('h3v_direct_kitchen_kv'):
+                        v = direct(
+                            x, rope_freqs,
+                            grouping_permutation[:, start - group_start:end - group_start],
+                            producer=producer, k_start=start,
+                            k_summary=k_summary, cta_k=kv_tile,
+                        )
+                    direct_k = v is not None
+                if not direct_k:
+                    with diagnostics.stage('h3v_grouped_kv_projection'):
+                        k, v = _project_grouped_kv_hnd(
+                            held,
+                            x,
+                            rope_freqs,
+                            grouping_permutation,
+                            group_start=group_start,
+                            start=start,
+                            end=end,
+                        )
+            else:
+                k, v = project_kv_hnd(held, x, rope_freqs, start, end)
             if staging is None and retained_v is None:
                 retained_v = v.new_empty(shape)
-            kitchen.quantize_int8_attention_k_chunk(
-                producer,
-                k,
-                k_start=start,
-                **chunk_kwargs,
-            )
-            k_mean = _tile_mean(k, kv_tile)
-            k_start = start // kv_tile
-            k_summary[
-                ..., k_start : k_start + int(k_mean.shape[-2]), :
-            ].copy_(k_mean)
+            if direct_k:
+                record_prepacked_int8_attention_k_chunk(
+                    producer, k_start=start, length=end - start
+                )
+            else:
+                kitchen.quantize_int8_attention_k_chunk(
+                    producer,
+                    k,
+                    k_start=start,
+                    **chunk_kwargs,
+                )
+                k_mean = _tile_mean(k, kv_tile)
+                k_start = start // kv_tile
+                k_summary[
+                    ..., k_start : k_start + int(k_mean.shape[-2]), :
+                ].copy_(k_mean)
             if staging is None:
                 retained_v[..., start:end, :].copy_(v)
             else:
-                with diagnostics.stage("v_amax_update"):
-                    staging.update(v)
-            del k_mean, k, v
+                if smoothing_active:
+                    with diagnostics.stage("h3v_mean_amax_fused"):
+                        staging.update_with_means(v, v_means, start, kv_tile)
+                else:
+                    with diagnostics.stage("v_amax_update"):
+                        staging.update(v)
+            if not direct_k:
+                del k_mean, k
+            del v
 
         if staging is None:
+            if smoothing_active:
+                with diagnostics.stage("h3v_block_demean"):
+                    v_means = demean_v_blocks_(retained_v, kv_tile)
             kitchen.quantize_int8_attention_v(producer, retained_v)
+            if smoothing_active:
+                producer.v_mean = normalized_v_means(v_means, producer.v_scale)
             del retained_v
         else:
             staging.finalize_scale()
-            for start in range(0, sequence, chunk_rows):
-                end = min(start + chunk_rows, sequence)
+            for start, end in _iter_kv_chunks(
+                sequence,
+                chunk_rows,
+                group_start if h3v_enabled else None,
+            ):
+                grouped = bool(h3v_enabled and start >= group_start)
                 with diagnostics.stage("v_reprojection"):
-                    v = project_v_hnd(held, x, rope_freqs, start, end)
+                    if grouped:
+                        v = _project_grouped_v_hnd(
+                            held,
+                            x,
+                            rope_freqs,
+                            grouping_permutation,
+                            group_start=group_start,
+                            start=start,
+                            end=end,
+                        )
+                    else:
+                        v = project_v_hnd(held, x, rope_freqs, start, end)
                 with diagnostics.stage("v_carrier_pack"):
-                    staging.quantize(v, start)
+                    if smoothing_active:
+                        staging.quantize_with_means(v, v_means, start, kv_tile)
+                    else:
+                        staging.quantize(v, start)
                 del v
             producer.v, producer.v_scale = staging.finish()
+            if smoothing_active:
+                producer.v_mean = normalized_v_means(v_means, producer.v_scale)
         carrier = kitchen.finalize_int8_attention_producer(producer)
     finally:
         held.__exit__(None, None, None)
+
+    grouping_metadata = None
+    if grouping is not None:
+        grouping_metadata = {
+            'mode': 'per_head_online_kmeans',
+            'group_start': int(grouping.group_start),
+            'group_stop': int(grouping.group_stop),
+            'refreshed': bool(grouping.refreshed),
+            'refresh_step': int(grouping.refresh_step),
+            'demean_active': bool(grouping.demean),
+            'reuse_steps': 4,
+        }
 
     return StreamedSparseKitchenQKV(
         module=module,
@@ -296,8 +461,8 @@ def _run_streamed_sparse_kitchen_qkv(
         projection_mode=projection_mode,
         output_buffer=x,
         fused_q=fused_q,
+        grouping_metadata=grouping_metadata,
     )
-
 
 def _prepare_route_plan(router, k_summary, layout, video_budget):
     geometry = router.geometry(layout)
@@ -423,6 +588,8 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 "qkv_lifetime": "streamed_q_global_kitchen_kv",
                 "router_lifetime": "k_summary_q_slab_selection_lazy_kitchen_lut",
                 "attention_output": "chunked_out_proj_inplace",
+                "v_smoothing": self.config.v_smoothing,
+                "v_grouping": projected.grouping_metadata,
                 "q_producer": (
                     "h3_native_exact_128x256_fused"
                     if projected.fused_q
@@ -608,6 +775,11 @@ def _streamed_sparse_try_project(
         if projected is not None:
             return projected
 
+        if self.v_smoothing == V_SMOOTH_H3:
+            raise SparseKitchenError(
+                'H3V-Smooth requires the streamed Kitchen QKV producer; '
+                'the current QKV format/runtime could not enter that path'
+            )
         fallback = copy.copy(self)
         fallback.streamed_q = False
         return _ORIGINAL_PROJECTOR_TRY_PROJECT(
@@ -619,6 +791,10 @@ def _streamed_sparse_try_project(
             transformer_options=transformer_options,
         )
 
+    if self.v_smoothing == V_SMOOTH_H3:
+        raise SparseKitchenError(
+            'H3V-Smooth requires streamed Sparse Kitchen QKV production'
+        )
     return _ORIGINAL_PROJECTOR_TRY_PROJECT(
         self,
         module,

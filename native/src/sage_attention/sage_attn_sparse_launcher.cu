@@ -21,7 +21,8 @@ constexpr int SPARSE_HEAD_DIM = 128;
 template <int SPARSE_CTA_Q, int SPARSE_CTA_K, typename DTypeOut, bool RETURN_LSE>
 void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
                         float *lse, float *q_scale, float *k_scale, float *v_scale,
-                        const int32_t *lut, const int32_t *valid_block_num,
+                        const nv_bfloat16 *v_mean, const int32_t *lut,
+                        const int32_t *valid_block_num,
                         int lut_stride, int qo_len, int kv_len,
                         int num_qo_heads, int num_kv_groups, int stride_bz_q,
                         int stride_seq_q, int stride_h_q, int stride_bz_k,
@@ -60,7 +61,8 @@ void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
   dim3 block(32, (SPARSE_CTA_Q / WARP_Q) * (SPARSE_CTA_K / WARP_K));
 
   kernel<<<grid, block, smem_max, stream>>>(
-      q, k, v, o, lse, q_scale, k_scale, v_scale, nullptr, nullptr, 0, 0, 0,
+      q, k, v, o, lse, q_scale, k_scale, v_scale, v_mean, nullptr,
+      0, 0, 0,
       0, 0, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
       stride_h_q, stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v,
       stride_h_v, stride_d_v, stride_bz_o, stride_seq_o, stride_h_o,
@@ -95,7 +97,8 @@ const char *sage_attn_sparse_route_encoding() {
 template <bool RETURN_LSE>
 void launch_sparse(
     const void *q, const void *k, const void *v, void *o, void *lse,
-    const void *q_scale, const void *k_scale, const void *v_scale, const void *lut,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *v_mean, const void *lut,
     const void *valid_block_num, int lut_stride, int cta_q, int cta_k,
     int batch_size,
     int qo_len, int kv_len, int num_qo_heads, int num_kv_heads, int head_dim,
@@ -129,12 +132,13 @@ void launch_sparse(
   auto qs_ = const_cast<float *>(static_cast<const float *>(q_scale));
   auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
   auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
+  auto vm_ = static_cast<const nv_bfloat16 *>(v_mean);
   auto lut_ = static_cast<const int32_t *>(lut);
   auto valid_ = static_cast<const int32_t *>(valid_block_num);
 
 #define LAUNCH_SPARSE(CQ, CK, DT)                                                  \
   launch_sparse_impl<CQ, CK, DT, RETURN_LSE>(q_, k_, v_, static_cast<DT *>(o),     \
-                         static_cast<float *>(lse), qs_, ks_, vs_, lut_,            \
+                         static_cast<float *>(lse), qs_, ks_, vs_, vm_, lut_,       \
                          valid_, lut_stride, qo_len, kv_len, num_qo_heads,     \
                          num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, \
                          stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v,   \
@@ -173,7 +177,7 @@ void launch_sparse(
 
 void launch_sage_attn_sparse_kernel(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
-    const void *k_scale, const void *v_scale, const void *lut,
+    const void *k_scale, const void *v_scale, const void *v_mean, const void *lut,
     const void *valid_block_num, int lut_stride, int cta_q, int cta_k,
     int batch_size,
     int qo_len, int kv_len, int num_qo_heads, int num_kv_heads, int head_dim,
@@ -183,7 +187,7 @@ void launch_sage_attn_sparse_kernel(
     int stride_bz_q_scale, int stride_h_q_scale, float sm_scale,
     int output_dtype_code, cudaStream_t stream) {
   launch_sparse<false>(
-      q, k, v, o, nullptr, q_scale, k_scale, v_scale, lut, valid_block_num,
+      q, k, v, o, nullptr, q_scale, k_scale, v_scale, v_mean, lut, valid_block_num,
       lut_stride, cta_q, cta_k, batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
       head_dim, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
@@ -194,7 +198,8 @@ void launch_sage_attn_sparse_kernel(
 void launch_sage_attn_sparse_kernel_lse(
     const void *q, const void *k, const void *v, void *o, void *lse,
     const void *q_scale, const void *k_scale, const void *v_scale,
-    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    const void *v_mean, const void *lut, const void *valid_block_num,
+    int lut_stride, int cta_q,
     int cta_k, int batch_size, int qo_len, int kv_len, int num_qo_heads, int num_kv_heads,
     int head_dim, int stride_bz_q, int stride_seq_q, int stride_h_q,
     int stride_bz_k, int stride_seq_k, int stride_h_k, int stride_bz_v,
@@ -205,7 +210,7 @@ void launch_sage_attn_sparse_kernel_lse(
     throw std::runtime_error("sage_attn_sparse_lse: an LSE output is required");
   }
   launch_sparse<true>(
-      q, k, v, o, lse, q_scale, k_scale, v_scale, lut, valid_block_num,
+      q, k, v, o, lse, q_scale, k_scale, v_scale, v_mean, lut, valid_block_num,
       lut_stride, cta_q, cta_k, batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
       head_dim, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,

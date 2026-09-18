@@ -88,6 +88,7 @@ class Int8AttentionProducer:
     k_scale: torch.Tensor
     v: torch.Tensor | None = None
     v_scale: torch.Tensor | None = None
+    v_mean: torch.Tensor | None = None
     _q_ranges: list = field(default_factory=list, repr=False)
     _k_ranges: list = field(default_factory=list, repr=False)
     _finalized: bool = field(default=False, repr=False)
@@ -417,6 +418,17 @@ def quantize_int8_attention_q(q, *, full_k_length, allow_strided_input=False):
     return q_int8, q_scale
 
 
+def record_prepacked_int8_attention_k_chunk(producer, *, k_start, length):
+    """Record a K range written directly by an H3 fused producer."""
+    if producer._finalized:
+        raise RuntimeError('the producer has already been finalized')
+    spec = producer.spec
+    _check_chunk('k', int(k_start), int(length), spec.k_input_shape[2], spec.sequence_alignment)
+    if not producer._q_ranges:
+        producer._q_ranges.append((0, 1))
+    producer._k_ranges.append((int(k_start), int(k_start) + int(length)))
+
+
 def quantize_int8_attention_k_chunk(
     producer, k, *, k_start, allow_strided_input=False
 ):
@@ -528,7 +540,7 @@ def finalize_int8_attention_producer(producer):
     return PrequantizedInt8Attention(
         q=producer.q, k=producer.k, v=producer.v,
         q_scale=producer.q_scale, k_scale=producer.k_scale,
-        v_scale=producer.v_scale,
+        v_scale=producer.v_scale, v_mean=producer.v_mean,
         original_head_dim=spec.original_head_dim,
         input_dtype=spec.input_dtype,
         attention_scale=spec.attention_scale,

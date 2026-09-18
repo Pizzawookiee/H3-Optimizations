@@ -16,6 +16,10 @@ _NATIVE_SYMBOLS = (
     'h3_int8_v_amax_chunk',
     'h3_int8_quantize_v_chunk_into',
 )
+_SMOOTH_NATIVE_SYMBOLS = (
+    'h3_int8_v_mean_amax_chunk',
+    'h3_int8_quantize_v_mean_chunk_into',
+)
 
 
 class VStagingError(RuntimeError):
@@ -38,6 +42,22 @@ def _bind(library):
         + [integer64] * 3
         + [integer, stream]
     )
+    if hasattr(library, 'h3_int8_v_mean_amax_chunk'):
+        library.h3_int8_v_mean_amax_chunk.restype = integer
+        library.h3_int8_v_mean_amax_chunk.argtypes = (
+            [pointer, pointer, pointer]
+            + [integer] * 7
+            + [integer64] * 3
+            + [integer, stream]
+        )
+    if hasattr(library, 'h3_int8_quantize_v_mean_chunk_into'):
+        library.h3_int8_quantize_v_mean_chunk_into.restype = integer
+        library.h3_int8_quantize_v_mean_chunk_into.argtypes = (
+            [pointer, pointer, pointer, pointer]
+            + [integer] * 8
+            + [integer64] * 3
+            + [integer, stream]
+        )
     return library
 
 
@@ -53,6 +73,13 @@ def _native_library():
 
 def native_v_staging_available():
     return _native_library() is not None
+
+
+def native_v_smoothing_staging_available():
+    library = _native_library()
+    return library is not None and all(
+        hasattr(library, symbol) for symbol in _SMOOTH_NATIVE_SYMBOLS
+    )
 
 
 def _check(library, status, what):
@@ -176,6 +203,73 @@ class TwoPassVCarrier:
             ),
             'v_amax_chunk',
         )
+
+    def update_with_means(self, v_chunk, means, row_start, block_rows):
+        """Compute V block means and residual amax in one native read."""
+        if self.scale is not None:
+            raise VStagingError('V scale is already finalized')
+        self._check_chunk(v_chunk)
+        if self.backend != BACKEND_NATIVE:
+            raise VStagingError('fused V smoothing staging requires native backend')
+        if not all(hasattr(self.library, symbol) for symbol in _SMOOTH_NATIVE_SYMBOLS):
+            raise VStagingError(
+                'native library lacks fused H3V-Smooth V staging symbols'
+            )
+        if means.dtype != torch.float32 or not means.is_contiguous():
+            raise VStagingError('H3V-Smooth means must be contiguous FP32')
+        if tuple(means.shape[:2]) != (self.batch, self.heads) or int(means.shape[-1]) != self.head_dim:
+            raise VStagingError('H3V-Smooth mean geometry does not match V staging')
+        row_start = int(row_start)
+        block_rows = int(block_rows)
+        total_blocks = int(means.shape[-2])
+        rows = int(v_chunk.shape[2])
+        if row_start < 0 or block_rows <= 0 or row_start % block_rows:
+            raise VStagingError('H3V-Smooth V chunk is not block aligned')
+        batch, heads, _, head_dim = v_chunk.shape
+        _check(
+            self.library,
+            self.library.h3_int8_v_mean_amax_chunk(
+                _ptr(v_chunk),
+                _ptr(means),
+                _ptr(self.amax),
+                batch, heads, rows, row_start, block_rows, total_blocks, head_dim,
+                v_chunk.stride(0), v_chunk.stride(1), v_chunk.stride(2),
+                _DTYPE_TO_CODE[v_chunk.dtype], _stream(),
+            ),
+            'v_mean_amax_chunk',
+        )
+
+    def quantize_with_means(self, v_chunk, means, row_start, block_rows):
+        """Subtract block means and quantize directly into the carrier."""
+        if self.scale is None:
+            raise VStagingError('V scale must be finalized before quantization')
+        self._check_chunk(v_chunk)
+        if self.backend != BACKEND_NATIVE:
+            raise VStagingError('fused V smoothing quantization requires native backend')
+        if not all(hasattr(self.library, symbol) for symbol in _SMOOTH_NATIVE_SYMBOLS):
+            raise VStagingError(
+                'native library lacks fused H3V-Smooth V staging symbols'
+            )
+        if means.dtype != torch.float32 or not means.is_contiguous():
+            raise VStagingError('H3V-Smooth means must be contiguous FP32')
+        row_start = int(row_start)
+        block_rows = int(block_rows)
+        total_blocks = int(means.shape[-2])
+        rows = int(v_chunk.shape[2])
+        if row_start < 0 or row_start + rows > self.sequence or row_start % block_rows:
+            raise VStagingError('H3V-Smooth V chunk is outside or misaligned')
+        batch, heads, _, head_dim = v_chunk.shape
+        _check(
+            self.library,
+            self.library.h3_int8_quantize_v_mean_chunk_into(
+                _ptr(v_chunk), _ptr(means), _ptr(self.v_int8), _ptr(self.scale),
+                batch, heads, rows, row_start, block_rows, total_blocks, head_dim,
+                self.padded, v_chunk.stride(0), v_chunk.stride(1), v_chunk.stride(2),
+                _DTYPE_TO_CODE[v_chunk.dtype], _stream(),
+            ),
+            'quantize_v_mean_chunk_into',
+        )
+        self._covered.append((row_start, row_start + rows))
 
     def finalize_scale(self):
         if self.scale is None:

@@ -47,6 +47,56 @@
 #define PACK_SIZE_V 16  // int8
 #define PACK_SIZE_O 8   // fp16
 
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v>
+__device__ __forceinline__ void h3_add_v_block_mean_u8(
+    uint32_t RS_u8[][num_tiles_k / 2][4],
+    int32_t RS_scale[][num_tiles_k][8], float RO[][num_tiles_v][8],
+    const nv_bfloat16 *__restrict__ mean_block) {
+  if (mean_block == nullptr) return;
+  float row_mass[num_tiles_q][2];
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; ++fq) {
+#pragma unroll
+    for (uint32_t row = 0; row < 2; ++row) {
+      uint32_t local_sum = 0;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k / 2; ++fk) {
+        local_sum = __dp4a(RS_u8[fq][fk][row], 0x01010101u, local_sum);
+        local_sum = __dp4a(RS_u8[fq][fk][row + 2], 0x01010101u, local_sum);
+      }
+      float mass = __uint2float_rn(local_sum) *
+                   __int_as_float(RS_scale[fq][0][row]);
+      mass += __shfl_xor_sync(0xffffffff, mass, 0x1);
+      mass += __shfl_xor_sync(0xffffffff, mass, 0x2);
+      row_mass[fq][row] = mass;
+    }
+  }
+  const uint32_t lane = get_lane_id();
+  const uint32_t channel_lane = lane % 4;
+#pragma unroll
+  for (uint32_t fv = 0; fv < num_tiles_v; ++fv) {
+    const nv_bfloat162 first_h = *reinterpret_cast<const nv_bfloat162 *>(
+        mean_block + fv * 16 + channel_lane * 2);
+    const nv_bfloat162 second_h = *reinterpret_cast<const nv_bfloat162 *>(
+        mean_block + fv * 16 + 8 + channel_lane * 2);
+    const float2 first = __bfloat1622float2(first_h);
+    const float2 second = __bfloat1622float2(second_h);
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; ++fq) {
+      const float r0 = row_mass[fq][0];
+      const float r1 = row_mass[fq][1];
+      RO[fq][fv][0] = fmaf(r0, first.x, RO[fq][fv][0]);
+      RO[fq][fv][1] = fmaf(r0, first.y, RO[fq][fv][1]);
+      RO[fq][fv][2] = fmaf(r1, first.x, RO[fq][fv][2]);
+      RO[fq][fv][3] = fmaf(r1, first.y, RO[fq][fv][3]);
+      RO[fq][fv][4] = fmaf(r0, second.x, RO[fq][fv][4]);
+      RO[fq][fv][5] = fmaf(r0, second.y, RO[fq][fv][5]);
+      RO[fq][fv][6] = fmaf(r1, second.x, RO[fq][fv][6]);
+      RO[fq][fv][7] = fmaf(r1, second.y, RO[fq][fv][7]);
+    }
+  }
+}
+
 // treat as if int8 tensor core
 #define MMA_QK_M 16
 #define MMA_QK_N 16
@@ -70,7 +120,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
     float *__restrict__ Q_scale, float *__restrict__ K_scale,
-    float *__restrict__ V_scale, float *__restrict__ V_mean,
+    float *__restrict__ V_scale, const nv_bfloat16 *__restrict__ V_mean,
     const void *__restrict__ AttnMask, const int64_t mask_stride_b,
     const int64_t mask_stride_h, const int64_t mask_stride_q,
     const int64_t mask_stride_k, const int mask_dtype_code,
@@ -350,6 +400,17 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
   const uint32_t K_load_idx_origin = K_load_idx_lane_base;
   const uint32_t K_idx_origin = K_idx_lane_base;
 
+  const uint32_t kv_head = head_id / num_kv_groups;
+  const uint32_t kv_heads = num_qo_heads / num_kv_groups;
+  const uint32_t v_mean_tiles = div_ceil(kv_len, CTA_K);
+  auto v_mean_block = [&](uint32_t block) -> const nv_bfloat16 * {
+    if (V_mean == nullptr) return nullptr;
+    return V_mean +
+           (((static_cast<int64_t>(batch_id) * kv_heads + kv_head) *
+                 v_mean_tiles +
+             block) * head_dim);
+  };
+
   auto seek_kv_block = [&](uint32_t block) {
     K_lane_base_ptr =
         K_lane_origin + static_cast<int64_t>(block) * CTA_K * stride_seq_k;
@@ -508,6 +569,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
 
     __syncthreads();
 
+    const uint32_t compute_block = load_block;
     // step to the next routed KV tile and load K with predicate
     load_block += static_cast<uint32_t>(lut_row[iter]);
     seek_kv_block(load_block);
@@ -530,6 +592,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                     num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
         smem_V, RS, RS_u8, RO);
+    h3_add_v_block_mean_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+        RS_u8, RS, RO, v_mean_block(compute_block));
     __syncthreads();
     // load V
     load_int8_V_global_to_share<
@@ -615,6 +679,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
 
     __syncthreads();
 
+    const uint32_t compute_block = load_block;
     // step to the final routed KV tile and load K with predicate
     load_block += static_cast<uint32_t>(lut_row[num_iterations - 1]);
     seek_kv_block(load_block);
@@ -637,6 +702,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                     num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
         smem_V, RS, RS_u8, RO);
+    h3_add_v_block_mean_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+        RS_u8, RS, RO, v_mean_block(compute_block));
 
     __syncthreads();
     // load V
@@ -726,6 +793,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                     num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
         smem_V, RS, RS_u8, RO);
+    h3_add_v_block_mean_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+        RS_u8, RS, RO, v_mean_block(load_block));
 
     __syncthreads();
   }
@@ -776,29 +845,6 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
           const float scale_value = v_scale[(k / 4) * 2 + (k % 2)];
           RO[fq][fv][k] *= scale_value;
         }
-      }
-    }
-  }
-
-  if constexpr (fuse_v_mean) {
-    float v_mean[4];
-    float *V_mean_base_ptr =
-        V_mean + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
-        (head_id / num_kv_groups) * head_dim + (lane_id % 4) * 2;
-#pragma unroll
-    for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-      ((float2 *)v_mean)[0] = *((float2 *)(V_mean_base_ptr + fv * 16));
-      ((float2 *)v_mean)[1] = *((float2 *)(V_mean_base_ptr + fv * 16 + 8));
-#pragma unroll
-      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-        RO[fq][fv][0] += v_mean[0];
-        RO[fq][fv][1] += v_mean[1];
-        RO[fq][fv][2] += v_mean[0];
-        RO[fq][fv][3] += v_mean[1];
-        RO[fq][fv][4] += v_mean[2];
-        RO[fq][fv][5] += v_mean[3];
-        RO[fq][fv][6] += v_mean[2];
-        RO[fq][fv][7] += v_mean[3];
       }
     }
   }

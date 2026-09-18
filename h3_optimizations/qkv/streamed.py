@@ -76,6 +76,62 @@ def project_kv_hnd(held, x, rope_freqs, start, end):
     return k, v
 
 
+
+def project_k_head_rows(held, x, rope_freqs, rows, head):
+    """Project one K head for arbitrary absolute sequence rows."""
+    project = getattr(held, "project_k_head_rows", None)
+    if callable(project):
+        return project(x, rope_freqs, rows, head)
+    q, k, v = held.project_rows(x, rope_freqs, rows)
+    result = k[0, int(head)]
+    del q, k, v
+    return result
+
+
+def project_v_head_rows(held, x, rope_freqs, rows, head):
+    """Project one V head for arbitrary absolute sequence rows."""
+    project = getattr(held, "project_v_head_rows", None)
+    if callable(project):
+        return project(x, rope_freqs, rows, head)
+    q, k, v = held.project_rows(x, rope_freqs, rows)
+    result = v[0, int(head)]
+    del q, k, v
+    return result
+
+
+def project_grouped_kv_hnd(held, x, rope_freqs, rows):
+    """Project per-head arbitrary rows; use a fused provider path when available."""
+    project = getattr(held, "project_grouped_kv_hnd", None)
+    if callable(project):
+        return project(x, rope_freqs, rows)
+    heads, count = (int(rows.shape[0]), int(rows.shape[1]))
+    k_out = v_out = None
+    for head in range(heads):
+        k_head = project_k_head_rows(held, x, rope_freqs, rows[head], head)
+        v_head = project_v_head_rows(held, x, rope_freqs, rows[head], head)
+        if k_out is None:
+            dim = int(k_head.shape[-1])
+            k_out = k_head.new_empty((1, heads, count, dim))
+            v_out = v_head.new_empty((1, heads, count, dim))
+        k_out[0, head].copy_(k_head)
+        v_out[0, head].copy_(v_head)
+    return k_out, v_out
+
+
+def project_grouped_v_hnd(held, x, rope_freqs, rows):
+    """Project grouped V; use a fused provider path when available."""
+    project = getattr(held, "project_grouped_v_hnd", None)
+    if callable(project):
+        return project(x, rope_freqs, rows)
+    heads, count = (int(rows.shape[0]), int(rows.shape[1]))
+    v_out = None
+    for head in range(heads):
+        v_head = project_v_head_rows(held, x, rope_freqs, rows[head], head)
+        if v_out is None:
+            v_out = v_head.new_empty((1, heads, count, int(v_head.shape[-1])))
+        v_out[0, head].copy_(v_head)
+    return v_out
+
 def project_v_hnd(held, x, rope_freqs, start, end):
     """Project V alone; two-pass staging requires this bounded row slice."""
     project_v = getattr(held, "project_v_hnd", None)
@@ -94,7 +150,11 @@ __all__ = [
     "PROJECTION_NATIVE",
     "StreamedQKVBindingError",
     "create_held_qkv",
+    "project_grouped_kv_hnd",
+    "project_grouped_v_hnd",
+    "project_k_head_rows",
     "project_kv_hnd",
     "project_q_hnd",
+    "project_v_head_rows",
     "project_v_hnd",
 ]

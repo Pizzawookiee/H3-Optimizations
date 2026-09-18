@@ -46,6 +46,7 @@ add_library(h3_int8_attention SHARED
     src/h3_int8_attention_api.cu
     src/convrot_quantize.cu
     src/h3_fused_q_cutlass.cu
+    src/h3_fused_kv_cutlass.cu
     src/sage_attention/sage_attn_launcher.cu
     src/sage_attention/sage_attn_sparse_launcher.cu
     src/sage_attention/quant_qk_int8.cu

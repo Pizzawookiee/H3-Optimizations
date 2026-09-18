@@ -148,6 +148,23 @@ def _bind(library):
         + [i, i, f, i, sz]
     )
 
+    try:
+        vmean_sparse = library.h3_int8_sparse_attention_vmean
+        vmean_sparse_lse = library.h3_int8_sparse_attention_lse_vmean
+    except AttributeError:
+        pass
+    else:
+        vmean_sparse.restype = i
+        vmean_sparse.argtypes = (
+            attention_common + [p, p, p, i, i, i] + geometry + strides
+            + [i, i, f, i, sz]
+        )
+        vmean_sparse_lse.restype = i
+        vmean_sparse_lse.argtypes = (
+            [p] * 9 + [p, p, i, i, i] + geometry + strides
+            + [i, i, f, i, sz]
+        )
+
     library.h3_int8_quantize_qk.restype = i
     library.h3_int8_quantize_qk.argtypes = (
         [p, p, p, p, p, p] + [i] * 10 + [i64] * 6 + [i, p, sz]
@@ -183,6 +200,14 @@ def _bind(library):
     else:
         fused_q.restype = i
         fused_q.argtypes = [p] * 9 + [i64] * 3 + [i, f, sz]
+
+    try:
+        fused_kv = library.h3_int8_fused_kv
+    except AttributeError:
+        pass
+    else:
+        fused_kv.restype = i
+        fused_kv.argtypes = [p] * 12 + [i64] * 4 + [i] * 2 + [f, sz]
 
     library.h3_int8_quantize_v.restype = i
     library.h3_int8_quantize_v.argtypes = [p, p, p] + [i] * 5 + [i64] * 3 + [i, sz]

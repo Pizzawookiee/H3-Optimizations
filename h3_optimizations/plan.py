@@ -7,7 +7,7 @@ import math
 
 PLAN_KEY = 'h3_optimizations_plan'
 STATUS_KEY = 'h3_optimizations_status'
-PLAN_VERSION = 3
+PLAN_VERSION = 4
 
 ATTENTION_AUTO = 'auto'
 ATTENTION_EXISTING = 'existing'
@@ -91,6 +91,10 @@ V_MEMORY_REQUESTS = (
     V_MEMORY_RETAIN,
     V_MEMORY_TWO_PASS,
 )
+
+V_SMOOTH_OFF = 'Off'
+V_SMOOTH_H3 = 'H3V-Smooth'
+V_SMOOTH_OPTIONS = (V_SMOOTH_OFF, V_SMOOTH_H3)
 # Two-pass V started out Kitchen-only. It now also covers the Sage FP8
 # carriers, so the neutral names above are canonical; these aliases keep the
 # original spelling working for callers that still use it.
@@ -247,6 +251,7 @@ class SparseRequest:
     early_schedule: str = EARLY_SCHEDULE_HOLD
     step_video_budgets: tuple[float, ...] | None = None
     video_token_order: str = DEFAULT_VIDEO_TOKEN_ORDER
+    v_smoothing: str = V_SMOOTH_OFF
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
@@ -262,6 +267,8 @@ class SparseRequest:
             raise ValueError(
                 'unknown video token order %r' % self.video_token_order
             )
+        if self.v_smoothing not in V_SMOOTH_OPTIONS:
+            raise ValueError('unknown V smoothing request %r' % self.v_smoothing)
         _validate_edge_schedule(
             self.early_steps,
             self.early_kv,
@@ -309,6 +316,7 @@ class SparseRequest:
             None if self.late_kv is None else float(self.late_kv),
             self.step_video_budgets,
             self.video_token_order,
+            self.v_smoothing,
         )
 
 

@@ -370,6 +370,10 @@ def format_sparse_status(model):
             sparse.get('video_token_order')
             or getattr(plan_sparse, 'video_token_order', 'unknown')
         ),
+        'V smoothing: %s' % (
+            sparse.get('v_smoothing')
+            or getattr(plan_sparse, 'v_smoothing', 'Off')
+        ),
         'Requested video KV budget: %.1f%%' % (float(budget) * 100.0),
         'QKV: %s' % format_qkv_execution(status),
         (

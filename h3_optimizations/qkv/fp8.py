@@ -248,6 +248,43 @@ class HeldFP8Linear:
         )
         return F.linear(qx, weight, bias)
 
+    def linear_ranges(self, x, ranges):
+        """Quantize the gathered activation once and execute disjoint FP8 rows."""
+        if self.weight is None or self.layout_type is None:
+            raise RuntimeError("FP8 binding is not active")
+        normalized = [(int(start), int(end)) for start, end in ranges]
+        if not normalized or any(
+            not 0 <= start < end <= int(self.weight.shape[0])
+            for start, end in normalized
+        ):
+            raise FP8BindingError("FP8 output ranges are invalid")
+        params = self.weight._params
+        if params.scale.numel() != 1:
+            raise FP8BindingError("FP8 multi-range slicing requires a tensorwise scale")
+        qdata = torch.cat(
+            [self.weight._qdata[start:end] for start, end in normalized], dim=0
+        ).contiguous()
+        rows = sum(end - start for start, end in normalized)
+        weight = QuantizedTensor(
+            qdata,
+            self.layout_type,
+            replace(
+                params,
+                orig_shape=(rows, int(self.weight.shape[1])),
+            ),
+        )
+        bias = None
+        if self.bias is not None:
+            bias = torch.cat(
+                [self.bias[start:end] for start, end in normalized], dim=0
+            ).contiguous()
+        qx = QuantizedTensor.from_float(
+            x,
+            self.layout_type,
+            scale=self.input_scale,
+        )
+        return F.linear(qx, weight, bias)
+
 
 class HeldFP8QKV:
     """Hold an FP8 QKV projection weight across all sequence chunks."""
@@ -332,6 +369,77 @@ class HeldFP8QKV:
             v = self.binding.linear_range(x[start:end], inner * 2, inner * 3)
         v = v.view(end - start, self.attention.heads, self.attention.head_dim)
         return v.transpose(0, 1).unsqueeze(0)
+
+
+    def _finish_k_head(self, projected, rope):
+        seq = int(projected.shape[0])
+        projected = projected.view(1, seq, 1, self.attention.head_dim)
+        norm = self.attention.k_norm
+        if rope is None:
+            return norm(projected[0])[:, 0, :]
+        scale = comfy.ops.cast_to_input(norm.weight, projected)
+        projected = F.rms_norm(
+            projected,
+            (self.attention.head_dim,),
+            weight=scale,
+            eps=norm.eps,
+        )
+        rot_dim = int(rope.shape[-3]) * 2
+        comfy.quant_ops.ck.apply_rope_split_half1_(projected[..., :rot_dim], rope)
+        return projected[0, :, 0, :]
+
+    def project_grouped_kv_hnd(self, x, rope_freqs, rows):
+        """Grouped K/V with one gather + one scaled FP8 GEMM per head."""
+        heads, count = int(rows.shape[0]), int(rows.shape[1])
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if heads != int(self.attention.heads):
+            raise FP8BindingError('grouped row-map head count mismatch')
+        k_out = x.new_empty((1, heads, count, dim))
+        v_out = x.new_empty((1, heads, count, dim))
+        for head in range(heads):
+            head_rows = rows[head].to(dtype=torch.long)
+            sample_x = x.index_select(0, head_rows)
+            rope = None if rope_freqs is None else rope_freqs.index_select(1, head_rows)
+            k_start = inner + head * dim
+            v_start = inner * 2 + head * dim
+            with diagnostics.stage('qkv_linear'):
+                projected = self.binding.linear_ranges(
+                    sample_x,
+                    ((k_start, k_start + dim), (v_start, v_start + dim)),
+                )
+            k_head, v_head = projected.split(dim, dim=-1)
+            with diagnostics.stage('qk_norm_rope'):
+                k_head = self._finish_k_head(k_head, rope)
+            k_out[0, head].copy_(k_head)
+            v_out[0, head].copy_(v_head)
+        return k_out, v_out
+
+    def project_k_head_rows(self, x, rope_freqs, rows, head):
+        head = int(head)
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if not 0 <= head < int(self.attention.heads):
+            raise FP8BindingError('K head index is out of range')
+        sample_x = x.index_select(0, rows)
+        rope = None if rope_freqs is None else rope_freqs.index_select(1, rows)
+        start = inner + head * dim
+        with diagnostics.stage('qkv_linear'):
+            projected = self.binding.linear_range(sample_x, start, start + dim)
+        with diagnostics.stage('qk_norm_rope'):
+            return self._finish_k_head(projected, rope)
+
+    def project_v_head_rows(self, x, rope_freqs, rows, head):
+        del rope_freqs
+        head = int(head)
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if not 0 <= head < int(self.attention.heads):
+            raise FP8BindingError('V head index is out of range')
+        sample_x = x.index_select(0, rows)
+        start = inner * 2 + head * dim
+        with diagnostics.stage('qkv_linear'):
+            return self.binding.linear_range(sample_x, start, start + dim)
 
     def project_rows(self, x, rope_freqs, rows):
         sample_x = x.index_select(0, rows)

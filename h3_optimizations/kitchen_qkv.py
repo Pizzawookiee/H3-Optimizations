@@ -28,6 +28,7 @@ from .qkv.streamed import (
     project_v_hnd,
 )
 from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
+from .plan import V_SMOOTH_H3, V_SMOOTH_OFF, V_SMOOTH_OPTIONS
 
 
 CHUNK_ROWS = 4096
@@ -194,6 +195,32 @@ def _tile_mean(x, tile):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
 
 
+def _h3v_smoothing_context(transformer_options):
+    from .runtime.context import get_runtime_snapshot
+    from .attention.sparse.v_smoothing import h3v_smooth_active
+
+    snapshot = get_runtime_snapshot(transformer_options)
+    return snapshot, h3v_smooth_active(snapshot)
+
+
+def _h3v_demean(v, block_rows):
+    from .attention.sparse.v_smoothing import demean_v_blocks_
+
+    return demean_v_blocks_(v, block_rows)
+
+
+def _h3v_subtract(v, means, block_rows, row_start):
+    from .attention.sparse.v_smoothing import subtract_v_means_
+
+    return subtract_v_means_(v, means, block_rows, row_start)
+
+
+def _h3v_normalize(means, v_scale):
+    from .attention.sparse.v_smoothing import normalized_v_means
+
+    return normalized_v_means(means, v_scale)
+
+
 def run_chunked_kitchen_qkv(
     module,
     x,
@@ -211,17 +238,29 @@ def run_chunked_kitchen_qkv(
     routing_kv_tile=None,
     strided_qk_input=False,
     v_mode=V_MODE_RETAIN,
+    v_smoothing=V_SMOOTH_OFF,
 ):
-    del layer_index, transformer_options
     routing_q_tile = int(
         spec.q_tile if routing_q_tile is None else routing_q_tile
     )
     routing_kv_tile = int(
         spec.k_tile if routing_kv_tile is None else routing_kv_tile
     )
+    if v_smoothing not in V_SMOOTH_OPTIONS:
+        raise FusedQKVError('unknown V smoothing mode %r' % v_smoothing)
+    smoothing_active = False
+    if v_smoothing == V_SMOOTH_H3:
+        _snapshot, smoothing_active = _h3v_smoothing_context(transformer_options)
     kitchen = resolve_kitchen(x.device)
     if kitchen is None:
         raise FusedQKVError('no INT8 attention producer is available')
+    if v_smoothing == V_SMOOTH_H3 and (
+        not callable(getattr(kitchen, 'h3v_smooth_is_available', None))
+        or not kitchen.h3v_smooth_is_available()
+    ):
+        raise FusedQKVError(
+            'H3V-Smooth requires the vendored rebuilt Kitchen backend'
+        )
     held = None
     try:
         fmt = describe_linear(module.qkv_proj)
@@ -277,6 +316,13 @@ def run_chunked_kitchen_qkv(
 
             staging = TwoPassVCarrier(spec)
         retained_v = None
+        v_means = None
+        if smoothing_active:
+            kv_tiles = (sequence + routing_kv_tile - 1) // routing_kv_tile
+            v_means = torch.empty(
+                1, int(module.heads), kv_tiles, int(module.head_dim),
+                dtype=torch.float32, device=x.device,
+            )
         q_summaries = []
         k_summaries = []
         for start in range(0, sequence, int(chunk_rows)):
@@ -309,12 +355,24 @@ def run_chunked_kitchen_qkv(
                 with diagnostics.stage('v_retention_copy'):
                     retained_v[:, :, start:end, :].copy_(v)
             else:
+                if smoothing_active:
+                    with diagnostics.stage('h3v_block_demean'):
+                        chunk_means = _h3v_demean(v, routing_kv_tile)
+                        block_start = start // routing_kv_tile
+                        v_means[
+                            ..., block_start:block_start + int(chunk_means.shape[-2]), :
+                        ].copy_(chunk_means)
                 with diagnostics.stage('v_amax_update'):
                     staging.update(v)
             del q, k, v
 
         if staging is None:
+            if smoothing_active:
+                with diagnostics.stage('h3v_block_demean'):
+                    v_means = _h3v_demean(retained_v, routing_kv_tile)
             kitchen.quantize_int8_attention_v(producer, retained_v)
+            if smoothing_active:
+                producer.v_mean = _h3v_normalize(v_means, producer.v_scale)
             del retained_v
         else:
             staging.finalize_scale()
@@ -322,10 +380,15 @@ def run_chunked_kitchen_qkv(
                 end = min(start + int(chunk_rows), sequence)
                 with diagnostics.stage('v_reprojection'):
                     v = project_v_hnd(held, x, rope_freqs, start, end)
+                if smoothing_active:
+                    with diagnostics.stage('h3v_block_demean'):
+                        _h3v_subtract(v, v_means, routing_kv_tile, start)
                 with diagnostics.stage('v_carrier_pack'):
                     staging.quantize(v, start)
                 del v
             producer.v, producer.v_scale = staging.finish()
+            if smoothing_active:
+                producer.v_mean = _h3v_normalize(v_means, producer.v_scale)
         with diagnostics.stage('carrier_finalize'):
             return PreparedChunkedKitchenQKV(
                 kitchen.finalize_int8_attention_producer(producer),
@@ -455,6 +518,7 @@ class ChunkedKitchenQKVProjector:
         stream_output=False,
         streamed_q=False,
         v_mode=V_MODE_RETAIN,
+        v_smoothing=V_SMOOTH_OFF,
     ):
         self.chunk_rows = int(chunk_rows)
         self.force_weights_bf16 = bool(force_weights_bf16)
@@ -483,6 +547,9 @@ class ChunkedKitchenQKVProjector:
         if v_mode not in V_MODES:
             raise ValueError('unknown Kitchen V mode %r' % v_mode)
         self.v_mode = v_mode
+        if v_smoothing not in V_SMOOTH_OPTIONS:
+            raise ValueError('unknown V smoothing mode %r' % v_smoothing)
+        self.v_smoothing = v_smoothing
         if self.streamed_q and not self.stream_output:
             raise ValueError('streamed Kitchen Q requires streamed output')
 
@@ -501,6 +568,7 @@ class ChunkedKitchenQKVProjector:
             self.stream_output,
             self.streamed_q,
             self.v_mode,
+            self.v_smoothing,
         )
 
     def try_project(
@@ -621,6 +689,7 @@ class ChunkedKitchenQKVProjector:
                         routing_kv_tile=self.kv_tile,
                         strided_qk_input=self.strided_qk_input,
                         v_mode=self.v_mode,
+                        v_smoothing=self.v_smoothing,
                     )
                 if self.stream_output:
                     projected = replace(projected, output_buffer=x)

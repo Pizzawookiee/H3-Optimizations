@@ -41,7 +41,7 @@ _lse_results = {}
 
 # Bump whenever the meaning of a cached pass/fail changes without changing the
 # native binary build ID. Otherwise an old failure can survive a Python-only fix.
-_SELFTEST_REVISION = 'v9'
+_SELFTEST_REVISION = 'v10'
 
 # K > 512 is intentional. Blackwell's dense CTA_K=64 launcher chooses a
 # lower-pressure probability path at K <= 512 while sparse always uses fused
@@ -240,6 +240,92 @@ def _run_fused_q(device):
     }
 
 
+
+def _run_fused_kv(device):
+    from .convrot import quantize_int8_rowwise_convrot256
+    from .fused_kv import fused_h3_kv_from_int8
+    from .producer import (
+        Int8AttentionKAnchor,
+        create_int8_attention_producer,
+        int8_attention_producer_spec,
+        quantize_int8_attention_k_chunk,
+    )
+
+    library = loader.load()
+    available = bool(
+        getattr(library, 'h3_int8_quantize_bf16_rowwise_convrot256', None)
+        and getattr(library, 'h3_int8_fused_kv', None)
+    )
+    if not available:
+        return {'available': False, 'passed': False}
+    if tuple(torch.cuda.get_device_capability(device)) < (8, 0):
+        return {'available': False, 'passed': False, 'reason': 'requires_sm80'}
+
+    rows, hidden, head_dim, full_rows = 128, 256, 128, 384
+    generator = torch.Generator(device=device).manual_seed(20260918)
+    x = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16, generator=generator)
+    activation, activation_scale = quantize_int8_rowwise_convrot256(x)
+    weight = torch.randint(-8, 8, (256, hidden), device=device, dtype=torch.int32, generator=generator).to(torch.int8)
+    weight_scale = (torch.rand(256, device=device, dtype=torch.float32, generator=generator) * 0.01 + 0.005)
+    norm = (torch.rand(head_dim, device=device, dtype=torch.float32, generator=generator) * 0.5 + 0.75).to(torch.bfloat16)
+    freqs = torch.zeros(rows, 48, 2, 2, device=device, dtype=torch.bfloat16)
+    freqs[:, :, 0, 0] = 1
+    freqs[:, :, 1, 1] = 1
+    epsilon = 1e-6
+
+    projected = torch.matmul(activation.float(), weight.float().transpose(0, 1))
+    projected = (projected * activation_scale * weight_scale.unsqueeze(0)).to(torch.bfloat16)
+    k_ref = projected[:, :head_dim]
+    v_ref = projected[:, head_dim:]
+    inv = torch.rsqrt(k_ref.float().square().mean(dim=-1, keepdim=True) + epsilon)
+    k_ref = (k_ref.float() * inv * norm.float()).to(torch.bfloat16)
+    summary_ref_64 = k_ref.view(2, 64, head_dim).float().mean(dim=1).to(torch.bfloat16)
+
+    results = {}
+    for cta_k in (64, 128):
+        spec = int8_attention_producer_spec(
+            (1, 1, 1, head_dim), (1, 1, full_rows, head_dim),
+            dtype=torch.bfloat16, device=device, cta_k=cta_k,
+        )
+        anchor_value = k_ref[17].reshape(1, 1, head_dim).contiguous()
+        anchor_index = torch.tensor([[17]], device=device, dtype=torch.int32)
+        anchor = Int8AttentionKAnchor(values=anchor_value, indices=anchor_index)
+        producer = create_int8_attention_producer(spec, anchor)
+        quantize_int8_attention_k_chunk(
+            producer, k_ref.reshape(1, 1, rows, head_dim), k_start=0
+        )
+
+        blocks = (full_rows + cta_k - 1) // cta_k
+        k_out = torch.empty(full_rows, head_dim, dtype=torch.int8, device=device)
+        k_scale = torch.empty(blocks * 4, dtype=torch.float32, device=device)
+        summary = torch.empty(blocks, head_dim, dtype=torch.bfloat16, device=device)
+        v_out = fused_h3_kv_from_int8(
+            activation, weight, activation_scale, weight_scale, norm, freqs,
+            anchor_value[0, 0], anchor_index.reshape(-1), k_out, k_scale, summary,
+            full_rows=full_rows, k_start=0, cta_k=cta_k,
+            full_k_length=full_rows, epsilon=epsilon,
+        )
+        used_blocks = rows // cta_k
+        ref_summary = summary_ref_64 if cta_k == 64 else k_ref.float().mean(dim=0, keepdim=True).to(torch.bfloat16)
+        k_equal = torch.equal(k_out[:rows], producer.k[0, 0, :rows])
+        scale_equal = torch.equal(k_scale[:used_blocks * 4], producer.k_scale[0, 0, :used_blocks * 4])
+        v_rel = _relative_l2(v_out, v_ref)
+        summary_rel = _relative_l2(summary[:used_blocks], ref_summary)
+        results[str(cta_k)] = {
+            'k_bytes_equal': bool(k_equal),
+            'k_scales_equal': bool(scale_equal),
+            'v_rel_l2': round(v_rel, 6),
+            'summary_rel_l2': round(summary_rel, 6),
+        }
+
+    torch.cuda.synchronize(device)
+    passed = all(
+        item['k_bytes_equal'] and item['k_scales_equal']
+        and item['v_rel_l2'] < 0.002 and item['summary_rel_l2'] < 0.01
+        for item in results.values()
+    )
+    return {'available': True, 'geometries': results, 'passed': bool(passed)}
+
 def _carrier_lse_reference(carrier):
     batch, heads, q_length, _head_dim = carrier.q.shape
     kv_length = carrier.k.shape[-2]
@@ -389,6 +475,14 @@ def run(device=None, *, verbose=False):
                 'passed': False,
                 'error': '%s: %s' % (type(error).__name__, error),
             }
+        try:
+            detail['fused_kv'] = _run_fused_kv(device)
+        except Exception as error:
+            detail['fused_kv'] = {
+                'available': True,
+                'passed': False,
+                'error': '%s: %s' % (type(error).__name__, error),
+            }
         torch.cuda.synchronize(device)
     except Exception as error:  # noqa: BLE001 - reporting is the job
         detail['error'] = '%s: %s' % (type(error).__name__, error)
@@ -534,6 +628,11 @@ def fused_q_check(device=None, *, force=False):
     """Whether the optional exact fused-Q producer passed device parity."""
     _passed, detail = _load_result(device, force=force)
     return bool(detail.get('fused_q', {}).get('passed', False))
+
+def fused_kv_check(device=None, *, force=False):
+    """Whether the direct K/V producer passed carrier parity on this GPU."""
+    _passed, detail = _load_result(device, force=force)
+    return bool(detail.get('fused_kv', {}).get('passed', False))
 
 
 def sparse_lse_check(device=None, *, force=False):

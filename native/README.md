@@ -67,9 +67,15 @@ remains one FP32 base-2 log-sum-exp value per query row. The packaged Windows
 DLL is build-versioned so a running Comfy process can keep an older mapped DLL
 until the next normal restart.
 
+ABI 4 builds may additionally expose the additive
+`h3_int8_sparse_attention_vmean` and `h3_int8_sparse_attention_lse_vmean`
+entry points used by H3V-Smooth. They carry one optional per-KV-tile BF16
+V-mean tensor while leaving the established ABI-4 sparse entry points intact,
+so an older packaged ABI-4 binary still runs normally when V smoothing is Off.
+
 ABI 4 also accepts the additive
-`h3_int8_quantize_bf16_rowwise_convrot256` and `h3_int8_fused_q` symbols. They
-are optional when loading an older ABI-4 binary, so unsupported installs keep
+`h3_int8_quantize_bf16_rowwise_convrot256`, `h3_int8_fused_q`, and `h3_int8_fused_kv` symbols. They
+remain optional symbols; unsupported installs keep
 the established Q projection and packing path. The fixed exact 128x256 fused-Q
 kernel is selected only on SM80 or newer; this does not change the SM75 support
 of the existing attention kernels.

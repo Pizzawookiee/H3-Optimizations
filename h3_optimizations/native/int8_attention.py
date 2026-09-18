@@ -76,6 +76,7 @@ class PrequantizedInt8Attention:
     input_dtype: torch.dtype
     attention_scale: float
     cta_k: int
+    v_mean: torch.Tensor | None = None
     anchor_indices: torch.Tensor | None = None
 
 
@@ -230,17 +231,45 @@ def _check_quantize_v(*arguments):
     loader.check(loader.load().h3_int8_quantize_v(*arguments), 'quantize_v')
 
 
-def _check_sparse_attention(*arguments):
-    loader.check(
-        loader.load().h3_int8_sparse_attention(*arguments), 'sparse attention'
+def h3v_smooth_is_available():
+    try:
+        library = loader.load()
+    except loader.NativeUnavailableError:
+        return False
+    return bool(
+        getattr(library, 'h3_int8_sparse_attention_vmean', None)
+        and getattr(library, 'h3_int8_sparse_attention_lse_vmean', None)
     )
 
 
-def _check_sparse_attention_lse(*arguments):
-    loader.check(
-        loader.load().h3_int8_sparse_attention_lse(*arguments),
-        'sparse attention with LSE',
-    )
+def _check_sparse_attention(*arguments, v_mean=None):
+    library = loader.load()
+    if v_mean is None:
+        status = library.h3_int8_sparse_attention(*arguments)
+    else:
+        function = getattr(library, 'h3_int8_sparse_attention_vmean', None)
+        if function is None:
+            raise RuntimeError(
+                'H3V-Smooth requires a native library built with V-mean support'
+            )
+        # v_mean is inserted after the ordinary V scale (argument 7).
+        status = function(*arguments[:7], _ptr(v_mean), *arguments[7:])
+    loader.check(status, 'sparse attention')
+
+
+def _check_sparse_attention_lse(*arguments, v_mean=None):
+    library = loader.load()
+    if v_mean is None:
+        status = library.h3_int8_sparse_attention_lse(*arguments)
+    else:
+        function = getattr(library, 'h3_int8_sparse_attention_lse_vmean', None)
+        if function is None:
+            raise RuntimeError(
+                'H3V-Smooth requires a native library built with V-mean support'
+            )
+        # LSE shifts the scale tuple by one pointer; V scale is argument 7.
+        status = function(*arguments[:8], _ptr(v_mean), *arguments[8:])
+    loader.check(status, 'sparse attention with LSE')
 
 
 def _validate_sparse_route(quantized, route):
@@ -267,6 +296,30 @@ def _validate_sparse_route(quantized, route):
     if kernel_route.indices.dtype != torch.int32 or kernel_route.counts.dtype != torch.int32:
         raise TypeError('route indices and counts must be int32')
     return kernel_route
+
+
+def _validate_v_mean(quantized):
+    mean = quantized.v_mean
+    if mean is None:
+        return
+    batch, kv_heads, kv_length, kernel_head_dim = quantized.k.shape
+    expected = (
+        int(batch),
+        int(kv_heads),
+        _pad_to(int(kv_length), int(quantized.cta_k)) // int(quantized.cta_k),
+        int(kernel_head_dim),
+    )
+    if tuple(mean.shape) != expected:
+        raise ValueError(
+            'H3V-Smooth V mean carrier must have shape %s, got %s'
+            % (expected, tuple(mean.shape))
+        )
+    if mean.dtype != torch.bfloat16:
+        raise TypeError('H3V-Smooth V mean carrier must be bfloat16')
+    if mean.device != quantized.q.device:
+        raise ValueError('H3V-Smooth V mean carrier must share the attention device')
+    if not mean.is_contiguous():
+        raise ValueError('H3V-Smooth V mean carrier must be contiguous')
 
 
 def _kernel_head_dim(head_dim):
@@ -360,6 +413,7 @@ def prequantize_int8_attention(q, k, v, *, scale=None, cta_k=None):
     return PrequantizedInt8Attention(
         q=q_int8, k=k_int8, v=v_int8,
         q_scale=q_scale, k_scale=k_scale, v_scale=v_scale,
+        v_mean=None,
         original_head_dim=original_head_dim,
         input_dtype=input_dtype,
         attention_scale=attention_scale,
@@ -471,6 +525,7 @@ def block_sparse_int8_attention_from_prequantized(
         quantized, route, validate_geometry=validate_geometry
     )
     kernel_route = _validate_sparse_route(quantized, route)
+    _validate_v_mean(quantized)
 
     output, output_dtype, geometry, strides = _attention_geometry(
         quantized, output_layout
@@ -487,6 +542,7 @@ def block_sparse_int8_attention_from_prequantized(
             quantized.q_scale.stride(0), quantized.q_scale.stride(1),
             quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
             _stream(),
+            v_mean=quantized.v_mean,
         )
     return _finish(quantized, output)
 
@@ -503,6 +559,7 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
         quantized, route, validate_geometry=validate_geometry
     )
     kernel_route = _validate_sparse_route(quantized, route)
+    _validate_v_mean(quantized)
 
     output, output_dtype, geometry, strides = _attention_geometry(
         quantized, output_layout
@@ -517,11 +574,13 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(lse), _ptr(quantized.q_scale),
             _ptr(quantized.k_scale), _ptr(quantized.v_scale),
-            _ptr(kernel_route.indices), _ptr(kernel_route.counts),
+            _ptr(kernel_route.indices),
+            _ptr(kernel_route.counts),
             kv_tiles, route.q_tile, quantized.cta_k, *geometry, *strides,
             quantized.q_scale.stride(0), quantized.q_scale.stride(1),
             quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
             _stream(),
+            v_mean=quantized.v_mean,
         )
     return _finish(quantized, output), lse
 

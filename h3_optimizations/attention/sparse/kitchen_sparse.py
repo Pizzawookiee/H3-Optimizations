@@ -25,8 +25,10 @@ from dataclasses import dataclass, replace
 from ... import diagnostics
 from ...normalized_rows import attention_output_buffer
 from ...runtime.context import get_runtime_snapshot
+from ...plan import V_SMOOTH_H3
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
+from .v_smoothing import demean_v_blocks_, h3v_smooth_active, normalized_v_means
 from ...kitchen_qkv import PreparedChunkedKitchenQKV
 
 
@@ -446,7 +448,22 @@ class SparseKitchenBackend:
             layer_index=layer_index,
             transformer_options=transformer_options,
         )
-        return self.executor.prepare(
+        v_means = None
+        if self.config.v_smoothing == V_SMOOTH_H3:
+            if (
+                not callable(
+                    getattr(self.executor.kitchen, 'h3v_smooth_is_available', None)
+                )
+                or not self.executor.kitchen.h3v_smooth_is_available()
+            ):
+                raise SparseKitchenError(
+                    'H3V-Smooth requires the vendored rebuilt Kitchen sparse backend'
+                )
+            snapshot = snapshot_for(transformer_options, v.shape[-2])
+            if h3v_smooth_active(snapshot):
+                with diagnostics.stage('h3v_block_demean'):
+                    v_means = demean_v_blocks_(v, self.executor.kv_tile)
+        prepared = self.executor.prepare(
             q,
             k,
             v,
@@ -455,6 +472,14 @@ class SparseKitchenBackend:
             layer_index=layer_index,
             metadata=route_metadata(mask_metadata, layer_index, q.shape[1]),
         )
+        if v_means is not None:
+            prepared.quantized = replace(
+                prepared.quantized,
+                v_mean=normalized_v_means(
+                    v_means, prepared.quantized.v_scale
+                ),
+            )
+        return prepared
 
     def prepare_projected(
         self,
@@ -586,6 +611,7 @@ class SparseKitchenBackend:
             'sparse_q_tile': int(self.executor.q_tile),
             'sparse_kv_tile': int(self.executor.kv_tile),
             'sparse_v_format': 'int8',
+            'v_smoothing': self.config.v_smoothing,
             'route_encoding': getattr(
                 self.executor.kitchen,
                 'KERNEL_ROUTE_ENCODING',

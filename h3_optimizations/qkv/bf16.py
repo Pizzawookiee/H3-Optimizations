@@ -249,6 +249,93 @@ class HeldBF16QKV:
         rope = None if rope_freqs is None else rope_freqs[:, start:end]
         return self._finish(x[start:end], rope)
 
+
+    def _finish_k_head(self, projected, rope):
+        seq = int(projected.shape[0])
+        projected = projected.view(1, seq, 1, self.attention.head_dim)
+        norm = self.attention.k_norm
+        if rope is None:
+            return norm(projected[0])[:, 0, :]
+        scale = comfy.model_management.cast_to(
+            norm.weight,
+            device=projected.device,
+        )
+        projected = F.rms_norm(
+            projected,
+            (self.attention.head_dim,),
+            weight=scale,
+            eps=norm.eps,
+        )
+        rot_dim = int(rope.shape[-3]) * 2
+        comfy.quant_ops.ck.apply_rope_split_half1_(
+            projected[..., :rot_dim],
+            rope,
+        )
+        return projected[0, :, 0, :]
+
+    def _finish_grouped_k(self, k, rope_freqs, rows):
+        # k: [heads, rows, dim]; each head has a distinct absolute row map.
+        heads, count, dim = map(int, k.shape)
+        norm = self.attention.k_norm
+        scale = comfy.model_management.cast_to(norm.weight, device=k.device)
+        k = F.rms_norm(k, (dim,), weight=scale, eps=norm.eps)
+        if rope_freqs is not None:
+            rot_dim = int(rope_freqs.shape[-3]) * 2
+            # Comfy's RoPE helper expects one row order at a time.  Projection
+            # is fused across heads; only this small normalization/RoPE tail is
+            # head-looped.
+            for head in range(heads):
+                rope = rope_freqs.index_select(1, rows[head].to(torch.long))
+                view = k[head:head + 1].transpose(0, 1).unsqueeze(0)
+                comfy.quant_ops.ck.apply_rope_split_half1_(view[..., :rot_dim], rope)
+                k[head].copy_(view[0, :, 0, :])
+        return k
+
+    def project_grouped_kv_hnd(self, x, rope_freqs, rows):
+        from .grouped_projection import grouped_bf16_kv_linear
+        k, v = grouped_bf16_kv_linear(
+            x, self.weight, self.bias, rows,
+            heads=int(self.attention.heads), head_dim=int(self.attention.head_dim),
+            want_k=True, want_v=True,
+        )
+        with diagnostics.stage('qk_norm_rope'):
+            k = self._finish_grouped_k(k, rope_freqs, rows)
+        return k.unsqueeze(0), v.unsqueeze(0)
+
+    def project_grouped_v_hnd(self, x, rope_freqs, rows):
+        del rope_freqs
+        from .grouped_projection import grouped_bf16_kv_linear
+        _k, v = grouped_bf16_kv_linear(
+            x, self.weight, self.bias, rows,
+            heads=int(self.attention.heads), head_dim=int(self.attention.head_dim),
+            want_k=False, want_v=True,
+        )
+        return v.unsqueeze(0)
+
+    def project_k_head_rows(self, x, rope_freqs, rows, head):
+        head = int(head)
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if not 0 <= head < int(self.attention.heads):
+            raise BF16QKVBindingError('K head index is out of range')
+        sample_x = x.index_select(0, rows)
+        rope = None if rope_freqs is None else rope_freqs.index_select(1, rows)
+        start = inner + head * dim
+        projected = self._project_slice(sample_x, start, start + dim)
+        with diagnostics.stage('qk_norm_rope'):
+            return self._finish_k_head(projected, rope)
+
+    def project_v_head_rows(self, x, rope_freqs, rows, head):
+        del rope_freqs
+        head = int(head)
+        dim = int(self.attention.head_dim)
+        inner = int(self.attention.heads) * dim
+        if not 0 <= head < int(self.attention.heads):
+            raise BF16QKVBindingError('V head index is out of range')
+        sample_x = x.index_select(0, rows)
+        start = inner * 2 + head * dim
+        return self._project_slice(sample_x, start, start + dim)
+
     def project_rows(self, x, rope_freqs, rows):
         sample_x = x.index_select(0, rows)
         sample_rope = None if rope_freqs is None else rope_freqs.index_select(1, rows)

@@ -16,9 +16,13 @@ from .plan import (
     EARLY_SCHEDULE_RAMP,
     SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
     VIDEO_TOKEN_ORDER_REQUESTS,
+    V_SMOOTH_H3,
+    V_SMOOTH_OFF,
+    V_SMOOTH_OPTIONS,
     read_plan,
 )
 from .status import (
@@ -273,6 +277,20 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'Raster restores unchanged H3 target-video ordering.'
                     ),
                 ),
+                io.Combo.Input(
+                    'v_smoothing',
+                    display_name='V Smoothing',
+                    options=list(V_SMOOTH_OPTIONS),
+                    default=V_SMOOTH_OFF,
+                    tooltip=(
+                        'H3V-Smooth runs per-head value-guided online k-means, '
+                        'permutes K/V together before H3 chooses grouped KV blocks, '
+                        'then demeans the grouped V blocks and restores their means '
+                        'inside Kitchen attention. Grouping/demeaning uses the first '
+                        '25% of denoising steps with four-step permutation reuse; '
+                        'the final permutation remains active afterward.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -289,6 +307,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         backend=SPARSE_BACKEND_KITCHEN,
         early_schedule=_ADVANCED_DEFAULT_EARLY_SCHEDULE,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
+        v_smoothing=V_SMOOTH_OFF,
     ):
         plan = read_plan(model).with_sparse(
             SparseRequest(
@@ -300,6 +319,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 backend=backend,
                 early_schedule=early_schedule,
                 video_token_order=video_token_order,
+                v_smoothing=v_smoothing,
             )
         )
         patched = apply_plan(model, plan)
@@ -319,6 +339,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         late_steps=DEFAULT_LATE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
+        v_smoothing=V_SMOOTH_OFF,
     ):
         if backend is not None and backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
             return 'unknown sparse backend %r' % backend
@@ -326,6 +347,13 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
             return 'unknown early schedule %r' % early_schedule
         if video_token_order is not None and video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:
             return 'unknown video token order %r' % video_token_order
+        if v_smoothing is not None and v_smoothing not in V_SMOOTH_OPTIONS:
+            return 'unknown V smoothing request %r' % v_smoothing
+        if v_smoothing == V_SMOOTH_H3 and backend not in (
+            SPARSE_BACKEND_KITCHEN,
+            SPARSE_BACKEND_KITCHEN_64X128,
+        ):
+            return 'H3V-Smooth currently requires a Kitchen INT8 sparse backend'
         for name, value in (
             ('video_budget', video_budget),
             ('early_kv', early_kv),

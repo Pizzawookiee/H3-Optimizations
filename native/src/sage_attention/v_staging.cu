@@ -12,6 +12,13 @@ namespace {
 
 constexpr int kDTile = 8;
 
+__device__ __forceinline__ float warp_reduce_sum_staging(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_xor_sync(0xffffffff, v, off);
+  return v;
+}
+
 __device__ __forceinline__ int inv_perm16_staging(int value) {
   return (value & 1) | (((value >> 3) & 1) << 1) |
          (((value >> 1) & 1) << 2) | (((value >> 2) & 1) << 3);
@@ -111,6 +118,132 @@ __global__ void v_amax_chunk_kernel(const T *__restrict__ v,
 }
 
 template <typename T, int Threads>
+__global__ void v_mean_amax_chunk_kernel(
+    const T *__restrict__ v, float *__restrict__ means,
+    float *__restrict__ amax, int rows, int row_start, int block_rows,
+    int total_blocks, int H, int D, int64_t sb, int64_t sh, int64_t sn) {
+  const int local_blocks = (rows + block_rows - 1) / block_rows;
+  const int d_tiles = D / kDTile;
+  const int d_tile = blockIdx.x % d_tiles;
+  const int tmp = blockIdx.x / d_tiles;
+  const int local_block = tmp % local_blocks;
+  const int bh = tmp / local_blocks;
+  const int h = bh % H;
+  const int b = bh / H;
+  const int d0 = d_tile * kDTile;
+  const int local_start = local_block * block_rows;
+  const int valid_rows = min(block_rows, rows - local_start);
+  const T *base = v + b * sb + h * sh + (int64_t)local_start * sn + d0;
+  constexpr int Warps = Threads / 32;
+
+  float sum[kDTile];
+#pragma unroll
+  for (int i = 0; i < kDTile; ++i) sum[i] = 0.f;
+  for (int row = threadIdx.x; row < valid_rows; row += Threads) {
+    float values[kDTile];
+    load_tile_staging(base + (int64_t)row * sn, values);
+#pragma unroll
+    for (int i = 0; i < kDTile; ++i) sum[i] += values[i];
+  }
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int i = 0; i < kDTile; ++i) sum[i] = warp_reduce_sum_staging(sum[i]);
+  __shared__ float warp_sum[kDTile][Warps];
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < kDTile; ++i) warp_sum[i][warp] = sum[i];
+  }
+  __syncthreads();
+
+  __shared__ float mean_shared[kDTile];
+  if (threadIdx.x < kDTile) {
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < Warps; ++w) total += warp_sum[threadIdx.x][w];
+    mean_shared[threadIdx.x] = total / (float)valid_rows;
+    const int global_block = row_start / block_rows + local_block;
+    const int64_t mean_slot =
+        (((int64_t)b * H + h) * total_blocks + global_block) * D +
+        d0 + threadIdx.x;
+    means[mean_slot] = mean_shared[threadIdx.x];
+  }
+  __syncthreads();
+
+  float maximum[kDTile];
+#pragma unroll
+  for (int i = 0; i < kDTile; ++i) maximum[i] = 0.f;
+  for (int row = threadIdx.x; row < valid_rows; row += Threads) {
+    float values[kDTile];
+    load_tile_staging(base + (int64_t)row * sn, values);
+#pragma unroll
+    for (int i = 0; i < kDTile; ++i)
+      maximum[i] = fmaxf(maximum[i], fabsf(values[i] - mean_shared[i]));
+  }
+#pragma unroll
+  for (int i = 0; i < kDTile; ++i)
+    maximum[i] = comfy::warp_reduce_fmax(maximum[i]);
+  __shared__ float warp_maximum_smooth[kDTile][Warps];
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < kDTile; ++i)
+      warp_maximum_smooth[i][warp] = maximum[i];
+  }
+  __syncthreads();
+  if (threadIdx.x < kDTile) {
+    float value = 0.f;
+#pragma unroll
+    for (int w = 0; w < Warps; ++w)
+      value = fmaxf(value, warp_maximum_smooth[threadIdx.x][w]);
+    const int64_t slot = (int64_t)(b * H + h) * D + d0 + threadIdx.x;
+    // amax is initialized non-negative, so integer atomicMax preserves ordering.
+    atomicMax(reinterpret_cast<int *>(amax + slot), __float_as_int(value));
+  }
+}
+
+template <typename T, int Threads>
+__global__ void quant_v_mean_chunk_into_kernel(
+    const T *__restrict__ v, const float *__restrict__ means,
+    int8_t *__restrict__ out, const float *__restrict__ scale, int rows,
+    int row_start, int block_rows, int total_blocks, int padded_N, int H, int D,
+    int64_t sb, int64_t sh, int64_t sn) {
+  const int d_tiles = D / kDTile;
+  const int d_tile = blockIdx.x % d_tiles;
+  const int bh = blockIdx.x / d_tiles;
+  const int h = bh % H;
+  const int b = bh / H;
+  const int d0 = d_tile * kDTile;
+  const T *base = v + b * sb + h * sh + d0;
+  const int64_t out_row = (int64_t)(b * H + h) * D + d0;
+
+  __shared__ float inverse_scale[kDTile];
+  if (threadIdx.x < kDTile)
+    inverse_scale[threadIdx.x] = 1.f / scale[out_row + threadIdx.x];
+  __syncthreads();
+  float inverse[kDTile];
+#pragma unroll
+  for (int i = 0; i < kDTile; ++i) inverse[i] = inverse_scale[i];
+
+  for (int local = rows - 1 - (int)threadIdx.x; local >= 0;
+       local -= Threads) {
+    const int source = row_start + local;
+    const int destination = (source & ~15) | inv_perm16_staging(source & 15);
+    const int block = source / block_rows;
+    const int64_t mean_base =
+        (((int64_t)b * H + h) * total_blocks + block) * D + d0;
+    float values[kDTile];
+    load_tile_staging(base + (int64_t)local * sn, values);
+#pragma unroll
+    for (int i = 0; i < kDTile; ++i) {
+      const float mean = means[mean_base + i];
+      out[(out_row + i) * padded_N + destination] =
+          comfy::float_to_int8_rn((values[i] - mean) * inverse[i]);
+    }
+  }
+}
+
+template <typename T, int Threads>
 __global__ void quant_v_chunk_into_kernel(
     const T *__restrict__ v, int8_t *__restrict__ out,
     const float *__restrict__ scale, int rows, int row_start, int padded_N,
@@ -201,6 +334,58 @@ void launch_v_amax_chunk(const void *v, void *amax, int B, int H, int rows,
     }
   });
   report_launch("v_amax_chunk");
+}
+
+void launch_v_mean_amax_chunk(const void *v, void *means, void *amax,
+                              int B, int H, int rows, int row_start,
+                              int block_rows, int total_blocks, int D,
+                              int64_t sb, int64_t sh, int64_t sn,
+                              int input_dtype_code, cudaStream_t stream) {
+  check_v_layout(v, B, H, rows, D, sb, sh, sn, input_dtype_code,
+                 "v_mean_amax_chunk");
+  if (means == nullptr || amax == nullptr || block_rows <= 0 ||
+      row_start < 0 || row_start % block_rows != 0 || total_blocks <= 0 ||
+      row_start + rows > total_blocks * block_rows) {
+    throw std::runtime_error("v_mean_amax_chunk: invalid smoothing geometry");
+  }
+  const int local_blocks = (rows + block_rows - 1) / block_rows;
+  const int blocks = B * H * local_blocks * (D / kDTile);
+  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+    v_mean_amax_chunk_kernel<T, 128><<<blocks, 128, 0, stream>>>(
+        static_cast<const T *>(v), static_cast<float *>(means),
+        static_cast<float *>(amax), rows, row_start, block_rows, total_blocks,
+        H, D, sb, sh, sn);
+  });
+  report_launch("v_mean_amax_chunk");
+}
+
+void launch_quant_v_mean_chunk_into(
+    const void *v, const void *means, void *out, const void *scale, int B,
+    int H, int rows, int row_start, int block_rows, int total_blocks, int D,
+    int padded_N, int64_t sb, int64_t sh, int64_t sn, int input_dtype_code,
+    cudaStream_t stream) {
+  check_v_layout(v, B, H, rows, D, sb, sh, sn, input_dtype_code,
+                 "quantize_v_mean_chunk_into");
+  if (means == nullptr || scale == nullptr || block_rows <= 0 ||
+      row_start < 0 || row_start % block_rows != 0 || total_blocks <= 0 ||
+      row_start + rows > total_blocks * block_rows || row_start + rows > padded_N) {
+    throw std::runtime_error("quantize_v_mean_chunk_into: invalid smoothing geometry");
+  }
+  const int blocks = B * H * (D / kDTile);
+  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+    if (rows <= 256) {
+      quant_v_mean_chunk_into_kernel<T, 128><<<blocks, 128, 0, stream>>>(
+          static_cast<const T *>(v), static_cast<const float *>(means),
+          static_cast<int8_t *>(out), static_cast<const float *>(scale), rows,
+          row_start, block_rows, total_blocks, padded_N, H, D, sb, sh, sn);
+    } else {
+      quant_v_mean_chunk_into_kernel<T, 512><<<blocks, 512, 0, stream>>>(
+          static_cast<const T *>(v), static_cast<const float *>(means),
+          static_cast<int8_t *>(out), static_cast<const float *>(scale), rows,
+          row_start, block_rows, total_blocks, padded_N, H, D, sb, sh, sn);
+    }
+  });
+  report_launch("quantize_v_mean_chunk_into");
 }
 
 void launch_quant_v_chunk_into(const void *v, void *out, const void *scale,

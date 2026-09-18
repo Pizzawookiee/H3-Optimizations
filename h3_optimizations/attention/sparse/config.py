@@ -7,6 +7,8 @@ from ...plan import (
     EARLY_SCHEDULE_HOLD,
     EARLY_SCHEDULE_OPTIONS,
     EARLY_SCHEDULE_RAMP,
+    V_SMOOTH_OFF,
+    V_SMOOTH_OPTIONS,
 )
 
 MODE_SAGE128 = 'sage128'
@@ -39,6 +41,7 @@ class HybridSparseConfig:
     late_kv: float | None = None
     early_schedule: str = EARLY_SCHEDULE_HOLD
     step_video_budgets: tuple[float, ...] | None = None
+    v_smoothing: str = V_SMOOTH_OFF
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
             raise ValueError(
@@ -50,6 +53,8 @@ class HybridSparseConfig:
         _validate_budget('late_kv', self.late_kv)
         if self.early_schedule not in EARLY_SCHEDULE_OPTIONS:
             raise ValueError('unknown early schedule %r' % self.early_schedule)
+        if self.v_smoothing not in V_SMOOTH_OPTIONS:
+            raise ValueError('unknown V smoothing request %r' % self.v_smoothing)
         if self.step_video_budgets is not None:
             budgets = tuple(float(value) for value in self.step_video_budgets)
             if not budgets:
@@ -93,6 +98,7 @@ class HybridSparseConfig:
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
             self.step_video_budgets,
+            self.v_smoothing,
         )
 
 

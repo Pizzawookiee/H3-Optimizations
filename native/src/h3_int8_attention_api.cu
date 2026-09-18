@@ -48,8 +48,9 @@ void launch_sage_attn_kernel(
 
 void launch_sage_attn_sparse_kernel(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
-    const void *k_scale, const void *v_scale, const void *lut,
-    const void *valid_block_num, int lut_stride, int cta_q, int cta_k, int B,
+    const void *k_scale, const void *v_scale, const void *v_mean,
+    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    int cta_k, int B,
     int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
     int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
     int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
@@ -58,7 +59,8 @@ void launch_sage_attn_sparse_kernel(
 void launch_sage_attn_sparse_kernel_lse(
     const void *q, const void *k, const void *v, void *o, void *lse,
     const void *q_scale, const void *k_scale, const void *v_scale,
-    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    const void *v_mean, const void *lut, const void *valid_block_num,
+    int lut_stride, int cta_q,
     int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz,
     int q_st_n, int q_st_h, int k_st_bz, int k_st_n, int k_st_h,
     int v_st_bz, int v_st_h, int v_st_d, int o_st_bz, int o_st_n,
@@ -100,6 +102,15 @@ void launch_h3_quantize_bf16_rowwise_convrot256(
     const void *input, void *output, void *scales, int64_t rows,
     int64_t columns, cudaStream_t stream);
 
+
+bool launch_h3_fused_kv_cutlass(
+    const void *a, const void *b, const void *x_scale, const void *weight_scale,
+    const void *norm, const void *freqs, const void *anchor,
+    const void *anchor_index, void *k_out, void *k_scale, void *summary,
+    void *v_out, int64_t rows, int64_t hidden, int64_t full_rows,
+    int64_t k_start, int cta_k, int full_k_length, float epsilon,
+    cudaStream_t stream);
+
 bool launch_h3_fused_q_cutlass(
     const void *a, const void *b, const void *x_scale,
     const void *weight_scale, const void *norm, const void *freqs, void *debug,
@@ -114,6 +125,18 @@ void launch_quant_v_int8_kernel(const void *v, void *out, void *scale, int B,
 void launch_v_amax_chunk(const void *v, void *amax, int B, int H, int rows,
                          int D, int64_t sb, int64_t sh, int64_t sn,
                          int input_dtype_code, cudaStream_t stream);
+
+void launch_v_mean_amax_chunk(const void *v, void *means, void *amax,
+                              int B, int H, int rows, int row_start,
+                              int block_rows, int total_blocks, int D,
+                              int64_t sb, int64_t sh, int64_t sn,
+                              int input_dtype_code, cudaStream_t stream);
+
+void launch_quant_v_mean_chunk_into(
+    const void *v, const void *means, void *out, const void *scale, int B,
+    int H, int rows, int row_start, int block_rows, int total_blocks, int D,
+    int padded_N, int64_t sb, int64_t sh, int64_t sn, int input_dtype_code,
+    cudaStream_t stream);
 
 void launch_quant_v_chunk_into(const void *v, void *out, const void *scale,
                                int B, int H, int rows, int row_start, int D,
@@ -199,10 +222,27 @@ H3_API int h3_int8_sparse_attention(
     int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
     float sm_scale, int output_dtype_code, uintptr_t stream) noexcept {
   H3_GUARD(launch_sage_attn_sparse_kernel(
-      q, k, v, o, q_scale, k_scale, v_scale, lut, valid_block_num, lut_stride,
-      cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h,
-      k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n,
-      o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
+      q, k, v, o, q_scale, k_scale, v_scale, nullptr, lut, valid_block_num,
+      lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
+      q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
+      o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_sparse_attention_vmean(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, const void *v_mean,
+    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz,
+    int q_st_n, int q_st_h, int k_st_bz, int k_st_n, int k_st_h,
+    int v_st_bz, int v_st_h, int v_st_d, int o_st_bz, int o_st_n,
+    int o_st_h, int qs_st_bz, int qs_st_h, float sm_scale,
+    int output_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_sparse_kernel(
+      q, k, v, o, q_scale, k_scale, v_scale, v_mean, lut, valid_block_num,
+      lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
+      q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
+      o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
       reinterpret_cast<cudaStream_t>(stream)))
 }
 
@@ -216,11 +256,28 @@ H3_API int h3_int8_sparse_attention_lse(
     int o_st_h, int qs_st_bz, int qs_st_h, float sm_scale,
     int output_dtype_code, uintptr_t stream) noexcept {
   H3_GUARD(launch_sage_attn_sparse_kernel_lse(
-      q, k, v, o, lse, q_scale, k_scale, v_scale, lut, valid_block_num,
-      lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
-      q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
-      o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
-      reinterpret_cast<cudaStream_t>(stream)))
+      q, k, v, o, lse, q_scale, k_scale, v_scale, nullptr, lut,
+      valid_block_num, lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D,
+      q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h,
+      v_st_d, o_st_bz, o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale,
+      output_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_sparse_attention_lse_vmean(
+    const void *q, const void *k, const void *v, void *o, void *lse,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *v_mean, const void *lut, const void *valid_block_num,
+    int lut_stride, int cta_q, int cta_k, int B, int Lq, int Lk, int H_q,
+    int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h, int k_st_bz,
+    int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
+    float sm_scale, int output_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_sparse_kernel_lse(
+      q, k, v, o, lse, q_scale, k_scale, v_scale, v_mean, lut,
+      valid_block_num, lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D,
+      q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h,
+      v_st_d, o_st_bz, o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale,
+      output_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
 }
 
 H3_API int h3_int8_quantize_qk(
@@ -311,6 +368,40 @@ H3_API int h3_int8_fused_q(
   })
 }
 
+H3_API int h3_int8_fused_kv(
+    const void *activation, const void *weight, const void *activation_scale,
+    const void *weight_scale, const void *norm, const void *freqs,
+    const void *anchor, const void *anchor_index, void *k_out, void *k_scale,
+    void *summary, void *v_out, int64_t rows, int64_t hidden,
+    int64_t full_rows, int64_t k_start, int cta_k, int full_k_length,
+    float epsilon, uintptr_t stream) noexcept {
+  H3_GUARD({
+    if (!activation || !weight || !activation_scale || !weight_scale ||
+        !norm || !freqs || !anchor || !anchor_index || !k_out || !k_scale ||
+        !summary || !v_out) {
+      throw std::runtime_error("fused H3 K/V received a null pointer");
+    }
+    if (rows <= 0 || hidden <= 0 || full_rows <= 0 || k_start < 0 ||
+        k_start + rows > full_rows || (cta_k != 64 && cta_k != 128) ||
+        k_start % cta_k != 0 ||
+        (k_start + rows < full_rows && rows % 128 != 0) ||
+        rows > std::numeric_limits<int>::max() - 127 ||
+        hidden > std::numeric_limits<int>::max() ||
+        full_rows > std::numeric_limits<int>::max() ||
+        full_k_length <= 0 || !std::isfinite(epsilon) || epsilon <= 0.0f) {
+      throw std::runtime_error("fused H3 K/V received invalid geometry");
+    }
+    if (!launch_h3_fused_kv_cutlass(
+            activation, weight, activation_scale, weight_scale, norm, freqs,
+            anchor, anchor_index, k_out, k_scale, summary, v_out, rows, hidden,
+            full_rows, k_start, cta_k, full_k_length, epsilon,
+            reinterpret_cast<cudaStream_t>(stream))) {
+      throw std::runtime_error(
+          "exact 128x256 CUTLASS H3 K/V kernel rejected the request");
+    }
+  })
+}
+
 H3_API int h3_int8_quantize_v(const void *v, void *out, void *scale, int B, int H,
                        int N, int D, int padded_N, int64_t sb, int64_t sh,
                        int64_t sn, int input_dtype_code,
@@ -327,6 +418,26 @@ H3_API int h3_int8_v_amax_chunk(const void *v, void *amax, int B, int H,
   H3_GUARD(launch_v_amax_chunk(v, amax, B, H, rows, D, sb, sh, sn,
                                input_dtype_code,
                                reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_v_mean_amax_chunk(
+    const void *v, void *means, void *amax, int B, int H, int rows,
+    int row_start, int block_rows, int total_blocks, int D, int64_t sb,
+    int64_t sh, int64_t sn, int input_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_v_mean_amax_chunk(
+      v, means, amax, B, H, rows, row_start, block_rows, total_blocks, D, sb,
+      sh, sn, input_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_quantize_v_mean_chunk_into(
+    const void *v, const void *means, void *out, const void *scale, int B,
+    int H, int rows, int row_start, int block_rows, int total_blocks, int D,
+    int padded_N, int64_t sb, int64_t sh, int64_t sn, int input_dtype_code,
+    uintptr_t stream) noexcept {
+  H3_GUARD(launch_quant_v_mean_chunk_into(
+      v, means, out, scale, B, H, rows, row_start, block_rows, total_blocks,
+      D, padded_N, sb, sh, sn, input_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
 }
 
 H3_API int h3_int8_quantize_v_chunk_into(

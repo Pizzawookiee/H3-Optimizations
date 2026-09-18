@@ -1,0 +1,102 @@
+name: Build native NVIDIA libraries
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux CUDA shared library
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Build release library in the shipping container
+        working-directory: native
+        run: |
+          docker build -f Dockerfile.linux -t h3-int8-attention-linux-build .
+          container="$(docker create h3-int8-attention-linux-build)"
+          trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
+          mkdir -p bin
+          docker cp "${container}:/src/build/libh3_int8_attention.so" bin/libh3_int8_attention.so
+          test -s bin/libh3_int8_attention.so
+          test "$(wc -c < bin/libh3_int8_attention.so)" -lt $((50 * 1024 * 1024))
+          nm -D bin/libh3_int8_attention.so | grep -q 'h3_int8_sparse_attention_vmean'
+          nm -D bin/libh3_int8_attention.so | grep -q 'h3_int8_sparse_attention_lse_vmean'
+          nm -D bin/libh3_int8_attention.so | grep -q 'h3_int8_v_mean_amax_chunk'
+          nm -D bin/libh3_int8_attention.so | grep -q 'h3_int8_fused_kv'
+          nm -D bin/libh3_int8_attention.so | grep -q 'h3_int8_quantize_v_mean_chunk_into'
+
+      - name: Upload Linux library
+        uses: actions/upload-artifact@v4
+        with:
+          name: h3-int8-attention-linux
+          path: native/bin/libh3_int8_attention.so
+          if-no-files-found: error
+
+  windows:
+    name: Windows CUDA shared library
+    runs-on: windows-2022
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Install CUDA Toolkit 13.0.2
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.0.2'
+          method: 'network'
+          log-file-suffix: 'h3-windows-2022.txt'
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      - name: Verify CUDA toolchain
+        shell: pwsh
+        run: |
+          nvcc --version
+          cmake --version
+          ninja --version
+
+      - name: Build release library
+        shell: pwsh
+        run: |
+          cmake -S native -B native/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/build --parallel
+          New-Item -ItemType Directory -Force native/bin | Out-Null
+          Copy-Item native/build/h3_int8_attention.dll native/bin/h3_int8_attention_v5.dll -Force
+          if (-not (Test-Path native/bin/h3_int8_attention_v5.dll)) {
+            throw 'Windows native library was not produced'
+          }
+          $exports = dumpbin /EXPORTS native/bin/h3_int8_attention_v5.dll | Out-String
+          if ($exports -notmatch 'h3_int8_sparse_attention_vmean') {
+            throw 'Windows library is missing h3_int8_sparse_attention_vmean'
+          }
+          if ($exports -notmatch 'h3_int8_sparse_attention_lse_vmean') {
+            throw 'Windows library is missing h3_int8_sparse_attention_lse_vmean'
+          }
+          if ($exports -notmatch 'h3_int8_v_mean_amax_chunk') {
+            throw 'Windows library is missing h3_int8_v_mean_amax_chunk'
+          }
+          if ($exports -notmatch 'h3_int8_fused_kv') {
+            throw 'Windows library is missing h3_int8_fused_kv'
+          }
+          if ($exports -notmatch 'h3_int8_quantize_v_mean_chunk_into') {
+            throw 'Windows library is missing h3_int8_quantize_v_mean_chunk_into'
+          }
+
+      - name: Upload Windows library
+        uses: actions/upload-artifact@v4
+        with:
+          name: h3-int8-attention-windows
+          path: native/bin/h3_int8_attention_v5.dll
+          if-no-files-found: error

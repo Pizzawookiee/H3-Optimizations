@@ -89,6 +89,7 @@ from .plan import (
     EMBEDDING_MEMORY_STOCK,
     H3OptimizationPlan,
     V_MEMORY_RETAIN,
+    V_SMOOTH_H3,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
@@ -340,6 +341,7 @@ def _sparse_config_kwargs(plan):
         'late_kv': sparse.late_kv,
         'early_schedule': sparse.early_schedule,
         'step_video_budgets': sparse.step_video_budgets,
+        'v_smoothing': sparse.v_smoothing,
         'strict': True,
     }
 
@@ -883,22 +885,53 @@ def _resolve_kitchen_sparse(
         memory_optimize=plan.memory is not None,
         fp8_available=_fp8_execution_available(environment),
     )
+    if (
+        plan.sparse.v_smoothing == V_SMOOTH_H3
+        and (
+            not callable(getattr(kitchen, 'h3v_smooth_is_available', None))
+            or not kitchen.h3v_smooth_is_available()
+        )
+    ):
+        raise SparseKitchenError(
+            'H3V-Smooth requires the rebuilt vendored NVIDIA Kitchen sparse kernel'
+        )
     use_projected = qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
         QKV_STREAMED_BF16_KITCHEN,
         QKV_FORCE_CONVROT_INT8_KITCHEN,
         QKV_FORCE_BF16_STREAMED_KITCHEN,
     )
+    h3v_bounded = bool(
+        plan.sparse.v_smoothing == V_SMOOTH_H3
+        and qkv.provider_id in _BOUNDED_QKV_PROVIDERS
+    )
+    if h3v_bounded:
+        # H3V-Smooth needs the Kitchen streamed producer because its grouped
+        # per-head K/V layout must be established before sparse routing.  The
+        # generic bounded projectors preserve the same weight policy but do not
+        # expose that producer lifecycle.
+        use_projected = True
     config = HybridSparseConfig(
         mode=MODE_SAGE128_FUSED_QKV if use_projected else MODE_SAGE128,
         **_sparse_config_kwargs(plan),
     )
-    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
+    if qkv.provider_id in _BOUNDED_QKV_PROVIDERS and not h3v_bounded:
         projector = _bounded_qkv_projector(qkv)
     elif use_projected:
         projector = ChunkedKitchenQKVProjector(
+            chunk_rows=(
+                4096
+                if plan.memory is None
+                else _effective_qkv_chunk_rows(plan.memory.chunk_rows)
+            ),
             force_weights_bf16=(
-                qkv.provider_id == QKV_FORCE_BF16_STREAMED_KITCHEN
+                qkv.provider_id in (
+                    QKV_FORCE_BF16_STREAMED_KITCHEN,
+                    QKV_FORCE_BF16_CHUNKED,
+                )
+            ),
+            fp8_projection=(
+                qkv.provider_id == QKV_FORCE_FP8_CHUNKED
             ),
             routing_summaries=True,
             q_tile=q_tile,
@@ -906,16 +939,28 @@ def _resolve_kitchen_sparse(
             strided_qk_input=True,
             stream_output=True,
             convrot_int8_projection=(
-                qkv.provider_id == QKV_FORCE_CONVROT_INT8_KITCHEN
+                qkv.provider_id in (
+                    QKV_FORCE_CONVROT_INT8_KITCHEN,
+                    QKV_FORCE_CONVROT_INT8_CHUNKED,
+                )
             ),
             v_mode=(
                 V_MODE_RETAIN
                 if plan.memory is None
                 else plan.memory.attention_v_memory
             ),
+            v_smoothing=plan.sparse.v_smoothing,
         )
     else:
         projector = None
+    if (
+        plan.sparse.v_smoothing == V_SMOOTH_H3
+        and not isinstance(projector, ChunkedKitchenQKVProjector)
+    ):
+        raise SparseKitchenError(
+            'H3V-Smooth requires a streamed Kitchen QKV provider so grouped '
+            'K/V can be packed before sparse routing'
+        )
     # Reuse the disposable normalized input as the output buffer and project
     # query slices immediately. The non-projected fallback still uses the
     # sequence-major output and early carrier release below.
