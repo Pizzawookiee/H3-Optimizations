@@ -180,19 +180,29 @@ def normalized_v_means(means, v_scale):
     return (means.to(torch.float32) / scale).to(torch.bfloat16).contiguous()
 
 
-def _group_bounds(layout, block_rows):
+def _group_bounds(layout, block_rows, group_alignment=None):
     sequence = int(layout.seq_len)
     video_start, video_stop = (int(value) for value in layout.video_range)
     if video_stop != sequence:
         raise ValueError('H3V-Smooth requires target video to be the final segment')
-    # Match SparseTileRouter.pure_video_kv_start: the mixed prefix/video tile is
-    # left untouched and remains in the always-dense context region.
-    group_start = ((video_start + block_rows - 1) // block_rows) * block_rows
+    # Match SparseTileRouter.pure_video_kv_start, but also honor the producer's
+    # chunk alignment.  Kitchen's INT8 producer currently requires 128-row K
+    # chunks even for a 64-row KV tile, so starting grouping on only a 64-row
+    # boundary can split the prefix at e.g. 320 rows and make that non-final K
+    # chunk illegal.  Align to both constraints while keeping `block_rows` as
+    # the actual clustering / V-mean block size.
+    alignment = int(block_rows)
+    if group_alignment is not None:
+        group_alignment = int(group_alignment)
+        if group_alignment <= 0:
+            raise ValueError('H3V-Smooth group_alignment must be positive')
+        alignment = math.lcm(alignment, group_alignment)
+    group_start = ((video_start + alignment - 1) // alignment) * alignment
     return min(group_start, video_stop), video_stop
 
 
-def _state_signature(snapshot, layout, block_rows, heads, head_dim):
-    group_start, group_stop = _group_bounds(layout, block_rows)
+def _state_signature(snapshot, layout, block_rows, heads, head_dim, group_alignment=None):
+    group_start, group_stop = _group_bounds(layout, block_rows, group_alignment)
     return (
         int(getattr(snapshot, 'request_id', -1)),
         int(getattr(snapshot, 'total_steps', 0)),
@@ -204,6 +214,7 @@ def _state_signature(snapshot, layout, block_rows, heads, head_dim):
         int(head_dim),
         int(group_start),
         int(group_stop),
+        None if group_alignment is None else int(group_alignment),
     )
 
 
@@ -407,6 +418,7 @@ def resolve_h3v_grouping(
     project_v_head_rows,
     project_v_rows=None,
     cluster_rows=V_SMOOTH_CLUSTER_ROWS,
+    group_alignment=None,
 ):
     '''Build/reuse the per-head V-guided permutation for this H3 layer.
 
@@ -417,7 +429,7 @@ def resolve_h3v_grouping(
     block_rows = int(block_rows)
     heads = int(heads)
     head_dim = int(head_dim)
-    group_start, group_stop = _group_bounds(layout, block_rows)
+    group_start, group_stop = _group_bounds(layout, block_rows, group_alignment)
     grouped_rows = int(group_stop - group_start)
     if grouped_rows <= 0:
         identity = torch.empty((heads, 0), dtype=torch.int32)
@@ -427,7 +439,7 @@ def resolve_h3v_grouping(
         )
 
     signature = _state_signature(
-        snapshot, layout, block_rows, heads, head_dim
+        snapshot, layout, block_rows, heads, head_dim, group_alignment
     )
     with _CACHE_LOCK:
         state = _CACHE.get(module)

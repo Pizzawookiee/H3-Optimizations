@@ -309,11 +309,12 @@ def _run_streamed_sparse_kitchen_qkv(
                     project_v_rows=lambda start, end: project_v_hnd(
                         held, x, rope_freqs, start, end
                     ),
+                    group_alignment=int(spec.sequence_alignment),
                 )
             group_start = int(grouping.group_start)
-            if group_start % alignment:
+            if group_start % int(spec.sequence_alignment):
                 raise SparseKitchenError(
-                    'H3V-Smooth pure-video grouping boundary is not Kitchen aligned'
+                    'H3V-Smooth pure-video grouping boundary is not Kitchen producer aligned'
                 )
             grouping_permutation = grouping.to_device(x.device)
 
