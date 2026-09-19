@@ -12,9 +12,10 @@ prefix stays in stock order; only the pure-video tail (the region that H3 may
 sparsify) is grouped.  Q stays in stock order.
 
 To keep the low-VRAM streamed path, grouping never materializes a full BF16 V
-or a reordered BF16 K/V carrier.  It projects one V head in bounded row chunks,
-keeps only centroids/labels, stores the resulting permutation on CPU between
-steps, and lets the producer re-project K/V directly in grouped order.
+or a reordered BF16 K/V carrier.  The production path projects one bounded
+all-head V slab at a time, clusters in a compact feature space, stores only the
+resulting permutation/centroids between refreshes, and lets the producer
+re-project K/V directly in grouped order.
 '''
 
 from __future__ import annotations
@@ -33,6 +34,20 @@ V_SMOOTH_REUSE_STEPS = 4
 # well below the normal QKV chunk size avoids replacing QKV intermediates with a
 # large clustering intermediate.
 V_SMOOTH_CLUSTER_ROWS = 1024
+# Fast clustering path used when an all-head V projector is available.  The
+# permutation only needs a value-space neighborhood signal; doing nearest-
+# centroid assignment in the full 128-D head space against one centroid per
+# hardware block is prohibitively expensive on long video sequences.
+V_SMOOTH_FEATURE_DIM = 8
+# Skinny feature projection chunks can be much larger than full-V clustering
+# slabs because they produce only heads * feature_dim outputs.
+V_SMOOTH_FEATURE_ROWS = 8192
+V_SMOOTH_MAX_COARSE_CLUSTERS = 256
+V_SMOOTH_HEAD_BATCH = 8
+V_SMOOTH_CLUSTER_ALGO_VERSION = 3
+
+_FEATURE_PROJECTION_CACHE = {}
+_FEATURE_PROJECTION_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -57,7 +72,7 @@ class H3VGroupingPlan:
 @dataclass
 class _GroupingState:
     signature: tuple
-    centroids: torch.Tensor  # [heads, clusters, dim], FP32 CPU
+    centroids: torch.Tensor  # clustering centroids, FP32 CPU
     permutation: torch.Tensor  # [heads, rows], absolute int32 CPU
     refresh_step: int
 
@@ -85,24 +100,16 @@ def h3v_smooth_active(snapshot) -> bool:
 
 
 def h3v_grouping_refresh_due(snapshot, previous_refresh_step=None) -> bool:
-    '''Paper schedule: refresh in the first quarter, reuse for four steps.
+    '''Build one grouping per layer per sampling request, then reuse it.
 
-    A missing cached layout must be established even if execution first reaches
-    this layer outside the nominal grouping window.
+    The cache signature contains the request id / sequence geometry, so a new
+    generation naturally invalidates the previous grouping.  Re-clustering every
+    four denoising steps made the optimization slower than the attention itself
+    on long H3 video sequences and provides little value relative to the much
+    larger variation between transformer layers.
     '''
-    if snapshot is None:
-        return previous_refresh_step is None
-    step_index = int(getattr(snapshot, 'step_index', -1))
-    total_steps = int(getattr(snapshot, 'total_steps', 0))
-    if step_index < 0 or total_steps <= 0:
-        return previous_refresh_step is None
-    if previous_refresh_step is None:
-        return True
-    return bool(
-        h3v_smooth_active(snapshot)
-        and step_index % V_SMOOTH_REUSE_STEPS == 0
-        and step_index != int(previous_refresh_step)
-    )
+    del snapshot
+    return previous_refresh_step is None
 
 
 def _validate_v(v, block_rows):
@@ -215,6 +222,10 @@ def _state_signature(snapshot, layout, block_rows, heads, head_dim, group_alignm
         int(group_start),
         int(group_stop),
         None if group_alignment is None else int(group_alignment),
+        int(V_SMOOTH_CLUSTER_ALGO_VERSION),
+        int(V_SMOOTH_FEATURE_DIM),
+        int(V_SMOOTH_FEATURE_ROWS),
+        int(V_SMOOTH_MAX_COARSE_CLUSTERS),
     )
 
 
@@ -235,6 +246,43 @@ def _initial_centroid_rows(group_start, group_stop, clusters, device, head=0):
     ) % rows
     return (positions + group_start).to(torch.int32)
 
+
+
+def _feature_projection(head_dim, feature_dim, device):
+    """Deterministic Rademacher projection used only for clustering.
+
+    A small random-sign projection preserves broad value-space neighborhoods
+    while making nearest-centroid assignment far cheaper than the full head
+    dimension.  A private CPU generator keeps it deterministic without changing
+    PyTorch's global RNG state.
+    """
+    head_dim = int(head_dim)
+    feature_dim = max(1, min(int(feature_dim), head_dim))
+    key = (head_dim, feature_dim, str(device))
+    with _FEATURE_PROJECTION_LOCK:
+        cached = _FEATURE_PROJECTION_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(0x48335653 + head_dim * 131 + feature_dim * 17)
+    projection = torch.empty(
+        head_dim, feature_dim, dtype=torch.float32, device='cpu'
+    )
+    projection.bernoulli_(0.5, generator=generator)
+    projection.mul_(2.0).sub_(1.0).div_(math.sqrt(float(feature_dim)))
+    projection = projection.to(device=device, non_blocking=True).contiguous()
+    with _FEATURE_PROJECTION_LOCK:
+        _FEATURE_PROJECTION_CACHE[key] = projection
+    return projection
+
+
+def _cluster_features(values, feature_dim):
+    """Compress [..., head_dim] values into a small FP32 clustering space."""
+    if int(feature_dim) >= int(values.shape[-1]):
+        return values.to(torch.float32)
+    projection = _feature_projection(values.shape[-1], feature_dim, values.device)
+    return torch.matmul(values.to(torch.float32), projection)
 
 def _nearest_labels(values, centroids):
     '''Nearest-centroid labels with one bounded FP32 distance slab.'''
@@ -258,89 +306,150 @@ def _online_kmeans_heads(
     device,
     project_v_head_rows,
     project_v_rows,
+    project_v_features_rows=None,
     warm_centroids=None,
     cluster_rows=V_SMOOTH_CLUSTER_ROWS,
 ):
-    """Low-memory per-head k-means with one all-head V projection per slab.
+    """Fast low-memory per-head grouping for the streamed production path.
 
-    Clustering remains independent for every attention head.  Only projection is
-    shared: contiguous source rows are projected to all V heads once, then each
-    head's bounded [rows, clusters] distance matrix is processed sequentially.
-    This preserves the faithful per-head assignments while removing H separate
-    V GEMMs for every clustering slab.
+    The preferred path projects only a tiny set of V channels for every head
+    (8-D by default), so clustering never materializes a full 128-D V slab.
+    Providers that cannot expose a skinny projection fall back to the previous
+    full-V projection plus deterministic feature compression.  Labels stay
+    on the GPU for the full scan; only the final permutation and compact cached
+    centroids cross to CPU once per refresh.
+
+    Coarse clusters are intentionally allowed to contain multiple final 64/128-
+    row hardware blocks.  Stable sorting by coarse label still packs similar V
+    rows together, while avoiding one full k-means centroid per physical block.
     """
     rows = int(group_stop - group_start)
     heads = int(heads)
-    cluster_rows = max(1, int(cluster_rows))
-
-    centroids = torch.empty(
-        heads, clusters, head_dim, dtype=torch.float32, device=device
-    )
-    if warm_centroids is None:
-        # Seeds are head-specific, so the inexpensive initialization remains
-        # arbitrary-row.  The expensive full scan below is shared across heads.
-        for head in range(heads):
-            seed_rows = _initial_centroid_rows(
-                group_start, group_stop, clusters, device, head=head
-            )
-            centroids[head].copy_(
-                project_v_head_rows(head, seed_rows).to(torch.float32)
-            )
+    feature_dim = max(1, min(V_SMOOTH_FEATURE_DIM, int(head_dim)))
+    if project_v_features_rows is not None:
+        cluster_rows = max(1, int(V_SMOOTH_FEATURE_ROWS))
     else:
-        if tuple(warm_centroids.shape) != (heads, clusters, head_dim):
-            raise ValueError('cached H3V-Smooth centroid geometry changed')
-        centroids.copy_(warm_centroids.to(device=device, dtype=torch.float32))
+        cluster_rows = max(1, int(cluster_rows))
+    coarse_clusters = max(
+        1, min(int(clusters), V_SMOOTH_MAX_COARSE_CLUSTERS, cluster_rows, rows)
+    )
+    head_batch = max(1, min(V_SMOOTH_HEAD_BATCH, heads))
 
-    sums = torch.zeros_like(centroids)
-    counts = torch.zeros(heads, clusters, device=device, dtype=torch.int64)
-    labels_cpu = torch.empty(heads, rows, dtype=torch.int32, device='cpu')
+    centroids = None
+    if warm_centroids is not None:
+        expected = (heads, coarse_clusters, feature_dim)
+        if tuple(warm_centroids.shape) == expected:
+            centroids = warm_centroids.to(device=device, dtype=torch.float32)
+
+    sums = torch.zeros(
+        heads, coarse_clusters, feature_dim, dtype=torch.float32, device=device
+    )
+    counts = torch.zeros(
+        heads, coarse_clusters, dtype=torch.int32, device=device
+    )
+    labels_gpu = torch.empty(heads, rows, dtype=torch.int32, device=device)
 
     for relative_start in range(0, rows, cluster_rows):
         relative_stop = min(relative_start + cluster_rows, rows)
         absolute_start = group_start + relative_start
         absolute_stop = group_start + relative_stop
-        values_all = project_v_rows(absolute_start, absolute_stop)
-        if values_all.ndim == 4:
-            if int(values_all.shape[0]) != 1:
-                raise ValueError('H3V-Smooth all-head V projection batch must be 1')
-            values_all = values_all[0]
-        expected = (heads, relative_stop - relative_start, head_dim)
-        if tuple(values_all.shape) != expected:
-            raise ValueError(
-                'H3V-Smooth all-head V projection has shape %s, expected %s'
-                % (tuple(values_all.shape), expected)
+        if project_v_features_rows is not None:
+            features = project_v_features_rows(
+                absolute_start, absolute_stop, feature_dim
+            )
+            if features.ndim == 4:
+                if int(features.shape[0]) != 1:
+                    raise ValueError('H3V-Smooth skinny V projection batch must be 1')
+                features = features[0]
+            expected = (heads, relative_stop - relative_start, feature_dim)
+            if tuple(features.shape) != expected:
+                raise ValueError(
+                    'H3V-Smooth skinny V projection has shape %s, expected %s'
+                    % (tuple(features.shape), expected)
+                )
+            features = features.to(torch.float32)
+        else:
+            values_all = project_v_rows(absolute_start, absolute_stop)
+            if values_all.ndim == 4:
+                if int(values_all.shape[0]) != 1:
+                    raise ValueError('H3V-Smooth all-head V projection batch must be 1')
+                values_all = values_all[0]
+            expected = (heads, relative_stop - relative_start, head_dim)
+            if tuple(values_all.shape) != expected:
+                raise ValueError(
+                    'H3V-Smooth all-head V projection has shape %s, expected %s'
+                    % (tuple(values_all.shape), expected)
+                )
+            features = _cluster_features(values_all, feature_dim)
+            del values_all
+
+        if centroids is None:
+            slab_rows = int(features.shape[1])
+            if slab_rows < coarse_clusters:
+                raise ValueError('H3V-Smooth clustering slab is smaller than centroid count')
+            base = torch.linspace(
+                0, slab_rows - 1, coarse_clusters, device=device
+            ).round().to(torch.int64)
+            head_offsets = (
+                torch.arange(heads, device=device, dtype=torch.int64) * 17
+            ) % slab_rows
+            seed_idx = (base.unsqueeze(0) + head_offsets.unsqueeze(1)) % slab_rows
+            centroids = torch.gather(
+                features,
+                1,
+                seed_idx.unsqueeze(-1).expand(-1, -1, feature_dim),
+            ).contiguous()
+
+        for head_start in range(0, heads, head_batch):
+            head_stop = min(head_start + head_batch, heads)
+            values_f = features[head_start:head_stop]
+            center_f = centroids[head_start:head_stop]
+
+            x2 = (values_f * values_f).sum(dim=-1, keepdim=True)
+            c2 = (center_f * center_f).sum(dim=-1).unsqueeze(1)
+            distances = x2 + c2 - 2.0 * torch.bmm(
+                values_f, center_f.transpose(1, 2)
+            )
+            labels = torch.argmin(distances, dim=-1)
+            labels_gpu[head_start:head_stop, relative_start:relative_stop] = (
+                labels.to(torch.int32)
+            )
+            del distances, x2, c2
+
+            batch_heads = head_stop - head_start
+            offsets = (
+                torch.arange(batch_heads, device=device, dtype=torch.int64)
+                * coarse_clusters
+            ).unsqueeze(1)
+            flat_labels = (labels + offsets).reshape(-1)
+            sums_flat = sums[head_start:head_stop].reshape(
+                batch_heads * coarse_clusters, feature_dim
+            )
+            counts_flat = counts[head_start:head_stop].reshape(
+                batch_heads * coarse_clusters
+            )
+            sums_flat.index_add_(0, flat_labels, values_f.reshape(-1, feature_dim))
+            counts_flat.index_add_(
+                0, flat_labels, torch.ones_like(flat_labels, dtype=torch.int32)
             )
 
-        # Deliberately process heads one at a time so the FP32 distance workspace
-        # remains [cluster_rows, clusters], not [heads, cluster_rows, clusters].
-        for head in range(heads):
-            values = values_all[head]
-            labels = _nearest_labels(values, centroids[head])
-            values_f = values.to(torch.float32)
-            sums[head].index_add_(0, labels, values_f)
-            counts[head].index_add_(
-                0, labels, torch.ones_like(labels, dtype=torch.int64)
+            batch_counts = counts[head_start:head_stop]
+            updated = sums[head_start:head_stop] / batch_counts.clamp_min(1).unsqueeze(-1)
+            nonzero = batch_counts > 0
+            centroids[head_start:head_stop] = torch.where(
+                nonzero.unsqueeze(-1), updated, center_f
             )
-            nonzero = counts[head] > 0
-            centroids[head, nonzero] = (
-                sums[head, nonzero] / counts[head, nonzero].unsqueeze(-1)
-            )
-            labels_cpu[head, relative_start:relative_stop].copy_(
-                labels.to(device='cpu', dtype=torch.int32)
-            )
-            del values_f, labels, nonzero
-        del values_all
+            del labels, flat_labels, updated, nonzero
 
-    permutation_cpu = torch.empty(
-        heads, rows, dtype=torch.int32, device='cpu'
-    )
-    for head in range(heads):
-        permutation_cpu[head].copy_(
-            torch.argsort(labels_cpu[head], stable=True).to(torch.int32)
-            + int(group_start)
-        )
-    return centroids.to(device='cpu', dtype=torch.float32), permutation_cpu
+        del features
 
+    # One GPU sort and one GPU->CPU transfer per refresh, rather than one transfer
+    # for every head of every source slab.
+    permutation_gpu = torch.argsort(labels_gpu, dim=-1, stable=True).to(torch.int32)
+    permutation_gpu.add_(int(group_start))
+    permutation_cpu = permutation_gpu.to(device='cpu', dtype=torch.int32)
+    centroids_cpu = centroids.to(device='cpu', dtype=torch.float32)
+    return centroids_cpu, permutation_cpu
 
 def _online_kmeans_head(
     *,
@@ -417,6 +526,7 @@ def resolve_h3v_grouping(
     device,
     project_v_head_rows,
     project_v_rows=None,
+    project_v_features_rows=None,
     cluster_rows=V_SMOOTH_CLUSTER_ROWS,
     group_alignment=None,
 ):
@@ -450,15 +560,9 @@ def resolve_h3v_grouping(
 
     if refresh:
         clusters = max(1, int(math.ceil(grouped_rows / block_rows)))
-        centroids_cpu = torch.empty(
-            heads, clusters, head_dim, dtype=torch.float32, device='cpu'
-        )
-        permutation_cpu = torch.empty(
-            heads, grouped_rows, dtype=torch.int32, device='cpu'
-        )
-        if project_v_rows is not None:
+        if project_v_rows is not None or project_v_features_rows is not None:
             warm = None if state is None else state.centroids
-            centroids, permutation = _online_kmeans_heads(
+            centroids_cpu, permutation_cpu = _online_kmeans_heads(
                 heads=heads,
                 group_start=group_start,
                 group_stop=group_stop,
@@ -467,14 +571,19 @@ def resolve_h3v_grouping(
                 device=device,
                 project_v_head_rows=project_v_head_rows,
                 project_v_rows=project_v_rows,
+                project_v_features_rows=project_v_features_rows,
                 warm_centroids=warm,
                 cluster_rows=cluster_rows,
             )
-            centroids_cpu.copy_(centroids)
-            permutation_cpu.copy_(permutation)
         else:
             # Compatibility/reference path used by CPU tests and non-streamed
             # callers that only expose arbitrary one-head projection.
+            centroids_cpu = torch.empty(
+                heads, clusters, head_dim, dtype=torch.float32, device='cpu'
+            )
+            permutation_cpu = torch.empty(
+                heads, grouped_rows, dtype=torch.int32, device='cpu'
+            )
             for head in range(heads):
                 warm = None if state is None else state.centroids[head]
                 centroids, permutation = _online_kmeans_head(
@@ -516,6 +625,9 @@ __all__ = [
     'H3VGroupingPlan',
     'V_SMOOTH_ACTIVE_FRACTION',
     'V_SMOOTH_CLUSTER_ROWS',
+    'V_SMOOTH_FEATURE_DIM',
+    'V_SMOOTH_FEATURE_ROWS',
+    'V_SMOOTH_MAX_COARSE_CLUSTERS',
     'V_SMOOTH_REUSE_STEPS',
     'clear_h3v_grouping_cache',
     'demean_v_blocks_',

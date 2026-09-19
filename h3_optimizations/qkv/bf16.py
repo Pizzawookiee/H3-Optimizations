@@ -245,6 +245,27 @@ class HeldBF16QKV:
         v = v.view(end - start, self.attention.heads, self.attention.head_dim)
         return v.transpose(0, 1).unsqueeze(0)
 
+    def project_v_features_hnd(self, x, start, end, feature_dim):
+        """Project only a few evenly-spaced BF16 V channels per head."""
+        if self.weight is None:
+            raise RuntimeError('held BF16 QKV binding is not active')
+        heads = int(self.attention.heads)
+        dim = int(self.attention.head_dim)
+        feature_dim = max(1, min(int(feature_dim), dim))
+        inner = heads * dim
+        channels = [(i * dim) // feature_dim for i in range(feature_dim)]
+        indices = torch.tensor(
+            [inner * 2 + head * dim + channel
+             for head in range(heads) for channel in channels],
+            device=self.weight.device, dtype=torch.long,
+        )
+        weight = self.weight.index_select(0, indices)
+        bias = None if self.bias is None else self.bias.index_select(0, indices)
+        comfy.ops.run_every_op()
+        with diagnostics.stage('h3v_skinny_v_projection'):
+            projected = F.linear(x[start:end], weight, bias)
+        return projected.view(end - start, heads, feature_dim).permute(1, 0, 2).contiguous()
+
     def project_hnd(self, x, rope_freqs, start, end):
         rope = None if rope_freqs is None else rope_freqs[:, start:end]
         return self._finish(x[start:end], rope)

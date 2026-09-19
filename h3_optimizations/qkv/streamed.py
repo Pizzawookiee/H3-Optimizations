@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import torch
+
 from .bf16 import HeldBF16QKV
 from .formats import describe_linear
 from .fp8 import HeldFP8QKV
@@ -132,6 +134,32 @@ def project_grouped_v_hnd(held, x, rope_freqs, rows):
         v_out[0, head].copy_(v_head)
     return v_out
 
+
+def project_v_features_hnd(held, x, start, end, feature_dim):
+    """Project a skinny per-head V feature tensor for H3V grouping.
+
+    Providers may expose a true skinny projection that selects only a few V
+    output channels per head.  The fallback projects full V and slices evenly
+    spaced channels, preserving compatibility without changing native code.
+    Returns [heads, rows, feature_dim].
+    """
+    project = getattr(held, "project_v_features_hnd", None)
+    if callable(project):
+        return project(x, start, end, feature_dim)
+    v = project_v_hnd(held, x, None, start, end)
+    if v.ndim != 4 or int(v.shape[0]) != 1:
+        raise StreamedQKVBindingError(
+            "V feature fallback expects [1, heads, rows, dim]"
+        )
+    dim = int(v.shape[-1])
+    feature_dim = max(1, min(int(feature_dim), dim))
+    channels = torch.div(
+        torch.arange(feature_dim, device=v.device, dtype=torch.int64) * dim,
+        feature_dim,
+        rounding_mode="floor",
+    )
+    return v[0].index_select(-1, channels).contiguous()
+
 def project_v_hnd(held, x, rope_freqs, start, end):
     """Project V alone; two-pass staging requires this bounded row slice."""
     project_v = getattr(held, "project_v_hnd", None)
@@ -156,5 +184,6 @@ __all__ = [
     "project_kv_hnd",
     "project_q_hnd",
     "project_v_head_rows",
+    "project_v_features_hnd",
     "project_v_hnd",
 ]

@@ -317,6 +317,27 @@ class HeldConvRotINT8QKV:
         return v.transpose(0, 1).unsqueeze(0)
 
 
+    def project_v_features_hnd(self, x, start, end, feature_dim):
+        """Project only a few evenly-spaced V channels per head.
+
+        H3V-Smooth clustering only needs a compact value-space signal.  Packing
+        these disjoint output rows into one provider-native linear avoids the
+        full heads*head_dim V projection used by the previous clustering path.
+        """
+        heads = int(self.attention.heads)
+        dim = int(self.attention.head_dim)
+        feature_dim = max(1, min(int(feature_dim), dim))
+        inner = heads * dim
+        channels = [(i * dim) // feature_dim for i in range(feature_dim)]
+        ranges = []
+        for head in range(heads):
+            base = inner * 2 + head * dim
+            ranges.extend((base + channel, base + channel + 1) for channel in channels)
+        with diagnostics.stage('h3v_skinny_v_projection'):
+            projected = self.binding.linear_ranges(x[start:end], ranges)
+        return projected.view(end - start, heads, feature_dim).permute(1, 0, 2).contiguous()
+
+
     def _finish_k_head(self, projected, rope):
         seq = int(projected.shape[0])
         projected = projected.view(1, seq, 1, self.attention.head_dim)

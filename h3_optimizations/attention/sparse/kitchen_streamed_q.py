@@ -53,6 +53,7 @@ from ...qkv.streamed import (
     project_kv_hnd,
     project_q_hnd,
     project_v_head_rows,
+    project_v_features_hnd,
     project_v_hnd,
 )
 from .config import resolve_video_budget
@@ -309,6 +310,9 @@ def _run_streamed_sparse_kitchen_qkv(
                     project_v_rows=lambda start, end: project_v_hnd(
                         held, x, rope_freqs, start, end
                     ),
+                    project_v_features_rows=lambda start, end, feature_dim: (
+                        project_v_features_hnd(held, x, start, end, feature_dim)
+                    ),
                     group_alignment=int(spec.sequence_alignment),
                 )
             group_start = int(grouping.group_start)
@@ -449,7 +453,7 @@ def _run_streamed_sparse_kitchen_qkv(
             'refreshed': bool(grouping.refreshed),
             'refresh_step': int(grouping.refresh_step),
             'demean_active': bool(grouping.demean),
-            'reuse_steps': 4,
+            'reuse_steps': 'generation',
         }
 
     return StreamedSparseKitchenQKV(
