@@ -19,6 +19,7 @@ _MAX_INT = 2**31 - 1
 
 
 def fused_h3_kv_is_available(device=None):
+    """Structural availability of the direct grouped K/V producer."""
     if not torch.cuda.is_available():
         return False
     try:
@@ -27,10 +28,16 @@ def fused_h3_kv_is_available(device=None):
         library = loader.load()
     except (loader.NativeUnavailableError, RuntimeError):
         return False
-    if getattr(library, _SYMBOL, None) is None:
+    return getattr(library, _SYMBOL, None) is not None
+
+
+def fused_h3_kv_is_validated(device=None, *, force=False):
+    """Explicit parity test; never called by graph setup or normal inference."""
+    if not fused_h3_kv_is_available(device):
         return False
     from . import selftest
-    return selftest.fused_kv_check(device)
+
+    return selftest.fused_kv_check(device, force=force)
 
 
 def _tensor(name, value, *, dtype, device, dimensions=None):
@@ -132,4 +139,4 @@ def fused_h3_kv_from_int8(
     return v_out
 
 
-__all__ = ["fused_h3_kv_from_int8", "fused_h3_kv_is_available"]
+__all__ = ["fused_h3_kv_from_int8", "fused_h3_kv_is_available", "fused_h3_kv_is_validated"]

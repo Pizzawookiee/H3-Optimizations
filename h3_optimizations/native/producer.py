@@ -95,7 +95,11 @@ class Int8AttentionProducer:
 
 
 def int8_attention_producer_is_available(device=None):
-    """The producer is usable only when the consuming native kernel is proven."""
+    """Lightweight producer availability; numerical validation is explicit.
+
+    Keeping this structural is important because provider resolution calls it
+    while the sparse node is being installed.
+    """
     return int8_attention_is_available(device)
 
 

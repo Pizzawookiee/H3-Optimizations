@@ -32,8 +32,8 @@ from .convrot import (
     int8_rowwise_convrot256_is_available,
     quantize_int8_rowwise_convrot256,
 )
-from .fused_q import fused_h3_q_from_int8, fused_h3_q_is_available
-from .fused_kv import fused_h3_kv_from_int8, fused_h3_kv_is_available
+from .fused_q import fused_h3_q_from_int8, fused_h3_q_is_available, fused_h3_q_is_validated
+from .fused_kv import fused_h3_kv_from_int8, fused_h3_kv_is_available, fused_h3_kv_is_validated
 from .producer import (
     INT8_ATTENTION_PRODUCER_ABI_VERSION,
     SUPPORTS_STRIDED_QK_CHUNK,
@@ -76,8 +76,10 @@ __all__ = [
     'finalize_int8_attention_producer',
     'fused_h3_q_from_int8',
     'fused_h3_q_is_available',
+    'fused_h3_q_is_validated',
     'fused_h3_kv_from_int8',
     'fused_h3_kv_is_available',
+    'fused_h3_kv_is_validated',
     'int8_attention_from_prequantized',
     'int8_attention_is_available',
     'int8_attention_k_anchor_positions',

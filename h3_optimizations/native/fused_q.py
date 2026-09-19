@@ -18,7 +18,11 @@ _MAX_INT = 2**31 - 1
 
 
 def fused_h3_q_is_available(device=None):
-    """Whether this CUDA device can use the fixed CUTLASS producer."""
+    """Structural availability of the fixed CUTLASS Q producer.
+
+    Do not run the device parity suite here: this predicate is used on hot and
+    setup paths.  ``fused_h3_q_is_validated`` is the explicit diagnostic gate.
+    """
     if not torch.cuda.is_available():
         return False
     try:
@@ -27,11 +31,15 @@ def fused_h3_q_is_available(device=None):
         library = loader.load()
     except (loader.NativeUnavailableError, RuntimeError):
         return False
-    if getattr(library, _SYMBOL, None) is None:
+    return getattr(library, _SYMBOL, None) is not None
+
+
+def fused_h3_q_is_validated(device=None, *, force=False):
+    if not fused_h3_q_is_available(device):
         return False
     from . import selftest
 
-    return selftest.fused_q_check(device)
+    return selftest.fused_q_check(device, force=force)
 
 
 def _tensor(name, value, *, dtype, device, dimensions=None):

@@ -202,24 +202,22 @@ def _coarsen_64q_route_to_128q(route, kv_tiles):
 
 
 def _runtime_sparse_route(quantized, route, *, validate_geometry):
-    """Choose a geometry proven on this GPU, keeping Kitchen ahead of Triton."""
+    """Validate shipped geometry without running a synchronous GPU self-test.
+
+    Numerical parity tests remain available through ``native.selftest`` for
+    diagnostics/CI, but normal graph construction and first inference must not
+    execute the full validation suite.  The sparse kernels already validate
+    their runtime tensor/route contracts before launch.
+    """
     if not validate_geometry:
         return route
-    from . import selftest
 
-    device = quantized.q.device
-    q_tile, kv_tile = int(route.q_tile), int(route.kv_tile)
-    if selftest.sparse_geometry_check(q_tile, kv_tile, device):
+    geometry = (int(route.q_tile), int(route.kv_tile))
+    if geometry in SPARSE_GEOMETRIES:
         return route
-    if (q_tile, kv_tile) == (64, 64) and selftest.sparse_geometry_check(
-        128, 64, device
-    ):
-        kv_tiles = (int(quantized.k.shape[-2]) + 63) // 64
-        return _coarsen_64q_route_to_128q(route, kv_tiles)
     raise RuntimeError(
-        'native sparse geometry %dQ x %dKV failed its device self-test and no '
-        'carrier-compatible Kitchen fallback geometry is available'
-        % (q_tile, kv_tile)
+        'native sparse geometry %dQ x %dKV is not compiled into this build'
+        % geometry
     )
 
 
@@ -586,18 +584,30 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
 
 
 def int8_attention_is_available(device=None):
-    """Whether the vendored kernels can run here.
+    """Lightweight structural availability check for the vendored kernels.
 
-    Mirrors comfy_kitchen's predicate so callers can hold either module
-    without branching on which one they got.
+    This intentionally does *not* run the numerical self-test.  Availability is
+    queried while ComfyUI is resolving the sparse node, and the historical
+    self-test gate synchronously launched several attention kernels and CUDA
+    synchronizations there, making graph execution appear frozen.
     """
     if not torch.cuda.is_available():
         return False
     if not loader.is_available():
         return False
     capability = torch.cuda.get_device_capability(device)
-    if tuple(capability) < (7, 5):
+    return tuple(capability) >= (7, 5)
+
+
+def int8_attention_is_validated(device=None, *, force=False):
+    """Explicit numerical health check for diagnostics and CI.
+
+    Unlike ``int8_attention_is_available``, this can be expensive and may
+    synchronize the device.  No normal node-resolution or inference path calls
+    it implicitly.
+    """
+    if not int8_attention_is_available(device):
         return False
     from . import selftest
 
-    return selftest.check(device)
+    return selftest.check(device, force=force)
