@@ -121,6 +121,17 @@ void launch_quant_v_chunk_into(const void *v, void *out, const void *scale,
                                int64_t sn, int input_dtype_code,
                                cudaStream_t stream);
 
+void launch_h3_sparse_sage_sa2pp_sm89(
+    const void *q, const void *k, const void *v, void *output,
+    const void *lut, const void *valid, const void *pv_threshold,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    int batch, int q_length, int kv_length, int q_heads, int kv_heads,
+    int head_dim, int q_stride_b, int q_stride_n, int q_stride_h,
+    int k_stride_b, int k_stride_n, int k_stride_h,
+    int v_stride_b, int v_stride_h, int v_stride_d,
+    int o_stride_b, int o_stride_n, int o_stride_h,
+    float scale, int output_dtype_code, cudaStream_t stream);
+
 namespace {
 
 // One slot per thread: a failed call on one stream must not overwrite the
@@ -261,6 +272,24 @@ H3_API int h3_int8_quantize_qk_chunk(
       H_q, Lq, full_Lq, q_start, H_kv, Lk, full_Lk, k_start, C, cta_k,
       q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h, k_stride_n,
       input_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_sparse_sage_sa2pp_sm89(
+    const void *q, const void *k, const void *v, void *output,
+    const void *lut, const void *valid, const void *pv_threshold,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    int B, int Lq, int Lk, int H_q, int H_kv, int D,
+    int q_st_bz, int q_st_n, int q_st_h,
+    int k_st_bz, int k_st_n, int k_st_h,
+    int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h,
+    float sm_scale, int output_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_h3_sparse_sage_sa2pp_sm89(
+      q, k, v, output, lut, valid, pv_threshold, q_scale, k_scale, v_scale,
+      B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h,
+      k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d,
+      o_st_bz, o_st_n, o_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
 }
 
 H3_API int h3_int8_quantize_q_chunk(

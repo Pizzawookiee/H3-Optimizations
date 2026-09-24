@@ -93,10 +93,16 @@ def to_hnd(q, k, v):
 
 
 def _legacy_attention(module, q, k, v, transformer_options, attention=None):
-    attention_fn = (
-        attention if attention is not None else h3_model.optimized_attention
-    )
-    return attention_fn(
+    extra = {}
+    if attention is None:
+        attention = h3_model.optimized_attention
+        # Newer ComfyUI lets a checkpoint pick attention per block through
+        # Attention.comfy_attention; optimized_attention still ranks explicit
+        # overrides above it. Older cores have no such member.
+        preferred = getattr(module, 'comfy_attention', None)
+        if preferred is not None:
+            extra['preferred_attention'] = preferred
+    return attention(
         q,
         k,
         v,
@@ -105,6 +111,7 @@ def _legacy_attention(module, q, k, v, transformer_options, attention=None):
         skip_reshape=True,
         skip_output_reshape=True,
         transformer_options=transformer_options,
+        **extra,
     )
 
 

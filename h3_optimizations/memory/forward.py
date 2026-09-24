@@ -230,10 +230,8 @@ def make_forward(block, layer_index, config, original_forward=None):
                 'H3 Memory Optimization is inference-only; training requires '
                 'the original block forward'
             )
-
-        # Old ComfyUI does not pass an attention override. Newer ComfyUI may
-        # inject one through MiniMax H3 patches_replace (for example sparse/VSA
-        # attention), so preserve the old path while honoring the new contract.
+        # ComfyUI block replace patches (Fun Control, Block Sparse Attention)
+        # may substitute the attention callable for this block.
         attention = block.attn if attention is None else attention
 
         (

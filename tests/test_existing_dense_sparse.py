@@ -581,12 +581,7 @@ class ExistingDenseSparseSelectionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 apply_module,
-                'is_installed_dense_attention',
-                return_value=False,
-            ),
-            mock.patch.object(
-                apply_module,
-                'is_comfy_kitchen_dense_attention',
+                'is_replaceable_dense_attention',
                 return_value=False,
             ),
             mock.patch.object(
@@ -678,12 +673,7 @@ class ExistingDenseSparseSelectionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 apply_module,
-                'is_installed_dense_attention',
-                return_value=False,
-            ),
-            mock.patch.object(
-                apply_module,
-                'is_comfy_kitchen_dense_attention',
+                'is_replaceable_dense_attention',
                 return_value=False,
             ),
             mock.patch.object(

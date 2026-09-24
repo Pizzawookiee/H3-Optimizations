@@ -58,14 +58,20 @@ MLP_MEMORY_REQUESTS = (
 )
 
 SPARSE_BACKEND_AUTO = 'auto'
-SPARSE_BACKEND_SAGE = 'Sparse Sage'
-SPARSE_BACKEND_TRITON = 'BF16 Triton'
+SPARSE_BACKEND_SAGE = 'Sparse Sage (GPU-specific geometry)'
+SPARSE_BACKEND_SAGE_LEGACY = 'Sparse Sage'
+SPARSE_BACKEND_TRITON = 'BF16 Triton 64Q x 64KV'
+SPARSE_BACKEND_TRITON_BF16_LEGACY = 'BF16 Triton'
 SPARSE_BACKEND_TRITON_LEGACY = 'INT8 Triton'
-SPARSE_BACKEND_FLEX = 'FP8 FlexAttention'
-SPARSE_BACKEND_FROST = 'FROST BF16 (SM89)'
-SPARSE_BACKEND_KITCHEN = 'Kitchen INT8'
-SPARSE_BACKEND_KITCHEN_64X128 = 'Kitchen INT8 64x128 (experimental)'
+SPARSE_BACKEND_FLEX = 'FP8 FlexAttention 64Q x 64KV'
+SPARSE_BACKEND_FLEX_LEGACY = 'FP8 FlexAttention'
+SPARSE_BACKEND_FROST = 'FROST BF16 64Q x 64KV (SM89)'
+SPARSE_BACKEND_FROST_LEGACY = 'FROST BF16 (SM89)'
+SPARSE_BACKEND_KITCHEN = 'Kitchen INT8 64Q x 64KV (Quality)'
+SPARSE_BACKEND_KITCHEN_64X128 = 'Kitchen INT8 64Q x 128KV (Faster)'
+SPARSE_BACKEND_KITCHEN_64X64_LEGACY = 'Kitchen INT8'
 SPARSE_BACKEND_KITCHEN_LEGACY = 'Kitchen INT8 (experimental)'
+SPARSE_BACKEND_KITCHEN_64X128_LEGACY = 'Kitchen INT8 64x128 (experimental)'
 SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_SAGE,
@@ -99,8 +105,14 @@ KITCHEN_V_MEMORY_TWO_PASS = V_MEMORY_TWO_PASS
 KITCHEN_V_MEMORY_REQUESTS = V_MEMORY_REQUESTS
 SPARSE_BACKEND_COMPAT_REQUESTS = (
     *SPARSE_BACKEND_REQUESTS,
+    SPARSE_BACKEND_KITCHEN_64X64_LEGACY,
     SPARSE_BACKEND_KITCHEN_LEGACY,
+    SPARSE_BACKEND_KITCHEN_64X128_LEGACY,
+    SPARSE_BACKEND_SAGE_LEGACY,
+    SPARSE_BACKEND_TRITON_BF16_LEGACY,
     SPARSE_BACKEND_TRITON_LEGACY,
+    SPARSE_BACKEND_FLEX_LEGACY,
+    SPARSE_BACKEND_FROST_LEGACY,
 )
 SPARSE_BACKEND_PUBLIC_REQUESTS = (
     SPARSE_BACKEND_KITCHEN,
@@ -250,10 +262,24 @@ class SparseRequest:
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
-        if self.backend == SPARSE_BACKEND_KITCHEN_LEGACY:
+        if self.backend in (
+            SPARSE_BACKEND_KITCHEN_64X64_LEGACY,
+            SPARSE_BACKEND_KITCHEN_LEGACY,
+        ):
             object.__setattr__(self, 'backend', SPARSE_BACKEND_KITCHEN)
-        if self.backend == SPARSE_BACKEND_TRITON_LEGACY:
+        if self.backend == SPARSE_BACKEND_KITCHEN_64X128_LEGACY:
+            object.__setattr__(self, 'backend', SPARSE_BACKEND_KITCHEN_64X128)
+        if self.backend == SPARSE_BACKEND_SAGE_LEGACY:
+            object.__setattr__(self, 'backend', SPARSE_BACKEND_SAGE)
+        if self.backend in (
+            SPARSE_BACKEND_TRITON_BF16_LEGACY,
+            SPARSE_BACKEND_TRITON_LEGACY,
+        ):
             object.__setattr__(self, 'backend', SPARSE_BACKEND_TRITON)
+        if self.backend == SPARSE_BACKEND_FLEX_LEGACY:
+            object.__setattr__(self, 'backend', SPARSE_BACKEND_FLEX)
+        if self.backend == SPARSE_BACKEND_FROST_LEGACY:
+            object.__setattr__(self, 'backend', SPARSE_BACKEND_FROST)
         if self.backend not in SPARSE_BACKEND_REQUESTS:
             raise ValueError('unknown sparse backend request %r' % self.backend)
         if self.early_schedule not in EARLY_SCHEDULE_OPTIONS:

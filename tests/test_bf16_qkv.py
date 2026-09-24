@@ -132,6 +132,60 @@ class ChunkedBF16QKVContracts(unittest.TestCase):
         self.assertTrue(calls[0][1]['skip_reshape'])
         self.assertTrue(calls[0][1]['skip_output_reshape'])
 
+    def test_existing_attention_forwards_checkpoint_preference(self):
+        calls = []
+
+        def attention(*args, **kwargs):
+            calls.append(kwargs)
+            return args[0]
+
+        preferred = SimpleNamespace(function=None)
+        q = torch.empty((1, 2, 3, 4), dtype=torch.bfloat16)
+        with mock.patch(
+            'h3_optimizations.attention_forward.h3_model.optimized_attention',
+            side_effect=attention,
+        ):
+            _legacy_attention(
+                SimpleNamespace(heads=2, comfy_attention=preferred), q, q, q, {},
+            )
+            _legacy_attention(SimpleNamespace(heads=2), q, q, q, {})
+        _legacy_attention(
+            SimpleNamespace(heads=2, comfy_attention=preferred), q, q, q, {},
+            attention=attention,
+        )
+
+        self.assertIs(calls[0]['preferred_attention'], preferred)
+        self.assertNotIn('preferred_attention', calls[1])
+        self.assertNotIn('preferred_attention', calls[2])
+
+    def test_checkpoint_selected_attention_is_dispatched(self):
+        import comfy.ldm.modules.attention as comfy_attention
+
+        if not hasattr(comfy_attention, 'ComfyAttention'):
+            self.skipTest('installed ComfyUI has no per-block attention preference')
+        selected = []
+
+        def checkpoint_backend(q, *_args, **_kwargs):
+            selected.append(True)
+            return q
+
+        preference = comfy_attention.ComfyAttention()
+        preference.function = checkpoint_backend
+        module = SimpleNamespace(heads=2, comfy_attention=preference)
+        q = torch.randn((1, 2, 3, 4))
+
+        self.assertIs(_legacy_attention(module, q, q, q, {}), q)
+        self.assertEqual(selected, [True])
+
+        def explicit_override(func, q, *_args, **_kwargs):
+            return q + 1
+
+        out = _legacy_attention(
+            module, q, q, q, {'optimized_attention_override': explicit_override},
+        )
+        torch.testing.assert_close(out, q + 1)
+        self.assertEqual(selected, [True])
+
     def test_default_chunk_rows_is_4096(self):
         projector = ChunkedBF16QKVProjector()
         self.assertEqual(CHUNK_ROWS, 4096)

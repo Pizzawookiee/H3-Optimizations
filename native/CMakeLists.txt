@@ -42,7 +42,40 @@ endif()
 message(STATUS "H3 INT8 attention architectures: ${H3_CUDA_ARCHS}")
 set(CMAKE_CUDA_ARCHITECTURES ${H3_CUDA_ARCHS})
 
+add_library(h3_sparse_sage_sm89 OBJECT
+    src/sparge_attention/sm89_sparse_sage_sa2pp.cu
+)
+target_include_directories(h3_sparse_sage_sm89 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sparge_attention
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sparge_attention/qattn
+)
+target_compile_options(h3_sparse_sage_sm89 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=177>
+)
+set_target_properties(h3_sparse_sage_sm89 PROPERTIES
+    CUDA_ARCHITECTURES 89-real
+    CUDA_RUNTIME_LIBRARY Static
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
+)
+if(MSVC)
+    target_compile_options(h3_sparse_sage_sm89 PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHs>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    )
+else()
+    target_compile_options(h3_sparse_sage_sm89 PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fvisibility=hidden,-ffunction-sections,-fdata-sections>
+    )
+    set_target_properties(h3_sparse_sage_sm89 PROPERTIES
+        CUDA_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES
+    )
+endif()
+
 add_library(h3_int8_attention SHARED
+    $<TARGET_OBJECTS:h3_sparse_sage_sm89>
     src/h3_int8_attention_api.cu
     src/convrot_quantize.cu
     src/h3_fused_q_cutlass.cu

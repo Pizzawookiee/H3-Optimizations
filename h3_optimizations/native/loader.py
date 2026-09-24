@@ -184,6 +184,14 @@ def _bind(library):
         fused_q.restype = i
         fused_q.argtypes = [p] * 9 + [i64] * 3 + [i, f, sz]
 
+    try:
+        sparse_sage_sa2pp = library.h3_sparse_sage_sa2pp_sm89
+    except AttributeError:
+        pass
+    else:
+        sparse_sage_sa2pp.restype = i
+        sparse_sage_sa2pp.argtypes = [p] * 10 + [i] * 18 + [f, i, sz]
+
     library.h3_int8_quantize_v.restype = i
     library.h3_int8_quantize_v.argtypes = [p, p, p] + [i] * 5 + [i64] * 3 + [i, sz]
     return library

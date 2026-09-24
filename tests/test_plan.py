@@ -24,8 +24,11 @@ from h3_optimizations.plan import (  # noqa: E402
     MLP_MEMORY_PRESERVE,
     MemoryRequest,
     SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_FLEX,
+    SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128,
+    SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     SparseRequest,
     VIDEO_TOKEN_ORDER_1X8X8,
@@ -105,14 +108,32 @@ class PlanTests(unittest.TestCase):
         )
 
     def test_legacy_kitchen_label_is_normalized(self):
-        request = SparseRequest(backend='Kitchen INT8 (experimental)')
-        self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN)
-        self.assertIn(SPARSE_BACKEND_KITCHEN, request.signature)
+        for label in ('Kitchen INT8', 'Kitchen INT8 (experimental)'):
+            with self.subTest(label=label):
+                request = SparseRequest(backend=label)
+                self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN)
+                self.assertIn(SPARSE_BACKEND_KITCHEN, request.signature)
+
+        request = SparseRequest(backend='Kitchen INT8 64x128 (experimental)')
+        self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN_64X128)
+        self.assertIn(SPARSE_BACKEND_KITCHEN_64X128, request.signature)
 
     def test_rectangular_kitchen_geometry_is_an_explicit_request(self):
         request = SparseRequest(backend=SPARSE_BACKEND_KITCHEN_64X128)
         self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN_64X128)
         self.assertIn(SPARSE_BACKEND_KITCHEN_64X128, request.signature)
+
+    def test_legacy_backend_labels_are_normalized(self):
+        cases = (
+            ('Sparse Sage', SPARSE_BACKEND_SAGE),
+            ('BF16 Triton', SPARSE_BACKEND_TRITON),
+            ('INT8 Triton', SPARSE_BACKEND_TRITON),
+            ('FP8 FlexAttention', SPARSE_BACKEND_FLEX),
+            ('FROST BF16 (SM89)', SPARSE_BACKEND_FROST),
+        )
+        for label, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(SparseRequest(backend=label).backend, expected)
 
     def test_explicit_sparse_schedule_is_part_of_request_identity(self):
         request = SparseRequest(

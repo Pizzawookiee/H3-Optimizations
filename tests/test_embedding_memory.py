@@ -44,10 +44,10 @@ class Patcher:
 
 
 class EmbeddingMemoryTests(unittest.TestCase):
-    def _model(self):
+    def _model(self, num_layers=0):
         model = MiniMaxH3Model(
             hidden_size=32,
-            num_layers=0,
+            num_layers=num_layers,
             token_refiner_num_layers=0,
             num_attention_heads=1,
             attention_head_dim=32,
@@ -65,6 +65,12 @@ class EmbeddingMemoryTests(unittest.TestCase):
             parameter.detach().copy_(torch.randn_like(parameter) * 0.02)
         model.rope.inv_freq.copy_(torch.rand_like(model.rope.inv_freq))
         return model
+
+    def _generation(self, model):
+        try:
+            return embedding._validate_upstream_forward(model._forward)
+        except embedding.H3EmbeddingMemoryPatchError:
+            self.skipTest('installed ComfyUI H3 _forward keeps stock embedding lifetime')
 
     def _inputs(self):
         video = torch.randn(1, 24, 2, 4, 4) * 0.1
@@ -100,7 +106,7 @@ class EmbeddingMemoryTests(unittest.TestCase):
                 context,
                 minimax_payload=payload,
             )
-            actual = embedding.make_forward(model, model._forward)(
+            actual = embedding.make_forward(model, model._forward, self._generation(model))(
                 x,
                 timestep,
                 context,
@@ -111,6 +117,33 @@ class EmbeddingMemoryTests(unittest.TestCase):
 
         self.assertEqual(len(captured), 2)
         self.assertTrue(torch.equal(captured[0], captured[1]))
+        self.assertTrue(torch.equal(expected[0], actual[0]))
+        self.assertTrue(torch.equal(expected[1], actual[1]))
+
+    def test_release_forward_matches_block_replace_contract(self):
+        model = self._model(num_layers=1).requires_grad_(False)
+        x, timestep, context, payload = self._inputs()
+        seen = []
+
+        def block_patch(args, extra):
+            options = args['transformer_options']
+            seen.append((
+                sorted(args),
+                options.get('block_index'),
+                options.get('minimax_h3_layout') is not None,
+            ))
+            return extra['original_block'](args)
+
+        def run(forward):
+            options = {'patches_replace': {'dit': {('double_block', 0): block_patch}}}
+            with torch.inference_mode():
+                return forward(x, timestep, context, transformer_options=options, minimax_payload=payload)
+
+        expected = run(model._forward)
+        actual = run(embedding.make_forward(model, model._forward, self._generation(model)))
+
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])
         self.assertTrue(torch.equal(expected[0], actual[0]))
         self.assertTrue(torch.equal(expected[1], actual[1]))
 
@@ -141,7 +174,7 @@ class EmbeddingMemoryTests(unittest.TestCase):
         patcher = Patcher(self._model())
         installed = embedding.install(patcher)
 
-        # Per-row mask support arrived with the Comfy H3 forward we currently
+        # Per-row mask support arrived with the Comfy H3 forwards we currently
         # ship the static early-release implementation for. Older 0.33-era H3
         # implementations are intentionally recognized as stock-lifetime only.
         if hasattr(minimax, 'mask_row_values'):

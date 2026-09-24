@@ -195,15 +195,15 @@ def test_advanced_node_schema_and_request():
     )
     backend = input_by_id(schema, 'backend')
     check(
-        backend.default == 'Kitchen INT8'
+        backend.default == 'Kitchen INT8 64Q x 64KV (Quality)'
         and backend.options
         == [
-            'Kitchen INT8',
-            'Kitchen INT8 64x128 (experimental)',
-            'FROST BF16 (SM89)',
-            'Sparse Sage',
-            'BF16 Triton',
-            'FP8 FlexAttention',
+            'Kitchen INT8 64Q x 64KV (Quality)',
+            'Kitchen INT8 64Q x 128KV (Faster)',
+            'FROST BF16 64Q x 64KV (SM89)',
+            'Sparse Sage (GPU-specific geometry)',
+            'BF16 Triton 64Q x 64KV',
+            'FP8 FlexAttention 64Q x 64KV',
         ],
         'advanced backend selector exposes the supported sparse backends',
     )
@@ -264,7 +264,7 @@ def test_advanced_node_schema_and_request():
     request = apply.call_args.args[1].sparse
     check(
         result.args[0] is patched
-        and request.backend == 'BF16 Triton'
+        and request.backend == 'BF16 Triton 64Q x 64KV'
         and request.video_budget == 0.3
         and request.early_steps == 3
         and request.early_kv == 0.6

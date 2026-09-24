@@ -340,6 +340,48 @@ class MemoryTests(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(actual).all())
 
+    def test_block_replace_attention_substitutes_block_attention(self):
+        # ComfyUI 0.35+ block replace patches pass attention=; older cores
+        # never do, so the stock reference installs it as block.attn instead.
+        class HalfAttention(torch.nn.Module):
+            def forward(self, h, rope_freqs=None, transformer_options={}):
+                return h * 0.5
+
+        torch.manual_seed(4)
+        block = self._make_block()
+        x = torch.randn(19, 32) * 0.1
+        t_emb = torch.randn(1, 24) * 0.1
+        segments = [(0, 5, 0), (5, 13, 1), (13, 19, 2)]
+        config = ActivationMemoryConfig(mode=MODE_NATIVE, chunk_rows=8, alignment=4)
+        patched = make_forward(block, 0, config)
+
+        stock_attention = block.attn
+        block.attn = HalfAttention()
+        try:
+            expected = type(block).forward(
+                block, x.clone(), t_emb, segments, rope_freqs=None, transformer_options={},
+            )
+        finally:
+            block.attn = stock_attention
+
+        actual = patched(
+            x.clone(), t_emb, segments, rope_freqs=None, transformer_options={},
+            attention=HalfAttention(),
+        )
+        self.assertTrue(
+            torch.allclose(actual, expected, rtol=1e-5, atol=2e-6)
+        )
+        unchanged = patched(
+            x.clone(), t_emb, segments, rope_freqs=None, transformer_options={},
+            attention=None,
+        )
+        reference = block.forward(
+            x.clone(), t_emb, segments, rope_freqs=None, transformer_options={},
+        )
+        self.assertTrue(
+            torch.allclose(unchanged, reference, rtol=1e-5, atol=2e-6)
+        )
+
     def test_oversized_chunk_uses_one_upstream_mlp_call_without_held_path(self):
         torch.manual_seed(36)
         block = self._make_block()

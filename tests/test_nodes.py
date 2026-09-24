@@ -96,26 +96,33 @@ class NodeTests(unittest.TestCase):
             ],
         )
         backend = input_by_id(advanced, 'backend')
-        self.assertEqual(backend.default, 'Kitchen INT8')
+        self.assertEqual(backend.default, 'Kitchen INT8 64Q x 64KV (Quality)')
         self.assertEqual(
             backend.options,
             [
-                'Kitchen INT8',
-                'Kitchen INT8 64x128 (experimental)',
-                'FROST BF16 (SM89)',
-                'Sparse Sage',
-                'BF16 Triton',
-                'FP8 FlexAttention',
+                'Kitchen INT8 64Q x 64KV (Quality)',
+                'Kitchen INT8 64Q x 128KV (Faster)',
+                'FROST BF16 64Q x 64KV (SM89)',
+                'Sparse Sage (GPU-specific geometry)',
+                'BF16 Triton 64Q x 64KV',
+                'FP8 FlexAttention 64Q x 64KV',
             ],
         )
-        self.assertIn('Kitchen INT8 64x64 is the default', advanced.description)
+        self.assertIn(
+            'Kitchen INT8 64Q x 64KV (Quality) is the default',
+            advanced.description,
+        )
         self.assertIn('Bypass this node', backend.tooltip)
         self.assertIn(
-            'BF16 Triton and FP8 FlexAttention use the same 64Q x 64KV',
+            'FROST BF16, BF16 Triton, and FP8 FlexAttention use 64Q x 64KV',
             backend.tooltip,
         )
-        self.assertIn('FROST BF16 uses 64Q x 64KV', backend.tooltip)
-        self.assertIn('Kitchen INT8 64x128 (experimental)', backend.options)
+        self.assertIn(
+            'Sparse Sage uses 128Q x 64KV on SM80/86/87/89/120 and 64Q x '
+            '128KV on SM90',
+            backend.tooltip,
+        )
+        self.assertIn('Kitchen INT8 64Q x 128KV (Faster)', backend.options)
         early_schedule = input_by_id(advanced, 'early_schedule')
         self.assertEqual(early_schedule.default, EARLY_SCHEDULE_RAMP)
         self.assertEqual(
@@ -145,6 +152,17 @@ class NodeTests(unittest.TestCase):
                 'Kitchen INT8 64x128 (experimental)'
             )
         )
+        for legacy_backend in (
+            'Sparse Sage',
+            'BF16 Triton',
+            'INT8 Triton',
+            'FP8 FlexAttention',
+            'FROST BF16 (SM89)',
+        ):
+            with self.subTest(legacy_backend=legacy_backend):
+                self.assertTrue(
+                    H3SparseAttentionAdvanced.validate_inputs(legacy_backend)
+                )
         self.assertIsInstance(
             H3SparseAttentionAdvanced.validate_inputs('not a backend'),
             str,

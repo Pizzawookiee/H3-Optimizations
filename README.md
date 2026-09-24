@@ -202,14 +202,16 @@ selector, and target-video token order.
 - Step counts above the displayed `1000` editing limit remain valid; only
   negative step counts are rejected.
 - If the early and late windows overlap, the denser requested budget wins.
-- **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
-  Sparse Sage, BF16 Triton, or FP8 FlexAttention.
+- **Sparse backend** labels fixed tile geometries directly. Sparse Sage is
+  architecture-selected: 128Q x 64KV on SM80/86/87/89/120 and 64Q x 128KV on
+  SM90.
 - **Video token order** defaults to **1x8x8**. The measured **1x16x4** and
   **4x4x4** geometries remain available as comparison arms, and **Raster (stock
   H3 order)** provides the unchanged H3 ordering baseline.
-- **Kitchen INT8 64x128 (experimental)** is an explicit image-quality arm that
-  keeps 64-row query routing while selecting 128-row KV tiles. Ordinary
-  Kitchen INT8 remains the 64x64 default.
+- **Kitchen INT8 64Q x 64KV (Quality)** is the default. **Kitchen INT8 64Q x
+  128KV (Faster)** keeps 64-row query routing while selecting coarser 128-row KV
+  tiles. It was faster in the measured SM89 full-block comparison, but can
+  change output quality and is not guaranteed to be faster on every GPU.
 
 The defaults preserve the existing **Hold** behavior: four early steps at 50%,
 a 15% middle budget, and no late override, matching a 20-step schedule. Choose
@@ -457,7 +459,7 @@ PyTorch attention. These checks use a non-64-divisible sequence, production-
 shaped strided HND inputs, NHD output, varying per-head/query-block routes, and
 delta route conversion. A missing library, unsupported architecture, or failed
 self-test retires AMD Sparse Kitchen and leaves the existing automatic fallback
-behavior in control. Explicitly selecting `Kitchen INT8` remains a hard
+behavior in control. Explicitly selecting either Kitchen INT8 geometry remains a hard
 requirement and reports the failure instead.
 
 RDNA2 uses a different fail-open adapter path and is not evidence for the native
@@ -520,10 +522,30 @@ fresh H3 execution callables. Package-owned keyed wrappers and clone callbacks
 are replaced rather than appended, so repeated cloning does not accumulate
 hooks.
 
-Explicit external attention overrides are preserved. Foreign block, attention,
-and FinalLayer patches are preserved per conflicting key; the conflicting H3
-sub-optimization is disabled and reported in status instead of overwriting the
-other patch.
+Explicit external attention overrides are preserved, except for the recognized
+dense implementations listed below. Foreign block, attention, and FinalLayer
+patches are preserved per conflicting key; the conflicting H3 sub-optimization
+is disabled and reported in status instead of overwriting the other patch.
+
+### Recognized dense attention that Sparse Attention replaces
+
+An explicit sparse backend request replaces an upstream attention override only
+when that override is identified as a known dense H3 kernel:
+
+- this pack's own installed dense backend
+- Comfy Kitchen INT8, whether selected by ComfyUI or by an external node
+- KJNodes' SageAttention patch (`PathchSageAttentionKJ` and the other KJNodes
+  nodes that install Sage through the same factory)
+
+Replacing one of these changes the attention kernel, not the semantics the
+workflow asked for, so the sparse node behaves exactly as it would over stock
+dense attention. Any other override is preserved and sparse attention is
+disabled instead, because an unidentified override may not be dense at all.
+
+Dense-only runs are unaffected: with no sparse request, H3 Memory Optimization
+still preserves these overrides and drives them through the streamed-H3 QKV
+contract below. Note also that the override is left in `transformer_options`
+when sparse replaces it, so it remains available as the runtime dense fallback.
 
 ### Spectrum forecast output
 

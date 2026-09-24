@@ -161,9 +161,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 'to the measured 1x8x8 geometry and can be restored to stock raster '
                 'order. Lower budgets are faster but can change the generated '
                 'result, and the quality cost depends on the prompt and where '
-                'attention is removed in the denoising schedule. Kitchen INT8 '
-                '64x64 is the default; FROST BF16, Sparse Sage, BF16 Triton, and '
-                'FP8 FlexAttention are available as explicit alternatives.'
+                'removed in the denoising schedule. Kitchen INT8 64Q x 64KV '
+                '(Quality) is the default; the other geometries and backends '
+                'are available as explicit alternatives.'
             ),
             search_aliases=[
                 'H3 sparse advanced',
@@ -235,15 +235,15 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     options=list(SPARSE_BACKEND_PUBLIC_REQUESTS),
                     default=SPARSE_BACKEND_KITCHEN,
                     tooltip=(
-                        'Kitchen INT8 uses the shipped native 64Q x 64KV path. '
-                        'Kitchen INT8 64x128 is an experimental image-quality '
-                        'arm with the same 64-row query routing but coarser '
-                        '128-row KV selections. '
-                        'FROST BF16 uses 64Q x 64KV routing and is available '
-                        'only on SM89. '
-                        'BF16 Triton and FP8 FlexAttention use the same 64Q x '
-                        '64KV routing geometry. Sparse Sage uses its installed '
-                        'kernel geometry. Each alternative is selected explicitly. '
+                        'Kitchen INT8 64Q x 64KV (Quality) is the default. '
+                        'Kitchen INT8 64Q x 128KV (Faster) was faster in the '
+                        'measured full-block SM89 comparison, but its coarser '
+                        'KV selections can change output quality and the speed '
+                        'gain is not guaranteed on every GPU. '
+                        'FROST BF16, BF16 Triton, and FP8 FlexAttention use '
+                        '64Q x 64KV routing. Sparse Sage uses 128Q x 64KV on '
+                        'SM80/86/87/89/120 and 64Q x 128KV on SM90. '
+                        'Each alternative is selected explicitly. '
                         'Explicit backend choices fail if that backend is '
                         'unavailable and do not switch to another backend. '
                         'Bypass this node to force dense attention.'

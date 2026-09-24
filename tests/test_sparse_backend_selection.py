@@ -767,7 +767,10 @@ class SparseBackendSelectionTests(unittest.TestCase):
 
         text = format_sparse_status(model)
         self.assertIn('Attention: FROST BF16 (SM89)', text)
-        self.assertIn('Requested sparse backend: FROST BF16 (SM89)', text)
+        self.assertIn(
+            'Requested sparse backend: FROST BF16 64Q x 64KV (SM89)',
+            text,
+        )
         self.assertNotIn('Sparse fallback:', text)
 
 
