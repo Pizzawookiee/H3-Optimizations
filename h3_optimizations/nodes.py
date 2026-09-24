@@ -1,5 +1,6 @@
 '''Composable production nodes for MiniMax H3 optimization.'''
 
+import logging
 import math
 
 from comfy_api.latest import io, ui
@@ -25,6 +26,21 @@ from .status import (
     format_memory_status,
     format_sparse_status,
 )
+from .vsa.node import is_vsa_checkpoint
+
+VSA_PASSTHROUGH_MESSAGE = (
+    'VSA-trained H3 checkpoint detected (to_gate_compress layers, e.g. FastH3). '
+    'H3 Sparse Attention passed the model through unchanged: this checkpoint was '
+    'trained on its own sparse pattern. Use H3 VSA Attention (FastH3) instead.'
+)
+
+
+def _vsa_passthrough(model):
+    """Leave VSA-trained checkpoints to the VSA node rather than re-routing them."""
+    if not is_vsa_checkpoint(model):
+        return None
+    logging.warning('[H3 Optimizations] %s', VSA_PASSTHROUGH_MESSAGE)
+    return io.NodeOutput(model, ui=ui.PreviewText(VSA_PASSTHROUGH_MESSAGE))
 
 # On a 20-step sampler, this eight-step ramp spends the same 2.4 cumulative
 # extra video-budget steps as the simple node's default normalized early ramp.
@@ -124,6 +140,9 @@ class H3SparseAttention(io.ComfyNode):
         video_budget=DEFAULT_VIDEO_BUDGET,
         denser_early_late_steps=True,
     ):
+        passthrough = _vsa_passthrough(model)
+        if passthrough is not None:
+            return passthrough
         plan = read_plan(model).with_sparse(
             SparseRequest(
                 video_budget=float(video_budget),
@@ -290,6 +309,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         early_schedule=_ADVANCED_DEFAULT_EARLY_SCHEDULE,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
     ):
+        passthrough = _vsa_passthrough(model)
+        if passthrough is not None:
+            return passthrough
         plan = read_plan(model).with_sparse(
             SparseRequest(
                 video_budget=float(video_budget),

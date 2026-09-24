@@ -177,6 +177,18 @@ def _bind(library):
         convrot.argtypes = [p] * 3 + [i64] * 2 + [sz]
 
     try:
+        sparse_tiles = library.h3_int8_sparse_attention_tiles
+    except AttributeError:
+        pass
+    else:
+        # Additive to ABI 4: sparse traversal with per-tile live KV counts.
+        sparse_tiles.restype = i
+        sparse_tiles.argtypes = (
+            attention_common + [p, p, p, i] + geometry + strides
+            + [i, i, f, i, sz]
+        )
+
+    try:
         fused_q = library.h3_int8_fused_q
     except AttributeError:
         pass

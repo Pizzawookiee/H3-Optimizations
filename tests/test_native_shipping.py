@@ -67,6 +67,7 @@ class NativeShippingTests(unittest.TestCase):
             b'h3_int8_v_amax_chunk',
             b'h3_int8_quantize_v_chunk_into',
             b'h3_sparse_sage_sa2pp_sm89',
+            b'h3_int8_sparse_attention_tiles',
         )
         for name in ('h3_int8_attention_v5.dll', 'libh3_int8_attention.so'):
             contents = (BIN_DIR / name).read_bytes()

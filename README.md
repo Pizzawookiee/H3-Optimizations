@@ -39,7 +39,7 @@ Restart ComfyUI after installing. The nodes appear under
 > Sparse Attention only if you want more speed and accept a quality tradeoff.
 > You normally do not need the AIMDO or Advanced nodes.**
 
-The pack exposes three normal optimization nodes plus one manual AIMDO residency
+The pack exposes four normal optimization nodes plus one manual AIMDO residency
 control:
 
 | Node | What it is for | Normal recommendation |
@@ -47,6 +47,7 @@ control:
 | **H3 Memory Optimization** | Reduces peak VRAM use during H3 generation | Add it and leave the defaults alone |
 | **H3 Sparse Attention** | Makes H3 faster by calculating less video attention | Use it when speed matters and you accept a quality/speed tradeoff |
 | **H3 Sparse Attention (Advanced)** | Gives manual control over sparse scheduling, backend, and token order | Use only when you know why you need the extra controls |
+| **H3 VSA Attention (FastH3)** | Reproduces the learned sparse pattern and coarse branch of VSA-trained H3 checkpoints | Use only with a FastH3/VSA-trained checkpoint and its trained keep percentage |
 | **H3 AIMDO Residency Limiter** | Manually controls how much of the H3 model DynamicVRAM keeps persistently resident in VRAM | Mainly for benchmarking, debugging AIMDO, or deliberately forcing low residency |
 
 H3 Memory Optimization, AIMDO Residency Limiter, and Sparse Attention are
@@ -131,6 +132,11 @@ memory use.
 
 **Use this to make H3 faster at the cost of potentially changing the result.**
 
+VSA-trained checkpoints such as FastH3 must use **H3 VSA Attention (FastH3)**
+instead. The normal Sparse Attention nodes detect their learned gate layers and
+pass the model through unchanged rather than applying a different sparse
+pattern.
+
 Sparse Attention reduces the amount of video-to-video attention H3 calculates.
 The lower the **Video attention budget**, the less video attention work is done.
 
@@ -153,6 +159,25 @@ whole video KV tile, while values above it saturate at the full video route.
 
 Text, reference conditioning, audio, non-video queries, and mixed boundary tiles
 remain dense.
+
+## H3 VSA Attention (FastH3)
+
+**Use this only with a VSA-trained MiniMax H3 checkpoint.** The node reproduces
+the checkpoint's trained 4x4x4 video tiling, top-k video-tile selection, dense
+text/audio prefix, and learned coarse attention branch. It rejects an ordinary
+H3 checkpoint instead of silently applying VSA semantics to incompatible
+weights.
+
+Set **Video tiles kept** to the checkpoint's trained value. FastH3 8-Step V2
+uses 20%, while FastH3 Preview v1 uses 10%. Dense-step and dense-layer controls
+retain the coarse branch and are diagnostic overrides, not the trained default.
+
+The default **Auto** backend runs a one-time numerical check on each GPU before
+using the shipped INT8 tile kernel. A missing or failing kernel logs a warning
+and falls back to BF16 Triton. The shipped CUDA binaries contain native targets
+for sm75, sm80, sm89, sm120, and Linux sm90a, plus a compute_89 PTX fallback;
+only sm89 has received a live GPU run for this VSA kernel. ROCm uses BF16 Triton
+because the AMD native library does not expose the VSA tile entry point.
 
 The normal node uses the measured **1x8x8** target-video order. It groups real
 tokens into router-aligned 64-token spatial tiles through every H3 DiT block and

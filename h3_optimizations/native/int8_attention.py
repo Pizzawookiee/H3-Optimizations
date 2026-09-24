@@ -526,6 +526,63 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
     return _finish(quantized, output), lse
 
 
+def sparse_tiles_attention_is_available():
+    """Whether the loaded binary carries the per-tile KV length traversal."""
+    try:
+        return hasattr(loader.load(), 'h3_int8_sparse_attention_tiles')
+    except loader.NativeUnavailableError:
+        return False
+
+
+def block_sparse_int8_attention_tiles_from_prequantized(
+    quantized,
+    route,
+    kv_tile_len,
+    *,
+    output_layout=OUTPUT_HND,
+):
+    """64Q x 64KV sparse attention over padded tiles.
+
+    ``kv_tile_len`` is int32 ``[kv_tiles]``: the live keys at the front of each
+    64-row tile. Keys past it are masked out of the softmax, so zero pad rows
+    never take probability mass.
+    """
+    library = loader.load()
+    if not hasattr(library, 'h3_int8_sparse_attention_tiles'):
+        raise loader.NativeUnavailableError(
+            'the loaded INT8 attention library has no per-tile KV length traversal'
+        )
+    if (int(route.q_tile), int(route.kv_tile)) != (64, 64) or quantized.cta_k != 64:
+        raise ValueError('per-tile KV lengths are built for 64Q x 64KV only')
+    kernel_route = _validate_sparse_route(quantized, route)
+    kv_tile_len = kv_tile_len.to(device=quantized.q.device, dtype=torch.int32).contiguous()
+    kv_tiles = (int(quantized.k.shape[-2]) + 63) // 64
+    if kv_tile_len.numel() != kv_tiles:
+        raise ValueError(
+            'kv_tile_len has %d entries for %d KV tiles' % (kv_tile_len.numel(), kv_tiles)
+        )
+
+    output, output_dtype, geometry, strides = _attention_geometry(
+        quantized, output_layout
+    )
+    with diagnostics.stage('sparse_attention_kernel'):
+        loader.check(
+            library.h3_int8_sparse_attention_tiles(
+                _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
+                _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
+                _ptr(quantized.v_scale), _ptr(kernel_route.indices),
+                _ptr(kernel_route.counts), _ptr(kv_tile_len),
+                kernel_route.indices.shape[-1],
+                *geometry, *strides,
+                quantized.q_scale.stride(0), quantized.q_scale.stride(1),
+                quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
+                _stream(),
+            ),
+            'sparse attention over padded tiles',
+        )
+    return _finish(quantized, output)
+
+
 def int8_attention_is_available(device=None):
     """Whether the vendored kernels can run here.
 

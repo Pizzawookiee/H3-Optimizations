@@ -61,6 +61,7 @@ from h3_optimizations.plan import (  # noqa: E402
     KITCHEN_V_MEMORY_TWO_PASS,
 )
 from h3_optimizations.public_nodes import H3OptimizationsExtension  # noqa: E402
+from h3_optimizations.vsa.node import H3VSAAttention  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -75,6 +76,7 @@ class PublicNodeTests(unittest.TestCase):
                 H3AIMDOResidencyLimiter,
                 H3SparseAttention,
                 H3SparseAttentionAdvanced,
+                H3VSAAttention,
             ],
         )
         self.assertFalse(any('MLPSharing' in node.__name__ for node in nodes))
