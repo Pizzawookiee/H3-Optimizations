@@ -114,6 +114,19 @@ class QKVStatusReadabilityTests(unittest.TestCase):
         )
         self.assertIn('Sol attention features: pooled tail', format_sparse_status(model))
 
+    def test_sol_attn_features_report_triton_token_aug(self):
+        self.status['sparse']['sol_attn_features'] = True
+        self.status['attention']['backend_details'] = {'sol_token_aug': 64}
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: self.status},
+            }
+        )
+        self.assertIn(
+            'Sol attention features: pooled tail + token aug 64',
+            format_sparse_status(model),
+        )
+
     def test_kitchen_attention_uses_a_readable_name(self):
         model = SimpleNamespace(
             model_options={

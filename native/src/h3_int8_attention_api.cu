@@ -78,6 +78,23 @@ void launch_sage_attn_sparse_kernel_lse(
 
 const char *sage_attn_sparse_route_encoding();
 
+void launch_h3_sol_features(
+    void *output, void *exact_lse,
+    const void *q, const void *k, const void *v,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *q_summary, const void *k_summary, const void *v_sum,
+    const void *k_offset, const void *route, const void *counts,
+    void *route_bits, void *group_q, void *pooled_out, void *pooled_lse,
+    void *group_ref, void *histogram, void *token_max, void *threshold,
+    void *selected_idx, void *selected_count, void *token_num, void *token_den,
+    int B, int Hq, int Hkv, int Lq, int Lk, int padded_k,
+    int NQ, int NK, int groups, int words, int route_slots,
+    int route_is_delta, int kv_tile, int cta_k, int token_budget,
+    int q_scales_per_head, int k_scales_per_head,
+    int summary_dtype_code, int output_dtype_code,
+    int64_t out_sb, int64_t out_sh, int64_t out_sn,
+    float attention_scale, cudaStream_t stream);
+
 void launch_quant_qk_per_thread_int8(
     const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
     void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ,
@@ -172,7 +189,7 @@ void set_error(const char *what) {
 
 extern "C" {
 
-H3_API int h3_int8_abi_version() noexcept { return 4; }
+H3_API int h3_int8_abi_version() noexcept { return 5; }
 
 H3_API const char *h3_int8_last_error() noexcept {
   return g_last_error.empty() ? "" : g_last_error.c_str();
@@ -395,6 +412,34 @@ H3_API int h3_int8_quantize_v_chunk_into(
   H3_GUARD(launch_quant_v_chunk_into(
       v, out, scale, B, H, rows, row_start, D, padded_N, sb, sh, sn,
       input_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_sol_features_merge(
+    void *output, void *exact_lse,
+    const void *q, const void *k, const void *v,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *q_summary, const void *k_summary, const void *v_sum,
+    const void *k_offset, const void *route, const void *counts,
+    void *route_bits, void *group_q, void *pooled_out, void *pooled_lse,
+    void *group_ref, void *histogram, void *token_max, void *threshold,
+    void *selected_idx, void *selected_count, void *token_num, void *token_den,
+    int B, int Hq, int Hkv, int Lq, int Lk, int padded_k,
+    int NQ, int NK, int groups, int words, int route_slots,
+    int route_is_delta, int kv_tile, int cta_k, int token_budget,
+    int q_scales_per_head, int k_scales_per_head,
+    int summary_dtype_code, int output_dtype_code,
+    int64_t out_sb, int64_t out_sh, int64_t out_sn,
+    float attention_scale, uintptr_t stream) noexcept {
+  H3_GUARD(launch_h3_sol_features(
+      output, exact_lse, q, k, v, q_scale, k_scale, v_scale,
+      q_summary, k_summary, v_sum, k_offset, route, counts, route_bits,
+      group_q, pooled_out, pooled_lse, group_ref, histogram, token_max,
+      threshold, selected_idx, selected_count, token_num, token_den,
+      B, Hq, Hkv, Lq, Lk, padded_k, NQ, NK, groups, words, route_slots,
+      route_is_delta, kv_tile, cta_k, token_budget, q_scales_per_head,
+      k_scales_per_head, summary_dtype_code, output_dtype_code,
+      out_sb, out_sh, out_sn, attention_scale,
+      reinterpret_cast<cudaStream_t>(stream)))
 }
 
 } // extern "C"

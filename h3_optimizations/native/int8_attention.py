@@ -599,3 +599,179 @@ def int8_attention_is_available(device=None):
     from . import selftest
 
     return selftest.check(device)
+
+
+def merge_sol_features_native_from_prequantized(
+    exact_output,
+    exact_lse2,
+    quantized,
+    route,
+    *,
+    q_summary,
+    k_summary,
+    v_sum,
+    k_offset,
+    token_budget=64,
+    output_layout=OUTPUT_HND,
+):
+    """Merge native pooled-tail + histogram token augmentation in-place.
+
+    H3's route remains authoritative.  The compiled stage consumes the route
+    complement, the existing Kitchen INT8 Q/K/V carriers, and the routing
+    summaries.  No second token-level Q/K carrier is created.
+    """
+    if output_layout not in OUTPUT_LAYOUTS:
+        raise ValueError('output_layout must be one of %s' % (OUTPUT_LAYOUTS,))
+    if exact_lse2.dtype != torch.float32 or not exact_lse2.is_contiguous():
+        raise TypeError('exact_lse2 must be contiguous float32')
+    if exact_output.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError('native Sol features require fp16 or bf16 exact output')
+    if quantized.original_head_dim != 128:
+        raise ValueError('native Sol features require head_dim 128')
+    if int(route.q_tile) != 64 or int(route.kv_tile) not in (64, 128):
+        raise ValueError('native Sol features require 64Q x {64,128}KV H3 routing')
+    if int(quantized.cta_k) not in (64, 128):
+        raise ValueError('native Sol features require a 64- or 128-row Kitchen K carrier')
+    if int(token_budget) < 0 or int(token_budget) > 256:
+        raise ValueError('token_budget must be between 0 and 256')
+
+    q_summary = q_summary.contiguous()
+    k_summary = k_summary.contiguous()
+    k_offset = k_offset.contiguous()
+    v_sum = v_sum.float().contiguous()
+    if q_summary.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError('Q summary dtype is unsupported')
+    if k_summary.dtype != q_summary.dtype or k_offset.dtype != q_summary.dtype:
+        raise TypeError('Q/K summaries and K offset must share a dtype')
+
+    q = quantized.q
+    k = quantized.k
+    v = quantized.v
+    if q.dtype != torch.int8 or k.dtype != torch.int8 or v.dtype != torch.int8:
+        raise TypeError('native Sol features require Kitchen INT8 carriers')
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 2:
+        raise ValueError('native Sol features received invalid carrier shapes')
+    batch, q_heads, q_length, head_dim = map(int, q.shape)
+    if tuple(exact_lse2.shape) != (batch, q_heads, q_length):
+        raise ValueError('exact LSE shape does not match Q carrier')
+    kb, kv_heads, k_length, kd = map(int, k.shape)
+    if kb != batch or kd != head_dim or head_dim != 128:
+        raise ValueError('native Sol features received incompatible Q/K carriers')
+    if q_heads % kv_heads:
+        raise ValueError('Q heads must be divisible by KV heads')
+
+    n_q = int(q_summary.shape[-2])
+    n_k = int(k_summary.shape[-2])
+    if n_q != (q_length + int(route.q_tile) - 1) // int(route.q_tile):
+        raise ValueError('Q summary count does not match the routed Q geometry')
+    if n_k != (k_length + int(route.kv_tile) - 1) // int(route.kv_tile):
+        raise ValueError('K summary count does not match the routed KV geometry')
+    if tuple(q_summary.shape[:2]) != (batch, q_heads):
+        raise ValueError('Q summaries do not match Q carrier heads')
+    if tuple(k_summary.shape[:2]) != (batch, kv_heads):
+        raise ValueError('K summaries do not match KV carrier heads')
+    if tuple(v_sum.shape) != (batch, kv_heads, n_k, head_dim):
+        raise ValueError('V sums do not match KV summary geometry')
+    if tuple(k_offset.shape) != (batch, kv_heads, head_dim):
+        raise ValueError('K offset does not match KV heads')
+
+    indices = route.indices.contiguous()
+    counts = route.counts.to(torch.int32).contiguous()
+    if indices.dtype != torch.int32:
+        indices = indices.to(torch.int32)
+    if tuple(indices.shape[:3]) != (batch, q_heads, n_q):
+        raise ValueError('route indices do not match Q summary geometry')
+    if tuple(counts.shape) != (batch, q_heads, n_q):
+        raise ValueError('route counts do not match Q summary geometry')
+    route_is_delta = 1 if route.encoding == 'delta' else 0
+
+    groups = (n_q + 1) // 2
+    words = (n_k + 31) // 32
+    device = q.device
+    route_bits = torch.zeros(
+        batch, q_heads, n_q, words, dtype=torch.int32, device=device
+    )
+    group_q = torch.empty(
+        batch, q_heads, groups, head_dim, dtype=torch.float32, device=device
+    )
+    pooled_out = torch.empty(
+        batch, q_heads, n_q, head_dim, dtype=torch.float32, device=device
+    )
+    pooled_lse = torch.empty(
+        batch, q_heads, n_q, dtype=torch.float32, device=device
+    )
+    group_ref = torch.full(
+        (batch, q_heads, groups), float('-inf'), dtype=torch.float32, device=device
+    )
+
+    budget = int(token_budget)
+    # Keep non-null scratch even when the budget is zero; the merge kernel has
+    # one code path and simply sees empty token states.
+    storage_budget = max(1, budget)
+    histogram = torch.zeros(
+        batch, q_heads, groups, 128, dtype=torch.int32, device=device
+    )
+    token_max = torch.full(
+        (batch, q_heads, groups), float('-inf'), dtype=torch.float32, device=device
+    )
+    threshold = torch.empty(
+        batch, q_heads, groups, dtype=torch.float32, device=device
+    )
+    selected_idx = torch.full(
+        (batch, q_heads, groups, storage_budget), -1,
+        dtype=torch.int32, device=device,
+    )
+    selected_count = torch.zeros(
+        batch, q_heads, groups, dtype=torch.int32, device=device
+    )
+    token_num = torch.zeros(
+        batch, q_heads, groups, head_dim, dtype=torch.float32, device=device
+    )
+    token_den = torch.zeros(
+        batch, q_heads, groups, dtype=torch.float32, device=device
+    )
+
+    q_tiles_128 = (q_length + 127) // 128
+    if quantized.q_scale.shape[-1] % q_tiles_128:
+        raise ValueError('Kitchen Q scale geometry is invalid')
+    q_scales_per_head = int(quantized.q_scale.shape[-1])
+    k_scales_per_head = int(quantized.k_scale.shape[-1])
+    padded_k = int(v.shape[-1])
+
+    if output_layout == OUTPUT_HND:
+        if tuple(exact_output.shape) != (batch, q_heads, q_length, head_dim):
+            raise ValueError('HND exact output has the wrong shape')
+        out_sb, out_sh, out_sn = (
+            int(exact_output.stride(0)), int(exact_output.stride(1)),
+            int(exact_output.stride(2)),
+        )
+    else:
+        if tuple(exact_output.shape) != (batch, q_length, q_heads, head_dim):
+            raise ValueError('NHD exact output has the wrong shape')
+        out_sb, out_sh, out_sn = (
+            int(exact_output.stride(0)), int(exact_output.stride(2)),
+            int(exact_output.stride(1)),
+        )
+
+    library = loader.load()
+    loader.check(
+        library.h3_int8_sol_features_merge(
+            _ptr(exact_output), _ptr(exact_lse2),
+            _ptr(q), _ptr(k), _ptr(v),
+            _ptr(quantized.q_scale), _ptr(quantized.k_scale), _ptr(quantized.v_scale),
+            _ptr(q_summary), _ptr(k_summary), _ptr(v_sum), _ptr(k_offset),
+            _ptr(indices), _ptr(counts),
+            _ptr(route_bits), _ptr(group_q), _ptr(pooled_out), _ptr(pooled_lse),
+            _ptr(group_ref), _ptr(histogram), _ptr(token_max), _ptr(threshold),
+            _ptr(selected_idx), _ptr(selected_count), _ptr(token_num), _ptr(token_den),
+            batch, q_heads, kv_heads, q_length, k_length, padded_k,
+            n_q, n_k, groups, words, int(indices.shape[-1]),
+            route_is_delta, int(route.kv_tile), int(quantized.cta_k), budget,
+            q_scales_per_head, k_scales_per_head,
+            _DTYPE_TO_CODE[q_summary.dtype], _DTYPE_TO_CODE[exact_output.dtype],
+            out_sb, out_sh, out_sn,
+            float(quantized.attention_scale), _stream(),
+        ),
+        'native Sol pooled-tail/token-augmentation merge',
+    )
+    return exact_output, exact_lse2

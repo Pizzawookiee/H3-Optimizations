@@ -20,7 +20,13 @@ from ...qkv.streamed import (
 )
 from .config import resolve_video_budget
 from .router import SparseRouterError
-from .sol_tail import tile_sum, exact_mask_from_compact, merge_pooled_tail
+from .sol_tail import (
+    SOL_TOKEN_AUG_BUDGET,
+    exact_mask_from_compact,
+    merge_attention_state,
+    tile_sum,
+    token_augmented_tail_state,
+)
 from .triton_route import (
     TritonRouteError,
     build_compact_absolute_route_chunk,
@@ -392,6 +398,41 @@ def execute_streamed_triton_bf16(module, backend, prepared):
                 prepared.route_plan.release()
                 prepared.route_plan = None
 
+            branch_output = branch_lse2 = exact_mask = None
+            if backend.config.sol_attn_features:
+                local_q_tiles = int(q_summary.shape[-2])
+                global_q_tile_start = start // Q_TILE
+                local_dense = max(
+                    0,
+                    min(
+                        global_q_tile_start + local_q_tiles,
+                        prepared.dense_q_tiles,
+                    ) - global_q_tile_start,
+                )
+                exact_mask = exact_mask_from_compact(
+                    sparse_lut,
+                    heads=projected.heads,
+                    q_tiles=local_q_tiles,
+                    kv_tiles=int(prepared.route_plan.geometry.kv_tiles),
+                    dense_q_tiles=local_dense,
+                )
+                # Q aliases the Triton output slab, so token augmentation must
+                # consume the original BF16 Q rows before the exact launch.
+                branch_output, branch_lse2 = token_augmented_tail_state(
+                    q,
+                    projected.k,
+                    projected.v,
+                    q_summary=q_summary,
+                    k_summary=prepared.route_plan.k_summary,
+                    v_sum=projected.v_sum,
+                    exact_mask=exact_mask,
+                    sequence=sequence,
+                    q_tile=Q_TILE,
+                    kv_tile=KV_TILE,
+                    scale=HEAD_DIM ** -0.5,
+                    token_budget=SOL_TOKEN_AUG_BUDGET,
+                )
+
             with diagnostics.stage("sparse_attention_kernel"):
                 launched = _launch_streamed_chunk(
                     q,
@@ -411,35 +452,10 @@ def execute_streamed_triton_bf16(module, backend, prepared):
                 )
                 if backend.config.sol_attn_features:
                     output, lse2 = launched
-                    local_q_tiles = int(q_summary.shape[-2])
-                    global_q_tile_start = start // Q_TILE
-                    local_dense = max(
-                        0,
-                        min(
-                            global_q_tile_start + local_q_tiles,
-                            prepared.dense_q_tiles,
-                        ) - global_q_tile_start,
+                    output, _ = merge_attention_state(
+                        output, lse2, branch_output, branch_lse2
                     )
-                    exact_mask = exact_mask_from_compact(
-                        sparse_lut,
-                        heads=projected.heads,
-                        q_tiles=local_q_tiles,
-                        kv_tiles=int(prepared.route_plan.geometry.kv_tiles),
-                        dense_q_tiles=local_dense,
-                    )
-                    output, _ = merge_pooled_tail(
-                        output,
-                        lse2,
-                        q_summary=q_summary,
-                        k_summary=prepared.route_plan.k_summary,
-                        v_sum=projected.v_sum,
-                        exact_mask=exact_mask,
-                        sequence=sequence,
-                        q_tile=Q_TILE,
-                        kv_tile=KV_TILE,
-                        scale=HEAD_DIM ** -0.5,
-                    )
-                    del lse2, exact_mask
+                    del lse2, branch_output, branch_lse2, exact_mask
                 else:
                     output = launched
             del q, q_summary, sparse_lut

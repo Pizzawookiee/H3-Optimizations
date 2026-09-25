@@ -24,6 +24,7 @@ from .int8_attention import (
     block_sparse_int8_attention_from_prequantized,
     block_sparse_int8_attention_with_lse_from_prequantized,
     int8_attention_from_prequantized,
+    merge_sol_features_native_from_prequantized,
     int8_attention_is_available,
     prequantize_int8_attention,
 )
@@ -73,6 +74,7 @@ __all__ = [
     'fused_h3_q_from_int8',
     'fused_h3_q_is_available',
     'int8_attention_from_prequantized',
+    'merge_sol_features_native_from_prequantized',
     'int8_attention_is_available',
     'int8_attention_k_anchor_positions',
     'int8_attention_producer_is_available',

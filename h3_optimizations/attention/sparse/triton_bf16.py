@@ -12,8 +12,10 @@ from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
 from .sol_tail import (
+    SOL_TOKEN_AUG_BUDGET,
     exact_mask_from_compact,
-    merge_pooled_tail,
+    merge_attention_state,
+    token_augmented_tail_state,
     tile_mean,
     tile_sum,
 )
@@ -614,7 +616,6 @@ class TritonBF16Backend:
         try:
             if not self.config.sol_attn_features:
                 return _launch(prepared)
-            exact, lse2 = _launch(prepared, return_lse=True)
             sequence = int(prepared.q.shape[-2])
             q_tiles = (sequence + Q_TILE - 1) // Q_TILE
             kv_tiles = (sequence + KV_TILE - 1) // KV_TILE
@@ -625,9 +626,12 @@ class TritonBF16Backend:
                 kv_tiles=kv_tiles,
                 dense_q_tiles=prepared.dense_q_tiles,
             )
-            merged, _ = merge_pooled_tail(
-                exact,
-                lse2,
+            # Build the Sol complement before the exact launch. This is also the
+            # ordering required by streamed-Q execution, where Q aliases output.
+            branch_output, branch_lse2 = token_augmented_tail_state(
+                prepared.q,
+                prepared.k,
+                prepared.v,
                 q_summary=prepared.q_summary,
                 k_summary=prepared.k_summary,
                 v_sum=prepared.v_sum,
@@ -636,6 +640,11 @@ class TritonBF16Backend:
                 q_tile=Q_TILE,
                 kv_tile=KV_TILE,
                 scale=HEAD_DIM ** -0.5,
+                token_budget=SOL_TOKEN_AUG_BUDGET,
+            )
+            exact, lse2 = _launch(prepared, return_lse=True)
+            merged, _ = merge_attention_state(
+                exact, lse2, branch_output, branch_lse2
             )
             return merged
         except Exception as exc:
@@ -665,6 +674,9 @@ class TritonBF16Backend:
             'approximate': True,
             'sol_attn_features': bool(self.config.sol_attn_features),
             'sol_pooled_tail': bool(self.config.sol_attn_features),
+            'sol_token_aug': (
+                SOL_TOKEN_AUG_BUDGET if self.config.sol_attn_features else 0
+            ),
         }
 
 

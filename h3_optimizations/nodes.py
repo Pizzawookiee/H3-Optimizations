@@ -300,10 +300,14 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     default=False,
                     tooltip=(
                         'Enables Sol-Attn-inspired features while preserving the existing '
-                        'H3 routing policy. Currently only Kitchen INT8 and BF16 Triton '
-                        'support this option, and pooled tail is the only Sol feature '
-                        'implemented so far; Sol routing and token augmentation are not '
-                        'enabled.'
+                        'H3 routing policy. Kitchen INT8 (native rebuilt path) and BF16 Triton '
+                        'support pooled tail plus 64-token augmentation. Pooled tail preserves approximate '
+                        'softmax mass from omitted video blocks; token augmentation rescues '
+                        'important individual tokens hidden inside those omitted blocks. '
+                        'Together these can improve quality and temporal/detail stability '
+                        'at low sparse budgets without requiring as many additional exact '
+                        'blocks. Sol block routing is not implemented; the existing H3 '
+                        'router remains in control.'
                     ),
                 ),
             ],

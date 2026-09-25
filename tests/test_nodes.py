@@ -116,8 +116,9 @@ class NodeTests(unittest.TestCase):
         self.assertIn('Bypass this node', backend.tooltip)
         sol = input_by_id(advanced, 'sol_attn_features')
         self.assertFalse(sol.default)
-        self.assertIn('only Kitchen INT8 and BF16 Triton', sol.tooltip)
-        self.assertIn('pooled tail', sol.tooltip)
+        self.assertIn('Kitchen INT8 (native rebuilt path) and BF16 Triton', sol.tooltip)
+        self.assertIn('64-token augmentation', sol.tooltip)
+        self.assertIn('Sol block routing is not implemented', sol.tooltip)
         self.assertIn(
             'FROST BF16, BF16 Triton, and FP8 FlexAttention use 64Q x 64KV',
             backend.tooltip,

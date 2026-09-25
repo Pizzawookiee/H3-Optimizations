@@ -27,12 +27,7 @@ from ...normalized_rows import attention_output_buffer
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
-from .sol_tail import (
-    exact_mask_from_route,
-    merge_pooled_tail,
-    tile_mean,
-    tile_sum,
-)
+from .sol_tail import tile_mean, tile_sum
 from ...kitchen_qkv import PreparedChunkedKitchenQKV
 
 
@@ -597,21 +592,27 @@ class SparseKitchenBackend:
                 'Sol pooled tail requires Q/K summaries, V sums, and Kitchen K anchor values'
             )
         exact, lse2 = self.executor.execute_with_lse(prepared)
-        exact_mask = exact_mask_from_route(
-            prepared.route, prepared.k_summary.shape[-2]
+        operation = getattr(
+            self.executor.kitchen,
+            'merge_sol_features_native_from_prequantized',
+            None,
         )
-        merged, _ = merge_pooled_tail(
+        if operation is None:
+            raise SparseKitchenError(
+                'Sol features on Kitchen require the rebuilt H3 native library '
+                '(pooled tail + histogram token augmentation); Sol routing is not used'
+            )
+        merged, _ = operation(
             exact,
             lse2,
+            prepared.quantized,
+            prepared.route,
             q_summary=prepared.q_summary,
             k_summary=prepared.k_summary,
             v_sum=prepared.v_sum,
-            exact_mask=exact_mask,
-            sequence=int(exact.shape[-2]),
-            q_tile=int(prepared.route.q_tile),
-            kv_tile=int(prepared.route.kv_tile),
-            scale=float(prepared.quantized.attention_scale),
             k_offset=prepared.k_offset,
+            token_budget=64,
+            output_layout=OUTPUT_HND,
         )
         return merged
 
@@ -683,23 +684,29 @@ class SparseKitchenBackend:
                 q_summary = prepared.q_summary[
                     ..., first_route_tile:stop_route_tile, :
                 ]
-                exact_mask = exact_mask_from_route(
-                    chunk_route, prepared.k_summary.shape[-2]
+                merge_native = getattr(
+                    self.executor.kitchen,
+                    'merge_sol_features_native_from_prequantized',
+                    None,
                 )
-                raw, _ = merge_pooled_tail(
+                if merge_native is None:
+                    raise SparseKitchenError(
+                        'Sol features on Kitchen require the rebuilt H3 native library '
+                        '(pooled tail + histogram token augmentation); Sol routing is not used'
+                    )
+                raw, _ = merge_native(
                     raw,
                     lse2,
+                    chunk_carrier,
+                    chunk_route,
                     q_summary=q_summary,
                     k_summary=prepared.k_summary,
                     v_sum=prepared.v_sum,
-                    exact_mask=exact_mask,
-                    sequence=sequence,
-                    q_tile=route_q_tile,
-                    kv_tile=int(route.kv_tile),
-                    scale=float(chunk_carrier.attention_scale),
                     k_offset=prepared.k_offset,
+                    token_budget=64,
+                    output_layout=OUTPUT_NHD,
                 )
-                del lse2, q_summary, exact_mask
+                del lse2, q_summary
             else:
                 raw = self.executor.kitchen.block_sparse_int8_attention_from_prequantized(
                     chunk_carrier,
@@ -753,4 +760,6 @@ class SparseKitchenBackend:
             'smooth_k': False,
             'sol_attn_features': bool(self.config.sol_attn_features),
             'sol_pooled_tail': bool(self.config.sol_attn_features),
+            'sol_token_aug': 64 if self.config.sol_attn_features else 0,
+            'sol_native_kitchen': bool(self.config.sol_attn_features),
         }
