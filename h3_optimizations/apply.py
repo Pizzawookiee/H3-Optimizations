@@ -56,6 +56,7 @@ from .dense_resolver import (
     ATTENTION_SAGE_SM89,
     is_comfy_kitchen_dense_attention,
     is_installed_dense_attention,
+    is_replaceable_dense_attention,
     install_dense_attention,
     preserve_dense_attention,
     resolve_current_dense_attention,
@@ -954,11 +955,14 @@ def _resolve_attention(plan, model, inventory, environment):
         {},
     )
     explicit_override = options.get('optimized_attention_override')
+    # A recognized dense override -- ours, Comfy Kitchen, or KJNodes' Sage
+    # patch -- is a known dense H3 kernel, so an explicit sparse request
+    # replaces it exactly as it would replace stock dense attention. Every
+    # other override is preserved below.
     if (
         plan.sparse is not None
         and explicit_override is not None
-        and not is_installed_dense_attention(options)
-        and not is_comfy_kitchen_dense_attention(options)
+        and not is_replaceable_dense_attention(options)
     ):
         if plan.memory is None:
             dense = resolve_current_dense_attention(model, environment)

@@ -1,5 +1,6 @@
 '''Composable production nodes for MiniMax H3 optimization.'''
 
+import logging
 import math
 
 from comfy_api.latest import io, ui
@@ -25,6 +26,21 @@ from .status import (
     format_memory_status,
     format_sparse_status,
 )
+from .vsa.node import is_vsa_checkpoint
+
+VSA_PASSTHROUGH_MESSAGE = (
+    'VSA-trained H3 checkpoint detected (to_gate_compress layers, e.g. FastH3). '
+    'H3 Sparse Attention passed the model through unchanged: this checkpoint was '
+    'trained on its own sparse pattern. Use H3 VSA Attention (FastH3) instead.'
+)
+
+
+def _vsa_passthrough(model):
+    """Leave VSA-trained checkpoints to the VSA node rather than re-routing them."""
+    if not is_vsa_checkpoint(model):
+        return None
+    logging.warning('[H3 Optimizations] %s', VSA_PASSTHROUGH_MESSAGE)
+    return io.NodeOutput(model, ui=ui.PreviewText(VSA_PASSTHROUGH_MESSAGE))
 
 # On a 20-step sampler, this eight-step ramp spends the same 2.4 cumulative
 # extra video-budget steps as the simple node's default normalized early ramp.
@@ -124,6 +140,9 @@ class H3SparseAttention(io.ComfyNode):
         video_budget=DEFAULT_VIDEO_BUDGET,
         denser_early_late_steps=True,
     ):
+        passthrough = _vsa_passthrough(model)
+        if passthrough is not None:
+            return passthrough
         plan = read_plan(model).with_sparse(
             SparseRequest(
                 video_budget=float(video_budget),
@@ -161,9 +180,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 'to the measured 1x8x8 geometry and can be restored to stock raster '
                 'order. Lower budgets are faster but can change the generated '
                 'result, and the quality cost depends on the prompt and where '
-                'attention is removed in the denoising schedule. Kitchen INT8 '
-                '64x64 is the default; FROST BF16, Sparse Sage, BF16 Triton, and '
-                'FP8 FlexAttention are available as explicit alternatives.'
+                'removed in the denoising schedule. Kitchen INT8 64Q x 64KV '
+                '(Quality) is the default; the other geometries and backends '
+                'are available as explicit alternatives.'
             ),
             search_aliases=[
                 'H3 sparse advanced',
@@ -235,15 +254,15 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     options=list(SPARSE_BACKEND_PUBLIC_REQUESTS),
                     default=SPARSE_BACKEND_KITCHEN,
                     tooltip=(
-                        'Kitchen INT8 uses the shipped native 64Q x 64KV path. '
-                        'Kitchen INT8 64x128 is an experimental image-quality '
-                        'arm with the same 64-row query routing but coarser '
-                        '128-row KV selections. '
-                        'FROST BF16 uses 64Q x 64KV routing and is available '
-                        'only on SM89. '
-                        'BF16 Triton and FP8 FlexAttention use the same 64Q x '
-                        '64KV routing geometry. Sparse Sage uses its installed '
-                        'kernel geometry. Each alternative is selected explicitly. '
+                        'Kitchen INT8 64Q x 64KV (Quality) is the default. '
+                        'Kitchen INT8 64Q x 128KV (Faster) was faster in the '
+                        'measured full-block SM89 comparison, but its coarser '
+                        'KV selections can change output quality and the speed '
+                        'gain is not guaranteed on every GPU. '
+                        'FROST BF16, BF16 Triton, and FP8 FlexAttention use '
+                        '64Q x 64KV routing. Sparse Sage uses 128Q x 64KV on '
+                        'SM80/86/87/89/120 and 64Q x 128KV on SM90. '
+                        'Each alternative is selected explicitly. '
                         'Explicit backend choices fail if that backend is '
                         'unavailable and do not switch to another backend. '
                         'Bypass this node to force dense attention.'
@@ -290,6 +309,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         early_schedule=_ADVANCED_DEFAULT_EARLY_SCHEDULE,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
     ):
+        passthrough = _vsa_passthrough(model)
+        if passthrough is not None:
+            return passthrough
         plan = read_plan(model).with_sparse(
             SparseRequest(
                 video_budget=float(video_budget),

@@ -78,10 +78,11 @@ def _preserves_external_override(plan, model):
         return False
     options = getattr(model, 'model_options', {}).get('transformer_options', {}) or {}
     override = options.get('optimized_attention_override')
+    # Mirrors the core resolver's rule so both agree on which overrides survive
+    # a sparse request; recognized dense implementations are replaced, not kept.
     return bool(
         override is not None
-        and not _base.is_installed_dense_attention(options)
-        and not _base.is_comfy_kitchen_dense_attention(options)
+        and not _base.is_replaceable_dense_attention(options)
     )
 
 

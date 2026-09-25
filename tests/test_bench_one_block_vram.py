@@ -64,10 +64,8 @@ def test_free_barrier_is_unique_cpu_only_output_graph():
     }, True)
 
 
-def test_qkv_comparison_forces_config0_on_both_arms():
-    import asyncio
-
-    args = SimpleNamespace(
+def prompt_args(**overrides):
+    values = dict(
         unet="convrot.safetensors",
         clip="clip.safetensors",
         vae="vae.safetensors",
@@ -79,8 +77,17 @@ def test_qkv_comparison_forces_config0_on_both_arms():
         sampler="res_multistep",
         scheduler="simple",
         schedule_steps=20,
+        step=0,
         seed=1,
     )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_qkv_comparison_forces_config0_on_both_arms():
+    import asyncio
+
+    args = prompt_args()
     control = asyncio.run(build_arm_prompt(
         PromptSchemas(), "qkv_control_config0", args,
     ))
@@ -106,6 +113,30 @@ def test_qkv_comparison_forces_config0_on_both_arms():
     }}}}, "qkv_linear_only") == "12.346"
 
 
+def test_core_sparse_arm_sets_dynamic_inputs_and_can_skip_memory():
+    import asyncio
+
+    args = prompt_args(step=1)
+    graph = asyncio.run(build_arm_prompt(
+        PromptSchemas(), "core_sol_stock", args,
+    ))
+    patches = [
+        node for node in graph.values()
+        if node["_meta"]["title"].startswith("patch")
+    ]
+    assert [node["class_type"] for node in patches] == [
+        "BlockSparseAttention",
+        "H3AIMDOResidencyLimiter",
+        "MiniMaxH3VRAMBlockStopZi",
+    ]
+    inputs = patches[0]["inputs"]
+    assert inputs["selection"] == "sol-attn"
+    assert inputs["selection.tau"] == 1.3
+    assert inputs["start_percent"] == 0.0
+    assert patches[2]["inputs"]["step"] == 1
+    assert graph["split"]["inputs"]["step"] == 2
+
+
 def test_qkv_linear_output_is_explicitly_non_comparable():
     table = render_table([{
         "label": "diagnostic",
@@ -127,5 +158,6 @@ if __name__ == "__main__":
     test_expected_stop_rejects_other_failures()
     test_free_barrier_is_unique_cpu_only_output_graph()
     test_qkv_comparison_forces_config0_on_both_arms()
+    test_core_sparse_arm_sets_dynamic_inputs_and_can_skip_memory()
     test_qkv_linear_output_is_explicitly_non_comparable()
-    print("one-block VRAM benchmark: PASS (5 tests)")
+    print("one-block VRAM benchmark: PASS (6 tests)")

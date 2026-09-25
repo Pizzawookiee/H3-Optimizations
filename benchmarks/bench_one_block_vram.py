@@ -75,10 +75,30 @@ SPARSE_COMMON = {
 }
 
 
-def sparse_patch(backend):
+def sparse_patch(backend, video_budget=None):
+    common = dict(SPARSE_COMMON)
+    if video_budget is not None:
+        common.update(video_budget=video_budget, early_kv=video_budget, late_kv=video_budget)
     return (
         'H3SparseAttentionAdvanced',
-        {**SPARSE_COMMON, 'backend': backend},
+        {**common, 'backend': backend},
+    )
+
+
+def core_sparse_patch(method, value, extra_tokens=256):
+    # start_percent 0 keeps the captured step sparse; the node's 0.2 default
+    # would run early steps through the dense fallback instead.
+    parameter = 'tau' if method == 'sol-attn' else 'keep_percent'
+    return (
+        'BlockSparseAttention',
+        {
+            'selection': method,
+            'selection.' + parameter: value,
+            'start_percent': 0.0,
+            'end_percent': 1.0,
+            'extra_tokens': extra_tokens,
+            'verbose': True,
+        },
     )
 
 
@@ -141,6 +161,57 @@ ARMS = {
         'label': 'H3 BF16 Triton (30% video KV)',
         'after_memory': [sparse_patch('BF16 Triton')],
     },
+    'sparse_kitchen_15': {
+        'label': 'H3 Sparse Kitchen INT8 (15% video KV)',
+        'after_memory': [sparse_patch('Kitchen INT8', 0.15)],
+    },
+    'kitchen_stock': {
+        'label': 'Comfy Kitchen attention, no H3 Memory',
+        'before_memory': [
+            ('ModelAttentionBackend', {'attention': 'comfy kitchen attention'}),
+        ],
+        'memory_patch': None,
+    },
+    'core_sol': {
+        'label': 'Core Sol-Attn tau 1.3 + H3 Memory',
+        'after_memory': [core_sparse_patch('sol-attn', 1.3)],
+    },
+    'core_sol_stock': {
+        'label': 'Core Sol-Attn tau 1.3, no H3 Memory',
+        'after_memory': [core_sparse_patch('sol-attn', 1.3)],
+        'memory_patch': None,
+    },
+    'core_sla30': {
+        'label': 'Core SLA 30% + H3 Memory',
+        'after_memory': [core_sparse_patch('sla', 30.0)],
+    },
+    'core_sla30_noaug': {
+        'label': 'Core SLA 30%, extra_tokens 0 + H3 Memory',
+        'after_memory': [core_sparse_patch('sla', 30.0, extra_tokens=0)],
+    },
+    'fasth3_dense_sage': {
+        'label': 'VSA checkpoint dense, server attention (Sage) + H3 Memory',
+    },
+    'fasth3_dense_bf16': {
+        'label': 'VSA checkpoint dense, PyTorch BF16 attention + H3 Memory',
+        'before_memory': [
+            ('ModelAttentionBackend', {'attention': 'pytorch attention'}),
+        ],
+    },
+    'fasth3_vsa20': {
+        'label': 'H3 VSA Attention BF16 (20% video tiles) + H3 Memory',
+        'after_memory': [('H3VSAAttention', {'keep_percent': 20.0, 'backend': 'BF16 (Triton)'})],
+    },
+    'fasth3_vsa20_int8': {
+        'label': 'H3 VSA Attention INT8 (20% video tiles) + H3 Memory',
+        'after_memory': [('H3VSAAttention', {'keep_percent': 20.0, 'backend': 'INT8 (Kitchen)'})],
+    },
+    'fasth3_vsa20_int8_lowvram': {
+        'label': 'H3 VSA Attention INT8 Lower VRAM (20% video tiles) + H3 Memory',
+        'after_memory': [('H3VSAAttention', {
+            'keep_percent': 20.0, 'backend': 'INT8 (Kitchen)', 'memory_mode': 'Lower VRAM (slower)',
+        })],
+    },
     'qkv_control_config0': {
         'label': 'QKV optimizations Off (Comfy Kitchen Config 0 control)',
         'before_memory': [
@@ -178,9 +249,15 @@ DEFAULT_ARMS = ','.join((
 
 
 async def add_node(graph, schemas, node_id, node_type, overrides=None, links=None):
+    # Dotted keys are DynamicCombo sub-inputs ('selection.tau'); /object_info
+    # nests them inside the parent's options, so they bypass schema filling.
+    overrides = dict(overrides or {})
+    nested = {key: overrides.pop(key) for key in list(overrides) if '.' in key}
+    inputs = await schemas.inputs(node_type, overrides, links or {})
+    inputs.update(nested)
     graph[node_id] = {
         'class_type': node_type,
-        'inputs': await schemas.inputs(node_type, overrides or {}, links or {}),
+        'inputs': inputs,
         '_meta': {'title': node_id},
     }
     return [node_id, 0]
@@ -240,7 +317,9 @@ async def build_arm_prompt(schemas, arm_name, args):
     for node_type, overrides in arm.get('before_memory', ()):
         await patch(node_type, overrides)
 
-    await patch(*arm.get('memory_patch', MEMORY_PATCH))
+    memory_patch = arm.get('memory_patch', MEMORY_PATCH)
+    if memory_patch is not None:
+        await patch(*memory_patch)
 
     for node_type, overrides in arm.get('after_memory', ()):
         await patch(node_type, overrides)
@@ -253,12 +332,12 @@ async def build_arm_prompt(schemas, arm_name, args):
             'run_tag': args.run_tag,
             'arm_name': arm_name,
             'layer': 0,
-            'step': 0,
+            'step': args.step,
             'branch': 'conditional',
             'overwrite': False,
             'notes': (
-                'one-block H3 VRAM/timing benchmark; %dx%d, %d frames, AIMDO 0 blocks'
-                % (args.width, args.height, args.frames)
+                'one-block H3 VRAM/timing benchmark; %dx%d, %d frames, step %d, AIMDO 0 blocks'
+                % (args.width, args.height, args.frames, args.step)
             ),
         },
     )
@@ -277,7 +356,7 @@ async def build_arm_prompt(schemas, arm_name, args):
         {'model': ['loader', 0]},
     )
     await add_node(
-        graph, schemas, 'split', 'SplitSigmas', {'step': 1},
+        graph, schemas, 'split', 'SplitSigmas', {'step': args.step + 1},
         {'sigmas': ['schedule', 0]},
     )
     await add_node(graph, schemas, 'noise', 'RandomNoise', {'noise_seed': args.seed})
@@ -480,9 +559,9 @@ def write_results(path, args, context, records):
             'frames': args.frames,
             'seconds_at_24fps': args.frames / FPS,
             'schedule_steps': args.schedule_steps,
-            'sampled_steps': 1,
+            'sampled_steps': args.step + 1,
             'captured_layer': 0,
-            'captured_step': 0,
+            'captured_step': args.step,
             'aimdo_residency': '0 blocks',
             'memory_precision': 'Preserve native',
             'memory_qkv_streaming': 'arm-specific',
@@ -503,22 +582,25 @@ def render_table(records):
     lines = [
         'TIMING CONTRACT: ' + QKV_LINEAR_ONLY_WARNING,
         '',
-        '| Arm | Peak total GiB | Increase GiB | QKV linear-only ms* | Block ms | Route |',
-        '| --- | ---: | ---: | ---: | ---: | --- |',
+        '| Arm | Process peak GiB | Card peak GiB | Card increase GiB | QKV linear-only ms* | Block ms | Route |',
+        '| --- | ---: | ---: | ---: | ---: | ---: | --- |',
     ]
     for row in records:
         if row.get('error'):
-            lines.append('| %s | ERROR | - | - | - | %s |' % (
+            lines.append('| %s | ERROR | - | - | - | - | %s |' % (
                 row['label'], str(row['error']).replace('|', '\\|'),
             ))
             continue
         route = json.dumps(row.get('routes') or {}, sort_keys=True)
         if len(route) > 120:
             route = route[:117] + '...'
+        process_peak = row.get('process_peak_mib')
         lines.append(
-            '| %s | %.2f | %.2f | %s | %s | `%s` |'
+            '| %s | %s | %.2f | %.2f | %s | %s | `%s` |'
             % (
-                row['label'], row['peak_mib'] / 1024.0,
+                row['label'],
+                '-' if process_peak is None else '%.2f' % (process_peak / 1024.0),
+                row['peak_mib'] / 1024.0,
                 row['peak_over_baseline_mib'] / 1024.0,
                 _stage_ms(row, 'qkv_linear_only'),
                 _stage_ms(row, 'block_total'),
@@ -539,6 +621,25 @@ def _stage_ms(row, name):
     return '-' if not stage else '%.3f' % float(stage['gpu_ms'])
 
 
+def process_sampler_for(args):
+    """Per-process sampler for the server, or None when unavailable."""
+    if args.no_process_vram:
+        return None
+    try:
+        from process_vram import ProcessVramSampler, listener_pid
+    except ImportError as error:
+        print('  process VRAM unavailable (%s); whole-card only' % error, flush=True)
+        return None
+    pid = args.server_pid
+    if pid is None:
+        from urllib.parse import urlparse
+        pid = listener_pid(urlparse(args.server).port or 80)
+    if pid is None:
+        raise BenchError('cannot find the server PID; pass --server-pid')
+    print('server pid %d: sampling its dedicated GPU memory' % pid, flush=True)
+    return ProcessVramSampler(pid, interval_ms=args.sample_ms)
+
+
 async def run_matrix(args):
     import aiohttp
 
@@ -555,6 +656,7 @@ async def run_matrix(args):
                 )
 
         schemas = Schemas(args.server, session)
+        process = None if args.dry_run else process_sampler_for(args)
         if args.dry_run:
             graph = await build_arm_prompt(
                 schemas, args.arm_list[0], args,
@@ -582,6 +684,7 @@ async def run_matrix(args):
                     args.unload_timeout,
                 )
             baseline = gpu_now()
+            process_baseline = None if process is None else process.read_once()
             report_path = output_root / 'h3_vram' / args.run_tag / (arm_name + '.json')
             if report_path.exists():
                 raise BenchError(
@@ -600,6 +703,8 @@ async def run_matrix(args):
             }
             sampler = VramSampler(interval_ms=args.sample_ms)
             sampler.start()
+            if process is not None:
+                process.start()
             try:
                 result = await run_prompt(
                     session, args.server, client_id, graph, args.timeout, True,
@@ -617,6 +722,8 @@ async def run_matrix(args):
                 print('  FAILED: %s' % error, flush=True)
             finally:
                 sampler.stop()
+                if process is not None:
+                    process.stop()
 
             record['peak_mib'] = sampler.peak_mib()
             record['peak_watts'] = sampler.peak_watts()
@@ -624,13 +731,24 @@ async def run_matrix(args):
                 record['peak_over_baseline_mib'] = (
                     record['peak_mib'] - baseline['memory_used_mib']
                 )
+            if process is not None:
+                record['process_pid'] = process.pid
+                record['process_baseline_mib'] = process_baseline / (1024.0 * 1024.0)
+                record['process_peak_mib'] = process.peak_mib()
+                if record['process_peak_mib'] is not None:
+                    record['process_increase_mib'] = (
+                        record['process_peak_mib'] - record['process_baseline_mib']
+                    )
             records.append(record)
             write_results(args.output_path, args, stats, records)
             if not record.get('error'):
                 print(
-                    '  peak %.0f MiB (+%.0f MiB), %.2f s, report %s'
+                    '  peak %.0f MiB (+%.0f MiB), process peak %s MiB, block %s ms, %.2f s, report %s'
                     % (
                         record['peak_mib'], record['peak_over_baseline_mib'],
+                        '-' if record.get('process_peak_mib') is None
+                        else '%.0f' % record['process_peak_mib'],
+                        _stage_ms(record, 'block_total'),
                         record['wall_seconds'], report_path,
                     ),
                     flush=True,
@@ -653,6 +771,10 @@ def parse_args(argv=None):
     parser.add_argument('--height', type=int, default=ONE_MP[1])
     parser.add_argument('--frames', type=int, default=DEFAULT_FRAMES)
     parser.add_argument('--schedule-steps', type=int, default=20)
+    parser.add_argument(
+        '--step', type=int, default=0,
+        help='sampler step whose layer 0 is measured; earlier steps run in full',
+    )
     parser.add_argument('--sampler', default='res_multistep')
     parser.add_argument('--scheduler', default='simple')
     parser.add_argument('--seed', type=int, default=1234)
@@ -666,6 +788,14 @@ def parse_args(argv=None):
     parser.add_argument('--unload-timeout', type=float, default=45.0)
     parser.add_argument('--sample-ms', type=int, default=50)
     parser.add_argument('--idle-watts', type=float, default=60.0)
+    parser.add_argument(
+        '--server-pid', type=int, default=None,
+        help='server process to sample; default is the --server port listener',
+    )
+    parser.add_argument(
+        '--no-process-vram', action='store_true',
+        help='skip per-process sampling and report whole-card VRAM only',
+    )
     parser.add_argument('--run-tag', default='')
     parser.add_argument('--output', default='')
     parser.add_argument('--no-prime', dest='prime', action='store_false')
@@ -681,6 +811,8 @@ def parse_args(argv=None):
         parser.error('no arms selected')
     if args.frames < 1 or args.width < 1 or args.height < 1:
         parser.error('width, height, and frames must be positive')
+    if not 0 <= args.step < args.schedule_steps:
+        parser.error('--step must be in [0, --schedule-steps)')
     if args.sample_ms < 20:
         parser.error('--sample-ms must be at least 20')
     if not args.dry_run and not args.i_understand_this_uses_gpu:

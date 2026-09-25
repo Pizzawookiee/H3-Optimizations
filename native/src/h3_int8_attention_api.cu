@@ -55,6 +55,17 @@ void launch_sage_attn_sparse_kernel(
     int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
     float sm_scale, int output_dtype_code, cudaStream_t stream);
 
+void launch_sage_attn_sparse_tiles_kernel(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, const void *lut,
+    const void *valid_block_num, const void *kv_tile_len, int lut_stride,
+    int batch_size, int qo_len, int kv_len, int num_qo_heads, int num_kv_heads,
+    int head_dim, int stride_bz_q, int stride_seq_q, int stride_h_q,
+    int stride_bz_k, int stride_seq_k, int stride_h_k, int stride_bz_v,
+    int stride_h_v, int stride_d_v, int stride_bz_o, int stride_seq_o,
+    int stride_h_o, int stride_bz_q_scale, int stride_h_q_scale,
+    float sm_scale, int output_dtype_code, cudaStream_t stream);
+
 void launch_sage_attn_sparse_kernel_lse(
     const void *q, const void *k, const void *v, void *o, void *lse,
     const void *q_scale, const void *k_scale, const void *v_scale,
@@ -120,6 +131,17 @@ void launch_quant_v_chunk_into(const void *v, void *out, const void *scale,
                                int padded_N, int64_t sb, int64_t sh,
                                int64_t sn, int input_dtype_code,
                                cudaStream_t stream);
+
+void launch_h3_sparse_sage_sa2pp_sm89(
+    const void *q, const void *k, const void *v, void *output,
+    const void *lut, const void *valid, const void *pv_threshold,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    int batch, int q_length, int kv_length, int q_heads, int kv_heads,
+    int head_dim, int q_stride_b, int q_stride_n, int q_stride_h,
+    int k_stride_b, int k_stride_n, int k_stride_h,
+    int v_stride_b, int v_stride_h, int v_stride_d,
+    int o_stride_b, int o_stride_n, int o_stride_h,
+    float scale, int output_dtype_code, cudaStream_t stream);
 
 namespace {
 
@@ -206,6 +228,25 @@ H3_API int h3_int8_sparse_attention(
       reinterpret_cast<cudaStream_t>(stream)))
 }
 
+// Additive to ABI 4: 64Q x 64KV sparse traversal over padded tiles with a
+// per-tile live key count (H3 VSA). Loaders treat it as optional.
+H3_API int h3_int8_sparse_attention_tiles(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, const void *lut,
+    const void *valid_block_num, const void *kv_tile_len, int lut_stride,
+    int B, int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n,
+    int q_st_h, int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h,
+    int v_st_d, int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz,
+    int qs_st_h, float sm_scale, int output_dtype_code,
+    uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_sparse_tiles_kernel(
+      q, k, v, o, q_scale, k_scale, v_scale, lut, valid_block_num,
+      kv_tile_len, lut_stride, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
+      q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
+      o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
+}
+
 H3_API int h3_int8_sparse_attention_lse(
     const void *q, const void *k, const void *v, void *o, void *lse,
     const void *q_scale, const void *k_scale, const void *v_scale,
@@ -261,6 +302,24 @@ H3_API int h3_int8_quantize_qk_chunk(
       H_q, Lq, full_Lq, q_start, H_kv, Lk, full_Lk, k_start, C, cta_k,
       q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h, k_stride_n,
       input_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_sparse_sage_sa2pp_sm89(
+    const void *q, const void *k, const void *v, void *output,
+    const void *lut, const void *valid, const void *pv_threshold,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    int B, int Lq, int Lk, int H_q, int H_kv, int D,
+    int q_st_bz, int q_st_n, int q_st_h,
+    int k_st_bz, int k_st_n, int k_st_h,
+    int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h,
+    float sm_scale, int output_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_h3_sparse_sage_sa2pp_sm89(
+      q, k, v, output, lut, valid, pv_threshold, q_scale, k_scale, v_scale,
+      B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h,
+      k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d,
+      o_st_bz, o_st_n, o_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
 }
 
 H3_API int h3_int8_quantize_q_chunk(

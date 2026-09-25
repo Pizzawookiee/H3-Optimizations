@@ -65,7 +65,8 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
-          bool fuse_fp32_probabilities = true>
+          bool fuse_fp32_probabilities = true,
+          bool per_tile_kv_len = false>
 __global__ void qk_int_sv_i8_sparse_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -84,7 +85,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     const uint32_t stride_bz_q_scale, const uint32_t stride_h_q_scale,
     float sm_scale,
     const int32_t *__restrict__ BlockLut,
-    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride) {
+    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride,
+    const int32_t *__restrict__ KvTileLen) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
                 "DTypeQK must be int8 or int4");
@@ -357,6 +359,27 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     K_load_idx_lane_base = K_load_idx_origin + block * CTA_K;
   };
 
+  // H3 VSA: padded tiles carry their live key count. A partial tile leaves
+  // the fused integer softmax for the float path, where keys past the live
+  // count are masked exactly like the ragged sequence tail.
+  auto kv_tile_is_partial = [&](uint32_t block) -> bool {
+    if constexpr (per_tile_kv_len) {
+      return static_cast<uint32_t>(KvTileLen[block]) < CTA_K;
+    } else {
+      return false;
+    }
+  };
+  auto mask_kv_tile = [&](float RS_masked[][num_tiles_k][8], uint32_t block) {
+    if constexpr (per_tile_kv_len) {
+      if (kv_tile_is_partial(block)) {
+        apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(
+            K_idx_origin + block * CTA_K, RS_masked,
+            block * CTA_K + static_cast<uint32_t>(KvTileLen[block]),
+            pre_scale_scores ? -50000.0f : -1.0e30f);
+      }
+    }
+  };
+
   // An empty route has no softmax to normalize; emit zeros rather than
   // whatever the uninitialized accumulators happen to hold.
   if (num_iterations == 0) {
@@ -458,8 +481,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
           smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-    if constexpr (use_fused_fp32_probabilities &&
-                  mask_mode == MaskMode::kNone) {
+    if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
+        !kv_tile_is_partial(load_block)) {
       update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
           RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
     } else {
@@ -489,6 +512,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
             mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
             mask_dtype_code, 1.0f);
       }
+      mask_kv_tile(RS_soft, load_block);
 
       update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
                  pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
@@ -561,8 +585,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     }
 
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-    if constexpr (use_fused_fp32_probabilities &&
-                  mask_mode == MaskMode::kNone) {
+    if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
+        !kv_tile_is_partial(load_block)) {
       update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
           RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
     } else {
@@ -596,6 +620,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
             mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
             mask_dtype_code, 1.0f);
       }
+      mask_kv_tile(RS_soft, load_block);
 
       update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
                  pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
@@ -701,6 +726,7 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
     apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(
         K_idx_lane_base, RS_soft, kv_len,
         pre_scale_scores ? -50000.0f : -1.0e30f);
+    mask_kv_tile(RS_soft, load_block);
 
     update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
                pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,

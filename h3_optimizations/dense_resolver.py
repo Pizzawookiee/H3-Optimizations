@@ -19,6 +19,17 @@ ATTENTION_SAGE_PREFIX = 'dense_sage_sm'
 ATTENTION_SAGE_SM89 = 'dense_sage_sm89'
 OVERRIDE_MARKER = '_h3_optimizations_dense_backend'
 
+# Recognized external dense attention implementations that sparse attention is
+# allowed to displace. Each entry is a specific implementation we have
+# identified as plain dense H3 attention, where swapping in sparse routing
+# changes the kernel and not the semantics the user asked for. Overrides that
+# are merely *compatible* with us -- including anything that only advertises
+# the streamed-H3 QKV contract -- are deliberately not on this list.
+KJ_SAGE_OVERRIDE_QUALNAME = (
+    'make_sage_attention_override.<locals>.attention_override_sage'
+)
+KJ_SAGE_OVERRIDE_MODULE = 'model_optimization_nodes'
+
 
 @dataclass(frozen=True)
 class DenseResolution:
@@ -158,6 +169,26 @@ def _override_wraps_backend(override, backend):
     return False
 
 
+def is_kj_sage_dense_attention(transformer_options):
+    '''Whether the active override is KJNodes' SageAttention patch.
+
+    Every KJNodes node that installs Sage builds its override through the same
+    ``make_sage_attention_override`` factory, so one identity check covers all
+    of them. Matching on the closure's own name plus its defining module keeps
+    this narrow: it will not claim an unrelated pack, and if KJNodes ever
+    restructures the factory the check simply stops matching and the override
+    is preserved as before.
+    '''
+    options = transformer_options or {}
+    override = options.get('optimized_attention_override')
+    if override is None:
+        return False
+    if getattr(override, '__qualname__', '') != KJ_SAGE_OVERRIDE_QUALNAME:
+        return False
+    module = getattr(override, '__module__', '') or ''
+    return module.rsplit('.', 1)[-1] == KJ_SAGE_OVERRIDE_MODULE
+
+
 def is_comfy_kitchen_dense_attention(transformer_options):
     '''Whether the active dense override is our Kitchen path or Comfy's own.'''
     options = transformer_options or {}
@@ -168,6 +199,23 @@ def is_comfy_kitchen_dense_attention(transformer_options):
         return True
     backend = get_attention_function(ATTENTION_COMFY_KITCHEN_INT8, None)
     return _override_wraps_backend(override, backend)
+
+
+def is_replaceable_dense_attention(transformer_options):
+    '''Whether sparse attention may take over from the active override.
+
+    True only for dense implementations we recognize by identity: our own
+    installed backend, Comfy Kitchen INT8, and KJNodes' Sage patch. Any other
+    override is preserved, because we cannot tell whether it is dense at all.
+    '''
+    options = transformer_options or {}
+    if options.get('optimized_attention_override') is None:
+        return False
+    return (
+        is_installed_dense_attention(options)
+        or is_comfy_kitchen_dense_attention(options)
+        or is_kj_sage_dense_attention(options)
+    )
 
 
 def is_known_comfy_dense_attention(transformer_options):

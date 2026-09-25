@@ -6,6 +6,7 @@ import importlib.metadata
 import torch
 
 from ..sage_v_fp8 import TRITON_AVAILABLE, direct_per_channel_fp8
+from ...native.sparse_sage import sparse_sage_sa2pp, sparse_sage_sa2pp_is_available
 from .router import KV_TILE, Q_TILE
 
 
@@ -143,6 +144,7 @@ _AMPERE_KERNEL = "qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_th
 _SM90_KERNEL = "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90"
 _SM89_F16_KERNEL = "qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold"
 _SM89_F32_KERNEL = "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold"
+_NATIVE_SM89_SA2PP_KERNEL = "h3_sparse_sage_sa2pp_sm89"
 
 _SPLIT_QATTN = {
     (8, 0): ("sm80", "spas_sage_attn_qattn_sm80"),
@@ -171,6 +173,19 @@ def _cuda_version():
 def _kernel(surface, name):
     value = getattr(surface, name, None)
     return value if callable(value) else None
+
+
+def _native_sm89_sa2pp_kernel(
+    q, k, v, output, lut, valid, pv_threshold, q_scale, k_scale, v_scale,
+    tensor_layout, is_causal, qk_quant_gran, sm_scale, return_pv_count,
+):
+    if (tensor_layout, is_causal, qk_quant_gran, return_pv_count) != (1, 0, 1, 0):
+        raise SparseSageError("H3 Sparse Sage SA2++ received an unsupported ABI mode")
+    if float(sm_scale) != 128 ** -0.5:
+        raise SparseSageError("H3 Sparse Sage SA2++ requires the head-dimension scale")
+    sparse_sage_sa2pp(
+        q, k, v, output, lut, valid, pv_threshold, q_scale, k_scale, v_scale,
+    )
 
 
 def _import_split_qattn(family):
@@ -334,6 +349,14 @@ def load_sparse_sage_spec(*, capability=None, capability_getter=None, cuda_versi
         cuda_version=cuda_version, extension_layout=extension_layout,
         sm90_v_quant_bound=448.0 if extension_layout == "split" else 2.25,
     )
+    if capability == (8, 9) and sparse_sage_sa2pp_is_available(capability=capability):
+        spec = replace(
+            spec,
+            kernel=_native_sm89_sa2pp_kernel,
+            accumulator="fp32+fp16",
+            extension_layout=extension_layout + "+h3-native",
+            kernel_name=_NATIVE_SM89_SA2PP_KERNEL,
+        )
     return spec
 
 

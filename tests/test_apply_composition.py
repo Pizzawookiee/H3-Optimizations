@@ -54,6 +54,23 @@ from h3_optimizations.status import format_sparse_status  # noqa: E402
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
+def make_sage_attention_override(new_attention):
+    """Replica of KJNodes' Sage override factory, named to match its identity."""
+
+    def attention_override_sage(func, *args, **kwargs):
+        return None
+
+    attention_override_sage.supports_streamed_h3_qkv = True
+    attention_override_sage.consume = lambda **_kwargs: None
+    return attention_override_sage
+
+
+def kj_sage_override():
+    override = make_sage_attention_override(None)
+    override.__module__ = 'comfyui-kjnodes.nodes.model_optimization_nodes'
+    return override
+
+
 class FakeModel:
     def __init__(self, options=None):
         self.model_options = deepcopy(options or {})
@@ -82,6 +99,19 @@ class FakeModel:
 
     def set_model_optimized_attention(self, attention):
         ModelPatcher.set_model_optimized_attention(self, attention)
+
+
+# ComfyUI 0.35 moved ModelAttentionBackend to the V3 node API.
+def attention_backend_choices():
+    if hasattr(ModelAttentionBackend, 'define_schema'):
+        return ModelAttentionBackend.define_schema().inputs[1].options
+    return ModelAttentionBackend.INPUT_TYPES()['required']['attention'][0]
+
+
+def apply_attention_backend(model, attention):
+    if hasattr(ModelAttentionBackend, 'define_schema'):
+        return ModelAttentionBackend.execute(model, attention).result[0]
+    return ModelAttentionBackend().patch(model, attention)[0]
 
 
 def resolved_attention(plan):
@@ -247,6 +277,69 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertEqual(qkv.provider_id, 'standard_h3_qkv')
         self.assertIn('explicit external attention override', attention.reason)
 
+    def test_sparse_replaces_the_kj_sage_attention_patch(self):
+        """KJ Sage is a recognized dense kernel, so sparse takes it over."""
+        model = FakeModel({
+            'transformer_options': {
+                'optimized_attention_override': kj_sage_override(),
+            },
+        })
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN),
+        )
+        sparse_resolution = (object(), object())
+
+        with mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            return_value=sparse_resolution,
+        ) as kitchen, mock.patch.object(
+            apply_module,
+            'resolve_current_dense_attention',
+        ) as preserve:
+            resolved = apply_module._resolve_attention(
+                plan,
+                model,
+                object(),
+                object(),
+            )
+
+        kitchen.assert_called_once()
+        preserve.assert_not_called()
+        self.assertIs(resolved, sparse_resolution)
+
+    def test_sparse_replaces_the_kj_sage_patch_alongside_memory(self):
+        """The memory branch must not divert the replacement into dense."""
+        model = FakeModel({
+            'transformer_options': {
+                'optimized_attention_override': kj_sage_override(),
+            },
+        })
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(),
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN),
+        )
+        sparse_resolution = (object(), object())
+
+        with mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            return_value=sparse_resolution,
+        ) as kitchen, mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+        ) as dense:
+            resolved = apply_module._resolve_attention(
+                plan,
+                model,
+                object(),
+                object(),
+            )
+
+        kitchen.assert_called_once()
+        dense.assert_not_called()
+        self.assertIs(resolved, sparse_resolution)
+
     def test_actual_kitchen_backend_node_composes_with_sparse(self):
         plan = H3OptimizationPlan(
             sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN),
@@ -269,11 +362,8 @@ class ApplyCompositionTests(unittest.TestCase):
                 ),
             },
         ):
-            choices = ModelAttentionBackend.INPUT_TYPES()[
-                'required'
-            ]['attention'][0]
-            self.assertIn('comfy kitchen attention', choices)
-            model, = ModelAttentionBackend().patch(
+            self.assertIn('comfy kitchen attention', attention_backend_choices())
+            model = apply_attention_backend(
                 FakeModel({'transformer_options': {}}),
                 'comfy kitchen attention',
             )

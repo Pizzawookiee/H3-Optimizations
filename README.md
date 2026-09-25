@@ -39,7 +39,7 @@ Restart ComfyUI after installing. The nodes appear under
 > Sparse Attention only if you want more speed and accept a quality tradeoff.
 > You normally do not need the AIMDO or Advanced nodes.**
 
-The pack exposes three normal optimization nodes plus one manual AIMDO residency
+The pack exposes four normal optimization nodes plus one manual AIMDO residency
 control:
 
 | Node | What it is for | Normal recommendation |
@@ -47,6 +47,7 @@ control:
 | **H3 Memory Optimization** | Reduces peak VRAM use during H3 generation | Add it and leave the defaults alone |
 | **H3 Sparse Attention** | Makes H3 faster by calculating less video attention | Use it when speed matters and you accept a quality/speed tradeoff |
 | **H3 Sparse Attention (Advanced)** | Gives manual control over sparse scheduling, backend, and token order | Use only when you know why you need the extra controls |
+| **H3 VSA Attention (FastH3)** | Reproduces the learned sparse pattern and coarse branch of VSA-trained H3 checkpoints | Use only with a FastH3/VSA-trained checkpoint and its trained keep percentage |
 | **H3 AIMDO Residency Limiter** | Manually controls how much of the H3 model DynamicVRAM keeps persistently resident in VRAM | Mainly for benchmarking, debugging AIMDO, or deliberately forcing low residency |
 
 H3 Memory Optimization, AIMDO Residency Limiter, and Sparse Attention are
@@ -131,6 +132,11 @@ memory use.
 
 **Use this to make H3 faster at the cost of potentially changing the result.**
 
+VSA-trained checkpoints such as FastH3 must use **H3 VSA Attention (FastH3)**
+instead. The normal Sparse Attention nodes detect their learned gate layers and
+pass the model through unchanged rather than applying a different sparse
+pattern.
+
 Sparse Attention reduces the amount of video-to-video attention H3 calculates.
 The lower the **Video attention budget**, the less video attention work is done.
 
@@ -153,6 +159,25 @@ whole video KV tile, while values above it saturate at the full video route.
 
 Text, reference conditioning, audio, non-video queries, and mixed boundary tiles
 remain dense.
+
+## H3 VSA Attention (FastH3)
+
+**Use this only with a VSA-trained MiniMax H3 checkpoint.** The node reproduces
+the checkpoint's trained 4x4x4 video tiling, top-k video-tile selection, dense
+text/audio prefix, and learned coarse attention branch. It rejects an ordinary
+H3 checkpoint instead of silently applying VSA semantics to incompatible
+weights.
+
+Set **Video tiles kept** to the checkpoint's trained value. FastH3 8-Step V2
+uses 20%, while FastH3 Preview v1 uses 10%. Dense-step and dense-layer controls
+retain the coarse branch and are diagnostic overrides, not the trained default.
+
+The default **Auto** backend runs a one-time numerical check on each GPU before
+using the shipped INT8 tile kernel. A missing or failing kernel logs a warning
+and falls back to BF16 Triton. The shipped CUDA binaries contain native targets
+for sm75, sm80, sm89, sm120, and Linux sm90a, plus a compute_89 PTX fallback;
+only sm89 has received a live GPU run for this VSA kernel. ROCm uses BF16 Triton
+because the AMD native library does not expose the VSA tile entry point.
 
 The normal node uses the measured **1x8x8** target-video order. It groups real
 tokens into router-aligned 64-token spatial tiles through every H3 DiT block and
@@ -202,14 +227,16 @@ selector, and target-video token order.
 - Step counts above the displayed `1000` editing limit remain valid; only
   negative step counts are rejected.
 - If the early and late windows overlap, the denser requested budget wins.
-- **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
-  Sparse Sage, BF16 Triton, or FP8 FlexAttention.
+- **Sparse backend** labels fixed tile geometries directly. Sparse Sage is
+  architecture-selected: 128Q x 64KV on SM80/86/87/89/120 and 64Q x 128KV on
+  SM90.
 - **Video token order** defaults to **1x8x8**. The measured **1x16x4** and
   **4x4x4** geometries remain available as comparison arms, and **Raster (stock
   H3 order)** provides the unchanged H3 ordering baseline.
-- **Kitchen INT8 64x128 (experimental)** is an explicit image-quality arm that
-  keeps 64-row query routing while selecting 128-row KV tiles. Ordinary
-  Kitchen INT8 remains the 64x64 default.
+- **Kitchen INT8 64Q x 64KV (Quality)** is the default. **Kitchen INT8 64Q x
+  128KV (Faster)** keeps 64-row query routing while selecting coarser 128-row KV
+  tiles. It was faster in the measured SM89 full-block comparison, but can
+  change output quality and is not guaranteed to be faster on every GPU.
 
 The defaults preserve the existing **Hold** behavior: four early steps at 50%,
 a 15% middle budget, and no late override, matching a 20-step schedule. Choose
@@ -457,7 +484,7 @@ PyTorch attention. These checks use a non-64-divisible sequence, production-
 shaped strided HND inputs, NHD output, varying per-head/query-block routes, and
 delta route conversion. A missing library, unsupported architecture, or failed
 self-test retires AMD Sparse Kitchen and leaves the existing automatic fallback
-behavior in control. Explicitly selecting `Kitchen INT8` remains a hard
+behavior in control. Explicitly selecting either Kitchen INT8 geometry remains a hard
 requirement and reports the failure instead.
 
 RDNA2 uses a different fail-open adapter path and is not evidence for the native
@@ -520,10 +547,30 @@ fresh H3 execution callables. Package-owned keyed wrappers and clone callbacks
 are replaced rather than appended, so repeated cloning does not accumulate
 hooks.
 
-Explicit external attention overrides are preserved. Foreign block, attention,
-and FinalLayer patches are preserved per conflicting key; the conflicting H3
-sub-optimization is disabled and reported in status instead of overwriting the
-other patch.
+Explicit external attention overrides are preserved, except for the recognized
+dense implementations listed below. Foreign block, attention, and FinalLayer
+patches are preserved per conflicting key; the conflicting H3 sub-optimization
+is disabled and reported in status instead of overwriting the other patch.
+
+### Recognized dense attention that Sparse Attention replaces
+
+An explicit sparse backend request replaces an upstream attention override only
+when that override is identified as a known dense H3 kernel:
+
+- this pack's own installed dense backend
+- Comfy Kitchen INT8, whether selected by ComfyUI or by an external node
+- KJNodes' SageAttention patch (`PathchSageAttentionKJ` and the other KJNodes
+  nodes that install Sage through the same factory)
+
+Replacing one of these changes the attention kernel, not the semantics the
+workflow asked for, so the sparse node behaves exactly as it would over stock
+dense attention. Any other override is preserved and sparse attention is
+disabled instead, because an unidentified override may not be dense at all.
+
+Dense-only runs are unaffected: with no sparse request, H3 Memory Optimization
+still preserves these overrides and drives them through the streamed-H3 QKV
+contract below. Note also that the override is left in `transformer_options`
+when sparse replaces it, so it remains available as the runtime dense fallback.
 
 ### Spectrum forecast output
 

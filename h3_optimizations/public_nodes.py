@@ -18,6 +18,7 @@ from .nodes import (
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
+from .vsa.node import H3VSAAttention
 
 
 class H3OptimizationsExtension(ComfyExtension):
@@ -29,4 +30,5 @@ class H3OptimizationsExtension(ComfyExtension):
             H3AIMDOResidencyLimiter,
             H3SparseAttention,
             H3SparseAttentionAdvanced,
+            H3VSAAttention,
         ]

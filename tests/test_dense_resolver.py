@@ -28,6 +28,27 @@ import h3_optimizations.kitchen_qkv as kitchen_qkv  # noqa: E402
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
+def make_sage_attention_override(new_attention):
+    """Replica of KJNodes' Sage override factory, named to match its identity.
+
+    Detection keys off the closure's qualified name and defining module, so the
+    factory has to be spelled and nested exactly like the real one.
+    """
+
+    def attention_override_sage(func, *args, **kwargs):
+        return None
+
+    attention_override_sage.supports_streamed_h3_qkv = True
+    attention_override_sage.consume = lambda **_kwargs: None
+    return attention_override_sage
+
+
+def kj_sage_override():
+    override = make_sage_attention_override(None)
+    override.__module__ = 'comfyui-kjnodes.nodes.model_optimization_nodes'
+    return override
+
+
 class FakePatcher:
     def __init__(self, override=None):
         transformer_options = {}
@@ -300,6 +321,63 @@ class DenseResolverTests(unittest.TestCase):
 
         self.assertIs(actual, expected)
         self.assertIs(options['optimized_attention_override'], upstream)
+
+
+class ReplaceableDenseAttentionTests(unittest.TestCase):
+    def test_kj_sage_patch_is_recognized(self):
+        options = {'optimized_attention_override': kj_sage_override()}
+        self.assertTrue(dense_resolver.is_kj_sage_dense_attention(options))
+        self.assertTrue(dense_resolver.is_replaceable_dense_attention(options))
+
+    def test_kj_sage_patch_from_another_module_is_not_claimed(self):
+        override = make_sage_attention_override(None)
+        override.__module__ = 'some_other_pack.attention'
+        options = {'optimized_attention_override': override}
+        self.assertFalse(dense_resolver.is_kj_sage_dense_attention(options))
+        self.assertFalse(dense_resolver.is_replaceable_dense_attention(options))
+
+    def test_streamed_h3_contract_alone_is_not_replaceable(self):
+        def override(*_args, **_kwargs):
+            return None
+
+        override.supports_streamed_h3_qkv = True
+        override.consume = lambda **_kwargs: None
+        options = {'optimized_attention_override': override}
+        self.assertFalse(dense_resolver.is_kj_sage_dense_attention(options))
+        self.assertFalse(dense_resolver.is_replaceable_dense_attention(options))
+
+    def test_unknown_override_is_not_replaceable(self):
+        options = {'optimized_attention_override': lambda *_a, **_k: None}
+        self.assertFalse(dense_resolver.is_replaceable_dense_attention(options))
+
+    def test_absent_override_is_not_replaceable(self):
+        self.assertFalse(dense_resolver.is_replaceable_dense_attention({}))
+        self.assertFalse(dense_resolver.is_replaceable_dense_attention(None))
+
+    def test_our_own_installed_backend_is_replaceable(self):
+        override = lambda *_a, **_k: None
+        setattr(
+            override,
+            dense_resolver.OVERRIDE_MARKER,
+            dense_resolver.ATTENTION_COMFY_KITCHEN_INT8,
+        )
+        options = {'optimized_attention_override': override}
+        self.assertTrue(dense_resolver.is_replaceable_dense_attention(options))
+
+    def test_kj_sage_is_still_preserved_by_the_dense_resolver(self):
+        """Dense-only runs keep using KJ Sage as the streamed-H3 consumer."""
+        patcher = FakePatcher(kj_sage_override())
+
+        resolution = dense_resolver.resolve_current_dense_attention(
+            patcher,
+            SimpleNamespace(capability=(8, 9)),
+        )
+
+        self.assertEqual(
+            resolution.backend_kind,
+            dense_resolver.ATTENTION_EXISTING,
+        )
+        self.assertIn('streamed-H3 QKV', resolution.reason)
 
 
 if __name__ == '__main__':

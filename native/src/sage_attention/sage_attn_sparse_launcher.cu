@@ -18,10 +18,12 @@ namespace {
 
 constexpr int SPARSE_HEAD_DIM = 128;
 
-template <int SPARSE_CTA_Q, int SPARSE_CTA_K, typename DTypeOut, bool RETURN_LSE>
+template <int SPARSE_CTA_Q, int SPARSE_CTA_K, typename DTypeOut, bool RETURN_LSE,
+          bool PER_TILE_KV_LEN = false>
 void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
                         float *lse, float *q_scale, float *k_scale, float *v_scale,
                         const int32_t *lut, const int32_t *valid_block_num,
+                        const int32_t *kv_tile_len,
                         int lut_stride, int qo_len, int kv_len,
                         int num_qo_heads, int num_kv_groups, int stride_bz_q,
                         int stride_seq_q, int stride_h_q, int stride_bz_k,
@@ -45,7 +47,8 @@ void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
       SPARSE_CTA_Q, SPARSE_CTA_K, WARP_Q, WARP_K, SPARSE_HEAD_DIM,
       DataType::kInt8, QuantGranularity::kPerThread,
       QuantGranularity::kPerThread, float, false, DTypeOut,
-      ComputeUnit::kCudaCore, MaskMode::kNone, RETURN_LSE, true, false, false, true>;
+      ComputeUnit::kCudaCore, MaskMode::kNone, RETURN_LSE, true, false, false, true,
+      PER_TILE_KV_LEN>;
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -65,7 +68,7 @@ void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
       stride_h_q, stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v,
       stride_h_v, stride_d_v, stride_bz_o, stride_seq_o, stride_h_o,
       stride_bz_q_scale, stride_h_q_scale, sm_scale, lut, valid_block_num,
-      static_cast<uint32_t>(lut_stride));
+      static_cast<uint32_t>(lut_stride), kv_tile_len);
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {
@@ -135,7 +138,7 @@ void launch_sparse(
 #define LAUNCH_SPARSE(CQ, CK, DT)                                                  \
   launch_sparse_impl<CQ, CK, DT, RETURN_LSE>(q_, k_, v_, static_cast<DT *>(o),     \
                          static_cast<float *>(lse), qs_, ks_, vs_, lut_,            \
-                         valid_, lut_stride, qo_len, kv_len, num_qo_heads,     \
+                         valid_, nullptr, lut_stride, qo_len, kv_len, num_qo_heads,     \
                          num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, \
                          stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v,   \
                          stride_h_v, stride_d_v, stride_bz_o, stride_seq_o,    \
@@ -211,4 +214,58 @@ void launch_sage_attn_sparse_kernel_lse(
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
       stride_h_q_scale, sm_scale, output_dtype_code, stream);
+}
+
+// H3 VSA: 64Q x 64KV traversal over padded tiles whose live key count is
+// kv_tile_len[tile]. Only the geometry VSA uses is built.
+void launch_sage_attn_sparse_tiles_kernel(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, const void *lut,
+    const void *valid_block_num, const void *kv_tile_len, int lut_stride,
+    int batch_size, int qo_len, int kv_len, int num_qo_heads, int num_kv_heads,
+    int head_dim, int stride_bz_q, int stride_seq_q, int stride_h_q,
+    int stride_bz_k, int stride_seq_k, int stride_h_k, int stride_bz_v,
+    int stride_h_v, int stride_d_v, int stride_bz_o, int stride_seq_o,
+    int stride_h_o, int stride_bz_q_scale, int stride_h_q_scale,
+    float sm_scale, int output_dtype_code, cudaStream_t stream) {
+  if (head_dim != SPARSE_HEAD_DIM) {
+    throw std::runtime_error(
+        "sage_attn_sparse_tiles: fixed to head_dim 128, got " +
+        std::to_string(head_dim));
+  }
+  if (lut == nullptr || valid_block_num == nullptr || kv_tile_len == nullptr) {
+    throw std::runtime_error(
+        "sage_attn_sparse_tiles: a route LUT and per-tile KV lengths are required");
+  }
+  if (kv_len % 64 != 0) {
+    throw std::runtime_error(
+        "sage_attn_sparse_tiles: the KV sequence must be padded to whole 64-row tiles");
+  }
+  int num_kv_groups = num_qo_heads / num_kv_heads;
+  auto q_ = const_cast<int8_t *>(static_cast<const int8_t *>(q));
+  auto k_ = const_cast<int8_t *>(static_cast<const int8_t *>(k));
+  auto v_ = const_cast<int8_t *>(static_cast<const int8_t *>(v));
+  auto qs_ = const_cast<float *>(static_cast<const float *>(q_scale));
+  auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
+  auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
+  auto lut_ = static_cast<const int32_t *>(lut);
+  auto valid_ = static_cast<const int32_t *>(valid_block_num);
+  auto tiles_ = static_cast<const int32_t *>(kv_tile_len);
+  if (output_dtype_code == 1) {
+    launch_sparse_impl<64, 64, half, false, true>(
+        q_, k_, v_, static_cast<half *>(o), nullptr, qs_, ks_, vs_, lut_,
+        valid_, tiles_, lut_stride, qo_len, kv_len, num_qo_heads,
+        num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
+        stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
+        stride_bz_o, stride_seq_o, stride_h_o, sm_scale, stride_bz_q_scale,
+        stride_h_q_scale, batch_size, stream);
+  } else {
+    launch_sparse_impl<64, 64, nv_bfloat16, false, true>(
+        q_, k_, v_, static_cast<nv_bfloat16 *>(o), nullptr, qs_, ks_, vs_,
+        lut_, valid_, tiles_, lut_stride, qo_len, kv_len, num_qo_heads,
+        num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
+        stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
+        stride_bz_o, stride_seq_o, stride_h_o, sm_scale, stride_bz_q_scale,
+        stride_h_q_scale, batch_size, stream);
+  }
 }

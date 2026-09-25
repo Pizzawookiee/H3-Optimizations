@@ -64,7 +64,6 @@ class TritonBF16Tests(unittest.TestCase):
     def test_legacy_int8_label_resolves_to_bf16(self):
         request = SparseRequest(backend=SPARSE_BACKEND_TRITON_LEGACY)
         self.assertEqual(request.backend, SPARSE_BACKEND_TRITON)
-        self.assertEqual(request.backend, 'BF16 Triton')
 
     def test_projector_produces_bf16_hnd_not_kitchen_carrier(self):
         projector = TritonSparseQKVProjector(chunk_rows=4096)

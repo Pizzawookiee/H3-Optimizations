@@ -82,7 +82,10 @@ class SparseBackendGuidanceTests(unittest.TestCase):
                 )
 
         text = str(raised.exception)
-        self.assertIn('Sparse Sage is unavailable on sm75', text)
+        self.assertIn(
+            'Sparse Sage (GPU-specific geometry) is unavailable on sm75',
+            text,
+        )
         self.assertIn('device capability 7.5', text)
         self.assertIn(
             'Available sparse backends detected on this system: Kitchen INT8',
@@ -135,11 +138,14 @@ class SparseBackendGuidanceTests(unittest.TestCase):
                 )
 
         text = str(raised.exception)
-        self.assertIn('Sparse Sage is unavailable on rocm', text)
+        self.assertIn(
+            'Sparse Sage (GPU-specific geometry) is unavailable on rocm',
+            text,
+        )
         self.assertIn('Hybrid Sparse Attention requires CUDA', text)
         self.assertIn(
             'Available sparse backends detected on this system: '
-            'BF16 Triton, FP8 FlexAttention',
+            'BF16 Triton 64Q x 64KV, FP8 FlexAttention 64Q x 64KV',
             text,
         )
         self.assertIn('select a compatible backend automatically', text)
@@ -190,21 +196,21 @@ class SparseBackendGuidanceTests(unittest.TestCase):
                 policy.FrostBF16Error(
                     'FROST BF16 is compiled for SM89; found SM75'
                 ),
-                'FROST BF16 (SM89) is unavailable on sm75',
+                'FROST BF16 64Q x 64KV (SM89) is unavailable on sm75',
             ),
             (
                 policy.SPARSE_BACKEND_TRITON,
                 policy._base.TritonSparseError(
                     'BF16 Triton requires NVIDIA compute capability 8.0 or newer'
                 ),
-                'BF16 Triton is unavailable on sm75',
+                'BF16 Triton 64Q x 64KV is unavailable on sm75',
             ),
             (
                 policy.SPARSE_BACKEND_FLEX,
                 policy._base.FP8FlexError(
                     'FP8 compute is unsupported on device capability 7.5'
                 ),
-                'FP8 FlexAttention is unavailable on sm75',
+                'FP8 FlexAttention 64Q x 64KV is unavailable on sm75',
             ),
         )
         with mock.patch.object(
