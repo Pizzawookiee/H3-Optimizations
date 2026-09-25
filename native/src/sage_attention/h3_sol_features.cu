@@ -343,7 +343,7 @@ __global__ void threshold_kernel(
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= total_groups) return;
   const float ref = group_ref[row];
-  if (!isfinite(ref)) { threshold[row] = CUDART_INF_F; return; }
+  if (!isfinite(ref)) { threshold[row] = 3.0e38f; return; }
   int acc = 0;
   int boundary = -1;
   for (int b = HIST_BINS - 1; b >= 0; --b) {
