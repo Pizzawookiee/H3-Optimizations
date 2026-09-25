@@ -3,7 +3,7 @@ name: Build Windows native DLL (SM89)
 on:
   workflow_dispatch:
   push:
-    branches: ["latest_ref"]
+    branches: ["pooled_tail"]
     paths:
       - ".github/workflows/build_native_windows.yml"
       - "native/CMakeLists.txt"
