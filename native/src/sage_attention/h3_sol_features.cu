@@ -34,7 +34,7 @@ constexpr float HIST_LOW = 8.0f;
 constexpr float HIST_FINE_WIDTH = 0.25f;
 constexpr float HIST_COARSE_WIDTH = 2.0f;
 constexpr int TOK_CHUNK = 128;
-constexpr float NEG_INF = -CUDART_INF_F;
+constexpr float NEG_INF = -3.0e38f;
 constexpr float LOG2E_F = 1.4426950408889634f;
 
 __device__ __forceinline__ int inv_perm16(int w) {
