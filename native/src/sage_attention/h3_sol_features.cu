@@ -3,7 +3,8 @@
 // H3-routed Sol-style complement for the vendored Kitchen INT8 carrier.
 //
 // Routing remains entirely H3-owned.  This file consumes that route and adds:
-//   * pooled omitted-block mass,
+//   * pooled omitted-block mass scored with Kitchen-compatible quantized
+//     Q/K centroids,
 //   * Sol-style two-pass histogram token augmentation over blocks omitted by
 //     both neighbouring 64-row query tiles, and
 //   * an in-place shared-softmax merge with the exact sparse Kitchen result.
@@ -36,6 +37,8 @@ constexpr float HIST_COARSE_WIDTH = 2.0f;
 constexpr int TOK_CHUNK = 128;
 constexpr float NEG_INF = -3.0e38f;
 constexpr float LOG2E_F = 1.4426950408889634f;
+
+inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 
 __device__ __forceinline__ int inv_perm16(int w) {
   return (w & 1) | (((w >> 3) & 1) << 1) | (((w >> 1) & 1) << 2) |
@@ -90,6 +93,31 @@ __device__ __forceinline__ float block_sum_128(float x) {
   if (threadIdx.x == 0) warp_sum[0] = out;
   __syncthreads();
   return warp_sum[0];
+}
+
+__device__ __forceinline__ float block_max_128(float x) {
+  __shared__ float warp_max[4];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  #pragma unroll
+  for (int off = 16; off; off >>= 1)
+    x = fmaxf(x, __shfl_down_sync(0xffffffffu, x, off));
+  if (lane == 0) warp_max[warp] = x;
+  __syncthreads();
+  float out = threadIdx.x < 4 ? warp_max[lane] : 0.0f;
+  if (warp == 0) {
+    #pragma unroll
+    for (int off = 16; off; off >>= 1)
+      out = fmaxf(out, __shfl_down_sync(0xffffffffu, out, off));
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) warp_max[0] = out;
+  __syncthreads();
+  return warp_max[0];
+}
+
+__device__ __forceinline__ int8_t quant_i8(float x, float inv_scale) {
+  return (int8_t)max(-127, min(127, __float2int_rn(x * inv_scale)));
 }
 
 __device__ __forceinline__ bool route_bit(
@@ -160,6 +188,41 @@ __device__ __forceinline__ float sign128(int channel) {
   return ((signs >> shift) & 1u) ? 1.0f : -1.0f;
 }
 
+// Match Kitchen's HD128 Q/K transform dispatch: short sequences use the
+// normalized H4 transform; long sequences use the randomized normalized H128.
+// The transform is orthonormal, but quantizing after it makes using the same
+// basis as the exact Kitchen carrier important for softmax-state calibration.
+__device__ __forceinline__ float rotate_centroid_128(
+    float value, int d, int rotate_full, float *scratch) {
+  if (rotate_full) value *= sign128(d);
+  scratch[d] = value;
+  __syncthreads();
+
+  if (rotate_full) {
+    for (int stride = 1; stride < HD; stride <<= 1) {
+      const int mate = d ^ stride;
+      const float a = scratch[d];
+      const float m = scratch[mate];
+      __syncthreads();
+      scratch[d] = (d & stride) ? (m - a) : (a + m);
+      __syncthreads();
+    }
+    value = scratch[d] * 0.08838834764831845f; // 1/sqrt(128)
+  } else {
+    const int g = d & ~3;
+    const float a = scratch[g + 0], b = scratch[g + 1];
+    const float c = scratch[g + 2], e = scratch[g + 3];
+    __syncthreads();
+    const int j = d & 3;
+    if (j == 0) value = (a + b + c + e) * 0.5f;
+    else if (j == 1) value = (a - b + c - e) * 0.5f;
+    else if (j == 2) value = (a + b - c - e) * 0.5f;
+    else value = (a - b - c + e) * 0.5f;
+  }
+  __syncthreads();
+  return value;
+}
+
 __global__ void build_route_bits_kernel(
     const int32_t *__restrict__ route, const int32_t *__restrict__ counts,
     int32_t *__restrict__ bits, int rows, int slots, int words,
@@ -175,6 +238,40 @@ __global__ void build_route_bits_kernel(
     if (value >= 0 && value < words * 32)
       dst[value >> 5] |= 1u << (value & 31);
   }
+}
+
+// Precompute each centred K block centroid once.  The temporary carrier lives
+// in the existing group_q allocation until pooled_tail_kernel completes; the
+// token-stage group_q kernel overwrites that buffer afterwards.  This removes
+// an O(NQ*NK) repeated centroid transform/quantize while preserving the exact
+// same centroid score arithmetic.
+template <typename SummaryT>
+__global__ void precompute_k_centroid_kernel(
+    const SummaryT *__restrict__ k_summary,
+    const SummaryT *__restrict__ k_offset,
+    int8_t *__restrict__ k_centroid,
+    float *__restrict__ k_centroid_scale,
+    int B, int Hkv, int NK, int rotate_full) {
+  const int d = threadIdx.x;
+  const int kb = blockIdx.x;
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
+  if (d >= HD || kb >= NK) return;
+
+  __shared__ float rotate_scratch[HD];
+  __shared__ float scale;
+  const int64_t kbase = (((int64_t)b * Hkv + h) * NK + kb) * HD;
+  const int64_t koff = ((int64_t)b * Hkv + h) * HD;
+  float k_rot = rotate_centroid_128(
+      as_float(k_summary[kbase + d]) - as_float(k_offset[koff + d]),
+      d, rotate_full, rotate_scratch);
+  const float k_max = block_max_128(fabsf(k_rot));
+  if (d == 0) scale = k_max / 127.0f + 1.0e-7f;
+  __syncthreads();
+
+  k_centroid[kbase + d] = quant_i8(k_rot, 1.0f / scale);
+  if (d == 0)
+    k_centroid_scale[((int64_t)b * Hkv + h) * NK + kb] = scale;
 }
 
 template <typename SummaryT>
@@ -196,44 +293,33 @@ __global__ void group_q_kernel(
     const int64_t base1 = (((int64_t)b * H + h) * NQ + q1) * HD;
     value = 0.5f * (value + as_float(q_summary[base1 + d]));
   }
-  if (rotate_full) value *= sign128(d);
-  x[d] = value;
-  __syncthreads();
+  value = rotate_centroid_128(value, d, rotate_full, x);
 
-  if (rotate_full) {
-    for (int stride = 1; stride < HD; stride <<= 1) {
-      const int mate = d ^ stride;
-      const float a = x[d];
-      const float m = x[mate];
-      __syncthreads();
-      x[d] = (d & stride) ? (m - a) : (a + m);
-      __syncthreads();
-    }
-    value = x[d] * 0.08838834764831845f; // 1/sqrt(128)
-  } else {
-    const int g = d & ~3;
-    const float a = x[g + 0], b0 = x[g + 1], c = x[g + 2], e = x[g + 3];
-    __syncthreads();
-    const int j = d & 3;
-    if (j == 0) value = (a + b0 + c + e) * 0.5f;
-    else if (j == 1) value = (a - b0 + c - e) * 0.5f;
-    else if (j == 2) value = (a + b0 - c - e) * 0.5f;
-    else value = (a - b0 - c + e) * 0.5f;
-  }
-  group_q[(((int64_t)b * H + h) * groups + group) * HD + d] = value;
+  // Match the pooled centroid score system used for group_ref: quantize the
+  // grouped Q centroid as its own pseudo Kitchen row, then store its
+  // dequantized value for the existing token kernels.  This keeps token score
+  // comparisons against group_ref in the same centroid-quantized Q space
+  // without changing the token-stage ABI or buffers.
+  const float qmax = block_max_128(fabsf(value));
+  __shared__ float qscale;
+  if (d == 0) qscale = qmax / 127.0f + 1.0e-7f;
+  __syncthreads();
+  const int8_t q8 = quant_i8(value, 1.0f / qscale);
+  group_q[(((int64_t)b * H + h) * groups + group) * HD + d] =
+      (float)q8 * qscale;
 }
 
 template <typename SummaryT>
 __global__ void pooled_tail_kernel(
     const SummaryT *__restrict__ q_summary,
-    const SummaryT *__restrict__ k_summary,
+    const int8_t *__restrict__ k_centroid,
+    const float *__restrict__ k_centroid_scale,
     const float *__restrict__ v_sum,
-    const SummaryT *__restrict__ k_offset,
     const int32_t *__restrict__ bits,
     float *__restrict__ pooled_out, float *__restrict__ pooled_lse,
     float *__restrict__ group_ref,
     int B, int Hq, int Hkv, int NQ, int NK, int words, int Lk,
-    int kv_tile, int token_budget, float scale_log2) {
+    int kv_tile, int token_budget, int rotate_full, float scale_log2) {
   const int d = threadIdx.x;
   const int qb = blockIdx.x;
   const int h = blockIdx.y;
@@ -247,12 +333,27 @@ __global__ void pooled_tail_kernel(
 
   float numerator = 0.0f;
   __shared__ float sm_m, sm_l, sm_alpha, sm_p, sm_score;
+  __shared__ float rotate_scratch[HD];
+  __shared__ int8_t q_centroid[HD];
+  __shared__ float q_centroid_scale;
   if (threadIdx.x == 0) { sm_m = NEG_INF; sm_l = 0.0f; }
   __syncthreads();
   float local_ref = NEG_INF;
 
   const int64_t qbase = (((int64_t)b * Hq + h) * NQ + qb) * HD;
-  const int64_t koff = ((int64_t)b * Hkv + kh) * HD;
+
+  // Quantize the Q centroid as a pseudo Kitchen row.  The exact sparse branch
+  // computes logits from Kitchen's rotated INT8 carrier, so keeping the pooled
+  // centroid in the same transformed/quantized score system avoids merging a
+  // full-precision centroid LSE against an INT8 exact LSE.
+  float q_rot = rotate_centroid_128(
+      as_float(q_summary[qbase + d]), d, rotate_full, rotate_scratch);
+  const float q_max = block_max_128(fabsf(q_rot));
+  if (threadIdx.x == 0)
+    q_centroid_scale = q_max / 127.0f + 1.0e-7f;
+  __syncthreads();
+  q_centroid[d] = quant_i8(q_rot, 1.0f / q_centroid_scale);
+  __syncthreads();
 
   for (int kb = 0; kb < NK; ++kb) {
     if (route_bit(bits, bhq, qb, kb, NQ, words)) continue;
@@ -260,9 +361,10 @@ __global__ void pooled_tail_kernel(
     const bool token_candidate = token_budget > 0 && partner_omits;
 
     const int64_t kbase = (((int64_t)b * Hkv + kh) * NK + kb) * HD;
-    const float qv = as_float(q_summary[qbase + d]);
-    const float kv = as_float(k_summary[kbase + d]) - as_float(k_offset[koff + d]);
-    const float score = block_sum_128(qv * kv) * scale_log2;
+    const float ks = k_centroid_scale[((int64_t)b * Hkv + kh) * NK + kb];
+    const float int_dot = block_sum_128(
+        (float)q_centroid[d] * (float)k_centroid[kbase + d]);
+    const float score = int_dot * q_centroid_scale * ks * scale_log2;
     if (threadIdx.x == 0) sm_score = score;
     __syncthreads();
 
@@ -575,17 +677,41 @@ void launch_h3_sol_features(
       route_is_delta);
 
   const int rotate_full = Lk > 256 ? 1 : 0;
-  dim3 group_grid(groups, Hq, B);
+
+  // Reuse group_q as a temporary K-centroid carrier.  pooled_tail_kernel is
+  // ordered after this precompute on the same stream, and the token-stage
+  // group_q kernel is ordered after pooled_tail_kernel, so the buffer can be
+  // safely overwritten without any extra allocation or ABI change.
+  const size_t group_q_bytes =
+      (size_t)B * Hq * groups * HD * sizeof(float);
+  const size_t k_centroid_count = (size_t)B * Hkv * NK;
+  const size_t k_centroid_bytes = k_centroid_count * HD * sizeof(int8_t);
+  const size_t k_scale_offset = align16(k_centroid_bytes);
+  const size_t k_scratch_bytes =
+      k_scale_offset + k_centroid_count * sizeof(float);
+  if (k_scratch_bytes > group_q_bytes)
+    throw std::runtime_error(
+        "h3_sol_features: group_q scratch is too small for precomputed K centroids");
+
+  char *centroid_scratch = static_cast<char *>(group_q);
+  int8_t *k_centroid = reinterpret_cast<int8_t *>(centroid_scratch);
+  float *k_centroid_scale =
+      reinterpret_cast<float *>(centroid_scratch + k_scale_offset);
+
 #define LAUNCH_SUMMARY(T) \
-  group_q_kernel<T><<<group_grid, HD, 0, stream>>>( \
-      static_cast<const T *>(q_summary), static_cast<float *>(group_q), \
-      B, Hq, NQ, groups, rotate_full); \
+  precompute_k_centroid_kernel<T><<<dim3(NK, Hkv, B), HD, 0, stream>>>( \
+      static_cast<const T *>(k_summary), static_cast<const T *>(k_offset), \
+      k_centroid, k_centroid_scale, B, Hkv, NK, rotate_full); \
   pooled_tail_kernel<T><<<dim3(NQ, Hq, B), HD, 0, stream>>>( \
-      static_cast<const T *>(q_summary), static_cast<const T *>(k_summary), \
-      static_cast<const float *>(v_sum), static_cast<const T *>(k_offset), \
-      static_cast<const int32_t *>(route_bits), static_cast<float *>(pooled_out), \
-      static_cast<float *>(pooled_lse), static_cast<float *>(group_ref), \
-      B, Hq, Hkv, NQ, NK, words, Lk, kv_tile, token_budget, attention_scale * LOG2E_F)
+      static_cast<const T *>(q_summary), k_centroid, k_centroid_scale, \
+      static_cast<const float *>(v_sum), static_cast<const int32_t *>(route_bits), \
+      static_cast<float *>(pooled_out), static_cast<float *>(pooled_lse), \
+      static_cast<float *>(group_ref), B, Hq, Hkv, NQ, NK, words, Lk, kv_tile, \
+      token_budget, rotate_full, attention_scale * LOG2E_F); \
+  if (token_budget > 0) \
+    group_q_kernel<T><<<dim3(groups, Hq, B), HD, 0, stream>>>( \
+        static_cast<const T *>(q_summary), static_cast<float *>(group_q), \
+        B, Hq, NQ, groups, rotate_full)
   if (summary_dtype_code == 0) { LAUNCH_SUMMARY(float); }
   else if (summary_dtype_code == 1) { LAUNCH_SUMMARY(half); }
   else if (summary_dtype_code == 2) { LAUNCH_SUMMARY(__nv_bfloat16); }
