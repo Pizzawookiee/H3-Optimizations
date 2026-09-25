@@ -301,7 +301,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     tooltip=(
                         'Enables Sol-Attn-inspired features while preserving the existing '
                         'H3 routing policy. Kitchen INT8 (native rebuilt path) and BF16 Triton '
-                        'support pooled tail plus 64-token augmentation. Pooled tail preserves approximate '
+                        'support pooled tail plus 256-token augmentation. Pooled tail preserves approximate '
                         'softmax mass from omitted video blocks; token augmentation rescues '
                         'important individual tokens hidden inside those omitted blocks. '
                         'Together these can improve quality and temporal/detail stability '

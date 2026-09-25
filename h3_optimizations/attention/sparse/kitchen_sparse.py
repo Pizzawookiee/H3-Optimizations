@@ -611,7 +611,7 @@ class SparseKitchenBackend:
             k_summary=prepared.k_summary,
             v_sum=prepared.v_sum,
             k_offset=prepared.k_offset,
-            token_budget=64,
+            token_budget=256,
             output_layout=OUTPUT_HND,
         )
         return merged
@@ -703,7 +703,7 @@ class SparseKitchenBackend:
                     k_summary=prepared.k_summary,
                     v_sum=prepared.v_sum,
                     k_offset=prepared.k_offset,
-                    token_budget=64,
+                    token_budget=256,
                     output_layout=OUTPUT_NHD,
                 )
                 del lse2, q_summary
