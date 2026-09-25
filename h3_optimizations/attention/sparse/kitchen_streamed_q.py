@@ -58,6 +58,7 @@ from .kitchen_sparse import (
     snapshot_for,
 )
 from .router import SparseRouterError
+from .sol_tail import tile_sum, exact_mask_from_route, merge_pooled_tail
 
 
 @dataclass
@@ -71,6 +72,8 @@ class StreamedSparseKitchenQKV:
     projection_mode: str
     output_buffer: torch.Tensor | None
     fused_q: bool = False
+    v_sum: torch.Tensor | None = None
+    anchor_values: torch.Tensor | None = None
 
     def release(self):
         self.module = None
@@ -79,6 +82,8 @@ class StreamedSparseKitchenQKV:
         self.rope_freqs = None
         self.carrier = None
         self.k_summary = None
+        self.v_sum = None
+        self.anchor_values = None
         self.output_buffer = None
         self.fused_q = False
 
@@ -232,6 +237,11 @@ def _run_streamed_sparse_kitchen_qkv(
         anchor = kitchen.select_int8_attention_k_anchor(spec, samples)
         del samples
         producer = kitchen.create_int8_attention_producer(spec, anchor)
+        anchor_values = (
+            getattr(anchor, 'values', None)
+            if projector.sol_attn_features
+            else None
+        )
         del anchor
 
         staging = None
@@ -243,6 +253,15 @@ def _run_streamed_sparse_kitchen_qkv(
         kv_tiles = (sequence + kv_tile - 1) // kv_tile
         k_summary = x.new_empty(
             (1, int(module.heads), kv_tiles, int(module.head_dim))
+        )
+        v_sum = (
+            torch.empty(
+                (1, int(module.heads), kv_tiles, int(module.head_dim)),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            if projector.sol_attn_features
+            else None
         )
         chunk_kwargs = _qk_chunk_kwargs(kitchen, projector.strided_qk_input)
 
@@ -262,12 +281,18 @@ def _run_streamed_sparse_kitchen_qkv(
             k_summary[
                 ..., k_start : k_start + int(k_mean.shape[-2]), :
             ].copy_(k_mean)
+            v_total = None
+            if v_sum is not None:
+                v_total = tile_sum(v, kv_tile)
+                v_sum[
+                    ..., k_start : k_start + int(v_total.shape[-2]), :
+                ].copy_(v_total)
             if staging is None:
                 retained_v[..., start:end, :].copy_(v)
             else:
                 with diagnostics.stage("v_amax_update"):
                     staging.update(v)
-            del k_mean, k, v
+            del k_mean, v_total, k, v
 
         if staging is None:
             kitchen.quantize_int8_attention_v(producer, retained_v)
@@ -293,6 +318,8 @@ def _run_streamed_sparse_kitchen_qkv(
         rope_freqs=rope_freqs,
         carrier=carrier,
         k_summary=k_summary,
+        v_sum=v_sum,
+        anchor_values=anchor_values,
         projection_mode=projection_mode,
         output_buffer=x,
         fused_q=fused_q,
@@ -448,6 +475,12 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
             )
         if prepared.route_plan is None:
             raise SparseKitchenError("streamed Sparse Kitchen route was released")
+        if self.config.sol_attn_features and (
+            projected.v_sum is None or projected.anchor_values is None
+        ):
+            raise SparseKitchenError(
+                "Sol pooled tail requires streamed V sums and Kitchen K anchor values"
+            )
 
         kitchen = self.executor.kitchen
         producer_module = projected.producer_module
@@ -533,7 +566,6 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                         q_summary,
                         tile_start=tile_start,
                     )
-                    del q_summary
                 route = kitchen.BlockSparseRoute(
                     indices=lut,
                     counts=counts,
@@ -544,12 +576,43 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 del lut, counts
 
                 with diagnostics.stage("sparse_attention_kernel"):
-                    raw = kitchen.block_sparse_int8_attention_from_prequantized(
-                        chunk_carrier,
-                        route,
-                        output_layout=OUTPUT_NHD,
-                    )
-                del route, chunk_carrier
+                    if self.config.sol_attn_features:
+                        operation = getattr(
+                            kitchen,
+                            'block_sparse_int8_attention_with_lse_from_prequantized',
+                            None,
+                        )
+                        if operation is None:
+                            raise SparseKitchenError(
+                                'Sol pooled tail requires Kitchen sparse LSE support'
+                            )
+                        raw, lse2 = operation(
+                            chunk_carrier, route, output_layout=OUTPUT_NHD
+                        )
+                        exact_mask = exact_mask_from_route(
+                            route, prepared.route_plan.k_summary.shape[-2]
+                        )
+                        raw, _ = merge_pooled_tail(
+                            raw,
+                            lse2,
+                            q_summary=q_summary,
+                            k_summary=prepared.route_plan.k_summary,
+                            v_sum=projected.v_sum,
+                            exact_mask=exact_mask,
+                            sequence=sequence,
+                            q_tile=q_tile,
+                            kv_tile=int(self.executor.kv_tile),
+                            scale=float(chunk_carrier.attention_scale),
+                            k_offset=projected.anchor_values,
+                        )
+                        del lse2, exact_mask
+                    else:
+                        raw = kitchen.block_sparse_int8_attention_from_prequantized(
+                            chunk_carrier,
+                            route,
+                            output_layout=OUTPUT_NHD,
+                        )
+                del q_summary, route, chunk_carrier
 
                 if stop == sequence:
                     projected.carrier = None

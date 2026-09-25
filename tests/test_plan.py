@@ -92,6 +92,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.early_schedule, EARLY_SCHEDULE_HOLD)
         self.assertEqual(request.video_token_order, VIDEO_TOKEN_ORDER_1X8X8)
         self.assertFalse(request.advanced_schedule)
+        self.assertFalse(request.sol_attn_features)
 
     def test_legacy_sparse_request_positional_shape_is_preserved(self):
         request = SparseRequest(0.3, False, 2, 0.5, 2, 0.5)
@@ -106,6 +107,17 @@ class PlanTests(unittest.TestCase):
             ),
             (2, 0.5, 2, 0.5),
         )
+
+    def test_sol_attn_features_are_part_of_sparse_identity(self):
+        request = SparseRequest(
+            backend=SPARSE_BACKEND_KITCHEN, sol_attn_features=True
+        )
+        self.assertTrue(request.sol_attn_features)
+        self.assertTrue(request.signature[-1])
+
+    def test_sol_attn_features_reject_unsupported_explicit_backend(self):
+        with self.assertRaisesRegex(ValueError, 'only Kitchen INT8 and BF16 Triton'):
+            SparseRequest(backend=SPARSE_BACKEND_FROST, sol_attn_features=True)
 
     def test_legacy_kitchen_label_is_normalized(self):
         for label in ('Kitchen INT8', 'Kitchen INT8 (experimental)'):

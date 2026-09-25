@@ -118,11 +118,15 @@ class PreparedChunkedKitchenQKV:
     q_summary: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     output_buffer: torch.Tensor | None = None
+    v_sum: torch.Tensor | None = None
+    anchor_values: torch.Tensor | None = None
 
     def release(self):
         self.carrier = None
         self.q_summary = None
         self.k_summary = None
+        self.v_sum = None
+        self.anchor_values = None
         self.output_buffer = None
 
 
@@ -194,6 +198,22 @@ def _tile_mean(x, tile):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
 
 
+def _tile_sum(x, tile):
+    full = x.shape[-2] // tile
+    remainder = x.shape[-2] % tile
+    pieces = []
+    if full:
+        pieces.append(
+            x[..., :full * tile, :]
+            .reshape(*x.shape[:-2], full, tile, x.shape[-1])
+            .float()
+            .sum(dim=-2)
+        )
+    if remainder:
+        pieces.append(x[..., full * tile:, :].float().sum(dim=-2, keepdim=True))
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
+
+
 def run_chunked_kitchen_qkv(
     module,
     x,
@@ -207,6 +227,7 @@ def run_chunked_kitchen_qkv(
     fp8_projection=False,
     convrot_int8_projection=False,
     routing_summaries=False,
+    sol_attn_features=False,
     routing_q_tile=None,
     routing_kv_tile=None,
     strided_qk_input=False,
@@ -265,6 +286,9 @@ def run_chunked_kitchen_qkv(
         del samples
         with diagnostics.stage('producer_create'):
             producer = kitchen.create_int8_attention_producer(spec, anchor)
+        anchor_values = (
+            getattr(anchor, 'values', None) if sol_attn_features else None
+        )
         del anchor
 
         sequence = int(x.shape[0])
@@ -279,6 +303,7 @@ def run_chunked_kitchen_qkv(
         retained_v = None
         q_summaries = []
         k_summaries = []
+        v_sums = [] if sol_attn_features else None
         for start in range(0, sequence, int(chunk_rows)):
             end = min(start + int(chunk_rows), sequence)
             q, k, v = project_chunk_hnd(
@@ -297,6 +322,8 @@ def run_chunked_kitchen_qkv(
                 with diagnostics.stage('routing_summary_generation'):
                     q_summaries.append(_tile_mean(q, routing_q_tile))
                     k_summaries.append(_tile_mean(k, routing_kv_tile))
+                    if sol_attn_features:
+                        v_sums.append(_tile_sum(v, routing_kv_tile))
             kitchen.quantize_int8_attention_qk_chunk(
                 producer,
                 q,
@@ -335,6 +362,12 @@ def run_chunked_kitchen_qkv(
                 k_summary=(
                     torch.cat(k_summaries, dim=-2) if k_summaries else None
                 ),
+                v_sum=(
+                    torch.cat(v_sums, dim=-2)
+                    if v_sums is not None and v_sums
+                    else None
+                ),
+                anchor_values=anchor_values,
             )
     finally:
         if held is not None:
@@ -449,6 +482,7 @@ class ChunkedKitchenQKVProjector:
         fp8_projection=False,
         convrot_int8_projection=False,
         routing_summaries=False,
+        sol_attn_features=False,
         q_tile=None,
         kv_tile=None,
         strided_qk_input=False,
@@ -471,6 +505,7 @@ class ChunkedKitchenQKVProjector:
                 'Kitchen QKV projection cannot force more than one weight format'
             )
         self.routing_summaries = bool(routing_summaries)
+        self.sol_attn_features = bool(sol_attn_features)
         self.q_tile = None if q_tile is None else int(q_tile)
         self.kv_tile = None if kv_tile is None else int(kv_tile)
         if self.q_tile is not None and self.q_tile <= 0:
@@ -495,6 +530,7 @@ class ChunkedKitchenQKVProjector:
             self.fp8_projection,
             self.convrot_int8_projection,
             self.routing_summaries,
+            self.sol_attn_features,
             self.q_tile,
             self.kv_tile,
             self.strided_qk_input,
@@ -617,6 +653,7 @@ class ChunkedKitchenQKVProjector:
                         fp8_projection=self.fp8_projection,
                         convrot_int8_projection=self.convrot_int8_projection,
                         routing_summaries=self.routing_summaries,
+                        sol_attn_features=self.sol_attn_features,
                         routing_q_tile=self.q_tile,
                         routing_kv_tile=self.kv_tile,
                         strided_qk_input=self.strided_qk_input,

@@ -17,6 +17,8 @@ from .plan import (
     EARLY_SCHEDULE_RAMP,
     SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
+    SPARSE_BACKEND_TRITON,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
     VIDEO_TOKEN_ORDER_REQUESTS,
@@ -292,6 +294,18 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'Raster restores unchanged H3 target-video ordering.'
                     ),
                 ),
+                io.Boolean.Input(
+                    'sol_attn_features',
+                    display_name='Sol attention features',
+                    default=False,
+                    tooltip=(
+                        'Enables Sol-Attn-inspired features while preserving the existing '
+                        'H3 routing policy. Currently only Kitchen INT8 and BF16 Triton '
+                        'support this option, and pooled tail is the only Sol feature '
+                        'implemented so far; Sol routing and token augmentation are not '
+                        'enabled.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -308,6 +322,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         backend=SPARSE_BACKEND_KITCHEN,
         early_schedule=_ADVANCED_DEFAULT_EARLY_SCHEDULE,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
+        sol_attn_features=False,
     ):
         passthrough = _vsa_passthrough(model)
         if passthrough is not None:
@@ -320,6 +335,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 late_steps=int(late_steps),
                 late_kv=float(late_kv),
                 backend=backend,
+                sol_attn_features=bool(sol_attn_features),
                 early_schedule=early_schedule,
                 video_token_order=video_token_order,
             )
@@ -341,9 +357,18 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         late_steps=DEFAULT_LATE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
+        sol_attn_features=False,
     ):
         if backend is not None and backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
             return 'unknown sparse backend %r' % backend
+        if sol_attn_features and backend not in (
+            None, 'auto', SPARSE_BACKEND_KITCHEN, SPARSE_BACKEND_KITCHEN_64X128,
+            SPARSE_BACKEND_TRITON, 'Kitchen INT8', 'Kitchen INT8 (experimental)',
+            'Kitchen INT8 64x128 (experimental)', 'BF16 Triton', 'INT8 Triton',
+        ):
+            return (
+                'sol_attn_features currently supports only Kitchen INT8 and BF16 Triton'
+            )
         if early_schedule is not None and early_schedule not in EARLY_SCHEDULE_OPTIONS:
             return 'unknown early schedule %r' % early_schedule
         if video_token_order is not None and video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:

@@ -39,7 +39,10 @@ class HybridSparseConfig:
     late_kv: float | None = None
     early_schedule: str = EARLY_SCHEDULE_HOLD
     step_video_budgets: tuple[float, ...] | None = None
+    sol_attn_features: bool = False
     def __post_init__(self):
+        if not isinstance(self.sol_attn_features, bool):
+            raise ValueError('sol_attn_features must be boolean')
         if self.mode not in IMPLEMENTED_MODES:
             raise ValueError(
                 'sparse mode %r is unavailable; implemented modes: %s'
@@ -93,6 +96,7 @@ class HybridSparseConfig:
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
             self.step_video_budgets,
+            bool(self.sol_attn_features),
         )
 
 

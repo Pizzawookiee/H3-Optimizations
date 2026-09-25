@@ -11,6 +11,12 @@ from ...qkv.bf16 import PreparedBF16QKV
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
+from .sol_tail import (
+    exact_mask_from_compact,
+    merge_pooled_tail,
+    tile_mean,
+    tile_sum,
+)
 
 try:
     import triton
@@ -59,6 +65,9 @@ class PreparedTritonBF16:
     sparse_selected: int
     layer_index: int
     metadata: dict
+    q_summary: torch.Tensor | None = None
+    k_summary: torch.Tensor | None = None
+    v_sum: torch.Tensor | None = None
 
 
 def preflight_triton_bf16(
@@ -136,6 +145,7 @@ if TRITON_AVAILABLE:
         V,
         LUT,
         O,
+        LSE,
         sequence,
         Q_BLOCK_START,
         Q_BLOCK_COUNT,
@@ -149,8 +159,11 @@ if TRITON_AVAILABLE:
         stride_vn: tl.constexpr,
         stride_oh: tl.constexpr,
         stride_on: tl.constexpr,
+        stride_lh: tl.constexpr,
+        stride_ln: tl.constexpr,
         N_SELECTED: tl.constexpr,
         USE_ROUTE: tl.constexpr,
+        STORE_LSE: tl.constexpr,
         softmax_scale: tl.constexpr,
         Q_TILE_: tl.constexpr,
         KV_TILE_: tl.constexpr,
@@ -218,9 +231,15 @@ if TRITON_AVAILABLE:
             (output / row_sum[:, None]).to(O.type.element_ty),
             mask=q_mask[:, None],
         )
+        if STORE_LSE:
+            tl.store(
+                LSE + bh * stride_lh + q_rows * stride_ln,
+                row_max + tl.log2(row_sum),
+                mask=q_mask,
+            )
 
 
-def _launch(prepared):
+def _launch(prepared, *, return_lse=False):
     if not TRITON_AVAILABLE:
         raise TritonBF16Error('BF16 Triton sparse attention requires Triton')
     if not isinstance(prepared, PreparedTritonBF16):
@@ -247,6 +266,15 @@ def _launch(prepared):
         dtype=prepared.q.dtype,
         device=prepared.q.device,
     )
+    lse = (
+        torch.empty(
+            (prepared.q.shape[0], prepared.q.shape[1], sequence),
+            dtype=torch.float32,
+            device=prepared.q.device,
+        )
+        if return_lse
+        else None
+    )
 
     def launch_group(q_start, q_count, selected, use_route):
         if not q_count:
@@ -257,6 +285,7 @@ def _launch(prepared):
             prepared.v,
             prepared.sparse_lut,
             output,
+            output if lse is None else lse,
             sequence,
             q_start,
             q_count,
@@ -270,8 +299,11 @@ def _launch(prepared):
             stride_vn=prepared.v.stride(2),
             stride_oh=output.stride(1),
             stride_on=output.stride(2),
+            stride_lh=(sequence if lse is None else lse.stride(1)),
+            stride_ln=(1 if lse is None else lse.stride(2)),
             N_SELECTED=selected,
             USE_ROUTE=use_route,
+            STORE_LSE=return_lse,
             softmax_scale=HEAD_DIM**-0.5,
             Q_TILE_=Q_TILE,
             KV_TILE_=KV_TILE,
@@ -287,7 +319,7 @@ def _launch(prepared):
         prepared.sparse_selected,
         True,
     )
-    return output
+    return (output, lse) if return_lse else output
 
 
 def _launch_streamed_chunk(
@@ -302,6 +334,7 @@ def _launch_streamed_chunk(
     sequence,
     q_row_start,
     sparse_lut_q_start=0,
+    return_lse=False,
 ):
     if not TRITON_AVAILABLE:
         raise TritonBF16Error('BF16 Triton sparse attention requires Triton')
@@ -350,6 +383,10 @@ def _launch_streamed_chunk(
     # that head. The store at the end can therefore safely overwrite the Q slab
     # in place. This makes one bounded allocation serve as both Q and O.
     output = q
+    lse = (
+        torch.empty((1, heads, rows), dtype=torch.float32, device=q.device)
+        if return_lse else None
+    )
 
     def launch_group(q_start, q_count, selected, use_route, lut):
         if not q_count:
@@ -360,6 +397,7 @@ def _launch_streamed_chunk(
             v,
             lut,
             output,
+            output if lse is None else lse,
             int(sequence),
             q_start,
             q_count,
@@ -373,8 +411,11 @@ def _launch_streamed_chunk(
             stride_vn=v.stride(2),
             stride_oh=output.stride(1),
             stride_on=output.stride(2),
+            stride_lh=(rows if lse is None else lse.stride(1)),
+            stride_ln=(1 if lse is None else lse.stride(2)),
             N_SELECTED=selected,
             USE_ROUTE=use_route,
+            STORE_LSE=return_lse,
             softmax_scale=HEAD_DIM**-0.5,
             Q_TILE_=Q_TILE,
             KV_TILE_=KV_TILE,
@@ -410,7 +451,7 @@ def _launch_streamed_chunk(
             True,
             route,
         )
-    return output
+    return (output, lse) if return_lse else output
 
 
 class TritonBF16Backend:
@@ -489,6 +530,15 @@ class TritonBF16Backend:
             sparse_selected=selected,
             layer_index=int(layer_index),
             metadata=metadata,
+            q_summary=(
+                tile_mean(q, Q_TILE) if self.config.sol_attn_features else None
+            ),
+            k_summary=(
+                tile_mean(k, KV_TILE) if self.config.sol_attn_features else None
+            ),
+            v_sum=(
+                tile_sum(v, KV_TILE) if self.config.sol_attn_features else None
+            ),
         )
 
     def prepare_projected(
@@ -562,7 +612,32 @@ class TritonBF16Backend:
                 'streamed BF16 Triton must execute through execute_projected'
             )
         try:
-            return _launch(prepared)
+            if not self.config.sol_attn_features:
+                return _launch(prepared)
+            exact, lse2 = _launch(prepared, return_lse=True)
+            sequence = int(prepared.q.shape[-2])
+            q_tiles = (sequence + Q_TILE - 1) // Q_TILE
+            kv_tiles = (sequence + KV_TILE - 1) // KV_TILE
+            exact_mask = exact_mask_from_compact(
+                prepared.sparse_lut,
+                heads=int(prepared.q.shape[1]),
+                q_tiles=q_tiles,
+                kv_tiles=kv_tiles,
+                dense_q_tiles=prepared.dense_q_tiles,
+            )
+            merged, _ = merge_pooled_tail(
+                exact,
+                lse2,
+                q_summary=prepared.q_summary,
+                k_summary=prepared.k_summary,
+                v_sum=prepared.v_sum,
+                exact_mask=exact_mask,
+                sequence=sequence,
+                q_tile=Q_TILE,
+                kv_tile=KV_TILE,
+                scale=HEAD_DIM ** -0.5,
+            )
+            return merged
         except Exception as exc:
             layer = getattr(prepared, 'layer_index', -1)
             raise TritonBF16Error(
@@ -588,6 +663,8 @@ class TritonBF16Backend:
                 else 'global_bf16_qkv'
             ),
             'approximate': True,
+            'sol_attn_features': bool(self.config.sol_attn_features),
+            'sol_pooled_tail': bool(self.config.sol_attn_features),
         }
 
 

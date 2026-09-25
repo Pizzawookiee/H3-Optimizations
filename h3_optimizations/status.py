@@ -371,6 +371,7 @@ def format_sparse_status(model):
             or getattr(plan_sparse, 'video_token_order', 'unknown')
         ),
         'Requested video KV budget: %.1f%%' % (float(budget) * 100.0),
+        'Sol attention features: %s' % ('pooled tail' if sparse.get('sol_attn_features') else 'Off'),
         'QKV: %s' % format_qkv_execution(status),
         (
             'Effective density rounds up to a whole KV-tile count at runtime; '

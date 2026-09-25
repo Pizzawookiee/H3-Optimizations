@@ -342,6 +342,7 @@ def _sparse_config_kwargs(plan):
         'early_schedule': sparse.early_schedule,
         'step_video_budgets': sparse.step_video_budgets,
         'strict': True,
+        'sol_attn_features': bool(sparse.sol_attn_features),
     }
 
 
@@ -870,6 +871,17 @@ def _resolve_kitchen_sparse(
         q_tile=q_tile,
         kv_tile=kv_tile,
     )
+    if (
+        bool(plan.sparse.sol_attn_features)
+        and not hasattr(
+            kitchen,
+            'block_sparse_int8_attention_with_lse_from_prequantized',
+        )
+    ):
+        raise SparseKitchenError(
+            'Sol pooled tail requires Kitchen sparse LSE support; '
+            'this Kitchen implementation does not provide it'
+        )
     qkv = resolve_qkv_provider(
         inventory,
         request=_qkv_request(plan),
@@ -902,6 +914,7 @@ def _resolve_kitchen_sparse(
                 qkv.provider_id == QKV_FORCE_BF16_STREAMED_KITCHEN
             ),
             routing_summaries=True,
+            sol_attn_features=bool(plan.sparse.sol_attn_features),
             q_tile=q_tile,
             kv_tile=kv_tile,
             strided_qk_input=True,
@@ -979,7 +992,10 @@ def _resolve_attention(plan, model, inventory, environment):
                 False,
                 'standard QKV preserves the explicit external attention consumer',
             )
-            if plan.sparse.backend == SPARSE_BACKEND_AUTO:
+            if (
+                plan.sparse.backend == SPARSE_BACKEND_AUTO
+                and not plan.sparse.sol_attn_features
+            ):
                 return _resolve_existing_dense_sparse(
                     plan,
                     model,
@@ -1009,7 +1025,10 @@ def _resolve_attention(plan, model, inventory, environment):
             inventory,
             environment,
         )
-        if plan.sparse.backend == SPARSE_BACKEND_AUTO:
+        if (
+            plan.sparse.backend == SPARSE_BACKEND_AUTO
+            and not plan.sparse.sol_attn_features
+        ):
             return _resolve_existing_dense_sparse(
                 plan,
                 model,
@@ -1076,6 +1095,28 @@ def _resolve_attention(plan, model, inventory, environment):
     try:
         return _resolve_kitchen_sparse(plan, environment, inventory)
     except SparseKitchenError as kitchen_exc:
+        if bool(getattr(plan.sparse, 'sol_attn_features', False)):
+            fallback_reason = 'Kitchen INT8 unavailable: %s' % kitchen_exc
+            try:
+                return _resolve_triton_sparse(
+                    plan, environment, inventory, fallback_reason
+                )
+            except TritonSparseError as triton_exc:
+                return (
+                    ResolvedAttention(
+                        requested=ATTENTION_SPARSE,
+                        selected=dense_attention.selected,
+                        backend=dense_attention.backend,
+                        reason=(
+                            '%s; BF16 Triton unavailable: %s; %s'
+                            % (fallback_reason, triton_exc, dense_attention.reason)
+                        ),
+                        backend_kind=dense_attention.backend_kind,
+                        projector=dense_attention.projector,
+                        dense_resolution=dense_attention.dense_resolution,
+                    ),
+                    dense_qkv,
+                )
         try:
             return _resolve_sparse(plan, environment, inventory)
         except SparseSageError as sparse_exc:
@@ -1239,6 +1280,7 @@ def _status(
                 'late_kv': plan.sparse.late_kv,
                 'early_schedule': plan.sparse.early_schedule,
                 'video_token_order': plan.sparse.video_token_order,
+                'sol_attn_features': bool(plan.sparse.sol_attn_features),
                 'step_video_budgets': (
                     None
                     if plan.sparse.step_video_budgets is None

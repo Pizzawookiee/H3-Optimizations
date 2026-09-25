@@ -491,6 +491,38 @@ class SparseBackendSelectionTests(unittest.TestCase):
         triton.assert_not_called()
         flex.assert_not_called()
 
+    def test_auto_sol_features_skip_unsupported_sparse_sage_and_use_triton(self):
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(sol_attn_features=True)
+        )
+        target = (resolved(apply_module.ATTENTION_TRITON_SPARSE), self.qkv)
+        with mock.patch.object(
+            apply_module,
+            '_resolve_dense',
+            return_value=(resolved('dense'), self.qkv),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            side_effect=SparseKitchenError('native self-test failed'),
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_sparse',
+        ) as sage, mock.patch.object(
+            apply_module,
+            '_resolve_triton_sparse',
+            return_value=target,
+        ) as triton, mock.patch.object(
+            apply_module,
+            '_resolve_fp8_flex',
+        ) as flex:
+            actual = apply_module._resolve_attention(
+                plan, self.model, self.inventory, self.environment
+            )
+        self.assertIs(actual, target)
+        sage.assert_not_called()
+        triton.assert_called_once()
+        flex.assert_not_called()
+
     def test_auto_uses_sparse_sage_after_kitchen_failure(self):
         plan = H3OptimizationPlan(sparse=SparseRequest())
         target = (resolved(apply_module.ATTENTION_SPARSE), self.qkv)

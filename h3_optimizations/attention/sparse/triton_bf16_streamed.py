@@ -20,6 +20,7 @@ from ...qkv.streamed import (
 )
 from .config import resolve_video_budget
 from .router import SparseRouterError
+from .sol_tail import tile_sum, exact_mask_from_compact, merge_pooled_tail
 from .triton_route import (
     TritonRouteError,
     build_compact_absolute_route_chunk,
@@ -48,6 +49,7 @@ class StreamedTritonBF16QKV:
     layer_index: int
     chunk_rows: int
     projection_mode: str = PROJECTION_NATIVE
+    v_sum: torch.Tensor | None = None
 
     def project_q(self, start, end):
         if self.held is not None:
@@ -85,6 +87,7 @@ class StreamedTritonBF16QKV:
         self.x = self.rope_freqs = None
         self.k = self.v = None
         self.k_summary = None
+        self.v_sum = None
 
 
 @dataclass
@@ -318,6 +321,8 @@ def prepare_streamed_triton_bf16(
         projected.release()
         raise
 
+    if backend.config.sol_attn_features:
+        projected.v_sum = tile_sum(projected.v, KV_TILE)
     projected.k_summary = None
     mask_metadata = route_plan.metadata
     metadata = mask_metadata.as_dict()
@@ -375,17 +380,20 @@ def execute_streamed_triton_bf16(module, backend, prepared):
                     prepared.route_plan,
                     q_tile_start=start // Q_TILE,
                 )
-            del q_summary
 
             # After the last query slab has selected its route, the global K
             # summary has no remaining consumer. Drop it before attention so
             # the same-stream allocator may reuse those bytes immediately.
-            if end == sequence and prepared.route_plan is not None:
+            if (
+                end == sequence
+                and prepared.route_plan is not None
+                and not backend.config.sol_attn_features
+            ):
                 prepared.route_plan.release()
                 prepared.route_plan = None
 
             with diagnostics.stage("sparse_attention_kernel"):
-                output = _launch_streamed_chunk(
+                launched = _launch_streamed_chunk(
                     q,
                     projected.k,
                     projected.v,
@@ -399,11 +407,49 @@ def execute_streamed_triton_bf16(module, backend, prepared):
                         0,
                         start // Q_TILE - prepared.dense_q_tiles,
                     ),
+                    return_lse=backend.config.sol_attn_features,
                 )
-            del q, sparse_lut
+                if backend.config.sol_attn_features:
+                    output, lse2 = launched
+                    local_q_tiles = int(q_summary.shape[-2])
+                    global_q_tile_start = start // Q_TILE
+                    local_dense = max(
+                        0,
+                        min(
+                            global_q_tile_start + local_q_tiles,
+                            prepared.dense_q_tiles,
+                        ) - global_q_tile_start,
+                    )
+                    exact_mask = exact_mask_from_compact(
+                        sparse_lut,
+                        heads=projected.heads,
+                        q_tiles=local_q_tiles,
+                        kv_tiles=int(prepared.route_plan.geometry.kv_tiles),
+                        dense_q_tiles=local_dense,
+                    )
+                    output, _ = merge_pooled_tail(
+                        output,
+                        lse2,
+                        q_summary=q_summary,
+                        k_summary=prepared.route_plan.k_summary,
+                        v_sum=projected.v_sum,
+                        exact_mask=exact_mask,
+                        sequence=sequence,
+                        q_tile=Q_TILE,
+                        kv_tile=KV_TILE,
+                        scale=HEAD_DIM ** -0.5,
+                    )
+                    del lse2, exact_mask
+                else:
+                    output = launched
+            del q, q_summary, sparse_lut
             if end == sequence:
+                if prepared.route_plan is not None:
+                    prepared.route_plan.release()
+                    prepared.route_plan = None
                 projected.k = None
                 projected.v = None
+                projected.v_sum = None
 
             with diagnostics.stage("attention_out"):
                 rows = end - start

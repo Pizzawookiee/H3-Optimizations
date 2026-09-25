@@ -27,6 +27,12 @@ from ...normalized_rows import attention_output_buffer
 from ...runtime.context import get_runtime_snapshot
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV, resolve_video_budget
 from .router import SparseRouterError, SparseTileRouter
+from .sol_tail import (
+    exact_mask_from_route,
+    merge_pooled_tail,
+    tile_mean,
+    tile_sum,
+)
 from ...kitchen_qkv import PreparedChunkedKitchenQKV
 
 
@@ -186,6 +192,10 @@ class PreparedSparseKitchen:
     layer_index: int
     metadata: dict
     output_buffer: object = None
+    q_summary: object = None
+    k_summary: object = None
+    v_sum: object = None
+    k_offset: object = None
 
     def release(self):
         """Drop the carriers and route once the kernel no longer needs them.
@@ -200,6 +210,10 @@ class PreparedSparseKitchen:
         self.quantized = None
         self.route = None
         self.output_buffer = None
+        self.q_summary = None
+        self.k_summary = None
+        self.v_sum = None
+        self.k_offset = None
 
 class SparseKitchenExecutor:
     '''Quantize with Kitchen, then attend over the routed KV tiles.'''
@@ -224,7 +238,10 @@ class SparseKitchenExecutor:
             )
         self.output_layout = str(output_layout)
 
-    def prepare(self, q, k, v, lut, valid_block_num, *, layer_index, metadata):
+    def prepare(
+        self, q, k, v, lut, valid_block_num, *, layer_index, metadata,
+        tail_summaries=False,
+    ):
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise SparseKitchenError('Kitchen sparse attention expects HND rank-4 Q/K/V')
         if q.shape[-1] != HEAD_DIM:
@@ -242,12 +259,39 @@ class SparseKitchenExecutor:
         # The router emits Sparge's delta encoding. Declaring it rather than
         # converting keeps this a zero-conversion path: the route knows how to
         # reach whatever encoding the compiled kernel walks.
+        q_summary = k_summary = v_sum = k_offset = None
+        if tail_summaries:
+            anchor_indices = getattr(quantized, 'anchor_indices', None)
+            if anchor_indices is None:
+                raise SparseKitchenError(
+                    'Sol pooled tail requires Kitchen K anchor metadata'
+                )
+            safe_anchor = anchor_indices.to(torch.int64).clamp_min(0)
+            k_offset = torch.gather(
+                k,
+                2,
+                safe_anchor[..., None, None].expand(
+                    k.shape[0], k.shape[1], 1, k.shape[-1]
+                ),
+            ).squeeze(2)
+            k_offset = torch.where(
+                (anchor_indices >= 0).unsqueeze(-1),
+                k_offset,
+                torch.zeros_like(k_offset),
+            ).contiguous()
+            q_summary = tile_mean(q, self.q_tile)
+            k_summary = tile_mean(k, self.kv_tile)
+            v_sum = tile_sum(v, self.kv_tile)
         return self.prepare_projected(
             quantized,
             lut,
             valid_block_num,
             layer_index=layer_index,
             metadata=metadata,
+            q_summary=q_summary,
+            k_summary=k_summary,
+            v_sum=v_sum,
+            k_offset=k_offset,
         )
 
     def prepare_projected(
@@ -258,6 +302,10 @@ class SparseKitchenExecutor:
         *,
         layer_index,
         metadata,
+        q_summary=None,
+        k_summary=None,
+        v_sum=None,
+        k_offset=None,
     ):
         if quantized.q.ndim != 4 or quantized.k.ndim != 4:
             raise SparseKitchenError(
@@ -295,6 +343,10 @@ class SparseKitchenExecutor:
             original_head_dim=int(quantized.original_head_dim),
             layer_index=int(layer_index),
             metadata=metadata,
+            q_summary=q_summary,
+            k_summary=k_summary,
+            v_sum=v_sum,
+            k_offset=k_offset,
         )
 
     def execute(self, prepared):
@@ -306,7 +358,21 @@ class SparseKitchenExecutor:
             prepared.quantized, prepared.route, output_layout=self.output_layout
         )
 
+    def _assert_sol_route_geometry(self, quantized, route):
+        resolver = getattr(self.kitchen, '_runtime_sparse_route', None)
+        if resolver is None:
+            return
+        resolved = resolver(quantized, route, validate_geometry=True)
+        if (int(resolved.q_tile), int(resolved.kv_tile)) != (
+            int(route.q_tile), int(route.kv_tile)
+        ):
+            raise SparseKitchenError(
+                'Sol pooled tail requires the requested Kitchen route geometry; '
+                'the native runtime selected a coarser fallback geometry instead'
+            )
+
     def execute_with_lse(self, prepared):
+        self._assert_sol_route_geometry(prepared.quantized, prepared.route)
         operation = getattr(
             self.kitchen,
             'block_sparse_int8_attention_with_lse_from_prequantized',
@@ -454,6 +520,7 @@ class SparseKitchenBackend:
             valid_block_num,
             layer_index=layer_index,
             metadata=route_metadata(mask_metadata, layer_index, q.shape[1]),
+            tail_summaries=self.config.sol_attn_features,
         )
 
     def prepare_projected(
@@ -505,6 +572,10 @@ class SparseKitchenBackend:
                 layer_index,
                 projected.q_summary.shape[1],
             ),
+            q_summary=projected.q_summary,
+            k_summary=projected.k_summary,
+            v_sum=getattr(projected, 'v_sum', None),
+            k_offset=getattr(projected, 'anchor_values', None),
         )
         prepared.output_buffer = projected.output_buffer
         return prepared
@@ -514,7 +585,35 @@ class SparseKitchenBackend:
         return self.executor.output_layout
 
     def execute(self, prepared):
-        return self.executor.execute(prepared)
+        if not self.config.sol_attn_features:
+            return self.executor.execute(prepared)
+        if (
+            prepared.q_summary is None
+            or prepared.k_summary is None
+            or prepared.v_sum is None
+            or prepared.k_offset is None
+        ):
+            raise SparseKitchenError(
+                'Sol pooled tail requires Q/K summaries, V sums, and Kitchen K anchor values'
+            )
+        exact, lse2 = self.executor.execute_with_lse(prepared)
+        exact_mask = exact_mask_from_route(
+            prepared.route, prepared.k_summary.shape[-2]
+        )
+        merged, _ = merge_pooled_tail(
+            exact,
+            lse2,
+            q_summary=prepared.q_summary,
+            k_summary=prepared.k_summary,
+            v_sum=prepared.v_sum,
+            exact_mask=exact_mask,
+            sequence=int(exact.shape[-2]),
+            q_tile=int(prepared.route.q_tile),
+            kv_tile=int(prepared.route.kv_tile),
+            scale=float(prepared.quantized.attention_scale),
+            k_offset=prepared.k_offset,
+        )
+        return merged
 
     def execute_projected(self, module, prepared):
         if not self.stream_output or prepared.output_buffer is None:
@@ -556,11 +655,57 @@ class SparseKitchenBackend:
                     ..., first_route_tile:stop_route_tile
                 ].contiguous(),
             )
-            raw = self.executor.kitchen.block_sparse_int8_attention_from_prequantized(
-                chunk_carrier,
-                chunk_route,
-                output_layout=OUTPUT_NHD,
-            )
+            if self.config.sol_attn_features:
+                if (
+                    prepared.q_summary is None
+                    or prepared.k_summary is None
+                    or prepared.v_sum is None
+                    or prepared.k_offset is None
+                ):
+                    raise SparseKitchenError(
+                        'Sol pooled tail requires Q/K summaries, V sums, and Kitchen K anchor values'
+                    )
+                self.executor._assert_sol_route_geometry(
+                    chunk_carrier, chunk_route
+                )
+                operation = getattr(
+                    self.executor.kitchen,
+                    'block_sparse_int8_attention_with_lse_from_prequantized',
+                    None,
+                )
+                if operation is None:
+                    raise SparseKitchenError(
+                        'Sol pooled tail requires Kitchen sparse LSE support'
+                    )
+                raw, lse2 = operation(
+                    chunk_carrier, chunk_route, output_layout=OUTPUT_NHD
+                )
+                q_summary = prepared.q_summary[
+                    ..., first_route_tile:stop_route_tile, :
+                ]
+                exact_mask = exact_mask_from_route(
+                    chunk_route, prepared.k_summary.shape[-2]
+                )
+                raw, _ = merge_pooled_tail(
+                    raw,
+                    lse2,
+                    q_summary=q_summary,
+                    k_summary=prepared.k_summary,
+                    v_sum=prepared.v_sum,
+                    exact_mask=exact_mask,
+                    sequence=sequence,
+                    q_tile=route_q_tile,
+                    kv_tile=int(route.kv_tile),
+                    scale=float(chunk_carrier.attention_scale),
+                    k_offset=prepared.k_offset,
+                )
+                del lse2, q_summary, exact_mask
+            else:
+                raw = self.executor.kitchen.block_sparse_int8_attention_from_prequantized(
+                    chunk_carrier,
+                    chunk_route,
+                    output_layout=OUTPUT_NHD,
+                )
             flat = raw.transpose(1, 2).reshape(
                 raw.shape[0],
                 raw.shape[2],
@@ -606,4 +751,6 @@ class SparseKitchenBackend:
                 None if self.projector is None else self.projector.name
             ),
             'smooth_k': False,
+            'sol_attn_features': bool(self.config.sol_attn_features),
+            'sol_pooled_tail': bool(self.config.sol_attn_features),
         }

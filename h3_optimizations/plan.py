@@ -259,6 +259,7 @@ class SparseRequest:
     early_schedule: str = EARLY_SCHEDULE_HOLD
     step_video_budgets: tuple[float, ...] | None = None
     video_token_order: str = DEFAULT_VIDEO_TOKEN_ORDER
+    sol_attn_features: bool = False
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
@@ -284,6 +285,17 @@ class SparseRequest:
             raise ValueError('unknown sparse backend request %r' % self.backend)
         if self.early_schedule not in EARLY_SCHEDULE_OPTIONS:
             raise ValueError('unknown early schedule %r' % self.early_schedule)
+        if not isinstance(self.sol_attn_features, bool):
+            raise ValueError('sol_attn_features must be boolean')
+        if self.sol_attn_features and self.backend not in (
+            SPARSE_BACKEND_AUTO,
+            SPARSE_BACKEND_KITCHEN,
+            SPARSE_BACKEND_KITCHEN_64X128,
+            SPARSE_BACKEND_TRITON,
+        ):
+            raise ValueError(
+                'sol_attn_features currently supports only Kitchen INT8 and BF16 Triton'
+            )
         if self.video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:
             raise ValueError(
                 'unknown video token order %r' % self.video_token_order
@@ -335,6 +347,7 @@ class SparseRequest:
             None if self.late_kv is None else float(self.late_kv),
             self.step_video_budgets,
             self.video_token_order,
+            bool(self.sol_attn_features),
         )
 
 

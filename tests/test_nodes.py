@@ -82,6 +82,7 @@ class NodeTests(unittest.TestCase):
                 'backend',
                 'early_schedule',
                 'video_token_order',
+                'sol_attn_features',
             ],
         )
         self.assertEqual(
@@ -113,6 +114,10 @@ class NodeTests(unittest.TestCase):
             advanced.description,
         )
         self.assertIn('Bypass this node', backend.tooltip)
+        sol = input_by_id(advanced, 'sol_attn_features')
+        self.assertFalse(sol.default)
+        self.assertIn('only Kitchen INT8 and BF16 Triton', sol.tooltip)
+        self.assertIn('pooled tail', sol.tooltip)
         self.assertIn(
             'FROST BF16, BF16 Triton, and FP8 FlexAttention use 64Q x 64KV',
             backend.tooltip,
@@ -136,6 +141,17 @@ class NodeTests(unittest.TestCase):
             list(VIDEO_TOKEN_ORDER_REQUESTS),
         )
         self.assertTrue(H3SparseAttentionAdvanced.validate_inputs('auto'))
+        self.assertTrue(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'BF16 Triton 64Q x 64KV', sol_attn_features=True
+            )
+        )
+        self.assertIsInstance(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'FROST BF16 64Q x 64KV (SM89)', sol_attn_features=True
+            ),
+            str,
+        )
         self.assertIsInstance(
             H3SparseAttentionAdvanced.validate_inputs(
                 'Native INT8 128x128 + Sol residual 64x64'
