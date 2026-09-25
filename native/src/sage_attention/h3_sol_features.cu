@@ -607,14 +607,27 @@ __global__ void final_merge_kernel(
   const float e_lse = exact_lse[lse_idx];
   const float p_lse = pooled_lse[((int64_t)b * Hq + h) * NQ + qb];
   const float t_den = token_den[grow];
-  const float t_lse = t_den > 0.0f && isfinite(token_max[grow])
+
+  const bool pooled_active = p_lse != NEG_INF;
+  const bool token_active = t_den > 0.0f && isfinite(token_max[grow]);
+  const bool selected_active = sel_l > 0.0f;
+
+  // Fully routed/protected rows have no Sol complement at all.
+  // Leave both the exact Kitchen output and its LSE completely untouched.
+  if (!pooled_active && !token_active && !selected_active)
+    return;
+
+  const float t_lse = token_active
                           ? token_max[grow] + log2f(t_den)
                           : NEG_INF;
-  const float total_m = fmaxf(fmaxf(e_lse, p_lse), fmaxf(t_lse, sel_lse));
+
+  const float total_m =
+      fmaxf(fmaxf(e_lse, p_lse), fmaxf(t_lse, sel_lse));
+      
   const float we = isfinite(e_lse) ? exp2f(e_lse - total_m) : 0.0f;
-  const float wp = isfinite(p_lse) ? exp2f(p_lse - total_m) : 0.0f;
-  const float wt = isfinite(t_lse) ? exp2f(t_lse - total_m) : 0.0f;
-  const float ws = isfinite(sel_lse) ? exp2f(sel_lse - total_m) : 0.0f;
+  const float wp = pooled_active ? exp2f(p_lse - total_m) : 0.0f;
+  const float wt = token_active ? exp2f(t_lse - total_m) : 0.0f;
+  const float ws = selected_active ? exp2f(sel_lse - total_m) : 0.0f;
   const float denom = we + wp + wt + ws;
 
   const int64_t obase = (int64_t)b * out_sb + (int64_t)h * out_sh + (int64_t)row * out_sn;
