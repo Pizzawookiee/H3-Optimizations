@@ -38,6 +38,7 @@ from ...kitchen_qkv import (
     resolve_kitchen,
 )
 from ...qkv.formats import describe_linear
+from ...qkv.fused_kv import HeldExactH3FusedKV, fused_h3_kv_supported
 from ...qkv.fused_q import HeldExactH3FusedQ, fused_h3_q_supported
 from ...qkv.streamed import (
     PROJECTION_FORCE_BF16,
@@ -71,6 +72,7 @@ class StreamedSparseKitchenQKV:
     projection_mode: str
     output_buffer: torch.Tensor | None
     fused_q: bool = False
+    fused_kv: bool = False
 
     def release(self):
         self.module = None
@@ -81,6 +83,7 @@ class StreamedSparseKitchenQKV:
         self.k_summary = None
         self.output_buffer = None
         self.fused_q = False
+        self.fused_kv = False
 
 
 @dataclass
@@ -200,6 +203,11 @@ def _run_streamed_sparse_kitchen_qkv(
         q_tile == 64
         and fused_h3_q_supported(module, x[:1], rope_freqs, projection_mode)
     )
+    fused_kv = bool(
+        kv_tile == 64
+        and chunk_rows % 128 == 0
+        and fused_h3_kv_supported(module, x[:1], rope_freqs, projection_mode)
+    )
     shape = (1, int(module.heads), sequence, int(module.head_dim))
     q_shape = (1, int(module.heads), 1, int(module.head_dim))
     try:
@@ -218,7 +226,11 @@ def _run_streamed_sparse_kitchen_qkv(
     ):
         return None
 
-    held = create_held_qkv(module, x[:1], projection_mode)
+    held = (
+        HeldExactH3FusedKV(module, x[:1], rope_freqs, projection_mode)
+        if fused_kv
+        else create_held_qkv(module, x[:1], projection_mode)
+    )
     held.__enter__()
     try:
         with diagnostics.stage("anchor_projection"):
@@ -248,16 +260,20 @@ def _run_streamed_sparse_kitchen_qkv(
 
         for start in range(0, sequence, chunk_rows):
             end = min(start + chunk_rows, sequence)
-            k, v = project_kv_hnd(held, x, rope_freqs, start, end)
+            if fused_kv:
+                v, k_mean = held.project(x, rope_freqs, start, end, producer)
+            else:
+                k, v = project_kv_hnd(held, x, rope_freqs, start, end)
+                kitchen.quantize_int8_attention_k_chunk(
+                    producer,
+                    k,
+                    k_start=start,
+                    **chunk_kwargs,
+                )
+                k_mean = _tile_mean(k, kv_tile)
+                del k
             if staging is None and retained_v is None:
                 retained_v = v.new_empty(shape)
-            kitchen.quantize_int8_attention_k_chunk(
-                producer,
-                k,
-                k_start=start,
-                **chunk_kwargs,
-            )
-            k_mean = _tile_mean(k, kv_tile)
             k_start = start // kv_tile
             k_summary[
                 ..., k_start : k_start + int(k_mean.shape[-2]), :
@@ -267,7 +283,7 @@ def _run_streamed_sparse_kitchen_qkv(
             else:
                 with diagnostics.stage("v_amax_update"):
                     staging.update(v)
-            del k_mean, k, v
+            del k_mean, v
 
         if staging is None:
             kitchen.quantize_int8_attention_v(producer, retained_v)
@@ -296,6 +312,7 @@ def _run_streamed_sparse_kitchen_qkv(
         projection_mode=projection_mode,
         output_buffer=x,
         fused_q=fused_q,
+        fused_kv=fused_kv,
     )
 
 
@@ -426,6 +443,11 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 "q_producer": (
                     "h3_native_exact_128x256_fused"
                     if projected.fused_q
+                    else "project_norm_rope_then_pack"
+                ),
+                "kv_producer": (
+                    "h3_native_exact_128x256_fused"
+                    if projected.fused_kv
                     else "project_norm_rope_then_pack"
                 ),
             }

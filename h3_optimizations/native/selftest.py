@@ -41,7 +41,7 @@ _lse_results = {}
 
 # Bump whenever the meaning of a cached pass/fail changes without changing the
 # native binary build ID. Otherwise an old failure can survive a Python-only fix.
-_SELFTEST_REVISION = 'v9'
+_SELFTEST_REVISION = 'v10'
 
 # K > 512 is intentional. Blackwell's dense CTA_K=64 launcher chooses a
 # lower-pressure probability path at K <= 512 while sparse always uses fused
@@ -240,6 +240,148 @@ def _run_fused_q(device):
     }
 
 
+def _run_fused_kv(device):
+    from .convrot import quantize_int8_rowwise_convrot256
+    from .fused_kv import fused_h3_kv_from_int8
+    from .producer import (
+        INT8_ATTENTION_PRODUCER_ABI_VERSION,
+        Int8AttentionProducerSpec,
+        Int8AttentionKAnchor,
+        create_int8_attention_producer,
+        int8_attention_k_anchor_positions,
+        quantize_int8_attention_k_chunk,
+    )
+
+    if tuple(torch.cuda.get_device_capability(device)) < (8, 0):
+        return {'available': False, 'passed': False, 'reason': 'requires_sm80'}
+
+    library = loader.load()
+    available = bool(
+        getattr(library, 'h3_int8_quantize_bf16_rowwise_convrot256', None)
+        and getattr(library, 'h3_int8_fused_kv', None)
+    )
+    if not available:
+        return {'available': False, 'passed': False}
+
+    rows, heads, hidden, head_dim, kv_length, row_start = 128, 2, 256, 128, 512, 128
+    generator = torch.Generator(device=device).manual_seed(20260927)
+    x = torch.randn(
+        rows, hidden, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    activation, activation_scale = quantize_int8_rowwise_convrot256(x)
+    weight = torch.randint(
+        -8,
+        8,
+        (2 * heads * head_dim, hidden),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
+    ).to(torch.int8)
+    weight_scale = (
+        torch.rand(
+            2 * heads * head_dim,
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.01
+        + 0.005
+    )
+    norm = (
+        torch.rand(
+            head_dim,
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.5
+        + 0.75
+    ).to(torch.bfloat16)
+    freqs = torch.zeros(rows, 48, 2, 2, device=device, dtype=torch.bfloat16)
+    freqs[:, :, 0, 0] = 1
+    freqs[:, :, 1, 1] = 1
+    epsilon = 1e-6
+
+    projected = torch.matmul(activation.float(), weight.float().transpose(0, 1))
+    projected = (
+        projected * activation_scale * weight_scale.unsqueeze(0)
+    ).to(torch.bfloat16)
+    inner = heads * head_dim
+    reference_k = torch.nn.functional.rms_norm(
+        projected[:, :inner].view(1, rows, heads, head_dim),
+        (head_dim,),
+        weight=norm,
+        eps=epsilon,
+    ).transpose(1, 2)
+    reference_v = (
+        projected[:, inner:]
+        .view(rows, heads, head_dim)
+        .transpose(0, 1)
+        .unsqueeze(0)
+    )
+    reference_summary = reference_k.view(1, heads, 2, 64, head_dim).mean(dim=-2)
+    anchor = Int8AttentionKAnchor(
+        values=reference_k[:, :, 0].contiguous(),
+        indices=torch.zeros((1, heads), dtype=torch.int32, device=device),
+    )
+    spec = Int8AttentionProducerSpec(
+        abi_version=INT8_ATTENTION_PRODUCER_ABI_VERSION,
+        backend='h3_native',
+        device=torch.device(device),
+        input_dtype=torch.bfloat16,
+        q_input_shape=(1, heads, 1, head_dim),
+        k_input_shape=(1, heads, kv_length, head_dim),
+        original_head_dim=head_dim,
+        kernel_head_dim=head_dim,
+        attention_scale=head_dim ** -0.5,
+        cta_k=64,
+        q_tile=128,
+        k_tile=64,
+        sequence_alignment=128,
+        k_anchor_positions=int8_attention_k_anchor_positions(kv_length),
+    )
+    reference_producer = create_int8_attention_producer(spec, anchor)
+    quantize_int8_attention_k_chunk(
+        reference_producer, reference_k, k_start=row_start
+    )
+    fused_producer = create_int8_attention_producer(spec, anchor)
+    fused_v, fused_summary = fused_h3_kv_from_int8(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        norm,
+        freqs,
+        fused_producer,
+        row_start=row_start,
+        epsilon=epsilon,
+    )
+    torch.cuda.synchronize(device)
+    k_slice = slice(row_start, row_start + rows)
+    scale_slice = slice((row_start // 64) * 4, ((row_start + rows) // 64) * 4)
+    k_identical = torch.equal(
+        fused_producer.k[:, :, k_slice], reference_producer.k[:, :, k_slice]
+    )
+    k_scale_identical = torch.equal(
+        fused_producer.k_scale[:, :, scale_slice],
+        reference_producer.k_scale[:, :, scale_slice],
+    )
+    passed = bool(
+        k_identical
+        and k_scale_identical
+        and torch.equal(fused_summary, reference_summary)
+        and torch.equal(fused_v, reference_v)
+    )
+    return {
+        'available': True,
+        'k_bit_identical': bool(k_identical),
+        'k_scale_bit_identical': bool(k_scale_identical),
+        'summary_bit_identical': bool(torch.equal(fused_summary, reference_summary)),
+        'v_bit_identical': bool(torch.equal(fused_v, reference_v)),
+        'passed': passed,
+    }
+
+
 def _carrier_lse_reference(carrier):
     batch, heads, q_length, _head_dim = carrier.q.shape
     kv_length = carrier.k.shape[-2]
@@ -389,6 +531,14 @@ def run(device=None, *, verbose=False):
                 'passed': False,
                 'error': '%s: %s' % (type(error).__name__, error),
             }
+        try:
+            detail['fused_kv'] = _run_fused_kv(device)
+        except Exception as error:
+            detail['fused_kv'] = {
+                'available': True,
+                'passed': False,
+                'error': '%s: %s' % (type(error).__name__, error),
+            }
         torch.cuda.synchronize(device)
     except Exception as error:  # noqa: BLE001 - reporting is the job
         detail['error'] = '%s: %s' % (type(error).__name__, error)
@@ -510,6 +660,15 @@ def _load_result(device=None, *, force=False):
                     key,
                     fused_q,
                 )
+            fused_kv = detail.get('fused_kv', {})
+            if fused_kv.get('available') and not fused_kv.get('passed'):
+                logging.debug(
+                    '%s native fused-KV self-test failed on %s; using the '
+                    'established K/V projection path. Detail: %s',
+                    LOG_PREFIX,
+                    key,
+                    fused_kv,
+                )
         return _result, _detail_result
 
 
@@ -534,6 +693,12 @@ def fused_q_check(device=None, *, force=False):
     """Whether the optional exact fused-Q producer passed device parity."""
     _passed, detail = _load_result(device, force=force)
     return bool(detail.get('fused_q', {}).get('passed', False))
+
+
+def fused_kv_check(device=None, *, force=False):
+    """Whether the optional exact fused-KV producer passed device parity."""
+    _passed, detail = _load_result(device, force=force)
+    return bool(detail.get('fused_kv', {}).get('passed', False))
 
 
 def sparse_lse_check(device=None, *, force=False):

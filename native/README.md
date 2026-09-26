@@ -11,7 +11,7 @@ happened to the chunked QKV producer: fully integrated on this side, calling a
 Kitchen API that was never released, so every install silently fell back to
 standard projection at roughly half the speed.
 
-Four pieces are needed and none is in 0.2.31:
+Five pieces are needed and none is in 0.2.31:
 
 - **the external INT8 attention producer**, which lets a chunked QKV
   projection quantize each chunk as it is produced rather than materializing
@@ -22,6 +22,9 @@ Four pieces are needed and none is in 0.2.31:
 - **the exact H3 fused-Q producer**, which combines the ConvRot INT8 Q GEMM,
   RMSNorm, RoPE, Kitchen Q packing, and 64-row routing summaries without a
   full BF16 Q intermediate.
+- **the exact H3 fused-KV producer**, which stores V directly and combines the
+  ConvRot INT8 K GEMM with RMSNorm, RoPE, routing summaries, anchor centering,
+  and Kitchen carrier packing without a full BF16 K intermediate.
 
 ## Provenance
 
@@ -39,7 +42,7 @@ throw terminates the process instead of reaching the catch in the API layer.
 Upstream warns about this as C4297 on every build; here it was fatal until the
 linkage changed.
 
-The exact fused-Q kernel uses the C++ header tree from NVIDIA CUTLASS 4.6.0.
+The exact fused-Q and fused-KV kernels use the C++ header tree from NVIDIA CUTLASS 4.6.0.
 Those headers and their BSD-3-Clause license are vendored under
 `third_party/cutlass`; they are build inputs only and introduce no runtime or
 Python-package dependency. The source revision is recorded in
@@ -68,11 +71,12 @@ DLL is build-versioned so a running Comfy process can keep an older mapped DLL
 until the next normal restart.
 
 ABI 4 also accepts the additive
-`h3_int8_quantize_bf16_rowwise_convrot256` and `h3_int8_fused_q` symbols. They
-are optional when loading an older ABI-4 binary, so unsupported installs keep
-the established Q projection and packing path. The fixed exact 128x256 fused-Q
-kernel is selected only on SM80 or newer; this does not change the SM75 support
-of the existing attention kernels.
+`h3_int8_quantize_bf16_rowwise_convrot256`, `h3_int8_fused_q`, and
+`h3_int8_fused_kv` symbols. They are optional when loading an older ABI-4
+binary, so unsupported installs keep the established projection and packing
+paths. The fixed exact 128x256 fused-Q and fused-KV kernels are selected only
+on SM80 or newer; this does not change the SM75 support of the existing
+attention kernels.
 
 ## Building
 

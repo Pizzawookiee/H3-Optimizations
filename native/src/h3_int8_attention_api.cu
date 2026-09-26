@@ -117,6 +117,13 @@ bool launch_h3_fused_q_cutlass(
     void *summary, void *q, void *q_scale, int64_t m, int64_t n, int64_t k,
     int full_k_length, float epsilon, cudaStream_t stream);
 
+bool launch_h3_fused_kv_cutlass(
+    const void *a, const void *b, const void *x_scale,
+    const void *weight_scale, const void *norm, const void *freqs,
+    const void *anchor, const int *anchor_indices, void *summary, void *v,
+    void *k_output, void *k_scale, int64_t m, int64_t n, int64_t k,
+    int full_k_length, int row_start, float epsilon, cudaStream_t stream);
+
 void launch_quant_v_int8_kernel(const void *v, void *out, void *scale, int B,
                                 int H, int N, int D, int padded_N, int64_t sb,
                                 int64_t sh, int64_t sn, int input_dtype_code,
@@ -366,6 +373,40 @@ H3_API int h3_int8_fused_q(
             reinterpret_cast<cudaStream_t>(stream))) {
       throw std::runtime_error(
           "exact 128x256 CUTLASS H3 Q kernel rejected the request");
+    }
+  })
+}
+
+H3_API int h3_int8_fused_kv(
+    const void *activation, const void *weight, const void *activation_scale,
+    const void *weight_scale, const void *norm, const void *freqs,
+    const void *anchor, const int *anchor_indices, void *summary, void *v,
+    void *k_output, void *k_scale, int64_t rows, int64_t outputs,
+    int64_t hidden, int full_k_length, int row_start, float epsilon,
+    uintptr_t stream) noexcept {
+  H3_GUARD({
+    if (!activation || !weight || !activation_scale || !weight_scale ||
+        !norm || !freqs || !anchor || !anchor_indices || !summary || !v ||
+        !k_output || !k_scale) {
+      throw std::runtime_error("fused H3 KV received a null pointer");
+    }
+    if (rows <= 0 || outputs <= 0 || outputs % 2 != 0 || hidden <= 0 ||
+        rows > std::numeric_limits<int>::max() - 127 ||
+        outputs > std::numeric_limits<int>::max() ||
+        hidden > std::numeric_limits<int>::max() || full_k_length <= 0 ||
+        row_start < 0 || row_start % 128 != 0 ||
+        row_start + rows > full_k_length ||
+        (row_start + rows < full_k_length && rows % 128 != 0) ||
+        !std::isfinite(epsilon) || epsilon <= 0.0f) {
+      throw std::runtime_error("fused H3 KV received invalid geometry");
+    }
+    if (!launch_h3_fused_kv_cutlass(
+            activation, weight, activation_scale, weight_scale, norm, freqs,
+            anchor, anchor_indices, summary, v, k_output, k_scale, rows,
+            outputs, hidden, full_k_length, row_start, epsilon,
+            reinterpret_cast<cudaStream_t>(stream))) {
+      throw std::runtime_error(
+          "exact 128x256 CUTLASS H3 KV kernel rejected the request");
     }
   })
 }

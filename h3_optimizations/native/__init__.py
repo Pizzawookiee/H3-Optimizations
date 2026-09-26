@@ -51,6 +51,7 @@ from .producer import (
     quantize_int8_attention_v,
     select_int8_attention_k_anchor,
 )
+from .fused_kv import fused_h3_kv_from_int8, fused_h3_kv_is_available
 
 __all__ = [
     'SUPPORTS_STRIDED_QK_CHUNK',
@@ -72,6 +73,8 @@ __all__ = [
     'finalize_int8_attention_producer',
     'fused_h3_q_from_int8',
     'fused_h3_q_is_available',
+    'fused_h3_kv_from_int8',
+    'fused_h3_kv_is_available',
     'int8_attention_from_prequantized',
     'int8_attention_is_available',
     'int8_attention_k_anchor_positions',

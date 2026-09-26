@@ -189,7 +189,7 @@ retain the coarse branch and are diagnostic overrides, not the trained default.
 The default **Auto** backend runs a one-time numerical check on each GPU before
 using the shipped INT8 tile kernel. A missing or failing kernel logs a warning
 and falls back to BF16 Triton. The shipped CUDA binaries contain native targets
-for sm75, sm80, sm89, sm120, and Linux sm90a, plus a compute_89 PTX fallback;
+for sm75, sm80, sm86, sm89, sm120, and Linux sm90a, plus a compute_89 PTX fallback;
 only sm89 has received a live GPU run for this VSA kernel. ROCm uses BF16 Triton
 because the AMD native library does not expose the VSA tile entry point.
 
@@ -206,6 +206,10 @@ production boundary was approximately speed-neutral while reducing the active
 allocator peak when two-pass V was enabled. Older GPUs, other weight formats,
 older native binaries, and devices that fail the one-time fused-Q parity
 self-test keep the established Q projection and packing path.
+The same path fuses the K/V projection with K RMSNorm, RoPE, routing summaries,
+anchor centering, and carrier packing while storing V directly. Its exact
+fused-KV self-test falls back independently, so a failure does not disable the
+validated fused-Q or sparse-attention paths.
 The implementation and its CUTLASS build headers ship in this repository; it
 does not require H3-Extended or a patched Comfy Kitchen checkout.
 
