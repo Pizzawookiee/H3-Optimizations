@@ -87,8 +87,10 @@ tile expansion is 14336 wide, not 28672. The QKV/MLP per-row ratio is exactly
 Production settings this experiment holds fixed:
 
 - `apply.py` builds `SparseFusedQKVProjector(kernel_spec, chunk_rows=4096)`.
-- Auto on a ConvRot checkpoint resolves the MLP to `mlp_chunked_convrot_2slice`
-  with `MemoryRequest.chunk_rows = 4096`.
+- At the time of this experiment, Auto on a ConvRot checkpoint resolved the MLP
+  to `mlp_chunked_convrot_2slice` with `MemoryRequest.chunk_rows = 4096`.
+  Current Auto uses ordinary 4096-row chunking; reproduce this historical arm
+  with the explicit experimental two-slice option.
 - The Comfy2 server logs `Device: cuda:0 NVIDIA GeForce RTX 4070 : native`, so
   production runs the **native** caching allocator. This checkout's local
   `cuda_malloc.py` change sets

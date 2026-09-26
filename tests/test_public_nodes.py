@@ -51,6 +51,7 @@ from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_PRESERVE_BF16,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_BF16,
+    MLP_MEMORY_CONVROT_2SLICE,
     MLP_MEMORY_FORCE_QUANT,
     MLP_MEMORY_OFF,
     MLP_MEMORY_PRESERVE,
@@ -199,9 +200,15 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(v_memory_index, embedding_index + 1)
 
         legacy = inputs[legacy_index]
+        mlp = inputs[ids.index('mlp_memory')]
         precision = inputs[precision_index]
         streaming = inputs[streaming_index]
         self.assertTrue(legacy.extra_dict.get('hidden'))
+        self.assertEqual(
+            mlp.options,
+            [MLP_MEMORY_AUTO, MLP_MEMORY_CONVROT_2SLICE, MLP_MEMORY_OFF],
+        )
+        self.assertEqual(mlp.default, MLP_MEMORY_AUTO)
         self.assertEqual(precision.options, list(PRECISION_MODE_OPTIONS))
         self.assertEqual(precision.default, PRECISION_MODE_AUTO)
         self.assertEqual(streaming.default, QKV_STREAMING_MODE_AUTO)

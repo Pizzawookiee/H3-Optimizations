@@ -301,6 +301,17 @@ def format_memory_status(model):
         'QKV: %s' % format_qkv_execution(status),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
+    canonical = status.get('canonical_quantization') or {}
+    if canonical.get('converted_count'):
+        lines.insert(
+            0,
+            'Weights: canonical ConvRot-256 INT8 (%d converted; %.2f GiB '
+            'released from this model branch)'
+            % (
+                int(canonical['converted_count']),
+                int(canonical.get('released_bytes') or 0) / 2**30,
+            ),
+        )
     if qkv.get('out_proj_runtime_convrot_int8'):
         lines.insert(2, 'Attention output: runtime ConvRot-256 INT8')
     if final_layer.get('chunked'):

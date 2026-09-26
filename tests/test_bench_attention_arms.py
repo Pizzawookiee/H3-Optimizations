@@ -66,7 +66,10 @@ STUB_SCHEMAS = {
     'H3MemoryOptimization': {'input': {'required': {
         'model': ['MODEL', {}],
         'fused_qkv': ['COMBO', {'default': 'auto', 'options': ['auto', 'off']}],
-        'mlp_memory': ['COMBO', {'default': 'auto', 'options': ['auto', 'off']}],
+        'mlp_memory': ['COMBO', {
+            'default': 'auto',
+            'options': ['auto', 'convrot_2slice_experimental', 'off'],
+        }],
         'chunk_rows': ['INT', {'default': 4096}],
         'preserve_precision': ['BOOLEAN', {'default': True}],
         'precision_mode': ['COMBO', {

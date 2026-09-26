@@ -12,9 +12,8 @@ from .attention.sparse.frost_bf16 import FrostBF16Error
 from .environment import RuntimeEnvironment
 from .plan import (
     FUSED_QKV_AUTO,
-    FUSED_QKV_FORCE_QUANT,
     MLP_MEMORY_AUTO,
-    MLP_MEMORY_FORCE_QUANT,
+    MLP_MEMORY_PRESERVE,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_FROST,
@@ -165,28 +164,19 @@ def resolve_qkv_provider(inventory, *, request, backend_kind, **kwargs):
     Auto policy. Keep the public immutable plan as Auto; only the effective
     provider request is coerced here.
 
-    Plain floating weights are runtime-quantized only when a direct Kitchen
-    carrier is selected. Other consumers stay on upstream Comfy QKV so Turing
-    receives its normal FP16/dequantized execution instead of entering one of
-    H3's BF16-only bounded projectors. Existing ConvRot checkpoints retain their
-    native provider. Unknown/unsupported quantized layouts likewise stay
-    upstream rather than being requantized blindly.
+    Plain floating weights stay on upstream Comfy QKV on Turing so it receives
+    its normal FP16 execution instead of entering one of H3's BF16-only bounded
+    projectors. Existing ConvRot checkpoints retain their native provider.
+    Unknown/unsupported quantized layouts likewise stay upstream rather than
+    being requantized blindly.
     '''
     capability = _current_capability()
     if capability == (7, 5) and request == FUSED_QKV_AUTO:
         if getattr(inventory, 'qkv_plain_float', False):
-            if backend_kind in ('comfy_kitchen_int8', 'sparse_kitchen_int8'):
-                return _qkv_policy.resolve_qkv_provider(
-                    inventory,
-                    request=FUSED_QKV_FORCE_QUANT,
-                    backend_kind=backend_kind,
-                    **kwargs,
-                )
             return _providers.QKVProviderResolution(
                 _providers.QKV_STANDARD,
                 False,
-                'SM75 Auto keeps floating QKV on upstream FP16 execution '
-                'unless a direct Kitchen INT8 carrier is selected',
+                'SM75 Auto preserves floating QKV on upstream FP16 execution',
             )
         if not getattr(inventory, 'qkv_convrot_int8_256', False):
             return _providers.QKVProviderResolution(
@@ -204,19 +194,18 @@ def resolve_qkv_provider(inventory, *, request, backend_kind, **kwargs):
 
 
 def resolve_mlp_provider(inventory, *, request, **kwargs):
-    '''Prefer ConvRot INT8 for floating Auto MLPs on NVIDIA.
+    '''Keep floating Auto MLPs in checkpoint precision.
 
     Checkpoint-native quantization remains authoritative: native FP8, W4A8 and
-    ConvRot checkpoints keep their existing providers. Only plain floating H3
-    MLP weights are runtime-quantized, using the Kitchen-backed ConvRot INT8
-    execution path. Non-NVIDIA backends keep the ordinary provider policy.
+    ConvRot checkpoints keep their existing providers. Plain floating H3 MLP
+    weights use the bounded preserve-native path; Force quant remains the
+    explicit one-time canonical ConvRot INT8 policy.
     '''
     if (
-        _current_capability() is not None
-        and request == MLP_MEMORY_AUTO
+        request == MLP_MEMORY_AUTO
         and getattr(inventory, 'mlp_plain_float', False)
     ):
-        request = MLP_MEMORY_FORCE_QUANT
+        request = MLP_MEMORY_PRESERVE
     return _BASE_MLP_RESOLVER(inventory, request=request, **kwargs)
 
 

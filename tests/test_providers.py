@@ -13,6 +13,7 @@ from h3_optimizations.qkv.formats import (  # noqa: E402
     inspect_h3_linears,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
+    MLP_CONVROT_INT8_CHUNKED,
     MLP_CONVROT_INT8_TWO_SLICE,
     MLP_FLOAT_CHUNKED,
     MLP_FP8_CHUNKED,
@@ -32,9 +33,8 @@ from h3_optimizations.qkv.providers import (  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_PRESERVE_BF16,
     MLP_MEMORY_BF16,
+    MLP_MEMORY_CONVROT_2SLICE,
     MLP_MEMORY_FORCE_QUANT,
-    MLP_MEMORY_LEGACY_BF16,
-    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
 )
 
 
@@ -172,7 +172,21 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(triton_sparse.provider_id, QKV_TRITON_SPARSE_CHUNKED)
 
         mlp = resolve_mlp_provider(inventory, request='auto')
-        self.assertEqual(mlp.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
+        self.assertEqual(mlp.provider_id, MLP_CONVROT_INT8_CHUNKED)
+        self.assertEqual(mlp.activation_mode, 'mlp_chunked_native')
+
+        experimental = resolve_mlp_provider(
+            inventory,
+            request=MLP_MEMORY_CONVROT_2SLICE,
+        )
+        self.assertEqual(
+            experimental.provider_id,
+            MLP_CONVROT_INT8_TWO_SLICE,
+        )
+        self.assertEqual(
+            experimental.activation_mode,
+            'mlp_chunked_convrot_2slice',
+        )
 
     def test_sparse_alone_preserves_alternative_checkpoint_projection(self):
         for weight in (self.plain, self.fp8, self.nvfp4):
@@ -188,8 +202,11 @@ class ProviderTests(unittest.TestCase):
             )
             self.assertEqual(qkv.provider_id, QKV_STANDARD)
 
-    def test_memory_fp8_and_bf16_use_fp8_providers(self):
-        for weight in (self.plain, self.fp8):
+    def test_memory_fp8_and_bf16_use_compatible_providers(self):
+        for weight, expected_qkv, expected_mlp in (
+            (self.plain, QKV_DENSE_KITCHEN_CHUNKED, MLP_FLOAT_CHUNKED),
+            (self.fp8, QKV_DENSE_FP8_CHUNKED, MLP_FP8_CHUNKED),
+        ):
             inventory = inspect_h3_linears([block(weight)])
             qkv = resolve_qkv_provider(
                 inventory,
@@ -199,13 +216,13 @@ class ProviderTests(unittest.TestCase):
                 memory_optimize=True,
                 fp8_available=True,
             )
-            self.assertEqual(qkv.provider_id, QKV_DENSE_FP8_CHUNKED)
+            self.assertEqual(qkv.provider_id, expected_qkv)
             mlp = resolve_mlp_provider(
                 inventory,
                 request='auto',
                 fp8_available=True,
             )
-            self.assertEqual(mlp.provider_id, MLP_FP8_CHUNKED)
+            self.assertEqual(mlp.provider_id, expected_mlp)
 
     def test_preserve_bf16_streams_into_existing_kitchen_carrier_consumers(self):
         inventory = inspect_h3_linears([block(self.plain)])
@@ -356,22 +373,6 @@ class ProviderTests(unittest.TestCase):
                 memory_optimize=True,
                 fp8_available=True,
             )
-
-    def test_legacy_mlp_requests_use_supported_production_modes(self):
-        convrot = inspect_h3_linears([block(self.convrot)])
-        required = resolve_mlp_provider(
-            convrot,
-            request=MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
-        )
-        self.assertEqual(required.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
-        plain = inspect_h3_linears([block(self.plain)])
-        bf16 = resolve_mlp_provider(
-            plain,
-            request=MLP_MEMORY_LEGACY_BF16,
-        )
-        self.assertEqual(bf16.provider_id, MLP_FLOAT_CHUNKED)
-        self.assertEqual(bf16.activation_mode, 'mlp_chunked_bf16')
-
 
 if __name__ == '__main__':
     unittest.main()

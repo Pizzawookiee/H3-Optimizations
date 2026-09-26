@@ -11,6 +11,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.quant_ops
 
+from .canonical_quant import CANONICAL_QUANT_KEY, clone_with_force_quant
 from .attention.sparse import (
     FP8FlexBackend,
     FP8FlexError,
@@ -1209,6 +1210,7 @@ def _status(
     runtime_installed,
     inventory,
     embedding_memory_selected,
+    canonical_quantization,
 ):
     return {
         'plan_version': int(plan.version),
@@ -1312,6 +1314,7 @@ def _status(
             }
         ),
         'weight_formats': _inventory_status(inventory),
+        'canonical_quantization': canonical_quantization,
         'runtime_installed': bool(runtime_installed),
         'device': {
             'name': environment.device_name,
@@ -1558,6 +1561,7 @@ def _reconcile_plan(
         runtime_installed=runtime_installed,
         inventory=inventory,
         embedding_memory_selected=embedding_memory_selected,
+        canonical_quantization=patched.model_options.get(CANONICAL_QUANT_KEY),
     )
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
     session = options.get(RUNTIME_SESSION_KEY)
@@ -1692,6 +1696,6 @@ def apply_plan(model, plan: H3OptimizationPlan):
         raise TypeError('plan must be H3OptimizationPlan')
     if not is_minimax_h3(model):
         return model
-    patched = model.clone()
+    patched = clone_with_force_quant(model, plan)
     patched.model_options[PLAN_KEY] = plan
     return _reconcile_plan(patched, plan)

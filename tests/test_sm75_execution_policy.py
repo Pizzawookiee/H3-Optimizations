@@ -33,7 +33,6 @@ from h3_optimizations.plan import (  # noqa: E402
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
     MLP_FLOAT_CHUNKED,
-    MLP_RUNTIME_CONVROT_INT8_CHUNKED,
     QKV_FORCE_BF16_STREAMED_KITCHEN,
     QKV_FORCE_CONVROT_INT8_KITCHEN,
     QKV_STANDARD,
@@ -95,7 +94,7 @@ class SM75ExecutionPolicyTests(unittest.TestCase):
                 kv_tile=64,
             )
 
-    def test_sm75_auto_plain_float_uses_direct_kitchen_convrot(self):
+    def test_sm75_auto_plain_float_qkv_stays_upstream(self):
         with mock.patch.object(policy, '_current_capability', return_value=(7, 5)):
             resolved = policy.resolve_qkv_provider(
                 qkv_inventory(plain_float=True),
@@ -105,8 +104,8 @@ class SM75ExecutionPolicyTests(unittest.TestCase):
                 memory_optimize=True,
                 fp8_available=False,
             )
-        self.assertEqual(resolved.provider_id, QKV_FORCE_CONVROT_INT8_KITCHEN)
-        self.assertTrue(resolved.fused)
+        self.assertEqual(resolved.provider_id, QKV_STANDARD)
+        self.assertFalse(resolved.fused)
 
     def test_sm75_auto_plain_float_keeps_generic_dense_qkv_upstream(self):
         with mock.patch.object(policy, '_current_capability', return_value=(7, 5)):
@@ -158,17 +157,14 @@ class SM75ExecutionPolicyTests(unittest.TestCase):
             )
         self.assertNotEqual(resolved.provider_id, QKV_FORCE_CONVROT_INT8_KITCHEN)
 
-    def test_sm75_auto_plain_float_mlp_uses_runtime_convrot(self):
+    def test_sm75_auto_plain_float_mlp_preserves_precision(self):
         with mock.patch.object(policy, '_current_capability', return_value=(7, 5)):
             resolved = policy.resolve_mlp_provider(
                 mlp_inventory(plain_float=True),
                 request=MLP_MEMORY_AUTO,
                 fp8_available=False,
             )
-        self.assertEqual(
-            resolved.provider_id,
-            MLP_RUNTIME_CONVROT_INT8_CHUNKED,
-        )
+        self.assertEqual(resolved.provider_id, MLP_FLOAT_CHUNKED)
 
     def test_sm75_preserve_mlp_is_not_rewritten(self):
         with mock.patch.object(policy, '_current_capability', return_value=(7, 5)):

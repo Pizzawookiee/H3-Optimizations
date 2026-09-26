@@ -43,18 +43,19 @@ MLP_MEMORY_OFF = 'off'
 MLP_MEMORY_BF16 = 'bf16'
 MLP_MEMORY_FORCE_QUANT = 'force_quant'
 MLP_MEMORY_PRESERVE = 'preserve_precision'
-MLP_MEMORY_LEGACY_BF16 = 'legacy_bf16'
-MLP_MEMORY_LEGACY_NATIVE = 'legacy_native'
-MLP_MEMORY_LEGACY_CONVROT_REQUIRED = 'legacy_convrot_2slice_required'
+MLP_MEMORY_CONVROT_2SLICE = 'convrot_2slice_experimental'
+# Transitional exports for the currently published H3-Extended adapter. The
+# aliases carry canonical values and can be removed after that adapter release.
+MLP_MEMORY_LEGACY_BF16 = MLP_MEMORY_BF16
+MLP_MEMORY_LEGACY_NATIVE = MLP_MEMORY_PRESERVE
+MLP_MEMORY_LEGACY_CONVROT_REQUIRED = MLP_MEMORY_CONVROT_2SLICE
 MLP_MEMORY_REQUESTS = (
     MLP_MEMORY_AUTO,
     MLP_MEMORY_OFF,
     MLP_MEMORY_BF16,
     MLP_MEMORY_FORCE_QUANT,
     MLP_MEMORY_PRESERVE,
-    MLP_MEMORY_LEGACY_BF16,
-    MLP_MEMORY_LEGACY_NATIVE,
-    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_CONVROT_2SLICE,
 )
 
 SPARSE_BACKEND_AUTO = 'auto'

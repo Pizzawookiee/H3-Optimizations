@@ -96,6 +96,8 @@ video attention connections for speed.
   recommendations; saved workflows may use any positive integer. A value at or
   above the current packed input length uses the ordinary unsliced MLP for that
   invocation instead of entering an effectively unchunked two-slice mode.
+  A model converted by `Force quant` uses the native ConvRot INT8 route at all
+  sequence lengths.
 
 The advanced precision and streaming controls are mainly useful for debugging,
 benchmarking, or deliberately forcing a particular execution policy.
@@ -362,15 +364,24 @@ embedding lifetime.
 
 The advanced precision selector exposes four policies:
 
-- `Auto` chooses the best compatible path and may use FP8 conversion as a
-  fallback.
+- `Auto` preserves floating checkpoint precision and keeps supported native
+  quantized formats native. For BF16/FP16 checkpoints this selects the bounded
+  preserve-native QKV and MLP paths without creating converted weight copies.
 - `BF16` materializes supported weights for BF16 execution.
 - `Preserve native` does not introduce a new weight conversion.
 - `Force quant` keeps supported native quantized checkpoints native and converts
-  floating H3 linears to execution-scoped ConvRot-256 INT8 where supported.
+  floating H3 linears once to canonical ConvRot-256 INT8. The converted model
+  branch owns the quantized parameters and releases its original BF16/FP16
+  weights; upstream and sibling branches remain unchanged.
+
+Force quant changes the in-memory model branch; it does not rewrite the source
+checkpoint. Creating the isolated branch reloads the model, so conversion can
+temporarily require close to two BF16 copies in system memory. Core UNET loaders
+provide the required reload support; unsupported custom loaders fail clearly.
 
 Saved legacy `Preserve precision` and `Allow FP8 conversion` workflow values are
-accepted as compatibility aliases for `Preserve native` and `Auto`.
+accepted as compatibility aliases for `Preserve native` and `Auto`; the latter
+now follows Auto's preserve-native policy for floating checkpoints.
 
 ### QKV streaming
 

@@ -1,4 +1,4 @@
-'''Execution-policy contracts for automatic H3 MLP quantization.'''
+'''Execution-policy contracts for automatic H3 MLP precision selection.'''
 
 from pathlib import Path
 import sys
@@ -12,7 +12,7 @@ sys.path.insert(0, str(PACK))
 from h3_optimizations import apply_policy  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     MLP_MEMORY_AUTO,
-    MLP_MEMORY_FORCE_QUANT,
+    MLP_MEMORY_PRESERVE,
 )
 
 
@@ -39,7 +39,7 @@ class MLPAutoPolicyTests(unittest.TestCase):
             )
         return result, resolver
 
-    def test_nvidia_auto_runtime_quantizes_plain_float_mlp(self):
+    def test_nvidia_auto_preserves_plain_float_mlp(self):
         result, resolver = self._resolve(
             capability=(8, 9),
             plain_float=True,
@@ -48,7 +48,7 @@ class MLPAutoPolicyTests(unittest.TestCase):
         resolver.assert_called_once()
         self.assertEqual(
             resolver.call_args.kwargs['request'],
-            MLP_MEMORY_FORCE_QUANT,
+            MLP_MEMORY_PRESERVE,
         )
 
     def test_native_quantized_mlp_keeps_auto_request(self):
@@ -61,14 +61,14 @@ class MLPAutoPolicyTests(unittest.TestCase):
             MLP_MEMORY_AUTO,
         )
 
-    def test_non_nvidia_plain_float_mlp_keeps_auto_request(self):
+    def test_non_nvidia_auto_preserves_plain_float_mlp(self):
         _result, resolver = self._resolve(
             capability=None,
             plain_float=True,
         )
         self.assertEqual(
             resolver.call_args.kwargs['request'],
-            MLP_MEMORY_AUTO,
+            MLP_MEMORY_PRESERVE,
         )
 
 

@@ -582,6 +582,7 @@ def run(args):
     )
     from h3_optimizations.qkv.formats import inspect_h3_linears
     from h3_optimizations.qkv.fp8 import HeldFP8MLP
+    from h3_optimizations.plan import MLP_MEMORY_CONVROT_2SLICE
     from h3_optimizations.qkv.providers import (
         MLP_CONVROT_INT8_TWO_SLICE,
         MLP_FLOAT_CHUNKED,
@@ -639,7 +640,7 @@ def run(args):
     native_fp8_inventory = _inventory(inspect_h3_linears, native_fp8_mlp)
     convrot_resolution = resolve_mlp_provider(
         convrot_inventory,
-        request='auto',
+        request=MLP_MEMORY_CONVROT_2SLICE,
         fp8_available=True,
     )
     bf16_float_resolution = resolve_mlp_provider(
@@ -658,7 +659,7 @@ def run(args):
         fp8_available=True,
     )
     if convrot_resolution.provider_id != MLP_CONVROT_INT8_TWO_SLICE:
-        raise RuntimeError('ConvRot auto did not resolve convrot_int8_two_slice')
+        raise RuntimeError('ConvRot experiment did not resolve convrot_int8_two_slice')
     if bf16_float_resolution.provider_id != MLP_FLOAT_CHUNKED:
         raise RuntimeError('BF16 float control did not resolve float_chunked')
     if bf16_auto_resolution.provider_id != MLP_FP8_CHUNKED:
