@@ -34,9 +34,9 @@ if(NOT DEFINED H3_CUDA_ARCHS)
     # synchronous shared-memory copies in place of cp.async. Runtime use stays
     # fail-closed behind the same per-GPU numerical self-test as newer parts.
     if(WIN32)
-        set(H3_CUDA_ARCHS "75-real;80-real;89-real;120f-real;89-virtual")
+        set(H3_CUDA_ARCHS "75-real;80-real;86-real;89-real;120f-real;89-virtual")
     else()
-        set(H3_CUDA_ARCHS "75-real;80-real;89-real;90a-real;120f-real;89-virtual")
+        set(H3_CUDA_ARCHS "75-real;80-real;86-real;89-real;90a-real;120f-real;89-virtual")
     endif()
 endif()
 message(STATUS "H3 INT8 attention architectures: ${H3_CUDA_ARCHS}")

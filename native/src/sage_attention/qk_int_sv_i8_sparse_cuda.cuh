@@ -67,7 +67,16 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           bool use_pv_fp16_accu = false,
           bool fuse_fp32_probabilities = true,
           bool per_tile_kv_len = false>
-__global__ void qk_int_sv_i8_sparse_attn_kernel(
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || \
+     __CUDA_ARCH__ == 1200)
+__global__ __launch_bounds__(
+    (CTA_Q / WARP_Q) * (CTA_K / WARP_K) * WARP_SIZE,
+    (CTA_Q == 64 && CTA_K == 64) ? 3 : 1)
+#else
+__global__
+#endif
+void qk_int_sv_i8_sparse_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
     float *__restrict__ Q_scale, float *__restrict__ K_scale,

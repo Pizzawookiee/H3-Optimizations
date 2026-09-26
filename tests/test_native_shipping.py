@@ -55,6 +55,21 @@ class NativeShippingTests(unittest.TestCase):
         linux_binary = BIN_DIR / 'libh3_int8_attention.so'
         self.assertLess(linux_binary.stat().st_size, MAX_LINUX_BINARY_BYTES)
 
+    def test_three_block_launch_bound_targets_consumer_architectures(self):
+        cmake = (PACK / 'native' / 'CMakeLists.txt').read_text(encoding='utf-8')
+        source = (
+            PACK / 'native' / 'src' / 'sage_attention'
+            / 'qk_int_sv_i8_sparse_cuda.cuh'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn('80-real;86-real;89-real', cmake)
+        self.assertIn(
+            '#if defined(__CUDA_ARCH__) && \\\n'
+            '    (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || \\\n'
+            '     __CUDA_ARCH__ == 1200)',
+            source,
+        )
+
     def test_shipped_binaries_export_the_current_kernel_surface(self):
         # BUILD_ID is a claim, not evidence: a stale binary alongside a bumped
         # BUILD_ID passes every size and magic-number check above. Assert the

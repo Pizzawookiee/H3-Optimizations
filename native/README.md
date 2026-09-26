@@ -99,11 +99,13 @@ pack owns. It is ignored by both Git and `.comfyignore`, so it never exists in
 a published install.
 
 Architectures default to
-`75-real;80-real;89-real;120f-real;89-virtual` on Windows and add `90a-real`
-on Linux. Every shipped target has real SASS, while one `compute_89` PTX
-payload provides the forward-compatible fallback without duplicating the
-family-limited `compute_120f` PTX. Override with `-DH3_CUDA_ARCHS=89` to build
-just one while iterating.
+`75-real;80-real;86-real;89-real;120f-real;89-virtual` on Windows and add
+`90a-real` on Linux. Every shipped target has real SASS, while one `compute_89`
+PTX payload provides the forward-compatible fallback without duplicating the
+family-limited `compute_120f` PTX. The 64Q x 64KV specialization requests three
+resident blocks only on the SM86, SM89, and SM120 consumer architectures;
+datacenter targets retain their unconstrained register allocation. Override
+with `-DH3_CUDA_ARCHS=89` to build just one while iterating.
 
 SM75 composes the Ampere-shaped INT8 MMA fragments from Turing's m8n8k16
 instructions and uses synchronous shared-memory copies where newer GPUs use
