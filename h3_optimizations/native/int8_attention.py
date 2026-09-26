@@ -749,8 +749,8 @@ def merge_sol_features_native_from_prequantized(
         if tuple(exact_output.shape) != (batch, q_length, q_heads, head_dim):
             raise ValueError('NHD exact output has the wrong shape')
         out_sb, out_sh, out_sn = (
-            int(exact_output.stride(0)), int(exact_output.stride(2)),
-            int(exact_output.stride(1)),
+            int(exact_output.stride(0)), int(exact_output.stride(1)),
+            int(exact_output.stride(2)),
         )
 
     library = loader.load()
