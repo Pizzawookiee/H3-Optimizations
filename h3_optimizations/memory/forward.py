@@ -170,8 +170,11 @@ def _run_mlp(block, h, held, mlp_path, config):
     expanded = None
     if mlp_path == 'convrot':
         out, path = held.fc1_fc2(h)
-    elif mlp_path in ('fp8', 'int8'):
+    elif mlp_path == 'fp8':
         out, path = held.fc1_fc2(h, swiglu_eager)
+    elif mlp_path == 'int8':
+        expanded = held.fc1(h)
+        out, path = held.fc2_swiglu(expanded)
     elif mlp_path == 'held':
         expanded = held.fc1(h)
         out, path = held.fc2_swiglu(
@@ -186,6 +189,42 @@ def _run_mlp(block, h, held, mlp_path, config):
             native=config.native_swiglu,
         )
     return out, expanded, path
+
+
+def _gated_path(mlp_path, config):
+    '''Sessions whose fc2 can fold the gated residual (see fused_residual).'''
+    return mlp_path == 'int8' or (mlp_path == 'held' and config.native_swiglu)
+
+
+def _short_sequence_uses_held(config):
+    '''Whether a sequence no longer than one chunk should still use the held path.
+
+    Runtime ConvRot INT8 must: the upstream single-call MLP would run the
+    unconverted floating weights (measured on a 4455-token BF16 H3 block: held
+    INT8 with one slab per modulation segment 18.5 ms / 81 MiB, upstream BF16
+    40.8 ms / 458 MiB). Checkpoint-native paths keep the upstream call: splitting
+    per modulation segment re-reads the full MLP weights once per segment, which
+    cost more than the fused residual saved (16.3 vs 14.3 ms on INT8 ConvRot).
+    '''
+    return config.runtime_convrot_int8
+
+
+def _run_held_native_gated(held, h, x_rows, gate, selector):
+    '''Held MLP plus gated residual for one scalar-modulation slab.
+
+    Prefers Kitchen's fused INT8 residual kernel, which writes
+    ``x_rows + gate * fc2(swiglu(fc1(h)))`` straight into ``x_rows``; otherwise
+    runs the ordinary fc2 and ``addcmul_``. Both give bit-identical results.
+    '''
+    expanded = held.fc1(h)
+    gate_row = _mod_row(gate, selector, x_rows.dtype)
+    if held.fc2_swiglu_residual_(expanded, x_rows, gate_row):
+        return 'held_int8_fused_residual'
+    del gate_row
+    out, path = held.fc2_swiglu(expanded, native=True)
+    del expanded
+    _gate_add(x_rows, out, gate, selector)
+    return path
 
 
 def _run_fc1_swiglu(block, h, held, mlp_path):
@@ -287,7 +326,10 @@ def make_forward(block, layer_index, config, original_forward=None):
             )
         del h, attn_out
 
-        if int(config.chunk_rows) >= int(x.shape[0]):
+        if (
+            int(config.chunk_rows) >= int(x.shape[0])
+            and not _short_sequence_uses_held(config)
+        ):
             h = block.norm2(x)
             for start, stop, selector in segments:
                 _scale_shift(
@@ -330,6 +372,22 @@ def make_forward(block, layer_index, config, original_forward=None):
                     scale_mlp,
                     chunk.mod_row,
                 )
+
+                if (
+                    _gated_path(mlp_path, config)
+                    and not torch.is_tensor(chunk.mod_row)
+                ):
+                    # The fused kernel takes one gate per output channel, so
+                    # only scalar modulation segments qualify.
+                    _run_held_native_gated(
+                        held,
+                        h,
+                        x[chunk.start:chunk.stop],
+                        gate_mlp,
+                        chunk.mod_row,
+                    )
+                    del h
+                    continue
 
                 out, expanded, _path = _run_mlp(
                     block,

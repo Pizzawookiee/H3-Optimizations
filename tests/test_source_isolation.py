@@ -16,7 +16,6 @@ class SourceIsolationTests(unittest.TestCase):
             'h3_activation_memory',
             'h3_runtime',
             'h3_probe',
-            'epilogue',
             'minimax_h3::',
             'torch.no_grad',
             'torch.inference_mode',

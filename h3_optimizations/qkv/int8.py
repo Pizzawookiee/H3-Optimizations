@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import comfy.model_management
 import comfy.ops
 import comfy.quant_ops
-from comfy.quant_ops import QuantizedTensor
+from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
 from .. import diagnostics
 from .formats import describe_linear, describe_weight
@@ -326,6 +326,58 @@ class HeldConvRotINT8MLP:
         activated = swiglu(expanded)
         out = self.fc2_binding.linear(activated)
         return out, "held_convrot_int8"
+
+    def fc1(self, x):
+        return self.fc1_binding.linear(x)
+
+    def _fc2_plain(self):
+        if getattr(self.fc2_binding.module, "_h3_benchmark_convrot_linear", None) is not None:
+            return None
+        weight = self.fc2_binding.weight
+        if weight is None or self.fc2_binding.bias is not None:
+            return None
+        return TensorWiseINT8Layout.get_plain_tensors(weight)
+
+    def fc2_swiglu(self, expanded, native=True):
+        """fc2 with SwiGLU folded into Kitchen's ConvRot activation quantizer."""
+        del native
+        plain = self._fc2_plain()
+        if plain is None:
+            from ..memory.linear import swiglu_eager  # memory imports this module
+
+            return self.fc2_binding.linear(swiglu_eager(expanded)), "held_convrot_int8"
+        comfy.ops.run_every_op()
+        qdata, scale = plain
+        out = comfy.quant_ops.ck.int8_linear(
+            expanded,
+            qdata,
+            scale,
+            None,
+            expanded.dtype,
+            convrot=True,
+            convrot_groupsize=GROUP_SIZE,
+            input_act="swiglu",
+        )
+        return out, "held_convrot_int8_fused_swiglu"
+
+    def fc2_swiglu_residual_(self, expanded, residual, gate):
+        """``residual += gate * fc2(swiglu(expanded))`` in place, or False."""
+        plain = self._fc2_plain()
+        if plain is None:
+            return False
+        from ..memory import fused_residual  # memory imports this module
+
+        qdata, scale = plain
+        return fused_residual.gated_swiglu_residual_(
+            expanded,
+            qdata,
+            scale,
+            None,
+            residual,
+            gate,
+            convrot=True,
+            convrot_groupsize=GROUP_SIZE,
+        )
 
 
 class LazyConvRotINT8Linear:

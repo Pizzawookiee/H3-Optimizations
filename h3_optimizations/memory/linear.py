@@ -11,6 +11,8 @@ import comfy.ops
 import comfy.quant_ops
 from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
+from . import fused_residual
+
 
 _CONVROT_MLPS = weakref.WeakValueDictionary()
 _CONVROT_MLP_IDS = itertools.count(1)
@@ -23,6 +25,18 @@ class UnsafeHeldWeights(RuntimeError):
 def swiglu_eager(x):
     gate, up = x.chunk(2, dim=-1)
     return torch.nn.functional.silu(gate).mul_(up)
+
+
+def swiglu_inplace_(x):
+    """SwiGLU written into the gate half of ``x``; returns that half as a view.
+
+    Bit-identical to :func:`swiglu_eager` without allocating a second
+    activation-width tensor. ``x`` is consumed: only the returned view is valid.
+    """
+    width = int(x.shape[-1]) // 2
+    gate = x[..., :width]
+    torch.nn.functional.silu(gate, inplace=True).mul_(x[..., width:])
+    return gate
 
 
 def _stream_from_handle(handle):
@@ -149,8 +163,34 @@ class HeldMLP:
             )
             return out, "held_tensorwise_int8_native"
 
-        activated = swiglu_eager(expanded)
+        activated = swiglu_inplace_(expanded)
         return F.linear(activated, weight, bias), "held_bf16_swiglu"
+
+    def fc2_swiglu_residual_(self, expanded, residual, gate):
+        """Fold ``residual += gate * fc2(swiglu(expanded))`` into the fc2 kernel.
+
+        Returns False, with ``residual`` untouched, unless fc2 is a TensorWise
+        INT8 weight and Comfy Kitchen's fused residual kernel is usable; the
+        caller then uses :meth:`fc2_swiglu` and ``addcmul_`` as before.
+        """
+        weight = self.fc2_weight.weight
+        if (
+            not isinstance(weight, QuantizedTensor)
+            or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout"
+            or getattr(weight._params, "transposed", False)
+        ):
+            return False
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+        return fused_residual.gated_swiglu_residual_(
+            expanded,
+            qdata,
+            scale,
+            self.fc2_weight.bias,
+            residual,
+            gate,
+            convrot=getattr(weight._params, "convrot", False),
+            convrot_groupsize=getattr(weight._params, "convrot_groupsize", 256),
+        )
 
 
 def _convrot_parts(weight, name):
@@ -561,4 +601,4 @@ def module_swiglu_fc2(mlp, expanded, native):
             comfy.ops.linear_input_act(mlp.fc2, expanded, "swiglu"),
             "module_native",
         )
-    return mlp.fc2(swiglu_eager(expanded)), "module_bf16_swiglu"
+    return mlp.fc2(swiglu_inplace_(expanded)), "module_bf16_swiglu"

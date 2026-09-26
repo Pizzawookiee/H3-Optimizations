@@ -72,6 +72,9 @@ from .kitchen_qkv import (
     producer_api_available,
 )
 from .memory.config import ActivationMemoryConfig
+from .memory.fused_residual import (
+    unavailable_reason as fused_residual_unavailable_reason,
+)
 from .memory.final_layer import install as install_final_layer
 from .memory.embedding import clear as clear_embedding_memory
 from .memory.embedding import install as install_embedding_memory
@@ -115,7 +118,9 @@ from .qkv.streamed import (
     PROJECTION_NATIVE,
 )
 from .qkv.providers import (
+    MLP_CONVROT_INT8_CHUNKED,
     MLP_OFF,
+    MLP_RUNTIME_CONVROT_INT8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
     QKV_BF16_CHUNKED,
     QKV_DENSE_CONVROT_INT8,
@@ -1198,6 +1203,25 @@ def _inventory_status(inventory):
     }
 
 
+def _fused_residual_status(mlp, environment):
+    '''Whether the held INT8 MLP can fold its gated residual into fc2.
+
+    Static only: the kernel's bit-identity self-test runs on first use, and a
+    failure there silently keeps the ordinary addcmul_ path.
+    '''
+    if mlp.provider_id not in (
+        MLP_CONVROT_INT8_CHUNKED,
+        MLP_RUNTIME_CONVROT_INT8_CHUNKED,
+    ):
+        return 'not applicable'
+    index = getattr(environment, 'device_index', None)
+    device = None if index is None else torch.device('cuda', int(index))
+    reason = fused_residual_unavailable_reason(device)
+    if reason is None:
+        return 'eligible (verified on first use)'
+    return 'unavailable: %s' % reason
+
+
 def _status(
     plan,
     environment,
@@ -1296,6 +1320,7 @@ def _status(
                 None if plan.memory is None else int(plan.memory.chunk_rows)
             ),
             'patched_blocks': int(mlp_blocks),
+            'fused_residual': _fused_residual_status(mlp, environment),
         },
         'final_layer': (
             None

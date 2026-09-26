@@ -85,7 +85,19 @@ video attention connections for speed.
 
 ### Normal settings
 
-- **MLP memory optimization: Auto** — leave enabled.
+- **MLP memory optimization: Auto** — uses ordinary 4096-row chunking by
+  default. The ConvRot two-slice path remains available as an experimental
+  explicit option. On ConvRot INT8 checkpoints, including a floating model
+  converted once by `Force quant`, the gated residual add
+  is folded into fc2 using Comfy Kitchen's fused INT8 residual kernel (Kitchen
+  0.2.34+, NVIDIA SM80+), writing straight into the block residual.
+  The output is bit-identical; each block's MLP gets slightly faster and holds
+  one fewer hidden-width temporary. Older Kitchen, Turing, ROCm, and
+  per-token modulation segments keep the ordinary residual add automatically.
+  The plan status reports it as `mlp.fused_residual`. Set
+  `H3_OPTIMIZATIONS_DISABLE_FUSED_RESIDUAL=1` to turn it off for debugging.
+  Floating (BF16/FP16) MLPs kept in their own precision compute SwiGLU in
+  place, saving one activation-width temporary per chunk with identical output.
 - **QKV streaming: Auto** — leave enabled. It uses a lower-memory path when the
   active attention backend can consume it safely.
 - **Precision mode: Auto** — lets the node choose a compatible execution path.
