@@ -190,12 +190,32 @@ def parse_args(argv=None):
         default='current',
     )
     parser.add_argument('--diagnostic-stages', action='store_true')
+    parser.add_argument(
+        '--stream-output',
+        action='store_true',
+        help='use the production streamed-Q/output Sparse Kitchen route',
+    )
+    parser.add_argument(
+        '--disable-attention-residual',
+        action='store_true',
+        help='benchmark-only control: retain the streamed output buffer and block gate pass',
+    )
+    parser.add_argument(
+        '--alternate-attention-residual',
+        action='store_true',
+        help='alternate the streamed output control and fused residual in one process',
+    )
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--forwards', type=int, default=12)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--label', default='')
     parser.add_argument('--output')
     parser.add_argument('--json', action='store_true')
+    parser.add_argument(
+        '--cuda-profiler-range',
+        action='store_true',
+        help='bracket measured forwards with cudaProfilerStart/Stop for Nsight',
+    )
     parser.add_argument('--i-understand-this-uses-gpu', action='store_true')
     args = parser.parse_args(argv)
     if args.sequence <= 0:
@@ -250,6 +270,7 @@ def main(argv=None):
         MODE_SAGE128_FUSED_QKV,
     )
     from h3_optimizations.attention.sparse.kitchen_sparse import (
+        OUTPUT_NHD,
         SparseKitchenError,
         SparseKitchenBackend,
         preflight_sparse_kitchen,
@@ -271,12 +292,19 @@ def main(argv=None):
         ActivationMemoryConfig,
     )
     from h3_optimizations.memory.forward import make_forward as make_block_forward
+    from h3_optimizations.normalized_rows import NormalizedRows
     from h3_optimizations.qkv.formats import describe_linear
     from h3_optimizations.qkv.chunked import project_chunk_hnd
     from h3_optimizations.runtime.context import RUNTIME_KEY, RuntimeSnapshot
 
     if not torch.cuda.is_available():
         raise SystemExit('CUDA is required')
+    if args.disable_attention_residual and not args.stream_output:
+        raise SystemExit('--disable-attention-residual requires --stream-output')
+    if args.alternate_attention_residual and not args.stream_output:
+        raise SystemExit('--alternate-attention-residual requires --stream-output')
+    if args.alternate_attention_residual and args.disable_attention_residual:
+        raise SystemExit('attention residual control modes are mutually exclusive')
     device = torch.device('cuda')
     if torch.cuda.get_allocator_backend() != 'native':
         raise SystemExit('the active CUDA allocator is not the production native backend')
@@ -553,11 +581,20 @@ def main(argv=None):
         projector = ChunkedKitchenQKVProjector(
             chunk_rows=args.qkv_chunk_rows,
             routing_summaries=True,
+            q_tile=64,
+            kv_tile=64,
+            strided_qk_input=args.stream_output,
+            stream_output=args.stream_output,
         )
         backend = SparseKitchenBackend(
             config,
             kitchen=kitchen,
             projector=projector,
+            output_layout=OUTPUT_NHD if args.stream_output else 'hnd',
+            release_carrier_before_out_proj=args.stream_output,
+            stream_output=args.stream_output,
+            q_tile=64 if args.stream_output else 128,
+            kv_tile=64 if args.stream_output else 128,
         )
 
     original_project = None if projector is None else projector.try_project
@@ -647,6 +684,12 @@ def main(argv=None):
         with timing.stage('attention_total'):
             return attention_forward(*positional, **keywords)
 
+    attention._h3_optimizations_lazy_norm_source = getattr(
+        attention_forward,
+        '_h3_optimizations_lazy_norm_source',
+        False,
+    )
+
     block.attn.forward = attention
     block_forward = make_block_forward(
         block,
@@ -658,6 +701,18 @@ def main(argv=None):
         ),
         original_forward=block.forward,
     )
+
+    attention_residual_state = {
+        'enabled': not args.disable_attention_residual,
+    }
+    if args.disable_attention_residual or args.alternate_attention_residual:
+        original_enable_attention_residual = NormalizedRows.enable_attention_residual
+
+        def benchmark_enable_attention_residual(source, gate):
+            if attention_residual_state['enabled']:
+                original_enable_attention_residual(source, gate)
+
+        NormalizedRows.enable_attention_residual = benchmark_enable_attention_residual
 
     layout = make_layout(args.sequence, args.video_start)
     mod_segments = mod_segments_from_layout(layout)
@@ -697,7 +752,25 @@ def main(argv=None):
             transformer_options=options,
         )
 
-    for _ in range(args.warmup):
+    parity = None
+    if args.alternate_attention_residual:
+        attention_residual_state['enabled'] = False
+        control_output = one_forward().clone()
+        attention_residual_state['enabled'] = True
+        fused_output = one_forward()
+        difference = fused_output.float() - control_output.float()
+        parity = {
+            'exact': bool(torch.equal(fused_output, control_output)),
+            'max_abs': float(difference.abs().max().item()),
+            'mismatch_fraction': float(
+                (fused_output != control_output).float().mean().item()
+            ),
+        }
+        del difference, fused_output, control_output
+
+    for warmup_index in range(args.warmup):
+        if args.alternate_attention_residual:
+            attention_residual_state['enabled'] = bool(warmup_index % 2)
         result = one_forward()
         torch.cuda.synchronize(device)
         del result
@@ -706,14 +779,32 @@ def main(argv=None):
     torch.cuda.synchronize(device)
     measured_forwards = []
     timing.enabled = True
-    for _ in range(args.forwards):
+    if args.cuda_profiler_range:
+        torch.cuda.cudart().cudaProfilerStart()
+    for forward_index in range(args.forwards):
+        if args.alternate_attention_residual:
+            # ABBA removes most monotonic clock and temperature drift while
+            # keeping both arms in the same loaded process.
+            attention_residual_state['enabled'] = (
+                forward_index % 4 in (0, 3)
+            )
         torch.cuda.reset_peak_memory_stats(device)
         timing.begin_forward()
-        with timing.stage('block'):
-            result = one_forward()
+        nvtx_range = (
+            torch.cuda.nvtx.range(
+                'attention_residual_%s'
+                % ('fused' if attention_residual_state['enabled'] else 'control')
+            )
+            if args.cuda_profiler_range
+            else contextlib.nullcontext()
+        )
+        with nvtx_range:
+            with timing.stage('block'):
+                result = one_forward()
         torch.cuda.synchronize(device)
         stages, counts = timing.finish_forward()
         measured_forwards.append({
+            'attention_residual': bool(attention_residual_state['enabled']),
             'stages': stages,
             'counts': counts,
             'peak_allocated_bytes': int(torch.cuda.max_memory_allocated(device)),
@@ -722,6 +813,8 @@ def main(argv=None):
             'end_reserved_bytes': int(torch.cuda.memory_reserved(device)),
         })
         del result
+    if args.cuda_profiler_range:
+        torch.cuda.cudart().cudaProfilerStop()
     timing.enabled = False
     stats_after_timing = memory_stats(torch, device)
 
@@ -771,6 +864,16 @@ def main(argv=None):
     )
 
     steady = measured_forwards[len(measured_forwards) // 2:]
+    case_stages = None
+    if args.alternate_attention_residual:
+        case_stages = {
+            'control': summarize_stages(
+                [row for row in steady if not row['attention_residual']]
+            ),
+            'fused': summarize_stages(
+                [row for row in steady if row['attention_residual']]
+            ),
+        }
     result = {
         'label': args.label or 'qkv%d' % args.qkv_chunk_rows,
         'checkpoint': str(checkpoint),
@@ -783,6 +886,9 @@ def main(argv=None):
         'hidden': int(hidden),
         'qkv_chunk_rows': int(args.qkv_chunk_rows),
         'producer_order': args.producer_order,
+        'stream_output': bool(args.stream_output),
+        'attention_residual': not args.disable_attention_residual,
+        'alternate_attention_residual': bool(args.alternate_attention_residual),
         'qkv_chunks_per_block': (
             args.sequence + args.qkv_chunk_rows - 1
         ) // args.qkv_chunk_rows,
@@ -791,7 +897,9 @@ def main(argv=None):
         'timing': {
             'forwards': measured_forwards,
             'stages': summarize_stages(steady),
+            'case_stages': case_stages,
         },
+        'attention_residual_parity': parity,
         'memory': {
             'uninstrumented_block': uninstrumented_block_peak,
             'phases': memory.phases,
@@ -826,12 +934,29 @@ def main(argv=None):
         print(serialized)
     else:
         stages = result['timing']['stages']
+        if case_stages is not None:
+            control = case_stages['control']
+            fused = case_stages['fused']
+            print(
+                '%s: control attention %.3f ms / block %.3f ms; '
+                'fused attention %.3f ms / block %.3f ms; exact=%s'
+                % (
+                    result['label'],
+                    control['attention_total']['median_gpu_ms'],
+                    control['block']['median_gpu_ms'],
+                    fused['attention_total']['median_gpu_ms'],
+                    fused['block']['median_gpu_ms'],
+                    parity['exact'],
+                )
+            )
+            return 0
+        pre_kernel = stages.get('attention_pre_kernel')
         print(
-            '%s: pre-kernel %.3f ms, attention %.3f ms, block %.3f ms, '
+            '%s: pre-kernel %s ms, attention %.3f ms, block %.3f ms, '
             'peak %.1f MiB allocated / %.1f MiB reserved'
             % (
                 result['label'],
-                stages['attention_pre_kernel']['median_gpu_ms'],
+                '-' if pre_kernel is None else '%.3f' % pre_kernel['median_gpu_ms'],
                 stages['attention_total']['median_gpu_ms'],
                 stages['block']['median_gpu_ms'],
                 uninstrumented_block_peak['peak_allocated_bytes'] / 2**20,

@@ -22,9 +22,12 @@ DENSE_KITCHEN_PREQUANTIZED = 'comfy_kitchen_int8_prequantized'
 
 
 class _AttentionOutProjectionProxy:
-    def __init__(self, module, out_proj):
+    def __init__(self, module, out_projection):
         self._module = module
-        self.out_proj = out_proj
+        self.out_proj = getattr(out_projection, 'linear', out_projection)
+        residual = getattr(out_projection, 'residual_', None)
+        if residual is not None:
+            self._h3_out_proj_residual = residual
 
     def __getattr__(self, name):
         return getattr(self._module, name)
@@ -173,7 +176,7 @@ def _finish_projected(module, backend, prepared, out_projection=None):
             if out_projection is None
             else _AttentionOutProjectionProxy(
                 module,
-                out_projection.linear,
+                out_projection,
             )
         )
         direct = execute_projected(execution_module, prepared)
@@ -336,12 +339,26 @@ def make_forward(
         bind_projector(module)
 
     def forward(x, rope_freqs=None, transformer_options=None):
-        if force_out_proj_int8:
+        norm1_source = (transformer_options or {}).get(NORM1_SOURCE_KEY)
+        native_residual = False
+        if (
+            norm1_source is not None
+            and norm1_source.attention_residual_pending
+        ):
+            from .qkv.formats import describe_linear
+
+            native_residual = describe_linear(
+                module.out_proj
+            ).convrot_int8_256
+        if force_out_proj_int8 or native_residual:
             from .qkv.int8 import LazyConvRotINT8Linear
 
         out_projection = (
-            LazyConvRotINT8Linear(module.out_proj)
-            if force_out_proj_int8
+            LazyConvRotINT8Linear(
+                module.out_proj,
+                allow_float_conversion=force_out_proj_int8,
+            )
+            if force_out_proj_int8 or native_residual
             else None
         )
         try:

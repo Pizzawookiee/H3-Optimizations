@@ -300,6 +300,7 @@ def make_forward(block, layer_index, config, original_forward=None):
             _scale_shift,
         )
         if _attention_supports_lazy_norm(attention):
+            h.enable_attention_residual(gate_msa)
             attention_options = dict(transformer_options or {})
             attention_options[NORM1_SOURCE_KEY] = h
             attn_out = attention(
@@ -307,6 +308,7 @@ def make_forward(block, layer_index, config, original_forward=None):
                 rope_freqs=rope_freqs,
                 transformer_options=attention_options,
             )
+            attention_residual_complete = h.attention_residual_complete
         else:
             h = h.materialize()
             attn_out = attention(
@@ -314,16 +316,18 @@ def make_forward(block, layer_index, config, original_forward=None):
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,
             )
-        for start, stop, selector in iter_modulation_chunks(
-            segments,
-            config.chunk_rows,
-        ):
-            _gate_add(
-                x[start:stop],
-                attn_out[start:stop],
-                gate_msa,
-                selector,
-            )
+            attention_residual_complete = False
+        if not attention_residual_complete:
+            for start, stop, selector in iter_modulation_chunks(
+                segments,
+                config.chunk_rows,
+            ):
+                _gate_add(
+                    x[start:stop],
+                    attn_out[start:stop],
+                    gate_msa,
+                    selector,
+                )
         del h, attn_out
 
         if (

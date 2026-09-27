@@ -475,8 +475,18 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
         producer_module = projected.producer_module
         if producer_module is None:
             raise SparseKitchenError("streamed Sparse Kitchen producer was released")
-        output = attention_output_buffer(projected.output_buffer)
-        if output is None:
+        residual_source = projected.output_buffer
+        project_residual = getattr(module, "_h3_out_proj_residual", None)
+        in_place_residual = bool(
+            callable(project_residual)
+            and getattr(residual_source, "attention_residual_pending", False)
+        )
+        output = (
+            None
+            if in_place_residual
+            else attention_output_buffer(residual_source)
+        )
+        if output is None and not in_place_residual:
             raise SparseKitchenError(
                 "streamed Sparse Kitchen requires an output-capturing projector"
             )
@@ -585,11 +595,25 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 )
                 del raw
                 with diagnostics.stage("attention_out"):
-                    projected_rows = module.out_proj(flat.squeeze(0))
-                    output[start:stop].copy_(projected_rows)
-                    del projected_rows
+                    projection_input = flat.squeeze(0)
+                    if in_place_residual:
+                        residual_source.write_attention_residual(
+                            projection_input,
+                            start,
+                            stop,
+                            module.out_proj,
+                            project_residual,
+                        )
+                    else:
+                        projected_rows = module.out_proj(projection_input)
+                        output[start:stop].copy_(projected_rows)
+                        del projected_rows
                 del flat
-            return output
+            return (
+                residual_source.finish_attention_residual()
+                if in_place_residual
+                else output
+            )
         finally:
             if fused is not None:
                 fused.__exit__(None, None, None)

@@ -422,6 +422,105 @@ class StreamedKitchenOutputTests(unittest.TestCase):
         self.assertTrue(torch.equal(residual, source.materialize()))
         torch.testing.assert_close(actual, residual)
 
+    def test_sparse_kitchen_streamed_q_writes_projected_slabs_into_residual(self):
+        class Held:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class Kitchen:
+            BlockSparseRoute = staticmethod(lambda **_kwargs: object())
+
+            @staticmethod
+            def block_sparse_int8_attention_from_prequantized(
+                carrier, _route, *, output_layout
+            ):
+                return carrier
+
+        sequence = 128
+        original = torch.arange(sequence, dtype=torch.float32).reshape(sequence, 1)
+        residual = original.clone()
+        source = NormalizedRows(
+            residual,
+            lambda rows: rows.clone(),
+            ((0, 32, 0), (32, sequence, 1)),
+            None,
+            None,
+            lambda rows, _shift, _scale, _selector: rows,
+        )
+        gate = torch.tensor([[0.5], [1.0]])
+        source.enable_attention_residual(gate)
+
+        def project_residual(rows, target, scale):
+            target.addcmul_(rows, scale)
+            return True
+
+        module = type(
+            'Module',
+            (),
+            {
+                'heads': 1,
+                'head_dim': 1,
+                'out_proj': staticmethod(lambda rows: rows),
+                '_h3_out_proj_residual': staticmethod(project_residual),
+            },
+        )()
+        projected = StreamedSparseKitchenQKV(
+            module=module,
+            producer_module=object(),
+            x=source,
+            rope_freqs=None,
+            carrier=object(),
+            k_summary=None,
+            projection_mode='native',
+            output_buffer=source,
+        )
+        prepared = PreparedStreamedSparseKitchen(
+            projected=projected,
+            route_plan=type('RoutePlan', (), {'release': lambda self: None})(),
+            metadata={},
+        )
+        backend = StreamedSparseKitchenBackend.__new__(StreamedSparseKitchenBackend)
+        backend.executor = type(
+            'Executor',
+            (object,),
+            {'kitchen': Kitchen(), 'q_tile': 64, 'kv_tile': 64},
+        )()
+        backend.query_chunk_rows = 64
+        backend.router = object()
+
+        def project_q(_held, rows, _rope, start, stop):
+            return rows[start:stop].transpose(0, 1).reshape(1, 1, stop - start, 1)
+
+        with mock.patch.object(
+            kitchen_streamed_q,
+            'create_held_qkv',
+            return_value=Held(),
+        ), mock.patch.object(
+            kitchen_streamed_q,
+            'project_q_hnd',
+            side_effect=project_q,
+        ), mock.patch.object(
+            kitchen_streamed_q,
+            '_build_route_chunk',
+            return_value=(torch.zeros(1, 1, 1, 1), torch.ones(1, 1, 1)),
+        ), mock.patch.object(
+            kitchen_streamed_q,
+            '_quantize_q_chunk',
+            side_effect=lambda _producer, _carrier, q: q,
+        ):
+            actual = backend.execute_projected(module, prepared)
+
+        expected = original.clone()
+        expected[:32].addcmul_(original[:32], gate[0])
+        expected[32:].addcmul_(original[32:], gate[1])
+        self.assertIs(actual, residual)
+        self.assertIsNone(source._output)
+        self.assertTrue(source.attention_residual_complete)
+        torch.testing.assert_close(actual, expected)
+
 
 if __name__ == '__main__':
     unittest.main()

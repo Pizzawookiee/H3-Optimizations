@@ -24,6 +24,7 @@ comfy.options.enable_args_parsing()
 
 import comfy.ops  # noqa: E402
 from comfy.quant_ops import TensorWiseINT8Layout  # noqa: E402
+from h3_optimizations.memory import fused_residual  # noqa: E402
 from h3_optimizations.qkv.int8 import (  # noqa: E402
     HeldConvRotINT8Linear,
     LazyConvRotINT8Linear,
@@ -120,6 +121,31 @@ class RuntimeConvRotINT8Tests(unittest.TestCase):
             self.assertEqual(acquire.call_count, 1)
             session.release()
             self.assertEqual(release.call_count, 1)
+
+    def test_lazy_binding_offers_plain_linear_to_residual_kernel(self):
+        residual = torch.zeros_like(self.sample)
+        gate = torch.ones(256, dtype=torch.bfloat16)
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(self.weight, None, object()),
+        ) as acquire, mock.patch.object(
+            comfy.ops,
+            "uncast_bias_weight",
+        ), mock.patch.object(
+            fused_residual,
+            "linear_residual_",
+            return_value=True,
+        ) as fused:
+            session = LazyConvRotINT8Linear(self.module)
+            self.assertTrue(session.residual_(self.sample, residual, gate))
+            self.assertTrue(session.residual_(self.sample, residual, gate))
+            self.assertEqual(acquire.call_count, 1)
+            session.release()
+
+        self.assertEqual(fused.call_count, 2)
+        self.assertIs(fused.call_args.kwargs["convrot"], True)
+        self.assertEqual(fused.call_args.kwargs["convrot_groupsize"], 256)
 
     def test_output_slices_match_one_full_convrot_linear(self):
         handle = object()

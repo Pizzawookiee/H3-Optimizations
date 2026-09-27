@@ -105,13 +105,35 @@ class FusedResidualRouteTests(unittest.TestCase):
             patch.object(torch.cuda, 'is_current_stream_capturing', return_value=False),
             patch.object(fused_residual, '_self_test', return_value=(True, None)) as self_test,
         ):
-            self.assertTrue(fused_residual._verified(None, None, device, torch.bfloat16, 'plain'))
-            self.assertTrue(fused_residual._verified(None, None, device, torch.bfloat16, 'plain'))
-            self.assertTrue(fused_residual._verified(None, None, device, torch.float16, 'plain'))
+            self.assertTrue(fused_residual._verified(
+                None, None, device, torch.bfloat16, 'plain', 'swiglu'
+            ))
+            self.assertTrue(fused_residual._verified(
+                None, None, device, torch.bfloat16, 'plain', 'swiglu'
+            ))
+            self.assertTrue(fused_residual._verified(
+                None, None, device, torch.bfloat16, 'plain', 'none'
+            ))
+            self.assertTrue(fused_residual._verified(
+                None, None, device, torch.float16, 'plain', 'swiglu'
+            ))
 
-        self.assertEqual(self_test.call_count, 2)
+        self.assertEqual(self_test.call_count, 3)
         self.assertEqual(self_test.call_args_list[0].args[3], torch.bfloat16)
-        self.assertEqual(self_test.call_args_list[1].args[3], torch.float16)
+        self.assertEqual(self_test.call_args_list[1].args[5], 'none')
+        self.assertEqual(self_test.call_args_list[2].args[3], torch.float16)
+
+    def test_no_activation_route_preserves_cpu_residual(self):
+        x = torch.zeros(8, 256, dtype=torch.bfloat16)
+        qdata = torch.zeros(256, 256, dtype=torch.int8)
+        residual = torch.ones(8, 256, dtype=torch.bfloat16)
+        before = residual.clone()
+        used = fused_residual.linear_residual_(
+            x, qdata, torch.ones(256), None, residual,
+            torch.ones(256, dtype=torch.bfloat16), convrot=True,
+        )
+        self.assertFalse(used)
+        self.assertTrue(torch.equal(residual, before))
 
     def test_status_reports_applicability(self):
         from h3_optimizations import apply

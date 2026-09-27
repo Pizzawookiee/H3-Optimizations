@@ -565,6 +565,48 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(source.shape, value.shape)
         self.assertTrue(options['owned'])
 
+    def test_owned_attention_may_finish_the_gated_residual_in_place(self):
+        torch.manual_seed(36)
+        block = self._make_block()
+        x = torch.randn(8, 32) * 0.1
+        t_emb = torch.randn(1, 24) * 0.1
+        segments = [(0, 8, 0)]
+        config = ActivationMemoryConfig(
+            mode=MODE_NATIVE,
+            chunk_rows=256,
+            alignment=256,
+        )
+
+        def ordinary(_value, **kwargs):
+            return kwargs['transformer_options'][NORM1_SOURCE_KEY].materialize()
+
+        ordinary._h3_optimizations_lazy_norm_source = True
+        block.attn.forward = ordinary
+        expected = make_forward(block, 9, config)(
+            x.clone(), t_emb, segments, rope_freqs=None, transformer_options={}
+        )
+
+        def in_place(_value, **kwargs):
+            source = kwargs['transformer_options'][NORM1_SOURCE_KEY]
+            rows = source.materialize()
+
+            def residual(projected, target, gate):
+                target.addcmul_(projected, gate)
+                return True
+
+            source.write_attention_residual(
+                rows, 0, len(source), lambda value: value, residual
+            )
+            return source.finish_attention_residual()
+
+        in_place._h3_optimizations_lazy_norm_source = True
+        block.attn.forward = in_place
+        actual = make_forward(block, 9, config)(
+            x.clone(), t_emb, segments, rope_freqs=None, transformer_options={}
+        )
+
+        torch.testing.assert_close(actual, expected)
+
 
 if __name__ == '__main__':
     unittest.main()

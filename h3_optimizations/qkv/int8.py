@@ -146,6 +146,29 @@ class HeldConvRotINT8Linear:
         comfy.ops.run_every_op()
         return self._linear(x, self.weight)
 
+    def residual_(self, x, residual, gate):
+        """``residual += gate * linear(x)`` in place, or False."""
+        if (
+            self.weight is None
+            or self.bias is not None
+            or getattr(self.module, "_h3_benchmark_convrot_linear", None) is not None
+        ):
+            return False
+        from ..memory import fused_residual
+
+        comfy.ops.run_every_op()
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(self.weight)
+        return fused_residual.linear_residual_(
+            x,
+            qdata,
+            scale,
+            None,
+            residual,
+            gate,
+            convrot=True,
+            convrot_groupsize=GROUP_SIZE,
+        )
+
     def linear_range(self, x, start, end):
         if self.weight is None:
             raise RuntimeError("ConvRot INT8 binding is not active")
@@ -383,20 +406,29 @@ class HeldConvRotINT8MLP:
 class LazyConvRotINT8Linear:
     """Delay runtime quantization until the first output-projection slab."""
 
-    def __init__(self, module):
+    def __init__(self, module, *, allow_float_conversion=True):
         self.module = module
+        self.allow_float_conversion = bool(allow_float_conversion)
         self.binding = None
 
-    def linear(self, x):
+    def _binding(self, x):
         if self.binding is None:
             sample = x.reshape(-1, x.shape[-1])[:1]
             self.binding = HeldConvRotINT8Linear(
                 self.module,
                 sample,
-                allow_float_conversion=True,
+                allow_float_conversion=self.allow_float_conversion,
             )
             self.binding.__enter__()
+        return self.binding
+
+    def linear(self, x):
+        self._binding(x)
         return self.binding.linear(x)
+
+    def residual_(self, x, residual, gate):
+        self._binding(x)
+        return self.binding.residual_(x, residual, gate)
 
     def release(self):
         if self.binding is not None:

@@ -1,24 +1,27 @@
-'''In-place ``residual += gate * fc2(swiglu(expanded))`` for held INT8 MLPs.
+'''In-place gated residuals for held INT8 linears.
 
-The bounded native MLP ends every token slab with a TensorWise INT8 fc2 whose
-output is only consumed by the block's gated residual ``x.addcmul_(out, gate)``.
-Comfy Kitchen 0.2.34 added a CUTLASS INT8 kernel variant that computes
+The bounded native MLP and streamed attention paths end token slabs with a
+TensorWise INT8 linear whose output is only consumed by the block's gated
+residual ``x.addcmul_(out, gate)``. Comfy Kitchen 0.2.34 added a CUTLASS INT8
+kernel variant that computes
 ``D = resid + rscale * (acc * xs * ws + bias)`` on the same tuned GEMM configs
 as the plain dequant kernel. Writing ``D`` over the residual rows removes the
-hidden-width fc2 output and the separate ``addcmul_`` pass.
+hidden-width linear output and the separate ``addcmul_`` pass.
 
-The result is bit-identical to ``int8_linear(..., input_act="swiglu")``
-followed by ``addcmul_``: the kernel rounds the dequantized GEMM result (with
-bias) to the output dtype exactly like the plain kernel and keeps only the
-residual multiply-add in FP32. Aliasing ``D`` onto the residual is safe because
-the residual is read by an AuxLoad visitor and written by an AuxStore visitor on
-the thread that owns each element, and stream-K tiles finish each output once.
+The result is bit-identical to ``int8_linear`` followed by ``addcmul_``, both
+with and without fused SwiGLU: the kernel rounds the dequantized GEMM result
+(with bias) to the output dtype exactly like the plain kernel and keeps only
+the residual multiply-add in FP32. Aliasing ``D`` onto the residual is safe
+because the residual is read by an AuxLoad visitor and written by an AuxStore
+visitor on the thread that owns each element, and stream-K tiles finish each
+output once.
 
 Kitchen's public ``int8_linear`` always allocates a fresh output, so this uses
-   the Kitchen CUDA backend's internal quantizer and GEMM bindings, exactly as the
-   public call would. Everything is feature-detected, self-tested once per device,
-   dtype, and variant against the public path, and any mismatch, missing symbol, or
-unexpected exception disables the fused route and falls back to ``addcmul_``.
+the Kitchen CUDA backend's internal quantizer and GEMM bindings, exactly as the
+public call would. Everything is feature-detected, self-tested once per device,
+dtype, activation, and variant against the public path, and any mismatch,
+missing symbol, or unexpected exception disables the fused route and falls
+back to ``addcmul_``.
 It only runs where Kitchen's own dispatcher would pick its CUDA backend for the
 equivalent call, and never during ``torch.compile`` tracing or CUDA graph
 capture.
@@ -35,6 +38,8 @@ DISABLE_ENV = 'H3_OPTIMIZATIONS_DISABLE_FUSED_RESIDUAL'
 MIN_KITCHEN = '0.2.34'
 VARIANT_CONVROT = 'convrot'
 VARIANT_PLAIN = 'plain'
+ACT_NONE = 'none'
+ACT_SWIGLU = 'swiglu'
 
 _REQUIRED_C = (
     'cutlass_int8_dequant_residual',
@@ -67,7 +72,7 @@ def _log_once(reason):
         return
     _LOGGED.add(reason)
     logging.debug(
-        '%s fused MLP residual kernel unavailable; using addcmul_. Detail: %s',
+        '%s fused INT8 residual kernel unavailable; using addcmul_. Detail: %s',
         LOG_PREFIX,
         reason,
     )
@@ -130,30 +135,46 @@ def _variant(convrot, convrot_groupsize):
     return VARIANT_PLAIN
 
 
-def _quantize(backend, expanded, variant):
-    device = expanded.device
+def _input_width(x, input_act):
+    width = int(x.shape[1])
+    if input_act == ACT_SWIGLU:
+        return width // 2 if width % 2 == 0 else None
+    if input_act == ACT_NONE:
+        return width
+    return None
+
+
+def _quantize(backend, x, variant, input_act):
+    device = x.device
     wrap = backend._wrap_for_dlpack
-    m = int(expanded.shape[0])
-    k = int(expanded.shape[1]) // 2
+    m = int(x.shape[0])
+    k = _input_width(x, input_act)
+    if k is None:
+        raise ValueError('unsupported fused residual input activation')
     stream = torch.cuda.current_stream(device).cuda_stream
     x_q = torch.empty((m, k), dtype=torch.int8, device=device)
     x_s = torch.empty((m, 1), dtype=torch.float32, device=device)
     if variant == VARIANT_CONVROT:
-        act = backend._act_weight_arg('swiglu', None, device, expanded.dtype)
+        kitchen_act = None if input_act == ACT_NONE else input_act
+        act = backend._act_weight_arg(kitchen_act, None, device, x.dtype)
         backend._C.quantize_int8_rowwise_convrot64(
-            wrap(expanded),
+            wrap(x),
             wrap(x_q),
             wrap(x_s),
             256,
             False,
-            backend._input_act_code('swiglu'),
+            backend._input_act_code(kitchen_act),
             0,
             wrap(act),
             0.0,
             stream,
         )
     else:
-        activated = backend._apply_input_act(expanded, 'swiglu', None, 0.0)
+        activated = (
+            x
+            if input_act == ACT_NONE
+            else backend._apply_input_act(x, input_act, None, 0.0)
+        )
         backend._C.quantize_int8_rowwise(
             wrap(activated),
             wrap(x_q),
@@ -193,48 +214,52 @@ def _gemm_residual_(backend, x_q, x_s, qdata, weight_scale, bias, residual, gate
     )
 
 
-def _shape_ok(backend, expanded, qdata, residual, gate, variant):
-    if expanded.ndim != 2 or residual.ndim != 2 or qdata.ndim != 2 or gate.ndim != 1:
+def _shape_ok(backend, x, qdata, residual, gate, variant, input_act):
+    if x.ndim != 2 or residual.ndim != 2 or qdata.ndim != 2 or gate.ndim != 1:
         return False
-    if expanded.dtype not in (torch.bfloat16, torch.float16):
+    if x.dtype not in (torch.bfloat16, torch.float16):
         return False
-    if residual.dtype != expanded.dtype or qdata.dtype != torch.int8:
+    if residual.dtype != x.dtype or qdata.dtype != torch.int8:
         return False
-    m = int(expanded.shape[0])
-    k = int(expanded.shape[1]) // 2
+    m = int(x.shape[0])
+    k = _input_width(x, input_act)
+    if k is None:
+        return False
     n = int(qdata.shape[0])
     # Kitchen serves one- and two-row calls with GEMV kernels, not CUTLASS.
-    if m <= 2 or int(expanded.shape[1]) % 2 or k % 16:
+    if m <= 2 or k % 16:
         return False
     if tuple(qdata.shape) != (n, k) or tuple(residual.shape) != (m, n):
         return False
     if int(gate.shape[0]) != n:
         return False
-    if not (expanded.is_contiguous() and residual.is_contiguous() and qdata.is_contiguous()):
+    if not (x.is_contiguous() and residual.is_contiguous() and qdata.is_contiguous()):
         return False
-    if not (expanded.is_cuda and residual.device == expanded.device == qdata.device):
+    if not (x.is_cuda and residual.device == x.device == qdata.device):
         return False
     if not backend._aligned16(residual):
         return False
     if variant == VARIANT_CONVROT:
         if k % 256 or not 256 <= k <= int(backend._CONVROT_FUSED_MAX_K):
             return False
-        if not backend._convrot_fused_shared_memory_fits(expanded, k, 256):
+        if not backend._convrot_fused_shared_memory_fits(x, k, 256):
             return False
     return True
 
 
-def _kitchen_routes_to_cuda(kitchen, expanded, qdata, weight_scale, bias, residual, gate, variant):
+def _kitchen_routes_to_cuda(
+    kitchen, x, qdata, weight_scale, bias, residual, gate, variant, input_act
+):
     '''The equivalent public call must dispatch to Kitchen's CUDA backend.'''
     kwargs = {
-        'x': expanded,
+        'x': x,
         'weight': qdata,
         'weight_scale': weight_scale,
         'bias': bias,
-        'out_dtype': expanded.dtype,
+        'out_dtype': x.dtype,
         'convrot': variant == VARIANT_CONVROT,
         'convrot_groupsize': 256,
-        'input_act': 'swiglu',
+        'input_act': None if input_act == ACT_NONE else input_act,
         'input_act_weight': None,
         'input_act_eps': 0.0,
         'residual': residual,
@@ -247,11 +272,12 @@ def _kitchen_routes_to_cuda(kitchen, expanded, qdata, weight_scale, bias, residu
         return False
 
 
-def _self_test(kitchen, backend, device, dtype, variant):
+def _self_test(kitchen, backend, device, dtype, variant, input_act):
     '''Compare the aliased kernel with the public path on a small problem.'''
     generator = torch.Generator(device=device).manual_seed(20260926)
     m, n, k = 48, 256, 256
-    expanded = torch.randn((m, 2 * k), generator=generator, device=device, dtype=dtype)
+    input_width = 2 * k if input_act == ACT_SWIGLU else k
+    x = torch.randn((m, input_width), generator=generator, device=device, dtype=dtype)
     qdata = torch.randint(-127, 128, (n, k), generator=generator, device=device, dtype=torch.int8)
     weight_scale = torch.rand((n,), generator=generator, device=device) * 1e-3 + 1e-4
     bias = torch.randn((n,), generator=generator, device=device, dtype=dtype)
@@ -259,12 +285,13 @@ def _self_test(kitchen, backend, device, dtype, variant):
     residual = 4.0 * torch.randn((m, n), generator=generator, device=device, dtype=dtype)
     convrot = variant == VARIANT_CONVROT
     plain = kitchen.int8_linear(
-        expanded, qdata, weight_scale, bias, dtype,
-        convrot=convrot, convrot_groupsize=256, input_act='swiglu',
+        x, qdata, weight_scale, bias, dtype,
+        convrot=convrot, convrot_groupsize=256,
+        input_act=None if input_act == ACT_NONE else input_act,
     )
     expected = residual.clone().addcmul_(plain, gate)
     actual = residual.clone()
-    x_q, x_s = _quantize(backend, expanded, variant)
+    x_q, x_s = _quantize(backend, x, variant, input_act)
     if not _gemm_residual_(backend, x_q, x_s, qdata, weight_scale, bias, actual, gate):
         return False, 'the CUTLASS residual kernel declined the self-test shape'
     if not torch.equal(actual, expected):
@@ -272,8 +299,8 @@ def _self_test(kitchen, backend, device, dtype, variant):
     return True, None
 
 
-def _verified(kitchen, backend, device, dtype, variant):
-    key = (int(device.index or 0), dtype, variant)
+def _verified(kitchen, backend, device, dtype, variant, input_act):
+    key = (int(device.index or 0), dtype, variant, input_act)
     with _LOCK:
         cached = _VERIFIED.get(key)
         if cached is not None:
@@ -281,13 +308,68 @@ def _verified(kitchen, backend, device, dtype, variant):
         if torch.cuda.is_current_stream_capturing():
             return False
         try:
-            ok, reason = _self_test(kitchen, backend, device, dtype, variant)
+            ok, reason = _self_test(
+                kitchen, backend, device, dtype, variant, input_act
+            )
         except Exception as exc:
             ok, reason = False, '%s: %s' % (type(exc).__name__, exc)
         if not ok:
-            _log_once('%s %s self-test failed: %s' % (variant, dtype, reason))
+            _log_once(
+                '%s %s %s self-test failed: %s'
+                % (variant, input_act, dtype, reason)
+            )
         _VERIFIED[key] = ok
         return ok
+
+
+def _linear_residual_(
+    x,
+    qdata,
+    weight_scale,
+    bias,
+    residual,
+    gate,
+    *,
+    convrot,
+    convrot_groupsize=256,
+    input_act,
+):
+    if torch.compiler.is_compiling():
+        return False
+    variant = _variant(convrot, convrot_groupsize)
+    if variant is None:
+        return False
+    reason = unavailable_reason(x.device)
+    if reason is not None:
+        _log_once(reason)
+        return False
+    kitchen, backend, reason = _kitchen_backend()
+    if reason is not None:
+        return False
+    if gate.dtype != residual.dtype:
+        gate = gate.to(dtype=residual.dtype)
+    if not _shape_ok(
+        backend, x, qdata, residual, gate, variant, input_act
+    ):
+        return False
+    if bias is not None and (bias.ndim != 1 or int(bias.shape[0]) != int(qdata.shape[0])):
+        return False
+    if not _kitchen_routes_to_cuda(
+        kitchen, x, qdata, weight_scale, bias, residual, gate, variant,
+        input_act,
+    ):
+        return False
+    if not _verified(
+        kitchen, backend, x.device, x.dtype, variant, input_act
+    ):
+        return False
+    try:
+        x_q, x_s = _quantize(backend, x, variant, input_act)
+        # A declined launch writes nothing, so the caller's fallback is exact.
+        return _gemm_residual_(backend, x_q, x_s, qdata, weight_scale, bias, residual, gate)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        _log_once('%s: %s' % (type(exc).__name__, exc))
+        return False
 
 
 def gated_swiglu_residual_(
@@ -301,46 +383,53 @@ def gated_swiglu_residual_(
     convrot,
     convrot_groupsize=256,
 ):
-    '''Try ``residual += gate * fc2(swiglu(expanded))`` in place.
+    '''Try ``residual += gate * fc2(swiglu(expanded))`` in place.'''
+    return _linear_residual_(
+        expanded,
+        qdata,
+        weight_scale,
+        bias,
+        residual,
+        gate,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
+        input_act=ACT_SWIGLU,
+    )
+
+
+def linear_residual_(
+    x,
+    qdata,
+    weight_scale,
+    bias,
+    residual,
+    gate,
+    *,
+    convrot,
+    convrot_groupsize=256,
+):
+    '''Try ``residual += gate * linear(x)`` in place.
 
     Returns True when the fused kernel wrote ``residual``. Returns False, with
-    ``residual`` untouched, whenever the route is unsupported; the caller then
-    runs the ordinary fc2 and ``addcmul_``.
+    ``residual`` untouched, whenever the route is unsupported.
     '''
-    if torch.compiler.is_compiling():
-        return False
-    variant = _variant(convrot, convrot_groupsize)
-    if variant is None:
-        return False
-    reason = unavailable_reason(expanded.device)
-    if reason is not None:
-        _log_once(reason)
-        return False
-    kitchen, backend, reason = _kitchen_backend()
-    if reason is not None:
-        return False
-    if gate.dtype != residual.dtype:
-        gate = gate.to(dtype=residual.dtype)
-    if not _shape_ok(backend, expanded, qdata, residual, gate, variant):
-        return False
-    if bias is not None and (bias.ndim != 1 or int(bias.shape[0]) != int(qdata.shape[0])):
-        return False
-    if not _kitchen_routes_to_cuda(kitchen, expanded, qdata, weight_scale, bias, residual, gate, variant):
-        return False
-    if not _verified(kitchen, backend, expanded.device, expanded.dtype, variant):
-        return False
-    try:
-        x_q, x_s = _quantize(backend, expanded, variant)
-        # A declined launch writes nothing, so the caller's fallback is exact.
-        return _gemm_residual_(backend, x_q, x_s, qdata, weight_scale, bias, residual, gate)
-    except (RuntimeError, TypeError, ValueError) as exc:
-        _log_once('%s: %s' % (type(exc).__name__, exc))
-        return False
+    return _linear_residual_(
+        x,
+        qdata,
+        weight_scale,
+        bias,
+        residual,
+        gate,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
+        input_act=ACT_NONE,
+    )
 
 
 __all__ = [
     'DISABLE_ENV',
     'gated_swiglu_residual_',
+    'linear_residual_',
     'set_enabled',
     'unavailable_reason',
 ]
