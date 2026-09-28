@@ -38,7 +38,7 @@ MAX_LINUX_BINARY_BYTES = 50 * 1024 * 1024
 
 class NativeShippingTests(unittest.TestCase):
     def test_native_binaries_are_packaged(self):
-        windows_binary = BIN_DIR / 'h3_int8_attention_v5.dll'
+        windows_binary = BIN_DIR / 'h3_int8_attention_v6.dll'
         linux_binary = BIN_DIR / 'libh3_int8_attention.so'
 
         self.assertEqual(loader._LIBRARY_NAMES['Windows'], windows_binary.name)
@@ -86,7 +86,7 @@ class NativeShippingTests(unittest.TestCase):
             b'h3_sparse_sage_sa2pp_sm89',
             b'h3_int8_sparse_attention_tiles',
         )
-        for name in ('h3_int8_attention_v5.dll', 'libh3_int8_attention.so'):
+        for name in ('h3_int8_attention_v6.dll', 'libh3_int8_attention.so'):
             contents = (BIN_DIR / name).read_bytes()
             for symbol in required:
                 self.assertIn(symbol, contents, '%s is missing %s' % (name, symbol.decode()))

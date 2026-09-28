@@ -19,7 +19,6 @@ from .plan import (
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128,
-    SPARSE_BACKEND_KITCHEN_HYBRID,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
 )
@@ -34,7 +33,6 @@ _BASE_RESOLVE_ATTENTION = _base._resolve_attention
 _BACKEND_LABELS = {
     SPARSE_BACKEND_KITCHEN: SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128: SPARSE_BACKEND_KITCHEN_64X128,
-    SPARSE_BACKEND_KITCHEN_HYBRID: SPARSE_BACKEND_KITCHEN_HYBRID,
     SPARSE_BACKEND_FROST: SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_SAGE: SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON: SPARSE_BACKEND_TRITON,
@@ -67,20 +65,7 @@ def _probe_sparse_backend(backend, environment):
     cuda_available = lambda: bool(getattr(environment, 'cuda_available', False))
     capability_getter = lambda: getattr(environment, 'capability', None)
 
-    if backend in (
-        SPARSE_BACKEND_KITCHEN,
-        SPARSE_BACKEND_KITCHEN_64X128,
-        SPARSE_BACKEND_KITCHEN_HYBRID,
-    ):
-        if backend == SPARSE_BACKEND_KITCHEN_HYBRID:
-            for kv_tile in (64, 128):
-                result = _base.preflight_sparse_kitchen(
-                    cuda_available=cuda_available,
-                    capability_getter=capability_getter,
-                    q_tile=64,
-                    kv_tile=kv_tile,
-                )
-            return result
+    if backend in (SPARSE_BACKEND_KITCHEN, SPARSE_BACKEND_KITCHEN_64X128):
         q_tile, kv_tile = (
             (64, 128)
             if backend == SPARSE_BACKEND_KITCHEN_64X128
@@ -121,7 +106,6 @@ def _available_sparse_alternatives(selected, environment):
     for backend in (
         SPARSE_BACKEND_KITCHEN,
         SPARSE_BACKEND_KITCHEN_64X128,
-        SPARSE_BACKEND_KITCHEN_HYBRID,
         SPARSE_BACKEND_FROST,
         SPARSE_BACKEND_SAGE,
         SPARSE_BACKEND_TRITON,

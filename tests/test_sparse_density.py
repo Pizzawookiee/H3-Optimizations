@@ -200,7 +200,6 @@ def test_advanced_node_schema_and_request():
         == [
             'Kitchen INT8 64Q x 64KV (Quality)',
             'Kitchen INT8 64Q x 128KV (Faster)',
-            'Kitchen INT8 Hybrid 64KV/128KV (Experimental)',
             'FROST BF16 64Q x 64KV (SM89)',
             'Sparse Sage (GPU-specific geometry)',
             'BF16 Triton 64Q x 64KV',

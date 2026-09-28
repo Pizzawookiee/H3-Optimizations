@@ -39,7 +39,6 @@ from h3_optimizations.plan import (  # noqa: E402
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128,
-    SPARSE_BACKEND_KITCHEN_HYBRID,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
     SparseRequest,
@@ -358,80 +357,6 @@ class SparseBackendSelectionTests(unittest.TestCase):
             self.inventory,
             q_tile=64,
             kv_tile=128,
-        )
-
-    def test_hybrid_kitchen_request_reaches_hybrid_resolver(self):
-        plan = H3OptimizationPlan(
-            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN_HYBRID)
-        )
-        target = (resolved('sparse_kitchen_int8_hybrid'), self.qkv)
-        with mock.patch.object(
-            apply_module,
-            '_resolve_kitchen_hybrid',
-            return_value=target,
-        ) as kitchen:
-            self.assertIs(
-                apply_module._resolve_attention(
-                    plan,
-                    self.model,
-                    self.inventory,
-                    self.environment,
-                ),
-                target,
-            )
-        kitchen.assert_called_once_with(
-            plan,
-            self.environment,
-            self.inventory,
-        )
-
-    def test_hybrid_kitchen_resolver_pairs_both_projector_geometries(self):
-        plan = H3OptimizationPlan(
-            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN_HYBRID)
-        )
-        inventory = SimpleNamespace(
-            qkv=(object(),),
-            qkv_convrot_int8_256=True,
-            qkv_w4a8=False,
-            qkv_fp8=False,
-            qkv_plain_float=False,
-            homogeneous=lambda name: name == 'qkv',
-            labels=lambda _name: ('TensorWiseINT8Layout+convrot256',),
-        )
-        environment = SimpleNamespace(
-            cuda_available=True,
-            capability=(8, 9),
-            device_index=0,
-        )
-        with mock.patch.object(
-            apply_module,
-            'preflight_sparse_kitchen',
-            return_value=SimpleNamespace(__version__='test'),
-        ) as preflight, mock.patch.object(
-            apply_module,
-            'producer_api_available',
-            return_value=True,
-        ):
-            attention, qkv = apply_module._resolve_kitchen_hybrid(
-                plan,
-                environment,
-                inventory,
-            )
-
-        self.assertEqual(qkv.provider_id, QKV_STREAMED_BF16_KITCHEN)
-        self.assertEqual(attention.backend.name, 'sparse_kitchen_int8_hybrid')
-        self.assertEqual(attention.projector.name, 'hybrid_kitchen_qkv')
-        self.assertEqual(
-            (attention.projector.quality.q_tile, attention.projector.quality.kv_tile),
-            (64, 64),
-        )
-        self.assertEqual(
-            (attention.projector.faster.q_tile, attention.projector.faster.kv_tile),
-            (64, 128),
-        )
-        self.assertEqual(
-            [call.kwargs['kv_tile'] for call in preflight.call_args_list],
-            [64, 128],
         )
 
     def test_preserve_precision_defaults_to_streamed_sparse_kitchen(self):

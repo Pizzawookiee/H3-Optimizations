@@ -578,7 +578,6 @@ class SparseKitchenBackend:
 
     def as_status(self):
         return {
-            'backend': self.name,
             'mode': self.config.mode,
             'video_budget': float(self.config.video_budget),
             'denser_early_late_steps': bool(self.config.denser_early_late_steps),

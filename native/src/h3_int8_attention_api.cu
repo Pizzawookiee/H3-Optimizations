@@ -66,19 +66,6 @@ void launch_sage_attn_sparse_tiles_kernel(
     int stride_h_o, int stride_bz_q_scale, int stride_h_q_scale,
     float sm_scale, int output_dtype_code, cudaStream_t stream);
 
-void launch_h3_fp8_attention_64(
-    const void *q, const void *k, const void *v, void *output,
-    const void *q_scale, const void *k_scale, const void *v_scale,
-    const void *v_mean,
-    const void *lut, const void *valid, const void *kv_tile_len,
-    int lut_stride, int batch, int q_length, int kv_length, int q_heads,
-    int kv_heads, int head_dim, int q_stride_b, int q_stride_n,
-    int q_stride_h, int k_stride_b, int k_stride_n, int k_stride_h,
-    int v_stride_b, int v_stride_h, int v_stride_d, int o_stride_b,
-    int o_stride_n, int o_stride_h, int qs_stride_b, int qs_stride_h,
-    float scale, int output_dtype_code, bool expcast, bool pre_fp8_denom,
-    bool v_smooth, cudaStream_t stream);
-
 void launch_sage_attn_sparse_kernel_lse(
     const void *q, const void *k, const void *v, void *o, void *lse,
     const void *q_scale, const void *k_scale, const void *v_scale,
@@ -377,28 +364,6 @@ H3_API int h3_int8_quantize_bf16_rms_adaln_rowwise_convrot256(
   H3_GUARD(launch_h3_quantize_bf16_rms_adaln_rowwise_convrot256(
       input, norm_weight, shift, modulation_scale, output, scales, rows,
       columns, epsilon, modulation_dtype_code, mode,
-      reinterpret_cast<cudaStream_t>(stream)))
-}
-
-// Additive experimental ABI-4 symbol. Q/K use the native INT8 carrier while
-// V and the online-softmax probabilities are E4M3. It is built only for SM89.
-H3_API int h3_fp8_attention_64(
-    const void *q, const void *k, const void *v, void *o,
-    const void *q_scale, const void *k_scale, const void *v_scale,
-    const void *v_mean,
-    const void *lut, const void *valid_block_num, const void *kv_tile_len,
-    int lut_stride, int B, int Lq, int Lk, int H_q, int H_kv, int D,
-    int q_st_bz, int q_st_n, int q_st_h, int k_st_bz, int k_st_n,
-    int k_st_h, int v_st_bz, int v_st_h, int v_st_d, int o_st_bz,
-    int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h, float sm_scale,
-    int output_dtype_code, int expcast, int pre_fp8_denom, int v_smooth,
-    uintptr_t stream) noexcept {
-  H3_GUARD(launch_h3_fp8_attention_64(
-      q, k, v, o, q_scale, k_scale, v_scale, v_mean, lut, valid_block_num,
-      kv_tile_len, lut_stride, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
-      q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
-      o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
-      expcast != 0, pre_fp8_denom != 0, v_smooth != 0,
       reinterpret_cast<cudaStream_t>(stream)))
 }
 

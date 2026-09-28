@@ -66,9 +66,7 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
           bool fuse_fp32_probabilities = true,
-          bool per_tile_kv_len = false, bool use_fp8_pv = false,
-          bool use_expcast = false, bool use_pre_fp8_denom = false,
-          bool use_v_smooth = false>
+          bool per_tile_kv_len = false>
 #if defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || \
      __CUDA_ARCH__ == 1200)
@@ -110,16 +108,6 @@ void qk_int_sv_i8_sparse_attn_kernel(
                     K_GRAN == QuantGranularity::kPerThread,
                 "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
-  static_assert(!use_expcast || use_fp8_pv,
-                "ExpCast requires an FP8 probability/value product");
-  static_assert(!use_pre_fp8_denom || (use_fp8_pv && !use_expcast),
-                "pre-FP8 denominator requires exp2 FP8 probabilities");
-  static_assert(!use_pre_fp8_denom || !use_v_smooth,
-                "V-Smooth requires a replicated probability row sum");
-  static_assert(!use_v_smooth || use_fp8_pv,
-                "V-Smooth requires an FP8 probability/value product");
-  static_assert(!use_v_smooth || (!fuse_v_scale && !fuse_v_mean),
-                "V-Smooth applies its scale and mean per value block");
   static_assert(std::is_same<DTypeSVAccum, float>::value,
                 "DTypeSVAccum must be float, half is WIP");
   static_assert(DenominatorAccumUnit == ComputeUnit::kCudaCore,
@@ -519,144 +507,69 @@ void qk_int_sv_i8_sparse_attn_kernel(
       cp_async::commit_group();
     }
 
-    if constexpr (use_fp8_pv) {
-      uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
-      float pv_scale[num_tiles_q][2];
-      float tile_d[num_tiles_q][2] = {};
-      const uint32_t pv_load_block = load_block;
-      if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
-          !kv_tile_is_partial(load_block)) {
-        if constexpr (use_pre_fp8_denom) {
-          update_mdo_i32_f8_sage<num_tiles_q, num_tiles_k, num_tiles_v>(
-              RS, RO, m, d, sm_scale, RS_f8, pv_scale);
-        } else {
-          update_mdo_i32_f8<num_tiles_q, num_tiles_k, num_tiles_v,
-                            use_expcast>(
-              RS, RO, m, d, sm_scale, RS_f8, pv_scale, tile_d);
-        }
-      } else {
-        float RS_soft[num_tiles_q][num_tiles_k][8];
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-#pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
-              const float score = __int2float_rz(RS[fq][fk][k]);
-              RS_soft[fq][fk][k] =
-                  pre_scale_scores ? score * sm_scale : score;
-            }
-          }
-        }
-
-        if constexpr (mask_mode == MaskMode::kCustom) {
-          apply_custom_mask<num_tiles_q, num_tiles_k>(
-              Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
-              mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-              batch_id, head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
-        } else if constexpr (mask_mode == MaskMode::kCustomKey) {
-          apply_custom_key_mask<num_tiles_q, num_tiles_k>(
-              K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
-              mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
-              mask_dtype_code, 1.0f);
-        }
-        mask_kv_tile(RS_soft, load_block);
-        if constexpr (use_pre_fp8_denom) {
-          update_mdo_f32_f8_sage<num_tiles_q, num_tiles_k, num_tiles_v,
-                                  pre_scale_scores>(
-              RS_soft, RO, m, d, sm_scale, RS_f8, pv_scale);
-        } else {
-          update_mdo_f32_f8<num_tiles_q, num_tiles_k, num_tiles_v,
-                            pre_scale_scores, use_expcast>(
-              RS_soft, RO, m, d, sm_scale, RS_f8, pv_scale, tile_d);
-        }
-      }
-
-      load_block += static_cast<uint32_t>(lut_row[iter]);
-      dequant_scale =
-          q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
-      sm_scale = original_sm_scale * dequant_scale;
-
-      cp_async::wait_group<1>();
-      __syncthreads();
-      if constexpr (use_v_smooth) {
-        compute_fp8_sv_v_smooth<num_warps_q, num_warps_k, num_tiles_q,
-                                num_tiles_k, num_tiles_v, swizzle_mode_V,
-                                V_SMEM_STRIDE / PACK_SIZE_V>(
-            smem_V, RS_f8, RO, pv_scale, tile_d, V_scale, V_mean, batch_id,
-            head_id / num_kv_groups, num_qo_heads / num_kv_groups,
-            div_ceil(kv_len, 128u), pv_load_block / 2);
-      } else {
-        compute_fp8_sv_scaled<num_warps_q, num_warps_k, num_tiles_q,
-                              num_tiles_k, num_tiles_v, swizzle_mode_V,
-                              V_SMEM_STRIDE / PACK_SIZE_V>(
-            smem_V, RS_f8, RO, pv_scale);
-      }
+    uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
+    if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
+        !kv_tile_is_partial(load_block)) {
+      update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+          RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
     } else {
-      uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-      if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
-          !kv_tile_is_partial(load_block)) {
-        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
-            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
-      } else {
-        float pv_scale[num_tiles_q][2];
-        float RS_soft[num_tiles_q][num_tiles_k][8];
+      float pv_scale[num_tiles_q][2];
+      float RS_soft[num_tiles_q][num_tiles_k][8];
 #pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
-              const float score = __int2float_rz(RS[fq][fk][k]);
-              RS_soft[fq][fk][k] =
-                  pre_scale_scores ? score * sm_scale : score;
-            }
+          for (uint32_t k = 0; k < 8; k++) {
+            const float score = __int2float_rz(RS[fq][fk][k]);
+            RS_soft[fq][fk][k] =
+                pre_scale_scores ? score * sm_scale : score;
           }
-        }
-
-        if constexpr (mask_mode == MaskMode::kCustom) {
-          apply_custom_mask<num_tiles_q, num_tiles_k>(
-              Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
-              mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-              batch_id, head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
-        } else if constexpr (mask_mode == MaskMode::kCustomKey) {
-          apply_custom_key_mask<num_tiles_q, num_tiles_k>(
-              K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
-              mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
-              mask_dtype_code, 1.0f);
-        }
-        mask_kv_tile(RS_soft, load_block);
-
-        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
-                   pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
-                                     S_U8_OFFSET);
-        RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
-
-        if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
-          accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
-        }
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-          for (uint32_t k = 0; k < 2; k++)
-            RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
         }
       }
 
-      // The pointer seek and K transfer above already target this routed tile.
-      load_block += static_cast<uint32_t>(lut_row[iter]);
-      dequant_scale =
-          q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
-      sm_scale = original_sm_scale * dequant_scale;
+      if constexpr (mask_mode == MaskMode::kCustom) {
+        apply_custom_mask<num_tiles_q, num_tiles_k>(
+            Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
+            mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
+            batch_id, head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
+      } else if constexpr (mask_mode == MaskMode::kCustomKey) {
+        apply_custom_key_mask<num_tiles_q, num_tiles_k>(
+            K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
+            mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
+            mask_dtype_code, 1.0f);
+      }
+      mask_kv_tile(RS_soft, load_block);
 
-      // ensure V is ready
-      cp_async::wait_group<1>();
-      __syncthreads();
+      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
+                 pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
+                                   S_U8_OFFSET);
+      RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
 
-      compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                      num_tiles_v, swizzle_mode_V,
-                      V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS, RS_u8, RO);
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
+        accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
+      }
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t k = 0; k < 2; k++)
+          RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
+      }
     }
+
+    // The pointer seek and K transfer above already target this routed tile.
+    load_block += static_cast<uint32_t>(lut_row[iter]);
+    dequant_scale =
+        q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
+    sm_scale = original_sm_scale * dequant_scale;
+
+    // ensure V is ready
+    cp_async::wait_group<1>();
+    __syncthreads();
+
+    compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+        smem_V, RS, RS_u8, RO);
     __syncthreads();
     // load V
     load_int8_V_global_to_share<
@@ -701,152 +614,73 @@ void qk_int_sv_i8_sparse_attn_kernel(
       cp_async::commit_group();
     }
 
-    if constexpr (use_fp8_pv) {
-      uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
-      float pv_scale[num_tiles_q][2];
-      float tile_d[num_tiles_q][2] = {};
-      const uint32_t pv_load_block = load_block;
-      if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
-          !kv_tile_is_partial(load_block)) {
-        if constexpr (use_pre_fp8_denom) {
-          update_mdo_i32_f8_sage<num_tiles_q, num_tiles_k, num_tiles_v>(
-              RS, RO, m, d, sm_scale, RS_f8, pv_scale);
-        } else {
-          update_mdo_i32_f8<num_tiles_q, num_tiles_k, num_tiles_v,
-                            use_expcast>(
-              RS, RO, m, d, sm_scale, RS_f8, pv_scale, tile_d);
-        }
-      } else {
-        float RS_soft[num_tiles_q][num_tiles_k][8];
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-#pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
-              const float score = __int2float_rz(RS[fq][fk][k]);
-              RS_soft[fq][fk][k] =
-                  pre_scale_scores ? score * sm_scale : score;
-            }
-          }
-        }
-
-        if constexpr (mask_mode == MaskMode::kCausal) {
-          apply_causal_mask<num_tiles_q, num_tiles_k>(
-              Q_idx_lane_base, K_idx_lane_base, RS_soft,
-              pre_scale_scores ? -50000.0f : -1.0e30f);
-        } else if constexpr (mask_mode == MaskMode::kCustom) {
-          apply_custom_mask<num_tiles_q, num_tiles_k>(
-              Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
-              mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-              batch_id, head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
-        } else if constexpr (mask_mode == MaskMode::kCustomKey) {
-          apply_custom_key_mask<num_tiles_q, num_tiles_k>(
-              K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
-              mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
-              mask_dtype_code, 1.0f);
-        }
-        mask_kv_tile(RS_soft, load_block);
-        if constexpr (use_pre_fp8_denom) {
-          update_mdo_f32_f8_sage<num_tiles_q, num_tiles_k, num_tiles_v,
-                                  pre_scale_scores>(
-              RS_soft, RO, m, d, sm_scale, RS_f8, pv_scale);
-        } else {
-          update_mdo_f32_f8<num_tiles_q, num_tiles_k, num_tiles_v,
-                            pre_scale_scores, use_expcast>(
-              RS_soft, RO, m, d, sm_scale, RS_f8, pv_scale, tile_d);
-        }
-      }
-
-      load_block += static_cast<uint32_t>(lut_row[num_iterations - 1]);
-      dequant_scale =
-          q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
-      sm_scale = original_sm_scale * dequant_scale;
-
-      cp_async::wait_group<1>();
-      __syncthreads();
-      if constexpr (use_v_smooth) {
-        compute_fp8_sv_v_smooth<num_warps_q, num_warps_k, num_tiles_q,
-                                num_tiles_k, num_tiles_v, swizzle_mode_V,
-                                V_SMEM_STRIDE / PACK_SIZE_V>(
-            smem_V, RS_f8, RO, pv_scale, tile_d, V_scale, V_mean, batch_id,
-            head_id / num_kv_groups, num_qo_heads / num_kv_groups,
-            div_ceil(kv_len, 128u), pv_load_block / 2);
-      } else {
-        compute_fp8_sv_scaled<num_warps_q, num_warps_k, num_tiles_q,
-                              num_tiles_k, num_tiles_v, swizzle_mode_V,
-                              V_SMEM_STRIDE / PACK_SIZE_V>(
-            smem_V, RS_f8, RO, pv_scale);
-      }
+    uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
+    if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
+        !kv_tile_is_partial(load_block)) {
+      update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+          RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
     } else {
-      uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-      if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
-          !kv_tile_is_partial(load_block)) {
-        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
-            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
-      } else {
-        float pv_scale[num_tiles_q][2];
-        float RS_soft[num_tiles_q][num_tiles_k][8];
+      float pv_scale[num_tiles_q][2];
+      float RS_soft[num_tiles_q][num_tiles_k][8];
 #pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-            for (uint32_t k = 0; k < 8; k++) {
-              const float score = __int2float_rz(RS[fq][fk][k]);
-              RS_soft[fq][fk][k] =
-                  pre_scale_scores ? score * sm_scale : score;
-            }
+          for (uint32_t k = 0; k < 8; k++) {
+            const float score = __int2float_rz(RS[fq][fk][k]);
+            RS_soft[fq][fk][k] =
+                pre_scale_scores ? score * sm_scale : score;
           }
-        }
-
-        if constexpr (mask_mode == MaskMode::kCausal) {
-          apply_causal_mask<num_tiles_q, num_tiles_k>(
-              Q_idx_lane_base, K_idx_lane_base, RS_soft,
-              pre_scale_scores ? -50000.0f : -1.0e30f);
-        } else if constexpr (mask_mode == MaskMode::kCustom) {
-          apply_custom_mask<num_tiles_q, num_tiles_k>(
-              Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
-              mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-              batch_id, head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
-        } else if constexpr (mask_mode == MaskMode::kCustomKey) {
-          apply_custom_key_mask<num_tiles_q, num_tiles_k>(
-              K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
-              mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
-              mask_dtype_code, 1.0f);
-        }
-        mask_kv_tile(RS_soft, load_block);
-
-        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
-                   pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
-                                     S_U8_OFFSET);
-        RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
-
-        if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
-          accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
-        }
-#pragma unroll
-        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-          for (uint32_t k = 0; k < 2; k++)
-            RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
         }
       }
 
-      // The pointer seek and K transfer above already target the final tile.
-      load_block += static_cast<uint32_t>(lut_row[num_iterations - 1]);
-      dequant_scale =
-          q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
-      sm_scale = original_sm_scale * dequant_scale;
+      if constexpr (mask_mode == MaskMode::kCausal) {
+        apply_causal_mask<num_tiles_q, num_tiles_k>(
+            Q_idx_lane_base, K_idx_lane_base, RS_soft,
+            pre_scale_scores ? -50000.0f : -1.0e30f);
+      } else if constexpr (mask_mode == MaskMode::kCustom) {
+        apply_custom_mask<num_tiles_q, num_tiles_k>(
+            Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
+            mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
+            batch_id, head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
+      } else if constexpr (mask_mode == MaskMode::kCustomKey) {
+        apply_custom_key_mask<num_tiles_q, num_tiles_k>(
+            K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
+            mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
+            mask_dtype_code, 1.0f);
+      }
+      mask_kv_tile(RS_soft, load_block);
 
-      // ensure V is ready
-      cp_async::wait_group<1>();
-      __syncthreads();
+      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
+                 pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
+                                   S_U8_OFFSET);
+      RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
 
-      compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                      num_tiles_v, swizzle_mode_V,
-                      V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS, RS_u8, RO);
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
+        accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
+      }
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t k = 0; k < 2; k++)
+          RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
+      }
     }
+
+    // The pointer seek and K transfer above already target the final tile.
+    load_block += static_cast<uint32_t>(lut_row[num_iterations - 1]);
+    dequant_scale =
+        q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
+    sm_scale = original_sm_scale * dequant_scale;
+
+    // ensure V is ready
+    cp_async::wait_group<1>();
+    __syncthreads();
+
+    compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+        smem_V, RS, RS_u8, RO);
 
     __syncthreads();
     // load V
@@ -913,60 +747,30 @@ void qk_int_sv_i8_sparse_attn_kernel(
         pre_scale_scores ? -50000.0f : -1.0e30f);
     mask_kv_tile(RS_soft, load_block);
 
-    if constexpr (use_fp8_pv) {
-      uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
-      float tile_d[num_tiles_q][2] = {};
-      if constexpr (use_pre_fp8_denom) {
-        update_mdo_f32_f8_sage<num_tiles_q, num_tiles_k, num_tiles_v,
-                                pre_scale_scores>(
-            RS_soft, RO, m, d, sm_scale, RS_f8, pv_scale);
-      } else {
-        update_mdo_f32_f8<num_tiles_q, num_tiles_k, num_tiles_v,
-                          pre_scale_scores, use_expcast>(
-            RS_soft, RO, m, d, sm_scale, RS_f8, pv_scale, tile_d);
-      }
+    update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
+               pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
+                                 S_U8_OFFSET);
 
-      cp_async::wait_group<0>();
-      __syncthreads();
-      if constexpr (use_v_smooth) {
-        compute_fp8_sv_v_smooth<num_warps_q, num_warps_k, num_tiles_q,
-                                num_tiles_k, num_tiles_v, swizzle_mode_V,
-                                V_SMEM_STRIDE / PACK_SIZE_V>(
-            smem_V, RS_f8, RO, pv_scale, tile_d, V_scale, V_mean, batch_id,
-            head_id / num_kv_groups, num_qo_heads / num_kv_groups,
-            div_ceil(kv_len, 128u), load_block / 2);
-      } else {
-        compute_fp8_sv_scaled<num_warps_q, num_warps_k, num_tiles_q,
-                              num_tiles_k, num_tiles_v, swizzle_mode_V,
-                              V_SMEM_STRIDE / PACK_SIZE_V>(
-            smem_V, RS_f8, RO, pv_scale);
-      }
-    } else {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
-                 pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
-                                   S_U8_OFFSET);
+    uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
+    RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
 
-      uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-      RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
-
-      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
-        accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
-      }
-#pragma unroll
-      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-#pragma unroll
-        for (uint32_t k = 0; k < 2; k++)
-          RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
-      }
-
-      // ensure V is ready
-      cp_async::wait_group<0>();
-      __syncthreads();
-
-      compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                      num_tiles_v, swizzle_mode_V,
-                      V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS, RS_u8, RO);
+    if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
+      accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
     }
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+      for (uint32_t k = 0; k < 2; k++)
+        RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
+    }
+
+    // ensure V is ready
+    cp_async::wait_group<0>();
+    __syncthreads();
+
+    compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+        smem_V, RS, RS_u8, RO);
 
     __syncthreads();
   }

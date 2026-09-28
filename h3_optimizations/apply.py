@@ -45,10 +45,6 @@ from .attention.sparse.kitchen_sparse import (
     SparseKitchenError,
     preflight_sparse_kitchen,
 )
-from .attention.sparse.kitchen_hybrid import (
-    HybridKitchenQKVProjector,
-    HybridSparseKitchenBackend,
-)
 from .cube_order import (
     TOKEN_ORDER_SHAPES,
     clear as clear_cube_order,
@@ -104,7 +100,6 @@ from .plan import (
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128,
-    SPARSE_BACKEND_KITCHEN_HYBRID,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
@@ -960,71 +955,6 @@ def _resolve_kitchen_sparse(
     )
 
 
-def _resolve_kitchen_hybrid(plan, environment, inventory):
-    quality, qkv = _resolve_kitchen_sparse(
-        plan,
-        environment,
-        inventory,
-        q_tile=64,
-        kv_tile=64,
-    )
-    faster, faster_qkv = _resolve_kitchen_sparse(
-        plan,
-        environment,
-        inventory,
-        q_tile=64,
-        kv_tile=128,
-    )
-    if qkv.provider_id != faster_qkv.provider_id:
-        raise SparseKitchenError(
-            'hybrid Kitchen geometries selected different QKV providers'
-        )
-    if quality.projector is None or faster.projector is None:
-        if quality.projector is not faster.projector:
-            raise SparseKitchenError(
-                'hybrid Kitchen geometries selected different projector modes'
-            )
-        projector = None
-    elif (
-        getattr(quality.projector, 'routing_summaries', False)
-        and getattr(faster.projector, 'routing_summaries', False)
-    ):
-        projector = HybridKitchenQKVProjector(
-            quality.backend.config,
-            quality.projector,
-            faster.projector,
-        )
-    else:
-        if (
-            quality.projector.installation_signature
-            != faster.projector.installation_signature
-        ):
-            raise SparseKitchenError(
-                'hybrid Kitchen geometries selected different projector modes'
-            )
-        projector = quality.projector
-    backend = HybridSparseKitchenBackend(
-        quality.backend.config,
-        quality.backend,
-        faster.backend,
-        projector,
-    )
-    return (
-        ResolvedAttention(
-            requested=ATTENTION_KITCHEN_SPARSE,
-            selected=ATTENTION_KITCHEN_SPARSE,
-            backend=backend,
-            reason=(
-                'native Kitchen INT8 hybrid sparse attention: 64Q x 64KV '
-                'below 20% video budget, 64Q x 128KV at or above 20%'
-            ),
-            backend_kind=ATTENTION_KITCHEN_SPARSE,
-            projector=projector,
-        ),
-        qkv,
-    )
-
-
 def _resolve_attention(plan, model, inventory, environment):
     options = getattr(model, 'model_options', {}).get(
         'transformer_options',
@@ -1127,8 +1057,6 @@ def _resolve_attention(plan, model, inventory, environment):
                 q_tile=64,
                 kv_tile=128,
             )
-        if backend_request == SPARSE_BACKEND_KITCHEN_HYBRID:
-            return _resolve_kitchen_hybrid(plan, environment, inventory)
         if backend_request == SPARSE_BACKEND_FLEX:
             return _resolve_fp8_flex(
                 plan,

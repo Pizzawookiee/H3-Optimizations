@@ -30,7 +30,7 @@ import torch
 ABI_VERSION = 4
 
 _LIBRARY_NAMES = {
-    'Windows': 'h3_int8_attention_v5.dll',
+    'Windows': 'h3_int8_attention_v6.dll',
     'Linux': 'libh3_int8_attention.so',
     'Darwin': 'libh3_int8_attention.dylib',
 }
@@ -196,19 +196,6 @@ def _bind(library):
         sparse_tiles.argtypes = (
             attention_common + [p, p, p, i] + geometry + strides
             + [i, i, f, i, sz]
-        )
-
-    try:
-        fp8_attention = library.h3_fp8_attention_64
-    except AttributeError:
-        pass
-    else:
-        # Additive to ABI 4 and SM89-only: 64Q x 64KV E4M3 PV with an
-        # optional ExpCast softmax conversion.
-        fp8_attention.restype = i
-        fp8_attention.argtypes = (
-            attention_common + [p, p, p, p, i] + geometry + strides
-            + [i, i, f, i, i, i, i, sz]
         )
 
     try:
