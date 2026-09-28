@@ -139,6 +139,25 @@ class HeldMLP:
         comfy.ops.run_every_op()
         return self.fc1_weight.linear(x)
 
+    def fc1_prequantized(self, qdata, scale, out_dtype):
+        weight = self.fc1_weight.weight
+        if self.fc1_weight.bias is not None:
+            return None
+        try:
+            weight_qdata, weight_scale = _convrot_parts(weight, "fc1")
+        except (TypeError, ValueError):
+            return None
+        from ..qkv.int8 import HeldConvRotINT8Linear
+
+        comfy.ops.run_every_op()
+        return HeldConvRotINT8Linear._prequantized_values(
+            qdata,
+            scale,
+            weight_qdata,
+            weight_scale,
+            out_dtype,
+        )
+
     def fc2_swiglu(self, expanded, native):
         weight = self.fc2_weight.weight
         bias = self.fc2_weight.bias
@@ -587,6 +606,31 @@ class ConvRotTwoSliceMLP:
                 output.add_(partial)
             del expanded, partial
         return output, "held_convrot_2slice"
+
+    def fc1_fc2_prequantized(self, qdata, scale, out_dtype):
+        if self.tiles is None:
+            raise RuntimeError("ConvRot two-slice session is not active")
+        from ..qkv.int8 import HeldConvRotINT8Linear
+
+        comfy.ops.run_every_op()
+        output = None
+        for tile in self.tiles:
+            expanded = HeldConvRotINT8Linear._prequantized_values(
+                qdata,
+                scale,
+                tile["fc1_weight"],
+                tile["fc1_scale"],
+                out_dtype,
+            )
+            partial = self.convrot_linear(
+                expanded,
+                tile["fc2_weight"],
+                tile["fc2_scale"],
+                input_act="swiglu",
+            )
+            output = partial if output is None else output.add_(partial)
+            del expanded, partial
+        return output, "held_convrot_2slice_fused_norm_quantize"
 
 
 def module_fc1(mlp, h):

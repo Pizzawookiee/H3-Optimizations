@@ -398,7 +398,10 @@ def is_expected_block_stop(data, expect_stop):
     )
 
 
-async def run_prompt(session, server, client_id, graph, timeout, expect_stop):
+async def run_prompt(
+    session, server, client_id, graph, timeout, expect_stop,
+    expect_interrupt=False,
+):
     import aiohttp
 
     ws_url = server.replace('https://', 'wss://').replace('http://', 'ws://')
@@ -451,6 +454,19 @@ async def run_prompt(session, server, client_id, graph, timeout, expect_stop):
                     },
                 }
             elif kind == 'execution_interrupted':
+                if expect_stop and expect_interrupt:
+                    return {
+                        'prompt_id': prompt_id,
+                        'wall_seconds': time.perf_counter() - started,
+                        'cached_nodes': cached_nodes,
+                        'expected_stop': True,
+                        'exception': {
+                            'type': 'InterruptProcessingException',
+                            'message': '',
+                            'node_id': data.get('node_id'),
+                            'node_type': data.get('node_type'),
+                        },
+                    }
                 raise BenchError('execution interrupted')
             elif kind == 'execution_success':
                 if expect_stop:

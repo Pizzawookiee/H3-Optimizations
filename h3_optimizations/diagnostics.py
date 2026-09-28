@@ -73,7 +73,17 @@ class installed:
 
 
 STAGE_NAMES = (
+    'block_total',
+    'adaln_proj',
     'attention_total',
+    'attention_residual_gate',
+    'norm2_modulation',
+    'norm2_modulation_quantize',
+    'mlp_fc1',
+    'mlp_fc1_fc2',
+    'mlp_swiglu_fc2',
+    'mlp_swiglu_fc2_gated',
+    'final_mlp_gate',
     'qkv_producer_total',
     'qkv_linear',
     'qk_norm_rope',

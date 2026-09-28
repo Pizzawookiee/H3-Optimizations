@@ -1,14 +1,13 @@
 '''Compare AIMDO residency limits on a real five-frame MiniMax H3 request.
 
 This specializes ``bench_attention_arms`` without duplicating its live-schema
-graph builder, prompt monitoring, or whole-device VRAM sampler. Every arm uses
-the same real H3 checkpoint, blank conditioning, seed, schedule, and sampler;
+graph builder, prompt monitoring, or process-memory sampler. Every arm uses the
+same real H3 checkpoint, synthetic conditioning, seed, schedule, and sampler;
 only the H3 AIMDO Residency Limiter setting changes.
 
 Use ``--unload-between-arms`` so each arm reloads the diffusion weights onto a
-mostly free card while the cached text conditioning survives. That is the
-condition in which stock AIMDO is free to retain as much of the model as it
-finds useful.
+mostly free card. That is the condition in which stock AIMDO is free to retain
+as much of the model as it finds useful.
 '''
 
 from __future__ import annotations
@@ -19,7 +18,11 @@ import bench_attention_arms as benchmark
 
 
 benchmark.WORKLOADS = {'5f': 5}
-benchmark.DEFAULT_PROMPT = ''
+benchmark.DEFAULT_OUTPUT = r'.agent\tmp\h3-aimdo-residency.json'
+benchmark.DEFAULT_EXPECTED_POWER_LIMIT_W = 0.0
+benchmark.DEFAULT_CONDITIONING_TOKENS = 29
+benchmark.DEFAULT_CONDITIONING_CACHE_ENTRY = ''
+benchmark.DEFAULT_ALLOW_ZERO_CONDITIONING = True
 benchmark.COMMON_SUFFIX = [
     entry for entry in benchmark.COMMON_SUFFIX
     if entry[0] != 'H3AIMDOResidencyLimiter'

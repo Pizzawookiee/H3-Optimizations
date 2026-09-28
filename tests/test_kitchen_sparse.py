@@ -153,6 +153,7 @@ def test_exact_quality_geometry_reaches_router_executor_and_status(q_tile, kv_ti
     assert (backend.router.q_tile, backend.router.kv_tile) == (q_tile, kv_tile)
     assert (backend.executor.q_tile, backend.executor.kv_tile) == (q_tile, kv_tile)
     status = backend.as_status()
+    assert status['backend'] == 'sparse_kitchen_int8'
     assert (status['sparse_q_tile'], status['sparse_kv_tile']) == (
         q_tile,
         kv_tile,

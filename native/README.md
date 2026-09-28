@@ -78,6 +78,23 @@ paths. The fixed exact 128x256 fused-Q and fused-KV kernels are selected only
 on SM80 or newer; this does not change the SM75 support of the existing
 attention kernels.
 
+ABI 4 also accepts the additive
+`h3_int8_quantize_bf16_rms_adaln_rowwise_convrot256` producer. The H3 ConvRot
+path uses its explicit-BF16-staging mode to fold RMSNorm and scalar AdaLN into
+the rowwise activation quantizer and feed the carrier directly to fc1. The
+explicit two-slice path reuses one carrier for both fc1 slices. Per-token
+modulation selectors, non-BF16 execution, compile
+tracing, and older binaries keep the eager path. The FP32-through mode remains
+available for numerical experiments. Compare both modes against the eager
+producer with:
+
+```text
+python benchmarks/bench_fused_norm_adaln_quantize.py `
+  --library native/build-vsa/h3_int8_attention.dll `
+  --checkpoint path/to/minimax_h3_ref2va_pruned_int8_convrot.safetensors `
+  --block-index 24 --rows 4096 --hidden 5376
+```
+
 ## Building
 
 ```

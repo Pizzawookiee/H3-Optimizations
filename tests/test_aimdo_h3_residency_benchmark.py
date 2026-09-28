@@ -44,6 +44,21 @@ class StubSchemas(bench.Schemas):
                 'height': ['INT', {'default': 768}],
                 'length': ['INT', {'default': 5}],
             }}},
+            'H3BenchmarkSyntheticConditioning': {'input': {'required': {
+                'tokens': ['INT', {'default': 29}],
+                'vision_start': ['INT', {'default': 0}],
+                'vision_tokens': ['INT', {'default': 0}],
+                'cache_entry': ['STRING', {'default': ''}],
+                'reference_width': ['INT', {'default': 0}],
+                'reference_height': ['INT', {'default': 0}],
+                'reference_frames': ['INT', {'default': 1}],
+                'reference_latent_entry': ['STRING', {'default': ''}],
+            }}},
+            'EmptyMiniMaxH3LatentAV': {'input': {'required': {
+                'width': ['INT', {'default': 1376}],
+                'height': ['INT', {'default': 768}],
+                'length': ['INT', {'default': 5}],
+            }}},
             'H3AIMDOResidencyLimiter': {'input': {'required': {
                 'model': ['MODEL', {}],
                 'residency': combo(
@@ -104,9 +119,14 @@ class AIMDOH3ResidencyBenchmarkTests(unittest.TestCase):
             ['--dry-run', '--unique-arm-seeds'],
         )
 
-    def test_matrix_is_five_frames_with_blank_conditioning(self):
+    def test_matrix_is_five_frames_with_synthetic_conditioning(self):
         self.assertEqual(bench.WORKLOADS, {'5f': 5})
-        self.assertEqual(bench.DEFAULT_PROMPT, '')
+        args = bench.parse_args(['--dry-run'])
+        self.assertEqual(args.output, r'.agent\tmp\h3-aimdo-residency.json')
+        self.assertEqual(args.expected_power_limit_w, 0.0)
+        self.assertEqual(args.conditioning_tokens, 29)
+        self.assertEqual(args.conditioning_cache_entry, '')
+        self.assertIs(args.allow_zero_conditioning, True)
 
     def test_every_arm_changes_only_the_limiter_value(self):
         expected = {
@@ -126,8 +146,10 @@ class AIMDOH3ResidencyBenchmarkTests(unittest.TestCase):
     def test_graph_uses_real_h3_path_and_three_sampler_steps(self):
         graph, executed = build('aimdo_2')
         self.assertEqual(executed, 3)
-        self.assertEqual(graph['cond']['inputs']['prompt'], '')
-        self.assertEqual(graph['cond']['inputs']['length'], 5)
+        self.assertEqual(graph['cond']['class_type'], 'H3BenchmarkSyntheticConditioning')
+        self.assertEqual(graph['cond']['inputs']['tokens'], 29)
+        self.assertEqual(graph['cond']['inputs']['cache_entry'], '')
+        self.assertEqual(graph['latent']['inputs']['length'], 5)
         self.assertEqual(
             graph['patch1_H3AIMDOResidencyLimiter']['inputs']['residency'],
             '2 blocks',
@@ -136,7 +158,7 @@ class AIMDOH3ResidencyBenchmarkTests(unittest.TestCase):
             graph['guider']['inputs']['model'],
             ['patch1_H3AIMDOResidencyLimiter', 0],
         )
-        self.assertEqual(graph['sample']['inputs']['latent_image'], ['cond', 1])
+        self.assertEqual(graph['sample']['inputs']['latent_image'], ['latent', 0])
         self.assertEqual(graph['sink']['class_type'], 'PreviewAny')
 
     def test_non_patch_graph_is_identical_across_arms(self):

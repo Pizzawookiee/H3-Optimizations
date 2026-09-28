@@ -28,8 +28,12 @@ from .int8_attention import (
     prequantize_int8_attention,
 )
 from .convrot import (
+    RMS_ADALN_BF16_STAGED,
+    RMS_ADALN_FP32_THROUGH,
     int8_rowwise_convrot256_is_available,
     quantize_int8_rowwise_convrot256,
+    quantize_rms_adaln_int8_rowwise_convrot256,
+    rms_adaln_int8_rowwise_convrot256_is_available,
 )
 from .fused_q import fused_h3_q_from_int8, fused_h3_q_is_available
 from .producer import (
@@ -65,6 +69,8 @@ __all__ = [
     'NativeCallError',
     'NativeUnavailableError',
     'PrequantizedInt8Attention',
+    'RMS_ADALN_BF16_STAGED',
+    'RMS_ADALN_FP32_THROUGH',
     'SPARSE_GEOMETRIES',
     'block_sparse_int8_attention_from_prequantized',
     'block_sparse_int8_attention_with_lse_from_prequantized',
@@ -85,12 +91,14 @@ __all__ = [
     'load',
     'prequantize_int8_attention',
     'quantize_int8_rowwise_convrot256',
+    'quantize_rms_adaln_int8_rowwise_convrot256',
     'quantize_int8_attention_k_chunk',
     'quantize_int8_attention_q',
     'quantize_int8_attention_q_chunk',
     'quantize_int8_attention_qk_chunk',
     'quantize_int8_attention_v',
     'route_encoding',
+    'rms_adaln_int8_rowwise_convrot256_is_available',
     'select_int8_attention_k_anchor',
     'unavailable_reason',
 ]

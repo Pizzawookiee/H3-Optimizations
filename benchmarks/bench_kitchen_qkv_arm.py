@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 from dataclasses import dataclass
 import json
 import os
@@ -177,6 +178,11 @@ def parse_args(argv=None):
         )
     )
     parser.add_argument('--checkpoint', required=True)
+    parser.add_argument(
+        '--library',
+        type=Path,
+        help='development H3 native library containing the fused norm producer',
+    )
     parser.add_argument('--block', type=int, default=0)
     parser.add_argument('--sequence', type=int, default=DEFAULT_SEQUENCE)
     parser.add_argument('--video-start', type=int, default=DEFAULT_VIDEO_START)
@@ -204,6 +210,11 @@ def parse_args(argv=None):
         '--alternate-attention-residual',
         action='store_true',
         help='alternate the streamed output control and fused residual in one process',
+    )
+    parser.add_argument(
+        '--alternate-fused-norm-quantize',
+        action='store_true',
+        help='ABBA the eager and staged fused Norm/AdaLN/ConvRot producers',
     )
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--forwards', type=int, default=12)
@@ -288,7 +299,7 @@ def main(argv=None):
     )
     from h3_optimizations.memory.config import (
         DEFAULT_CHUNK_ROWS as MLP_CHUNK_ROWS,
-        MODE_CONVROT_2SLICE,
+        MODE_NATIVE,
         ActivationMemoryConfig,
     )
     from h3_optimizations.memory.forward import make_forward as make_block_forward
@@ -296,6 +307,7 @@ def main(argv=None):
     from h3_optimizations.qkv.formats import describe_linear
     from h3_optimizations.qkv.chunked import project_chunk_hnd
     from h3_optimizations.runtime.context import RUNTIME_KEY, RuntimeSnapshot
+    from h3_optimizations.native import loader as native_loader
 
     if not torch.cuda.is_available():
         raise SystemExit('CUDA is required')
@@ -305,6 +317,23 @@ def main(argv=None):
         raise SystemExit('--alternate-attention-residual requires --stream-output')
     if args.alternate_attention_residual and args.disable_attention_residual:
         raise SystemExit('attention residual control modes are mutually exclusive')
+    if args.alternate_attention_residual and args.alternate_fused_norm_quantize:
+        raise SystemExit('alternate only one block optimization at a time')
+    if args.library is not None and not args.library.is_file():
+        raise SystemExit('--library does not exist: %s' % args.library)
+    if args.library is not None:
+        library = ctypes.CDLL(str(args.library.resolve()))
+        library.h3_int8_abi_version.restype = ctypes.c_int
+        library.h3_int8_abi_version.argtypes = []
+        found = library.h3_int8_abi_version()
+        if found != native_loader.ABI_VERSION:
+            raise SystemExit(
+                '%s reports ABI %d, expected %d'
+                % (args.library, found, native_loader.ABI_VERSION)
+            )
+        native_loader._bind(library)
+        native_loader._library = library
+        native_loader._load_error = None
     device = torch.device('cuda')
     if torch.cuda.get_allocator_backend() != 'native':
         raise SystemExit('the active CUDA allocator is not the production native backend')
@@ -691,20 +720,27 @@ def main(argv=None):
     )
 
     block.attn.forward = attention
-    block_forward = make_block_forward(
-        block,
-        args.block,
-        ActivationMemoryConfig(
-            mode=MODE_CONVROT_2SLICE,
-            chunk_rows=MLP_CHUNK_ROWS,
-            strict=True,
-        ),
-        original_forward=block.forward,
-    )
+
+    def build_block_forward(fused_norm_quantize):
+        return make_block_forward(
+            block,
+            args.block,
+            ActivationMemoryConfig(
+                mode=MODE_NATIVE,
+                chunk_rows=MLP_CHUNK_ROWS,
+                strict=True,
+                fused_norm_quantize=fused_norm_quantize,
+            ),
+            original_forward=block.forward,
+        )
+
+    control_block_forward = build_block_forward(False)
+    fused_norm_block_forward = build_block_forward(True)
 
     attention_residual_state = {
         'enabled': not args.disable_attention_residual,
     }
+    fused_norm_state = {'enabled': False}
     if args.disable_attention_residual or args.alternate_attention_residual:
         original_enable_attention_residual = NormalizedRows.enable_attention_residual
 
@@ -744,6 +780,11 @@ def main(argv=None):
 
     def one_forward():
         x.copy_(reference)
+        block_forward = (
+            fused_norm_block_forward
+            if fused_norm_state['enabled']
+            else control_block_forward
+        )
         return block_forward(
             x,
             t_emb,
@@ -753,6 +794,7 @@ def main(argv=None):
         )
 
     parity = None
+    fused_norm_parity = None
     if args.alternate_attention_residual:
         attention_residual_state['enabled'] = False
         control_output = one_forward().clone()
@@ -768,9 +810,58 @@ def main(argv=None):
         }
         del difference, fused_output, control_output
 
+    if args.alternate_fused_norm_quantize:
+        fused_norm_state['enabled'] = False
+        control_output = one_forward().clone()
+        fused_norm_state['enabled'] = True
+        fused_output = one_forward()
+        mismatch = 0
+        max_abs = 0.0
+        sum_square = 0.0
+        reference_square = 0.0
+        sum_abs = 0.0
+        reference_max_abs = 0.0
+        delta_over = {str(limit): 0 for limit in (1, 16, 256)}
+        elements = int(fused_output.numel())
+        for start in range(0, args.sequence, MLP_CHUNK_ROWS):
+            stop = min(start + MLP_CHUNK_ROWS, args.sequence)
+            reference_rows = control_output[start:stop].float()
+            delta = fused_output[start:stop].float().sub_(reference_rows)
+            abs_delta = delta.abs()
+            mismatch += int(
+                (fused_output[start:stop] != control_output[start:stop]).sum().item()
+            )
+            max_abs = max(max_abs, float(abs_delta.max().item()))
+            sum_square += float(delta.square().sum().item())
+            reference_square += float(reference_rows.square().sum().item())
+            sum_abs += float(abs_delta.sum().item())
+            reference_max_abs = max(
+                reference_max_abs,
+                float(reference_rows.abs().max().item()),
+            )
+            for limit in delta_over:
+                delta_over[limit] += int((abs_delta > int(limit)).sum().item())
+            del reference_rows, delta, abs_delta
+        fused_norm_parity = {
+            'exact': mismatch == 0,
+            'max_abs': max_abs,
+            'mismatch_fraction': mismatch / elements,
+            'mean_abs': sum_abs / elements,
+            'rmse': (sum_square / elements) ** 0.5,
+            'relative_l2': (sum_square / max(reference_square, 1e-30)) ** 0.5,
+            'reference_rms': (reference_square / elements) ** 0.5,
+            'reference_max_abs': reference_max_abs,
+            'abs_delta_over_fraction': {
+                limit: count / elements for limit, count in delta_over.items()
+            },
+        }
+        del fused_output, control_output
+
     for warmup_index in range(args.warmup):
         if args.alternate_attention_residual:
             attention_residual_state['enabled'] = bool(warmup_index % 2)
+        if args.alternate_fused_norm_quantize:
+            fused_norm_state['enabled'] = bool(warmup_index % 2)
         result = one_forward()
         torch.cuda.synchronize(device)
         del result
@@ -788,13 +879,21 @@ def main(argv=None):
             attention_residual_state['enabled'] = (
                 forward_index % 4 in (0, 3)
             )
+        if args.alternate_fused_norm_quantize:
+            fused_norm_state['enabled'] = forward_index % 4 in (0, 3)
         torch.cuda.reset_peak_memory_stats(device)
         timing.begin_forward()
-        nvtx_range = (
-            torch.cuda.nvtx.range(
-                'attention_residual_%s'
-                % ('fused' if attention_residual_state['enabled'] else 'control')
+        arm_name = (
+            'fused_norm'
+            if fused_norm_state['enabled']
+            else (
+                'attention_residual_fused'
+                if attention_residual_state['enabled']
+                else 'control'
             )
+        )
+        nvtx_range = (
+            torch.cuda.nvtx.range(arm_name)
             if args.cuda_profiler_range
             else contextlib.nullcontext()
         )
@@ -805,6 +904,7 @@ def main(argv=None):
         stages, counts = timing.finish_forward()
         measured_forwards.append({
             'attention_residual': bool(attention_residual_state['enabled']),
+            'fused_norm_quantize': bool(fused_norm_state['enabled']),
             'stages': stages,
             'counts': counts,
             'peak_allocated_bytes': int(torch.cuda.max_memory_allocated(device)),
@@ -828,6 +928,7 @@ def main(argv=None):
     del result
 
     mlp_started = {'value': False}
+    fused_norm_state['enabled'] = False
 
     def begin_mlp(_module, _inputs):
         if memory.enabled and not mlp_started['value']:
@@ -874,6 +975,24 @@ def main(argv=None):
                 [row for row in steady if row['attention_residual']]
             ),
         }
+    elif args.alternate_fused_norm_quantize:
+        control_rows = [
+            row for row in steady if not row['fused_norm_quantize']
+        ]
+        fused_rows = [
+            row for row in steady if row['fused_norm_quantize']
+        ]
+        if not control_rows or not fused_rows:
+            control_rows = [
+                row for row in measured_forwards if not row['fused_norm_quantize']
+            ]
+            fused_rows = [
+                row for row in measured_forwards if row['fused_norm_quantize']
+            ]
+        case_stages = {
+            'control': summarize_stages(control_rows),
+            'fused': summarize_stages(fused_rows),
+        }
     result = {
         'label': args.label or 'qkv%d' % args.qkv_chunk_rows,
         'checkpoint': str(checkpoint),
@@ -889,6 +1008,9 @@ def main(argv=None):
         'stream_output': bool(args.stream_output),
         'attention_residual': not args.disable_attention_residual,
         'alternate_attention_residual': bool(args.alternate_attention_residual),
+        'alternate_fused_norm_quantize': bool(
+            args.alternate_fused_norm_quantize
+        ),
         'qkv_chunks_per_block': (
             args.sequence + args.qkv_chunk_rows - 1
         ) // args.qkv_chunk_rows,
@@ -900,6 +1022,7 @@ def main(argv=None):
             'case_stages': case_stages,
         },
         'attention_residual_parity': parity,
+        'fused_norm_quantize_parity': fused_norm_parity,
         'memory': {
             'uninstrumented_block': uninstrumented_block_peak,
             'phases': memory.phases,
@@ -937,16 +1060,21 @@ def main(argv=None):
         if case_stages is not None:
             control = case_stages['control']
             fused = case_stages['fused']
+            active_parity = fused_norm_parity or parity
             print(
                 '%s: control attention %.3f ms / block %.3f ms; '
-                'fused attention %.3f ms / block %.3f ms; exact=%s'
+                'fused attention %.3f ms / block %.3f ms; rel_l2=%s'
                 % (
                     result['label'],
                     control['attention_total']['median_gpu_ms'],
                     control['block']['median_gpu_ms'],
                     fused['attention_total']['median_gpu_ms'],
                     fused['block']['median_gpu_ms'],
-                    parity['exact'],
+                    (
+                        '-'
+                        if 'relative_l2' not in active_parity
+                        else '%.8g' % active_parity['relative_l2']
+                    ),
                 )
             )
             return 0

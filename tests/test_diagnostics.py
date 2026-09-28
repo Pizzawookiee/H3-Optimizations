@@ -79,7 +79,17 @@ class StageCoverageTests(unittest.TestCase):
     '''Every stage the attribution needs has to exist in production source.'''
 
     REQUIRED = {
+        'block_total': 'memory/forward.py',
+        'adaln_proj': 'memory/forward.py',
         'attention_total': 'attention_forward.py',
+        'attention_residual_gate': 'memory/forward.py',
+        'norm2_modulation': 'memory/forward.py',
+        'norm2_modulation_quantize': 'memory/forward.py',
+        'mlp_fc1': 'memory/forward.py',
+        'mlp_fc1_fc2': 'memory/forward.py',
+        'mlp_swiglu_fc2': 'memory/forward.py',
+        'mlp_swiglu_fc2_gated': 'memory/forward.py',
+        'final_mlp_gate': 'memory/forward.py',
         'attention_out': 'attention_forward.py',
         'qkv_linear': 'attention_forward.py',
         'qk_norm_rope': 'attention_forward.py',

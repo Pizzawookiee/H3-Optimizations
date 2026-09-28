@@ -78,6 +78,7 @@ class NativeShippingTests(unittest.TestCase):
             b'h3_int8_fused_q',
             b'h3_int8_fused_kv',
             b'h3_int8_quantize_bf16_rowwise_convrot256',
+            b'h3_int8_quantize_bf16_rms_adaln_rowwise_convrot256',
             b'h3_int8_quantize_q_chunk',
             b'h3_int8_quantize_v',
             b'h3_int8_v_amax_chunk',

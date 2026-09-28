@@ -177,6 +177,16 @@ def _bind(library):
         convrot.argtypes = [p] * 3 + [i64] * 2 + [sz]
 
     try:
+        fused_norm_adaln = (
+            library.h3_int8_quantize_bf16_rms_adaln_rowwise_convrot256
+        )
+    except AttributeError:
+        pass
+    else:
+        fused_norm_adaln.restype = i
+        fused_norm_adaln.argtypes = [p] * 6 + [i64] * 2 + [f, i, i, sz]
+
+    try:
         sparse_tiles = library.h3_int8_sparse_attention_tiles
     except AttributeError:
         pass
@@ -186,6 +196,19 @@ def _bind(library):
         sparse_tiles.argtypes = (
             attention_common + [p, p, p, i] + geometry + strides
             + [i, i, f, i, sz]
+        )
+
+    try:
+        fp8_attention = library.h3_fp8_attention_64
+    except AttributeError:
+        pass
+    else:
+        # Additive to ABI 4 and SM89-only: 64Q x 64KV E4M3 PV with an
+        # optional ExpCast softmax conversion.
+        fp8_attention.restype = i
+        fp8_attention.argtypes = (
+            attention_common + [p, p, p, p, i] + geometry + strides
+            + [i, i, f, i, i, i, i, sz]
         )
 
     try:

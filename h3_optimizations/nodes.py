@@ -259,6 +259,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'measured full-block SM89 comparison, but its coarser '
                         'KV selections can change output quality and the speed '
                         'gain is not guaranteed on every GPU. '
+                        'Kitchen INT8 Hybrid uses 64KV below 20% video attention '
+                        'and 128KV at or above 20%; it is experimental. '
                         'FROST BF16, BF16 Triton, and FP8 FlexAttention use '
                         '64Q x 64KV routing. Sparse Sage uses 128Q x 64KV on '
                         'SM80/86/87/89/120 and 64Q x 128KV on SM90. '

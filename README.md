@@ -275,56 +275,63 @@ executes five sampler steps and reports the median of the last three; step 1
 carries model initialization and the step after it is a discarded warmup. The
 20-step columns are projections from that median, not separate wall-clock runs.
 
-The card was capped to **160 W** of its 200 W stock board power for these runs,
-which is quieter and holds a steadier clock than the stock limit. A stock-power
-card is faster than every row below, but not uniformly: the cap costs each
-configuration in proportion to how power-saturated it already was, and dense
-INT8 attention at 10 seconds is the most saturated cell in the matrix. The
-Comfy Kitchen baseline is therefore the row that transfers least well to a
-stock-power card, and the speedups below are, if anything, flattered by it.
+The card ran at its stock **200 W** board-power limit. The benchmark verifies
+that limit before sampling but does not pin GPU clocks, so the medians include
+the card's normal dynamic clock behavior. Observed board-power peaks ranged
+from 192 W to 197 W across the measured arms.
 
-Benchmark-only synthetic Qwen states and an empty native latent stand in for
+A real cached Qwen conditioning entry and an empty native latent stand in for
 the text encoder and VAE, so neither is loaded and neither contributes to the
 timings or the memory figures.
 
-Every benchmark arm also shares two controls that are **not normal user
-settings**:
+Every benchmark arm shares one control that is **not a normal user setting**,
+then uses separate residency policies for speed and VRAM:
 
 - `H3BenchmarkForceQKVConfig0` forces compatible ConvRot-256 INT8 QKV linears to
   Comfy Kitchen CUTLASS config 0 so the Kitchen dispatcher cannot choose a
   different large-sequence configuration between arms.
-- `H3 AIMDO Residency Limiter` is explicitly fixed to `0 blocks` so model-weight
-  residency cannot hide or amplify activation-memory differences between arms.
+- Speed runs use stock AIMDO residency, matching normal production behavior.
+- VRAM runs explicitly unload the model, fix AIMDO to `0 blocks`, and execute
+  one first-sigma step so retained weights cannot hide or amplify activation-
+  memory differences between arms.
 
-Both benchmark controls come from the benchmark setup; the first is provided by
-the sibling H3-Extended pack. They should not be interpreted as recommended
-workflow settings.
+The forced QKV configuration and the residency measurement policy come from the
+benchmark setup and are provided by the sibling H3-Extended pack. They should
+not be interpreted as recommended workflow settings.
 
 The VRAM columns are the **ComfyUI process's own dedicated GPU memory**, read
 from the Windows GPU Process Memory counters that Task Manager reports. This
 replaces the whole-GPU `nvidia-smi` figure used in earlier revisions of this
 table, which carried the desktop compositor and every other application on the
-card. That baseline is not a constant: measured here it sat near 2.9 GB during
-the 5-second arms and collapsed to roughly 1.0 GB during the 10-second ones, as
-Windows evicted desktop surfaces under pressure. Whole-GPU peaks from the two
-durations were therefore never comparable with each other. Arm-to-arm
+card. That baseline is not a constant: measured here it sat near 2.5 GB during
+the 5-second arms and fell to roughly 1.2-2.0 GB during the later 10-second
+ones, as Windows evicted desktop surfaces under pressure. Whole-GPU peaks from
+the two durations were therefore never comparable with each other. Arm-to-arm
 differences within one duration were much less affected, since the baseline
 largely cancels.
 
 | configuration | 5s step | 5s 20-step | 5s VRAM | 10s step | 10s 20-step | 10s VRAM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Comfy Kitchen INT8 dense | 28.2 s | ~9m24s | 6193 MiB | 89.0 s | ~29m40s | 10849 MiB |
-| SageAttention dense | 27.7 s | ~9m13s | 6737 MiB | out of memory | - | - |
-| SageAttention + streamed QKV, chunked MLP/FinalLayer | 28.0 s | ~9m19s | 2801 MiB | 77.9 s | ~25m58s | 4787 MiB |
-| H3 Memory Optimization + Sparse Attention (KV 100%) | 29.5 s | ~9m50s | 2963 MiB | 91.5 s | ~30m30s | 4595 MiB |
-| **H3 Memory Optimization + Sparse Attention (KV 30%, measured)** | **18.7 s** | **~6m14s** | **2963 MiB** | **46.1 s** | **~15m21s** | **4563 MiB** |
+| Comfy Kitchen INT8 dense | 24.9 s | ~8m18s | 5769 MiB | 71.7 s | ~23m55s | 9947 MiB |
+| SageAttention dense | 24.2 s | ~8m04s | 6201 MiB | 74.4 s | ~24m47s | 10747 MiB |
+| SageAttention dense + H3 Memory Optimization | 24.6 s | ~8m12s | 2963 MiB | 70.6 s | ~23m31s | 4435 MiB |
+| Native INT8 attention (KV 100%) + H3 Memory Optimization | 26.4 s | ~8m48s | 2939 MiB | 73.4 s | ~24m27s | 4491 MiB |
+| **Native INT8 attention (fixed KV 30%) + H3 Memory Optimization** | **16.9 s** | **~5m39s** | **2939 MiB** | **38.9 s** | **~12m59s** | **4491 MiB** |
+| Native INT8 attention (fixed KV 30%) + H3 Memory Optimization (Lower VRAM) | 17.2 s | ~5m44s | 2603 MiB | 40.9 s | ~13m37s | 3771 MiB |
 
 Against dense Comfy Kitchen attention, the measured 30% configuration achieved
-**1.51x faster at 5 seconds and 1.93x at 10 seconds**, using 3.2 GB less VRAM at
-5 seconds and 6.1 GB less at 10 seconds.
+**1.47x faster at 5 seconds and 1.84x at 10 seconds**, using 2830 MiB less VRAM
+at 5 seconds and 5456 MiB less at 10 seconds.
 
-These measurements predate the 15% middle-step and 50% early-step defaults; they
-should not be read as performance evidence for the new schedule.
+Lower VRAM saves a further **336 MiB at 5 seconds and 720 MiB at 10 seconds**
+against the standard fixed-30% path. Its measured speed cost was 1.5% and 5.0%,
+respectively.
+
+The fixed-30% row is the historical sparse operating point. The current default
+uses a 15% middle budget plus a denser-early ramp, redistributing roughly the
+same full-schedule attention work toward the quality-sensitive early steps. It
+is intentionally absent from this short-run table because measuring only those
+denser early steps would overstate its full-schedule cost.
 
 The rows isolate successive **conceptual optimization stages**, but they are not
 a ladder of untouched UI defaults. The Sage memory arm pins
@@ -337,16 +344,20 @@ attention path and the precision policy are. The stage comparison is:
 
 | conceptual stage | 5s speed | 5s VRAM |
 | --- | ---: | ---: |
-| Comfy Kitchen dense to dense SageAttention | 1.02x | +544 MiB |
-| stream ConvRot INT8 QKV into the dense Sage carrier, chunk MLP and FinalLayer | 0.99x | -3936 MiB |
-| swap that carrier for the native 64Q x 64KV path at 100% KV, precision on the automatic policy | 0.95x | +162 MiB |
-| reduce video KV density to 30 percent | 1.58x | +0 MiB |
+| Comfy Kitchen dense to dense SageAttention | 1.03x | +432 MiB |
+| stream ConvRot INT8 QKV into the dense Sage carrier, chunk MLP and FinalLayer | 0.99x | -3238 MiB |
+| swap that carrier for the native 64Q x 64KV path at 100% KV, precision on the automatic policy | 0.93x | -24 MiB |
+| reduce video KV density to 30 percent | 1.56x | +0 MiB |
+| stage V in two passes | 0.99x | -336 MiB |
 
-The native 64Q x 64KV path costs 162 MiB at 5 seconds rather than saving memory,
-and pays it back at 10 seconds, where it sits below the dense Sage carrier
-(4595 MiB against 4787 MiB, and 4563 MiB once KV drops to 30%). Dense Sage with
-streamed QKV is the more memory-efficient choice until the sequence grows long
-enough to invert that.
+The old sequential matrix made the native and streamed Sage peaks appear nearly
+equal and hid Lower VRAM's saving. A matched native-allocator replay over all 50
+H3 layers measured the Standard peak at 1730.7 MiB and Lower VRAM at 1381.2 MiB,
+a 349.5 MiB reduction. Standard held a 547.5 MiB full-sequence BF16 V carrier
+alongside the 273.9 MiB INT8 V carrier; two-pass staging removed the BF16 carrier
+and shifted the remaining peak to embedding work. The isolated process-memory
+runs above independently measured reductions of 336 MiB at 5 seconds and
+720 MiB at 10 seconds.
 
 The measurements were taken with the NVIDIA driver's CUDA sysmem fallback
 disabled, so exceeding VRAM fails instead of silently paging to system memory.
@@ -713,9 +724,35 @@ reports persistent VBAR pages, temporary cast buffers, AIMDO usage, and
 whole-device VRAM separately.
 
 The attention benchmark is `benchmarks/bench_attention_arms.py`; it drives a
-running ComfyUI server over the prompt API. It applies the same two shared
-benchmark controls described above to every arm: `H3BenchmarkForceQKVConfig0`
-and AIMDO `0 blocks`.
+running ComfyUI server over the prompt API. Every arm uses
+`H3BenchmarkForceQKVConfig0`; speed uses stock AIMDO residency, while a separate
+one-step VRAM run unloads the model and fixes AIMDO to `0 blocks`. Start ComfyUI
+with `--use-sage-attention`, then run from
+the ComfyUI root:
+
+```powershell
+.\.venv\Scripts\python.exe custom_nodes\H3-Optimizations\benchmarks\bench_attention_arms.py --i-understand-this-uses-gpu
+```
+
+The default matrix uses the owned cached Qwen conditioning entry
+`88b1c73b72bd6b8aaaafc711b27d006a.safetensors` (1450 tokens), an empty native
+H3 latent, and per-process dedicated GPU memory. It measures dense Kitchen,
+dense Sage, Sage with H3 memory optimization, native INT8 at 100% KV, fixed 30%
+KV, and fixed 30% KV in Lower VRAM mode. The cache entry is real conditioning
+but keeps CLIP out of the measurement. A missing or mismatched entry fails
+closed; zero conditioning requires the explicit diagnostic-only
+`--conditioning-cache-entry '' --allow-zero-conditioning` combination.
+
+The fixed-30% row is the historical sparse operating point and is the valid
+short-run timing comparison. The current 15% middle budget plus denser-early
+ramp reallocates roughly the same total attention work toward early steps for
+quality; it remains available as the explicit `h3opt` arm, but is not in the
+short default matrix because measuring only its early steps would overstate its
+full-schedule cost.
+
+The script prints a table in the exact README column format and checkpoints the
+full records plus that table to `.agent\tmp\h3-readme-benchmark.json` after every
+arm.
 
 ## Acknowledgements
 

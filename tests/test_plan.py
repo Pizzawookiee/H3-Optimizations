@@ -31,6 +31,7 @@ from h3_optimizations.plan import (  # noqa: E402
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128,
+    SPARSE_BACKEND_KITCHEN_HYBRID,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     SparseRequest,
@@ -119,6 +120,11 @@ class PlanTests(unittest.TestCase):
         request = SparseRequest(backend=SPARSE_BACKEND_KITCHEN_64X128)
         self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN_64X128)
         self.assertIn(SPARSE_BACKEND_KITCHEN_64X128, request.signature)
+
+    def test_hybrid_kitchen_geometry_is_an_explicit_request(self):
+        request = SparseRequest(backend=SPARSE_BACKEND_KITCHEN_HYBRID)
+        self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN_HYBRID)
+        self.assertIn(SPARSE_BACKEND_KITCHEN_HYBRID, request.signature)
 
     def test_legacy_backend_labels_are_normalized(self):
         cases = (

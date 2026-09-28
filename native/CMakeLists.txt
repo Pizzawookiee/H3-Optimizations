@@ -74,8 +74,41 @@ else()
     )
 endif()
 
+add_library(h3_fp8_expcast_sm89 OBJECT
+    src/sage_attention/fp8_expcast_64.cu
+)
+target_include_directories(h3_fp8_expcast_sm89 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sage_attention
+)
+target_compile_options(h3_fp8_expcast_sm89 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_CONVERSIONS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_BFLOAT16_OPERATORS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_BFLOAT16_CONVERSIONS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_BFLOAT162_OPERATORS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_BFLOAT162_CONVERSIONS__>
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=177>
+)
+set_target_properties(h3_fp8_expcast_sm89 PROPERTIES
+    CUDA_ARCHITECTURES 89-real
+    CUDA_RUNTIME_LIBRARY Static
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
+)
+if(MSVC)
+    target_compile_options(h3_fp8_expcast_sm89 PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHs>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    )
+endif()
+
 add_library(h3_int8_attention SHARED
     $<TARGET_OBJECTS:h3_sparse_sage_sm89>
+    $<TARGET_OBJECTS:h3_fp8_expcast_sm89>
     src/h3_int8_attention_api.cu
     src/convrot_quantize.cu
     src/h3_fused_q_cutlass.cu

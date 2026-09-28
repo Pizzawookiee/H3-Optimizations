@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,6 +47,10 @@ class MemoryTests(unittest.TestCase):
         config = ActivationMemoryConfig()
         self.assertEqual(config.mode, MODE_NATIVE)
         self.assertEqual(config.chunk_rows, 4096)
+        self.assertTrue(config.fused_norm_quantize)
+        self.assertFalse(
+            ActivationMemoryConfig(fused_norm_quantize=False).fused_norm_quantize
+        )
         self.assertTrue(
             ActivationMemoryConfig(
                 mode=MODE_CONVROT_2SLICE
@@ -68,6 +73,42 @@ class MemoryTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, 'positive integer'):
             ActivationMemoryConfig(chunk_rows=0)
+
+    def test_held_convrot_fc1_accepts_a_prequantized_carrier(self):
+        held = linear_module.HeldMLP.__new__(linear_module.HeldMLP)
+        held.fc1_weight = SimpleNamespace(weight=object(), bias=None)
+        activation_q = torch.zeros(3, 256, dtype=torch.int8)
+        activation_scale = torch.ones(3, 1)
+        weight_q = torch.zeros(512, 256, dtype=torch.int8)
+        weight_scale = torch.ones(512)
+        expected = torch.zeros(3, 512, dtype=torch.bfloat16)
+
+        with (
+            patch.object(
+                linear_module,
+                '_convrot_parts',
+                return_value=(weight_q, weight_scale),
+            ),
+            patch(
+                'h3_optimizations.qkv.int8.HeldConvRotINT8Linear._prequantized_values',
+                return_value=expected,
+            ) as linear,
+            patch.object(comfy.ops, 'run_every_op'),
+        ):
+            actual = held.fc1_prequantized(
+                activation_q,
+                activation_scale,
+                torch.bfloat16,
+            )
+
+        self.assertIs(actual, expected)
+        linear.assert_called_once_with(
+            activation_q,
+            activation_scale,
+            weight_q,
+            weight_scale,
+            torch.bfloat16,
+        )
 
     def test_chunk_planner_preserves_modulation_boundaries(self):
         result = list(
