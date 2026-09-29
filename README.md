@@ -209,9 +209,9 @@ order.
   the measured SM89 full-block comparison, but can change quality and is not
   guaranteed to be faster on every GPU.
 
-The defaults preserve the earlier Hold schedule: four early steps at 50%, a 15%
-middle budget, and no late override for a 20-step schedule. Choose Ramp for a
-gradual transition.
+The Advanced defaults use an eight-step **Ramp** starting at **68.33%** and
+moving toward the 15% middle budget, with no late override on the default
+20-step schedule.
 
 Explicit backend choices are hard requirements. If the selected backend is not
 available, the node errors instead of silently switching. Use the normal Sparse
@@ -244,9 +244,11 @@ above the requested cap.
 ### Benchmark methodology
 
 The table above was measured end to end through a real sampler with
-`res_multistep`/`simple`. Each arm executes five sampler steps and reports the
-median of the last three. Step 1 includes initialization and the next step is a
-discarded warmup.
+`res_multistep`/`simple`. Before the matrix, the harness performs one discarded
+priming request so checkpoint loading is outside the measured arms. Each speed
+request then executes five sampler steps: the extra first boundary establishes
+timing, the first of the four resulting durations is discarded as warmup, and
+the final three durations produce the reported median.
 
 The RTX 4070 ran at its stock **200 W** board-power limit. The harness verifies
 that limit but does not pin clocks. Observed board-power peaks ranged from 192 W
@@ -286,6 +288,16 @@ Pure benchmark and standalone experimental tooling lives in
 the attention-arm harness, one-step VRAM profiler, AIMDO residency benchmark,
 and experimental FP8/Hybrid Kitchen work. H3-Extended is not required to use the
 production nodes in this repository.
+
+The table is produced by
+[`bench_attention_arms.py`](https://github.com/Zironic/ComfyUI-H3-Extended/blob/main/benchmarks/bench_attention_arms.py).
+With H3-Extended installed beside this pack, start ComfyUI with SageAttention
+and run the harness from the ComfyUI root:
+
+```powershell
+python main.py --use-sage-attention
+.\.venv\Scripts\python.exe custom_nodes\ComfyUI-H3-Extended\benchmarks\bench_attention_arms.py --i-understand-this-uses-gpu
+```
 
 ### Memory Optimization internals
 
@@ -375,8 +387,8 @@ The repository ships Windows x64 and Linux x86-64 binaries. On first use, the
 loader checks the ABI and runs a cached per-GPU numerical self-test. Nothing is
 downloaded, compiled, or installed at startup.
 
-CUDA targets are SM75, SM80, SM89, and SM120 on Windows, with SM90a also on
-Linux. Each target includes SASS, with an SM89 PTX fallback for forward
+CUDA targets are SM75, SM80, SM86, SM89, and SM120 on Windows, with SM90a also
+on Linux. Each target includes SASS, with an SM89 PTX fallback for forward
 compatibility.
 
 #### FROST BF16
@@ -476,9 +488,6 @@ An `optimized_attention_override` can opt into bounded-Q execution without being
 imported by this pack:
 
 ```python
-override.supports_streamed_h3_qkv = True
-override.consume = consume
-
 def consume(
     q_chunk,
     global_k,
@@ -489,6 +498,9 @@ def consume(
     transformer_options,
 ):
     ...
+
+override.supports_streamed_h3_qkv = True
+override.consume = consume
 ```
 
 The tensors use HND layout. The consumer must support rectangular attention,
