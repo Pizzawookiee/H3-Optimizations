@@ -70,7 +70,7 @@ class EmbeddingMemoryTests(unittest.TestCase):
         try:
             return embedding._validate_upstream_forward(model._forward)
         except embedding.H3EmbeddingMemoryPatchError:
-            self.skipTest('installed ComfyUI H3 _forward keeps stock embedding lifetime')
+            self.skipTest('installed ComfyUI H3 _forward is not one the node patches')
 
     def _inputs(self):
         video = torch.randn(1, 24, 2, 4, 4) * 0.1
@@ -149,7 +149,8 @@ class EmbeddingMemoryTests(unittest.TestCase):
 
     def test_install_is_guarded_idempotent_and_clearable(self):
         patcher = Patcher(self._model())
-        with mock.patch.object(embedding, '_validate_upstream_forward'):
+        with mock.patch.object(embedding, '_validate_upstream_forward'), \
+                mock.patch.object(embedding, '_upstream_releases_embedding', return_value=False):
             self.assertTrue(embedding.install(patcher))
             installed = patcher.object_patches[embedding.FORWARD_KEY]
             self.assertFalse(embedding.install(patcher))
@@ -160,7 +161,8 @@ class EmbeddingMemoryTests(unittest.TestCase):
     def test_install_recovers_original_from_applied_patch(self):
         model = self._model()
         first = Patcher(model)
-        with mock.patch.object(embedding, '_validate_upstream_forward'):
+        with mock.patch.object(embedding, '_validate_upstream_forward'), \
+                mock.patch.object(embedding, '_upstream_releases_embedding', return_value=False):
             self.assertTrue(embedding.install(first))
             model._forward = first.object_patches[embedding.FORWARD_KEY]
 
@@ -174,10 +176,20 @@ class EmbeddingMemoryTests(unittest.TestCase):
         patcher = Patcher(self._model())
         installed = embedding.install(patcher)
 
-        # Per-row mask support arrived with the Comfy H3 forwards we currently
-        # ship the static early-release implementation for. Older 0.33-era H3
-        # implementations are intentionally recognized as stock-lifetime only.
-        if hasattr(minimax, 'mask_row_values'):
+        # ComfyUI 0.39.2+ releases the embedding temporaries itself, so nothing
+        # is installed and no fallback is reported. Per-row mask support arrived
+        # with the Comfy H3 forwards we ship the static early-release
+        # implementation for. Older 0.33-era H3 implementations are
+        # intentionally recognized as stock-lifetime only.
+        if hasattr(MiniMaxH3Model, '_embed_and_pack'):
+            self.assertFalse(installed)
+            self.assertFalse(embedding.is_installed(patcher))
+            self.assertTrue(embedding.released_by_comfy(patcher))
+            self.assertNotIn(
+                embedding.FALLBACK_REASON_KEY,
+                patcher.model_options['transformer_options'],
+            )
+        elif hasattr(minimax, 'mask_row_values'):
             self.assertTrue(installed)
             self.assertTrue(embedding.is_installed(patcher))
             self.assertNotIn(
@@ -193,6 +205,40 @@ class EmbeddingMemoryTests(unittest.TestCase):
                     embedding.FALLBACK_REASON_KEY
                 ],
             )
+
+    def test_comfy_managed_release_skips_patch_and_satisfies_explicit_release(self):
+        patcher = Patcher(self._model())
+        with mock.patch.object(embedding, '_upstream_releases_embedding', return_value=True), \
+                mock.patch.object(embedding.logging, 'warning') as warning:
+            self.assertFalse(embedding.install(patcher, strict=True))
+            self.assertTrue(embedding.released_by_comfy(patcher))
+        warning.assert_not_called()
+        self.assertNotIn(embedding.FORWARD_KEY, patcher.object_patches)
+        self.assertNotIn(
+            embedding.FALLBACK_REASON_KEY,
+            patcher.model_options['transformer_options'],
+        )
+
+    def test_comfy_managed_release_drops_previous_own_patch(self):
+        patcher = Patcher(self._model())
+        with mock.patch.object(embedding, '_validate_upstream_forward'), \
+                mock.patch.object(embedding, '_upstream_releases_embedding', return_value=False):
+            self.assertTrue(embedding.install(patcher))
+        with mock.patch.object(embedding, '_upstream_releases_embedding', return_value=True):
+            self.assertFalse(embedding.install(patcher, force_rebuild=True))
+        self.assertNotIn(embedding.FORWARD_KEY, patcher.object_patches)
+
+    def test_core_detection_requires_the_embed_helper_call(self):
+        if not hasattr(MiniMaxH3Model, '_embed_and_pack'):
+            self.assertFalse(embedding._upstream_releases_embedding(self._model()._forward))
+            return
+        with mock.patch.object(
+            embedding.inspect,
+            'getsource',
+            return_value='def _forward(self, x):\n    return x\n',
+        ):
+            self.assertFalse(embedding._upstream_releases_embedding(self._model()._forward))
+        self.assertTrue(embedding._upstream_releases_embedding(self._model()._forward))
 
     def test_foreign_forward_patch_is_preserved(self):
         patcher = Patcher(self._model())

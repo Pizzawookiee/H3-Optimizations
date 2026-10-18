@@ -79,6 +79,7 @@ from .memory.final_layer import install as install_final_layer
 from .memory.embedding import clear as clear_embedding_memory
 from .memory.embedding import install as install_embedding_memory
 from .memory.embedding import is_installed as is_embedding_memory_installed
+from .memory.embedding import released_by_comfy as embedding_released_by_comfy
 from .memory.patch import install as install_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import clear_backend, configure_backend
@@ -1569,9 +1570,12 @@ def _reconcile_plan(
         environment,
         **rebuild_kwargs,
     )
-    embedding_memory_selected = (
-        'release' if is_embedding_memory_installed(patched) else 'stock'
-    )
+    if is_embedding_memory_installed(patched):
+        embedding_memory_selected = 'release'
+    elif embedding_released_by_comfy(patched):
+        embedding_memory_selected = 'comfy_release'
+    else:
+        embedding_memory_selected = 'stock'
     if plan.sparse is not None:
         cube_shape = TOKEN_ORDER_SHAPES[plan.sparse.video_token_order]
         if cube_shape is not None:

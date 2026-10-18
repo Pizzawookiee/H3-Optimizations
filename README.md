@@ -77,9 +77,10 @@ Choose **Lower VRAM (slower)** only when you need to reduce the peak further.
 The **Activation chunk rows** control trades temporary memory for throughput;
 the default is the normal recommendation.
 
-On recognized ComfyUI versions, embedding assembly tensors are released before
-block 0. Unrecognized implementations retain ComfyUI's normal embedding lifetime
-instead of failing the workflow.
+Embedding assembly tensors are released before block 0. ComfyUI 0.39.2 and
+newer do this themselves; on older recognized versions the node does it.
+Unrecognized implementations retain ComfyUI's normal embedding lifetime instead
+of failing the workflow.
 
 This node is different from Sparse Attention: it changes how the work is
 executed and stored rather than intentionally removing video attention
