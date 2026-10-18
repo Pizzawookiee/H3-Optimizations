@@ -21,6 +21,22 @@ def get_minimax_h3_model(model_patcher, model_type=None):
     return diffusion_model if isinstance(diffusion_model, model_type) else None
 
 
+def unpatched_model_object(model_patcher, name, live):
+    """Return the value ``name`` holds with no object patches applied.
+
+    Comfy leaves a loaded patcher's object patches applied to the shared
+    model, so while an earlier clone stays loaded ``live`` may be that clone's
+    wrapper. Capturing it as an original nests the old wrapper inside the new
+    one. Clones share ``object_patches_backup``, which holds the stock value
+    of every key the loaded patcher replaced.
+    """
+
+    backup = getattr(model_patcher, "object_patches_backup", None)
+    if isinstance(backup, dict) and name in backup:
+        return backup[name]
+    return live
+
+
 def is_minimax_h3(model_patcher, model_type=None):
     return get_minimax_h3_model(model_patcher, model_type=model_type) is not None
 

@@ -11,7 +11,7 @@ import comfy.model_management
 import comfy.model_prefetch
 from comfy.ldm.minimax import model as minimax
 
-from ..model import get_minimax_h3_model
+from ..model import get_minimax_h3_model, unpatched_model_object
 
 
 FORWARD_KEY = 'diffusion_model._forward'
@@ -279,7 +279,7 @@ def install(model_patcher, *, force_rebuild=False, strict=False):
                 'installed embedding-memory patch has no recoverable original'
             )
     else:
-        original = model._forward
+        original = unpatched_model_object(model_patcher, FORWARD_KEY, model._forward)
         if getattr(original, OWNER_MARKER, False):
             original = getattr(original, ORIGINAL_MARKER, None)
             if original is None:

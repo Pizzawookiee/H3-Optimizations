@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from comfy.ldm import common_dit
 from comfy.ldm.minimax.model import MiniMaxH3Model, PackedLayout, patchify_video, unpatchify_video
 from .memory import final_layer
+from .model import unpatched_model_object
 from .plan import (
     VIDEO_TOKEN_ORDER_1X16X4,
     VIDEO_TOKEN_ORDER_1X8X8,
@@ -354,7 +355,8 @@ def clear(model_patcher):
     if state is not None:
         final_layer.clear_cube_state(model_patcher, state)
     model = model_patcher.get_model_object("diffusion_model")
-    if _same_callable(original, model._forward):
+    stock = unpatched_model_object(model_patcher, FORWARD_KEY, model._forward)
+    if _same_callable(original, stock):
         patches.pop(FORWARD_KEY)
     else:
         patches[FORWARD_KEY] = original
