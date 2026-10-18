@@ -180,8 +180,22 @@ SM75/Turing is a reduced-feature target. Memory Optimization, AIMDO, bounded
 FP16 execution, dense Comfy Kitchen INT8, and native sparse Kitchen are eligible;
 BF16 Triton, FROST, FP8, and Sparse Sage are not.
 
-AMD sparse support is experimental and has additional hardware-specific limits.
-See [Experimental AMD Sparse Kitchen](#experimental-amd-sparse-kitchen).
+AMD sparse support has additional hardware-specific limits. See
+[AMD Sparse Kitchen](#amd-sparse-kitchen).
+
+### LoRAs
+
+Use ComfyUI's standard **Load LoRA** node. Its weight patches apply normally
+with every node in this pack.
+
+Bypass-mode LoRAs, such as ComfyUI's **Load LoRA (Bypass)** debugging nodes or
+custom nodes that load LoRAs in bypass mode, are not supported with H3 Memory Optimization or H3 Sparse
+Attention. A bypass LoRA works by replacing a layer's `forward`, but these nodes
+compute the attention projections and MLP layers with their own chunked and
+fused kernels, which never call that `forward`. The LoRA is silently ignored on
+those layers, with no error. Supporting it would need a way for an adapter to
+apply its delta to part of a layer's output, which ComfyUI's bypass hook does
+not provide.
 
 ---
 
@@ -286,22 +300,6 @@ and 720 MiB at 10 seconds.
 CUDA sysmem fallback was disabled, so exceeding VRAM failed instead of silently
 paging to system memory.
 
-Pure benchmark and standalone experimental tooling lives in
-[ComfyUI-H3-Extended](https://github.com/Zironic/ComfyUI-H3-Extended), including
-the attention-arm harness, one-step VRAM profiler, AIMDO residency benchmark,
-and experimental FP8/Hybrid Kitchen work. H3-Extended is not required to use the
-production nodes in this repository.
-
-The table is produced by
-[`bench_attention_arms.py`](https://github.com/Zironic/ComfyUI-H3-Extended/blob/main/benchmarks/bench_attention_arms.py).
-With H3-Extended installed beside this pack, start ComfyUI with SageAttention
-and run the harness from the ComfyUI root:
-
-```powershell
-python main.py --use-sage-attention
-.\.venv\Scripts\python.exe custom_nodes\ComfyUI-H3-Extended\benchmarks\bench_attention_arms.py --i-understand-this-uses-gpu
-```
-
 ### Memory Optimization internals
 
 Memory Optimization preserves the dense attention selected by ComfyUI and adds
@@ -331,9 +329,8 @@ accepted as aliases for `Preserve native` and `Auto`.
 
 #### MLP and residual paths
 
-Auto uses ordinary 4096-row MLP chunking by default. The ConvRot two-slice path
-is an experimental explicit option. A chunk size at or above the packed input
-length uses the ordinary unsliced MLP for that invocation.
+Auto uses ordinary 4096-row MLP chunking by default. A chunk size at or above
+the packed input length uses the ordinary unsliced MLP for that invocation.
 
 On compatible ConvRot INT8 checkpoints, Comfy Kitchen 0.2.34+ and NVIDIA SM80+
 can fold the gated residual add into fc2. The output is bit-identical and avoids
@@ -430,12 +427,11 @@ On ROCm, FlexAttention retains BF16/FP16 Q/K/V and uses PyTorch FlexAttention's
 Triton lowering. If first-use validation fails, automatic mode retires that
 signature and returns to dense attention.
 
-#### Experimental AMD Sparse Kitchen
+#### AMD Sparse Kitchen
 
-This branch adapts the exact INT8 stage from Comfy Kitchen's HIP Sol-Attn work
-to H3's 64Q x 64KV route. H3 chooses every KV block; the Sol router, approximate
-tail, and fused QKV producer are not used. Native targets are gfx11 (RDNA 3/3.5)
-and gfx12 (RDNA 4).
+AMD Sparse Kitchen adapts the exact INT8 stage from Comfy Kitchen's HIP
+Sol-Attn work to H3's 64Q x 64KV route, with H3 choosing every KV block. Native
+targets are gfx11 (RDNA 3/3.5) and gfx12 (RDNA 4).
 
 Prebuilt Windows x64 and Linux x86-64 libraries were compiled with ROCm 7.2.1.
 The loader checks `native/hip/bin`, `native/hip/lib`, `native/hip/build`, and
@@ -451,12 +447,11 @@ a hard requirement and reports failures.
 RDNA2 uses the separate fail-open adapter described above; it is not evidence
 for the native HIP kernel.
 
-**This remains an experimental tester path.** The libraries have passed compile
-and ABI-export checks on Ubuntu 24.04 and Windows Server 2022 but have not been
-executed on AMD hardware. A live gfx11/gfx12 run is still required to establish
-numerical correctness and performance.
+The libraries have passed compile and ABI-export checks on Ubuntu 24.04 and
+Windows Server 2022 but have not yet been run on AMD hardware; the per-device
+tests above guard first use.
 
-Credit to Deluxa for the RDNA3+ Sol exact HIP kernel adapted by this branch.
+Credit to Deluxa for the RDNA3+ Sol exact HIP kernel adapted here.
 
 ### ModelPatcher composition
 
@@ -464,6 +459,7 @@ H3 stores an immutable optimization plan on the cloned `ModelPatcher` and
 reconciles consumer-dependent choices at ComfyUI's prepare-sampling boundary.
 Downstream nodes may clone, apply LoRA/weight patches, select compile options, or
 change attention without requiring H3 to be the last node before the sampler.
+Bypass-mode LoRAs are the exception; see [LoRAs](#loras).
 
 Each descendant receives a fresh request-local runtime session and execution
 callables. Package-owned wrappers and clone callbacks are replaced rather than
@@ -529,8 +525,7 @@ callable `consume` is an error. Unmarked overrides retain full-Q behavior.
 - Linux glibc 2.34+ and `GLIBCXX_3.4.21`+ for the shipped Linux native binary
 - Any ComfyUI-supported MiniMax H3 backend for the final dense fallback
 - NVIDIA SM75+ for native Kitchen
-- AMD gfx11/gfx12 plus a compatible ROCm PyTorch runtime for experimental AMD
-  Sparse Kitchen
+- AMD gfx11/gfx12 plus a compatible ROCm PyTorch runtime for AMD Sparse Kitchen
 - NVIDIA SM80+ with Triton for BF16 Triton; RDNA2 is unsupported
 - A ROCm PyTorch build with a working dense H3 consumer for the RDNA2 adapter
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for NVIDIA Flex
@@ -560,10 +555,6 @@ GPU validation is separate because it requires matching hardware and compiled
 backends. Live SM89 gates compare full and streamed carriers, exercise every
 shipped Kitchen geometry, and check backend outputs against dense or masked SDPA
 references with route-specific numerical limits.
-
-Pure benchmark harnesses and standalone experiment tests are maintained in
-[ComfyUI-H3-Extended](https://github.com/Zironic/ComfyUI-H3-Extended/tree/main/benchmarks),
-not in this production package.
 
 ## Acknowledgements
 
