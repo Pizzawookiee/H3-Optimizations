@@ -152,11 +152,16 @@ class FusedResidualRouteTests(unittest.TestCase):
             apply._fused_residual_status(SimpleNamespace(provider_id=MLP_FP8_CHUNKED), environment),
             'not applicable',
         )
-        # CUDA is hidden in this suite, so the eligible provider reports why not.
-        status = apply._fused_residual_status(
-            SimpleNamespace(provider_id=MLP_CONVROT_INT8_CHUNKED), environment
-        )
-        self.assertTrue(status.startswith('unavailable: '), status)
+        eligible = SimpleNamespace(provider_id=MLP_CONVROT_INT8_CHUNKED)
+        with patch.object(apply, 'fused_residual_unavailable_reason', return_value='no CUDA'):
+            self.assertEqual(
+                apply._fused_residual_status(eligible, environment), 'unavailable: no CUDA'
+            )
+        with patch.object(apply, 'fused_residual_unavailable_reason', return_value=None):
+            self.assertEqual(
+                apply._fused_residual_status(eligible, environment),
+                'eligible (verified on first use)',
+            )
 
     def test_non_int8_held_weights_decline(self):
         held = linear_module.HeldMLP.__new__(linear_module.HeldMLP)

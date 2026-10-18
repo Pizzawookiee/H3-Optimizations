@@ -59,7 +59,8 @@ class ThresholdRouteTests(unittest.TestCase):
             float(q @ expected[0, 0] @ q), float(scores.var(unbiased=False)), delta=1e-2 * float(scores.var()))
 
     def test_unavailable_without_cuda(self):
-        self.assertFalse(threshold_route.threshold_route_is_available())
+        with mock.patch.object(torch.cuda, 'is_available', return_value=False):
+            self.assertFalse(threshold_route.threshold_route_is_available())
 
     def test_plan_falls_back_to_top_k_when_the_native_router_is_unavailable(self):
         layout = SimpleNamespace(seq_len=8192, video_range=(1024, 8192),
@@ -68,8 +69,9 @@ class ThresholdRouteTests(unittest.TestCase):
         router = SparseTileRouter(None, q_tile=64, kv_tile=64)
         geometry = router.geometry(layout)
         summary = torch.zeros(1, 2, geometry.kv_tiles, 128, dtype=torch.bfloat16)
-        plan, _ = ksq._prepare_route_plan(router, summary, layout, 0.15,
-                                          mode=ksq.ROUTE_MODE_THRESHOLD)
+        with mock.patch.object(threshold_route, 'threshold_route_is_available', return_value=False):
+            plan, _ = ksq._prepare_route_plan(router, summary, layout, 0.15,
+                                              mode=ksq.ROUTE_MODE_THRESHOLD)
         self.assertEqual(plan.mode, ksq.ROUTE_MODE_TOPK)
         self.assertIsNone(plan.k_cov)
         with mock.patch.object(threshold_route, 'threshold_route_is_available', return_value=True):

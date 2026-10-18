@@ -9,7 +9,7 @@ import unittest
 
 
 PACK = Path(__file__).resolve().parents[1]
-ROOT = PACK.parents[1]
+ROOT = next(parent for parent in PACK.parents if (parent / 'comfy').is_dir())
 
 
 class PackageImportIdentityTests(unittest.TestCase):
