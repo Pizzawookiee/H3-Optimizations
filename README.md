@@ -143,19 +143,20 @@ GPU memory, not whole-card `nvidia-smi` usage.
 | Comfy Kitchen INT8 dense | 24.9 s | ~8m18s | 5769 MiB | 71.7 s | ~23m55s | 9947 MiB |
 | SageAttention dense | 24.2 s | ~8m04s | 6201 MiB | 74.4 s | ~24m47s | 10747 MiB |
 | SageAttention dense + H3 Memory Optimization | 24.6 s | ~8m12s | 2963 MiB | 70.6 s | ~23m31s | 4435 MiB |
-| Native INT8 attention (KV 100%) + H3 Memory Optimization | 26.4 s | ~8m48s | 2939 MiB | 73.4 s | ~24m27s | 4491 MiB |
-| **Native INT8 attention (fixed KV 30%) + H3 Memory Optimization** | **16.9 s** | **~5m39s** | **2939 MiB** | **38.9 s** | **~12m59s** | **4491 MiB** |
-| Native INT8 attention (fixed KV 30%) + H3 Memory Optimization (Lower VRAM) | 17.2 s | ~5m44s | 2603 MiB | 40.9 s | ~13m37s | 3771 MiB |
+| Native INT8 attention (KV 100%) + H3 Memory Optimization | 25.0 s | ~8m20s | 2933 MiB | 70.2 s | ~23m24s | 4501 MiB |
+| **Native INT8 attention (fixed KV 30%) + H3 Memory Optimization** | **15.5 s** | **~5m09s** | **2933 MiB** | **37.3 s** | **~12m25s** | **4501 MiB** |
+| Native INT8 attention (fixed KV 30%) + H3 Memory Optimization (Lower VRAM) | 16.5 s | ~5m30s | 2549 MiB | 39.2 s | ~13m04s | 3733 MiB |
 
-Against dense Comfy Kitchen attention, the measured fixed-30% configuration was
-**1.47x faster at 5 seconds and 1.84x at 10 seconds**, while using 2830 MiB less
-VRAM at 5 seconds and 5456 MiB less at 10 seconds.
+The three native KV rows were rerun on September 30, 2026 with the local
+**64Q x 32KV** production selection and threshold routing at KV30; KV100
+bypasses selection. The dense/Sage rows and packed64 stage progression below
+are earlier measurements, not fresh paired controls.
 
-Lower VRAM saved a further **336 MiB at 5 seconds and 720 MiB at 10 seconds**
-against that standard fixed-30% path, with measured speed costs of 1.5% and
-5.0%, respectively.
+Lower VRAM saved a further **384 MiB at 5 seconds and 768 MiB at 10 seconds**
+against that standard fixed-30% path, with measured speed costs of 6.8% and
+5.2%, respectively.
 
-The fixed-30% row is a historical comparison point, not the current default.
+The fixed-30% row is a constant-budget comparison point, not the current default.
 The current 15% middle budget plus denser-early ramp redistributes roughly the
 same full-schedule attention work toward quality-sensitive early steps. It is
 not shown here because a short run containing only those early steps would
@@ -204,7 +205,9 @@ order.
 - If early and late windows overlap, the denser requested budget wins.
 - **Video token order** defaults to **1x8x8**. Measured **1x16x4** and **4x4x4**
   layouts are comparison options; **Raster** is stock H3 order.
-- **Kitchen INT8 64Q x 64KV (Quality)** is the default geometry.
+- **Kitchen INT8 64Q x 32KV (Quality)** is the default geometry. Compatible
+  native builds use threshold routing; other builds retain top-k routing.
+  Auto selection falls back to 64KV if the 32KV device check fails.
 - **Kitchen INT8 64Q x 128KV (Faster)** uses coarser KV tiles. It was faster in
   the measured SM89 full-block comparison, but can change quality and is not
   guaranteed to be faster on every GPU.
@@ -265,7 +268,7 @@ config 0. This is a benchmark control, not a recommended workflow setting. The
 Memory/Sage row also pins **Precision = Preserve native**; later native rows use
 the normal automatic policy. Both use QKV streaming.
 
-The measured stage progression at 5 seconds was:
+The historical packed64 stage progression at 5 seconds was:
 
 | conceptual stage | speed | VRAM change |
 | --- | ---: | ---: |
@@ -335,8 +338,7 @@ length uses the ordinary unsliced MLP for that invocation.
 On compatible ConvRot INT8 checkpoints, Comfy Kitchen 0.2.34+ and NVIDIA SM80+
 can fold the gated residual add into fc2. The output is bit-identical and avoids
 one hidden-width temporary. Other hardware, older Kitchen versions, and
-per-token modulation segments retain the ordinary add. Set
-`H3_OPTIMIZATIONS_DISABLE_FUSED_RESIDUAL=1` only for debugging.
+per-token modulation segments retain the ordinary add.
 
 Floating MLPs that keep their own precision compute SwiGLU in place, saving one
 activation-width temporary per chunk with identical output.
@@ -374,14 +376,22 @@ ordinary dense attention.
 
 #### Native Kitchen
 
-The production sparse geometry is 64Q x 64KV. Compatible ConvRot-256 TensorWise
+The automatic production sparse geometry is 64Q x 32KV, with 64KV retained as
+a device-validated fallback and an explicit choice. Compatible ConvRot-256 TensorWise
 INT8 QKV can feed the sparse carrier without materializing full-sequence BF16
 Q/K/V.
 
+Packed32 consumes up to four routed 32-token tiles per 64Q x 128KV iteration
+over the same 64-token carrier. Compatible native builds select tiles with
+threshold routing using BF16 summaries. The requested budget targets average
+video density rather than an exact per-row tile count. Non-video context stays
+dense, 100% KV uses a full route, and builds without the threshold router retain
+top-k selection. Explicit 64KV and 128KV backends remain available.
+
 For compatible ConvRot-256 INT8 checkpoints on SM80+, the path can use an exact
-fused Q producer. Q projection dimensions are 128x256, but attention routing
-remains 64Q x 64KV. A one-time parity check falls back to the established
-producer when needed.
+fused Q producer. Q projection dimensions are 128x256, while packed32 routing
+uses 32-token KV summaries over the same 64-token carrier. A one-time parity
+check falls back to the established producer when needed.
 
 The repository ships Windows x64 and Linux x86-64 binaries. On first use, the
 loader checks the ABI and runs a cached per-GPU numerical self-test. Nothing is

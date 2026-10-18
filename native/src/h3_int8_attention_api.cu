@@ -55,6 +55,14 @@ void launch_sage_attn_sparse_kernel(
     int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
     float sm_scale, int output_dtype_code, cudaStream_t stream);
 
+void launch_sage_attn_packed_dense_kernel(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, int cta_k, int B, int Lq,
+    int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
+    int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h, float sm_scale, int output_dtype_code,
+    cudaStream_t stream);
+
 void launch_sage_attn_sparse_tiles_kernel(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
     const void *k_scale, const void *v_scale, const void *lut,
@@ -122,6 +130,13 @@ bool launch_h3_fused_q_cutlass(
     const void *weight_scale, const void *norm, const void *freqs, void *debug,
     void *summary, void *q, void *q_scale, int64_t m, int64_t n, int64_t k,
     int full_k_length, float epsilon, cudaStream_t stream);
+
+void launch_h3_threshold_route(const void *q, const void *k_video, const void *sigma,
+                               const void *kbar, void *lut, void *valid, void *masks, int bh,
+                               int tile_count,
+                               int64_t q_bh_stride, int64_t q_row_stride, int64_t k_bh_stride,
+                               int video_tiles, int pvs, int kv_tiles, int dense_rows, int width,
+                               float tau, cudaStream_t stream);
 
 void launch_quant_v_int8_kernel(const void *v, void *out, void *scale, int B,
                                 int H, int N, int D, int padded_N, int64_t sb,
@@ -216,6 +231,20 @@ H3_API int h3_int8_dense_attention(
       Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h,
       v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n, o_st_h, sm_scale,
       output_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_packed_dense_attention(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, int cta_k, int B, int Lq, int Lk,
+    int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
+    int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h, float sm_scale,
+    int output_dtype_code, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_packed_dense_kernel(
+      q, k, v, o, q_scale, k_scale, v_scale, cta_k, B, Lq, Lk, H_q, H_kv, D,
+      q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h,
+      v_st_d, o_st_bz, o_st_n, o_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream)))
 }
 
 H3_API int h3_int8_sparse_attention(
@@ -386,6 +415,24 @@ H3_API int h3_int8_fused_q(
       throw std::runtime_error(
           "exact 128x256 CUTLASS H3 Q kernel rejected the request");
     }
+  })
+}
+
+// Additive to ABI 4: threshold routing for the streamed sparse path (see
+// h3_threshold_route.cu). Loaders treat it as optional.
+H3_API int h3_int8_threshold_route(
+    const void *q, const void *k_video, const void *sigma, const void *kbar, void *lut,
+    void *valid, void *masks, int bh, int tile_count, int64_t q_bh_stride, int64_t q_row_stride,
+    int64_t k_bh_stride, int video_tiles, int pvs, int kv_tiles, int dense_rows, int width,
+    float tau, uintptr_t stream) noexcept {
+  H3_GUARD({
+    if (!q || !k_video || !sigma || !kbar || !lut || !valid || !masks) {
+      throw std::runtime_error("threshold route received a null pointer");
+    }
+    launch_h3_threshold_route(q, k_video, sigma, kbar, lut, valid, masks, bh, tile_count,
+                              q_bh_stride,
+                              q_row_stride, k_bh_stride, video_tiles, pvs, kv_tiles, dense_rows,
+                              width, tau, reinterpret_cast<cudaStream_t>(stream));
   })
 }
 

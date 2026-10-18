@@ -7,6 +7,7 @@ native/lib/
 native/selftest.json
 native/library_path.txt
 native/bin/h3_int8_attention_v5.dll
+native/bin/h3_int8_attention_v6.dll
 native/hip/build*/
 native/hip/lib/
 native/hip/selftest.json

@@ -195,9 +195,10 @@ def test_advanced_node_schema_and_request():
     )
     backend = input_by_id(schema, 'backend')
     check(
-        backend.default == 'Kitchen INT8 64Q x 64KV (Quality)'
+        backend.default == 'Kitchen INT8 64Q x 32KV (Quality)'
         and backend.options
         == [
+            'Kitchen INT8 64Q x 32KV (Quality)',
             'Kitchen INT8 64Q x 64KV (Quality)',
             'Kitchen INT8 64Q x 128KV (Faster)',
             'FROST BF16 64Q x 64KV (SM89)',

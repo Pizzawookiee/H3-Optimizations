@@ -41,7 +41,7 @@ _lse_results = {}
 
 # Bump whenever the meaning of a cached pass/fail changes without changing the
 # native binary build ID. Otherwise an old failure can survive a Python-only fix.
-_SELFTEST_REVISION = 'v9'
+_SELFTEST_REVISION = 'v14'
 
 # K > 512 is intentional. Blackwell's dense CTA_K=64 launcher chooses a
 # lower-pressure probability path at K <= 512 while sparse always uses fused
@@ -50,7 +50,7 @@ _BATCH, _HEADS, _Q_LEN, _KV_LEN, _HEAD_DIM = 1, 4, 640, 640, 128
 
 # Keep this local to the native startup layer: importing the high-level sparse
 # backend here would pull Comfy runtime modules into pre-startup initialization.
-_SPARSE_PARITY_GEOMETRIES = ((128, 128), (128, 64), (64, 128), (64, 64))
+_SPARSE_PARITY_GEOMETRIES = ((128, 128), (128, 64), (64, 128), (64, 64), (64, 32))
 _PRODUCTION_GEOMETRIES = ((64, 64), (128, 64))
 
 # Healthy INT8 error is ~0.016 relative L2; the mildest corruption injected in
@@ -60,6 +60,19 @@ _INT8_TOLERANCE = 0.15
 # drift, a localized 0.02 error, and non-finite output.
 _SPARSE_REL_L2_TOLERANCE = 0.002
 _SPARSE_MAX_ABS_TOLERANCE = 0.01
+# On SM86, SM89, and SM12x the 64Q x 64KV route runs the packed 64Q x 128KV
+# kernel, which quantizes P against a 128-column running maximum. Its full-route
+# output differs from dense INT8 by quantization noise (rel L2 ~0.006 on the
+# samples below) rather than matching it bit for bit. That noise is unbiased,
+# so the packed gate also bounds the least-squares gain of the output against
+# the dense one: distributed scaling drift fails the gain bound, a localized
+# error fails the max-abs bound, and noise at 2x the observed level fails the
+# relative-L2 bound. Bit-identical output passes trivially.
+# 64Q x 32KV (32-token routes over the 64-token carrier) always runs a packed
+# kernel, on every architecture.
+_PACKED_GEOMETRIES = ((64, 64), (64, 32))
+_PACKED_REL_L2_TOLERANCE = 0.012
+_PACKED_GAIN_TOLERANCE = 0.002
 _FUSED_Q_REL_L2_TOLERANCE = 0.01
 _FUSED_Q_SUMMARY_REL_L2_TOLERANCE = 0.01
 _FUSED_Q_SUMMARY_MAX_ABS_TOLERANCE = 0.02
@@ -95,6 +108,24 @@ def _sparse_output_health(actual, expected):
         'max_abs': round(max_abs, 6),
         'passed': passed,
     }
+
+
+def _packed_output_health(actual, expected):
+    passed, detail = _sparse_output_health(actual, expected)
+    if not detail['finite']:
+        return False, detail
+    expected_f = expected.float()
+    gain = (
+        (actual.float() * expected_f).sum()
+        / (expected_f * expected_f).sum().clamp_min(1e-12)
+    ).item()
+    passed = bool(
+        detail['rel_l2'] < _PACKED_REL_L2_TOLERANCE
+        and detail['max_abs'] < _SPARSE_MAX_ABS_TOLERANCE
+        and abs(gain - 1.0) < _PACKED_GAIN_TOLERANCE
+    )
+    detail.update({'gain': round(gain, 6), 'passed': passed})
+    return passed, detail
 
 
 def _dequantize_q(q, scale):
@@ -263,10 +294,20 @@ def _cache_key(device):
     major, minor = torch.cuda.get_device_capability(device)
     from .bootstrap import installed_build_id
 
+    # A library_path.txt override is not the packaged build, so its verdict
+    # must not share (or reuse) the packaged build's cache entry.
+    build = installed_build_id() or 'local'
+    override = loader._override_path()
+    if override is not None:
+        try:
+            stamp = int(override.stat().st_mtime)
+        except OSError:
+            stamp = 0
+        build = 'override:%s:%d' % (override.name, stamp)
     return 'sm%d%d|%s|%s|%s' % (
         major,
         minor,
-        installed_build_id() or 'local',
+        build,
         _SELFTEST_REVISION,
         torch.cuda.get_device_name(device),
     )
@@ -345,15 +386,17 @@ def run(device=None, *, verbose=False):
         for q_tile, kv_tile in _SPARSE_PARITY_GEOMETRIES:
             key = _geometry_key(q_tile, kv_tile)
             try:
-                if kv_tile not in carriers:
+                # A 32-token route walks the 64-token carrier.
+                carrier_tile = native.carrier_kv_tile(kv_tile)
+                if carrier_tile not in carriers:
                     carrier = native.prequantize_int8_attention(
-                        q, k, v, cta_k=kv_tile
+                        q, k, v, cta_k=carrier_tile
                     )
-                    carriers[kv_tile] = carrier
-                    dense_by_kv[kv_tile] = native.int8_attention_from_prequantized(
+                    carriers[carrier_tile] = carrier
+                    dense_by_kv[carrier_tile] = native.int8_attention_from_prequantized(
                         carrier
                     )
-                carrier = carriers[kv_tile]
+                carrier = carriers[carrier_tile]
                 route = _full_route(native, device, q_tile, kv_tile)
                 # The self-test is the authority that populates the geometry
                 # verdict, so bypass the runtime geometry gate here. Calling
@@ -362,9 +405,14 @@ def run(device=None, *, verbose=False):
                     carrier, route, validate_geometry=False
                 )
                 torch.cuda.synchronize(device)
-                parity[key] = torch.equal(routed, dense_by_kv[kv_tile])
-                geometry_passed[key], geometry_health[key] = (
-                    _sparse_output_health(routed, dense_by_kv[kv_tile])
+                parity[key] = torch.equal(routed, dense_by_kv[carrier_tile])
+                health = (
+                    _packed_output_health
+                    if (q_tile, kv_tile) in _PACKED_GEOMETRIES
+                    else _sparse_output_health
+                )
+                geometry_passed[key], geometry_health[key] = health(
+                    routed, dense_by_kv[carrier_tile]
                 )
             except Exception as error:  # geometry-local rejection when possible
                 parity[key] = False
@@ -375,6 +423,20 @@ def run(device=None, *, verbose=False):
         detail['full_route_bit_identical'] = parity
         detail['full_route_numerical_health'] = geometry_health
         detail['full_route_passed'] = geometry_passed
+        if hasattr(loader.load(), 'h3_int8_packed_dense_attention'):
+            try:
+                carrier = carriers[64]
+                route = _full_route(native, device, 64, 64)
+                routed = native.block_sparse_int8_attention_from_prequantized(
+                    carrier, route, validate_geometry=False
+                )
+                packed = native.packed_int8_attention_from_prequantized(carrier)
+                detail['packed_dense_passed'] = bool(
+                    torch.isfinite(packed).all() and torch.equal(packed, routed)
+                )
+            except Exception as error:
+                detail['packed_dense_passed'] = False
+                detail['packed_dense_error'] = '%s: %s' % (type(error).__name__, error)
 
         production_sparse_ok = any(
             bool(geometry_passed.get(_geometry_key(*geometry), False))
@@ -528,6 +590,11 @@ def sparse_geometry_check(q_tile, kv_tile, device=None, *, force=False):
         return False
     geometry_passed = detail.get('full_route_passed', {})
     return bool(geometry_passed.get(_geometry_key(*geometry), False))
+
+
+def packed_dense_check(device=None, *, force=False):
+    _passed, detail = _load_result(device, force=force)
+    return bool(detail.get('packed_dense_passed', False))
 
 
 def fused_q_check(device=None, *, force=False):

@@ -74,6 +74,18 @@ the established Q projection and packing path. The fixed exact 128x256 fused-Q
 kernel is selected only on SM80 or newer; this does not change the SM75 support
 of the existing attention kernels.
 
+ABI 4 also accepts the additive `h3_int8_threshold_route` symbol. It selects
+video KV tiles whose score exceeds the row's mean plus tau standard deviations,
+computed from the K-summary mean and covariance, so no score matrix, top-k, or
+sort is needed. It requires SM80 or newer and is optional when loading an older
+binary; the Python side then keeps top-k routing.
+
+64Q x 64KV routes run on the packed 64Q x 128KV kernel on SM86, SM89, and SM12x,
+where the card is usually power-limited and the packed kernel's lower energy
+per call becomes clock. Other targets keep the 64Q x 64KV kernel. 64Q x 32KV
+routes walk 32-token subtiles of the same 64-token carrier with the packed
+fine-route kernel on every target.
+
 ABI 4 also accepts the additive
 `h3_int8_quantize_bf16_rms_adaln_rowwise_convrot256` producer. The H3 ConvRot
 path uses its explicit-BF16-staging mode to fold RMSNorm and scalar AdaLN into

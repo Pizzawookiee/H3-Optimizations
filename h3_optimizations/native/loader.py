@@ -30,7 +30,7 @@ import torch
 ABI_VERSION = 4
 
 _LIBRARY_NAMES = {
-    'Windows': 'h3_int8_attention_v8.dll',
+    'Windows': 'h3_int8_attention_v9.dll',
     'Linux': 'libh3_int8_attention.so',
     'Darwin': 'libh3_int8_attention.dylib',
 }
@@ -66,7 +66,9 @@ def _override_path():
     the Registry package.
     """
     try:
-        text = _OVERRIDE_POINTER.read_text(encoding='utf-8')
+        # utf-8-sig: Windows editors and PowerShell 5.1 write a BOM, which
+        # would otherwise glue onto the first line and hide a leading comment.
+        text = _OVERRIDE_POINTER.read_text(encoding='utf-8-sig')
     except OSError:
         return None
     for line in text.splitlines():
@@ -136,6 +138,11 @@ def _bind(library):
     library.h3_int8_dense_attention.argtypes = (
         attention_common + [i] + geometry + strides + [f, i, sz]
     )
+    if hasattr(library, 'h3_int8_packed_dense_attention'):
+        library.h3_int8_packed_dense_attention.restype = i
+        library.h3_int8_packed_dense_attention.argtypes = (
+            attention_common + [i] + geometry + strides + [f, i, sz]
+        )
 
     library.h3_int8_sparse_attention.restype = i
     library.h3_int8_sparse_attention.argtypes = (
@@ -207,6 +214,14 @@ def _bind(library):
         fused_q.argtypes = [p] * 9 + [i64] * 3 + [i, f, sz]
 
     try:
+        threshold_route = library.h3_int8_threshold_route
+    except AttributeError:
+        pass
+    else:
+        threshold_route.restype = i
+        threshold_route.argtypes = [p] * 7 + [i, i] + [i64] * 3 + [i] * 5 + [f, sz]
+
+    try:
         sparse_sage_sa2pp = library.h3_sparse_sage_sa2pp_sm89
     except AttributeError:
         pass
@@ -222,6 +237,26 @@ def _bind(library):
 def _is_rocm_runtime():
     """PyTorch exposes ROCm GPUs through torch.cuda, so test HIP explicitly."""
     return bool(getattr(torch.version, 'hip', None))
+
+
+def _load_shared_library(path):
+    if platform.system() != 'Windows':
+        return ctypes.CDLL(str(path))
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    get_mode = kernel32.GetThreadErrorMode
+    get_mode.argtypes = []
+    get_mode.restype = ctypes.c_uint32
+    set_mode = kernel32.SetThreadErrorMode
+    set_mode.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    set_mode.restype = ctypes.c_int
+    previous = get_mode()
+    # Return DLL/dependency failures to ctypes instead of opening a system dialog.
+    if not set_mode(previous | 0x0001, None):  # SEM_FAILCRITICALERRORS
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.CDLL(str(path))
+    finally:
+        set_mode(previous, None)
 
 
 def load(force_reload=False):
@@ -252,7 +287,7 @@ def load(force_reload=False):
             raise NativeUnavailableError(_load_error)
 
         try:
-            library = ctypes.CDLL(str(path))
+            library = _load_shared_library(path)
         except OSError as error:
             # Usually a missing CUDA runtime or an architecture mismatch.
             _load_error = 'could not load %s: %s' % (path, error)

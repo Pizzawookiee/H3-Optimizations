@@ -25,6 +25,8 @@ from .int8_attention import (
     block_sparse_int8_attention_with_lse_from_prequantized,
     int8_attention_from_prequantized,
     int8_attention_is_available,
+    packed_dense_attention_is_available,
+    packed_int8_attention_from_prequantized,
     prequantize_int8_attention,
 )
 from .convrot import (
@@ -80,6 +82,8 @@ __all__ = [
     'fused_h3_q_is_available',
     'int8_attention_from_prequantized',
     'int8_attention_is_available',
+    'packed_dense_attention_is_available',
+    'packed_int8_attention_from_prequantized',
     'int8_attention_k_anchor_positions',
     'int8_attention_producer_is_available',
     'int8_attention_producer_spec',

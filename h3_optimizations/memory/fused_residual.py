@@ -28,13 +28,11 @@ capture.
 '''
 
 import logging
-import os
 import threading
 
 import torch
 
 LOG_PREFIX = '[H3 Optimizations]'
-DISABLE_ENV = 'H3_OPTIMIZATIONS_DISABLE_FUSED_RESIDUAL'
 MIN_KITCHEN = '0.2.34'
 VARIANT_CONVROT = 'convrot'
 VARIANT_PLAIN = 'plain'
@@ -81,8 +79,9 @@ def _log_once(reason):
 def set_enabled(enabled):
     '''Force the fused route on (subject to support), off, or back to Auto (None).
 
-    Intended for benchmarks and tests. The environment variable
-    ``H3_OPTIMIZATIONS_DISABLE_FUSED_RESIDUAL=1`` disables it process-wide.
+    Intended for benchmarks, tests, and debugging. There is deliberately no
+    environment switch: the Registry's package scanner flags runtime
+    environment reads, and a flagged release is withheld from users.
     '''
     global _OVERRIDE
     _OVERRIDE = None if enabled is None else bool(enabled)
@@ -109,7 +108,7 @@ def _kitchen_backend():
 
 def unavailable_reason(device=None):
     '''Cheap static check (no GPU work): None when the route can be attempted.'''
-    if _OVERRIDE is False or os.environ.get(DISABLE_ENV, '').strip() not in ('', '0'):
+    if _OVERRIDE is False:
         return 'disabled'
     if getattr(torch.version, 'hip', None):
         return 'requires the Comfy Kitchen CUDA backend (ROCm uses HIP kernels)'
@@ -427,7 +426,6 @@ def linear_residual_(
 
 
 __all__ = [
-    'DISABLE_ENV',
     'gated_swiglu_residual_',
     'linear_residual_',
     'set_enabled',

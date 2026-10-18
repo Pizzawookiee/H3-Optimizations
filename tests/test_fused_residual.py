@@ -73,8 +73,13 @@ class FusedResidualRouteTests(unittest.TestCase):
         fused_residual.set_enabled(False)
         self.assertEqual(fused_residual.unavailable_reason(), 'disabled')
         fused_residual.set_enabled(None)
-        with patch.dict(os.environ, {fused_residual.DISABLE_ENV: '1'}):
-            self.assertEqual(fused_residual.unavailable_reason(), 'disabled')
+        self.assertNotEqual(fused_residual.unavailable_reason(), 'disabled')
+
+    def test_no_environment_switch(self):
+        # The Registry scanner flags runtime environment reads.
+        source = Path(fused_residual.__file__).read_text(encoding='utf-8')
+        self.assertNotIn('os.environ', source)
+        self.assertFalse(hasattr(fused_residual, 'DISABLE_ENV'))
 
     def test_old_kitchen_is_reported_with_the_minimum_version(self):
         # Kitchen before 0.2.34: a loaded CUDA extension without the kernel.

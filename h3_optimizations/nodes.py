@@ -16,7 +16,7 @@ from .plan import (
     EARLY_SCHEDULE_OPTIONS,
     EARLY_SCHEDULE_RAMP,
     SPARSE_BACKEND_COMPAT_REQUESTS,
-    SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X32,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
     VIDEO_TOKEN_ORDER_REQUESTS,
@@ -63,8 +63,9 @@ def _video_budget_input():
             'and can reduce prompt adherence, change motion/detail, or otherwise '
             'change the result. There is no universally safe value: some prompts '
             'tolerate very low budgets while others require substantially more. '
-            'The request rounds up to whole KV tiles; non-video context and mixed '
-            'boundary tiles stay dense. 1.0 retains the full video route. The '
+            'Native threshold routing targets this density with variable tile '
+            'counts per row; other routers round up to whole KV tiles. Non-video '
+            'context and mixed boundary tiles stay dense. 1.0 retains the full video route. The '
             'displayed range is the recommended editing range; finite workflow '
             'values outside it saturate to at least one or at most all video tiles.'
         ),
@@ -97,7 +98,7 @@ class H3SparseAttention(io.ComfyNode):
             display_name='H3 Sparse Attention',
             category=NODE_CATEGORY,
             description=(
-                'Fixed-density sparse attention for MiniMax H3. Lower video '
+                'Budgeted sparse attention for MiniMax H3. Lower video '
                 'attention budgets are faster but can reduce prompt adherence, '
                 'change motion/detail, or otherwise change the generated result; '
                 'no percentage is lossless for every prompt. Text, reference '
@@ -180,7 +181,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 'to the measured 1x8x8 geometry and can be restored to stock raster '
                 'order. Lower budgets are faster but can change the generated '
                 'result, and the quality cost depends on the prompt and where '
-                'removed in the denoising schedule. Kitchen INT8 64Q x 64KV '
+                'removed in the denoising schedule. Kitchen INT8 64Q x 32KV '
                 '(Quality) is the default; the other geometries and backends '
                 'are available as explicit alternatives.'
             ),
@@ -252,13 +253,18 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     'backend',
                     display_name='Sparse backend',
                     options=list(SPARSE_BACKEND_PUBLIC_REQUESTS),
-                    default=SPARSE_BACKEND_KITCHEN,
+                    default=SPARSE_BACKEND_KITCHEN_64X32,
                     tooltip=(
-                        'Kitchen INT8 64Q x 64KV (Quality) is the default. '
+                        'Kitchen INT8 64Q x 32KV (Quality) is the default, using '
+                        'threshold routing when the native router is available. '
                         'Kitchen INT8 64Q x 128KV (Faster) was faster in the '
                         'measured full-block SM89 comparison, but its coarser '
                         'KV selections can change output quality and the speed '
                         'gain is not guaranteed on every GPU. '
+                        'Kitchen INT8 64Q x 32KV (Quality) routes finer '
+                        '32-token KV tiles over the same carrier: lower error '
+                        'at a given budget, measured faster than 64Q x 64KV '
+                        'at equal quality on SM89. '
                         'FROST BF16, BF16 Triton, and FP8 FlexAttention use '
                         '64Q x 64KV routing. Sparse Sage uses 128Q x 64KV on '
                         'SM80/86/87/89/120 and 64Q x 128KV on SM90. '
@@ -305,7 +311,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         early_kv=_ADVANCED_DEFAULT_EARLY_KV,
         late_steps=DEFAULT_LATE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
-        backend=SPARSE_BACKEND_KITCHEN,
+        backend=SPARSE_BACKEND_KITCHEN_64X32,
         early_schedule=_ADVANCED_DEFAULT_EARLY_SCHEDULE,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
     ):

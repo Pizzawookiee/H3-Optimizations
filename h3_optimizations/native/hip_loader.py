@@ -33,7 +33,7 @@ class NativeHIPCallError(RuntimeError):
 
 def _override_path():
     try:
-        text = _OVERRIDE_POINTER.read_text(encoding='utf-8')
+        text = _OVERRIDE_POINTER.read_text(encoding='utf-8-sig')  # tolerate a BOM
     except OSError:
         return None
     for line in text.splitlines():

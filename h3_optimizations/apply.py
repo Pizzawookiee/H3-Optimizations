@@ -100,6 +100,7 @@ from .plan import (
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128,
+    SPARSE_BACKEND_KITCHEN_64X32,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
@@ -875,6 +876,7 @@ def _resolve_kitchen_sparse(
         backend=getattr(environment, 'backend', None),
         q_tile=q_tile,
         kv_tile=kv_tile,
+        device=getattr(environment, 'device_index', None),
     )
     qkv = resolve_qkv_provider(
         inventory,
@@ -1057,6 +1059,14 @@ def _resolve_attention(plan, model, inventory, environment):
                 q_tile=64,
                 kv_tile=128,
             )
+        if backend_request == SPARSE_BACKEND_KITCHEN_64X32:
+            return _resolve_kitchen_sparse(
+                plan,
+                environment,
+                inventory,
+                q_tile=64,
+                kv_tile=32,
+            )
         if backend_request == SPARSE_BACKEND_FLEX:
             return _resolve_fp8_flex(
                 plan,
@@ -1079,6 +1089,12 @@ def _resolve_attention(plan, model, inventory, environment):
     if plan.sparse is None:
         return dense_attention, dense_qkv
 
+    try:
+        return _resolve_kitchen_sparse(
+            plan, environment, inventory, q_tile=64, kv_tile=32,
+        )
+    except SparseKitchenError:
+        pass
     try:
         return _resolve_kitchen_sparse(plan, environment, inventory)
     except SparseKitchenError as kitchen_exc:
