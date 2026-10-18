@@ -30,7 +30,7 @@ import torch
 ABI_VERSION = 4
 
 _LIBRARY_NAMES = {
-    'Windows': 'h3_int8_attention_v6.dll',
+    'Windows': 'h3_int8_attention_v8.dll',
     'Linux': 'libh3_int8_attention.so',
     'Darwin': 'libh3_int8_attention.dylib',
 }
@@ -205,14 +205,6 @@ def _bind(library):
     else:
         fused_q.restype = i
         fused_q.argtypes = [p] * 9 + [i64] * 3 + [i, f, sz]
-
-    try:
-        fused_kv = library.h3_int8_fused_kv
-    except AttributeError:
-        pass
-    else:
-        fused_kv.restype = i
-        fused_kv.argtypes = [p] * 12 + [i64] * 3 + [i] * 2 + [f, sz]
 
     try:
         sparse_sage_sa2pp = library.h3_sparse_sage_sa2pp_sm89

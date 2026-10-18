@@ -38,7 +38,7 @@ MAX_LINUX_BINARY_BYTES = 50 * 1024 * 1024
 
 class NativeShippingTests(unittest.TestCase):
     def test_native_binaries_are_packaged(self):
-        windows_binary = BIN_DIR / 'h3_int8_attention_v6.dll'
+        windows_binary = BIN_DIR / 'h3_int8_attention_v8.dll'
         linux_binary = BIN_DIR / 'libh3_int8_attention.so'
 
         self.assertEqual(loader._LIBRARY_NAMES['Windows'], windows_binary.name)
@@ -76,7 +76,6 @@ class NativeShippingTests(unittest.TestCase):
         # entry points the Python bindings dlsym at runtime are really present.
         required = (
             b'h3_int8_fused_q',
-            b'h3_int8_fused_kv',
             b'h3_int8_quantize_bf16_rowwise_convrot256',
             b'h3_int8_quantize_bf16_rms_adaln_rowwise_convrot256',
             b'h3_int8_quantize_q_chunk',
@@ -86,7 +85,7 @@ class NativeShippingTests(unittest.TestCase):
             b'h3_sparse_sage_sa2pp_sm89',
             b'h3_int8_sparse_attention_tiles',
         )
-        for name in ('h3_int8_attention_v6.dll', 'libh3_int8_attention.so'):
+        for name in ('h3_int8_attention_v8.dll', 'libh3_int8_attention.so'):
             contents = (BIN_DIR / name).read_bytes()
             for symbol in required:
                 self.assertIn(symbol, contents, '%s is missing %s' % (name, symbol.decode()))

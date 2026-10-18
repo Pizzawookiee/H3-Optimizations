@@ -378,10 +378,10 @@ The production sparse geometry is 64Q x 64KV. Compatible ConvRot-256 TensorWise
 INT8 QKV can feed the sparse carrier without materializing full-sequence BF16
 Q/K/V.
 
-For compatible ConvRot-256 INT8 checkpoints on SM80+, the path can use exact
-fused Q and K/V producers. Q projection dimensions are 128x256, but attention
-routing remains 64Q x 64KV. Independent one-time parity checks fall back to the
-established producer when needed.
+For compatible ConvRot-256 INT8 checkpoints on SM80+, the path can use an exact
+fused Q producer. Q projection dimensions are 128x256, but attention routing
+remains 64Q x 64KV. A one-time parity check falls back to the established
+producer when needed.
 
 The repository ships Windows x64 and Linux x86-64 binaries. On first use, the
 loader checks the ABI and runs a cached per-GPU numerical self-test. Nothing is
