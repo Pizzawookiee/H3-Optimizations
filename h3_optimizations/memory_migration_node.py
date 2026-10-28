@@ -26,6 +26,7 @@ from .plan import (
     MIN_CHUNK_ROWS,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_BF16,
+    MLP_MEMORY_CONVROT_2SLICE,
     MLP_MEMORY_FORCE_QUANT,
     MLP_MEMORY_OFF,
     MLP_MEMORY_PRESERVE,
@@ -224,11 +225,16 @@ class H3MemoryOptimization(io.ComfyNode):
                 io.Combo.Input(
                     'mlp_memory',
                     display_name='MLP memory optimization',
-                    options=[MLP_MEMORY_AUTO, MLP_MEMORY_OFF],
+                    options=[
+                        MLP_MEMORY_AUTO,
+                        MLP_MEMORY_CONVROT_2SLICE,
+                        MLP_MEMORY_OFF,
+                    ],
                     default=MLP_MEMORY_AUTO,
                     tooltip=(
-                        'auto applies the selected precision policy while retaining '
-                        'bounded MLP chunking. '
+                        'auto applies the selected precision policy with bounded '
+                        'row chunking. convrot_2slice_experimental explicitly enables '
+                        'the experimental two-slice path for compatible checkpoints. '
                         'Explicit off remains off.'
                     ),
                 ),
@@ -269,11 +275,11 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=PRECISION_MODE_AUTO,
                     advanced=True,
                     tooltip=(
-                        'Auto selects the best compatible native path and may use FP8 '
-                        'conversion as a fallback. BF16 materializes supported weights '
+                        'Auto preserves floating checkpoints and keeps supported native '
+                        'quantized formats native. BF16 materializes supported weights '
                         'as BF16. Preserve native never introduces a new conversion. '
                         'Force quant keeps supported quantized checkpoints native and '
-                        'converts floating H3 linears to execution-scoped ConvRot-256 INT8.'
+                        'converts floating H3 linears once to canonical ConvRot-256 INT8.'
                     ),
                 ),
                 io.Combo.Input(

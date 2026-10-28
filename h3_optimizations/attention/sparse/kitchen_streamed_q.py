@@ -37,6 +37,8 @@ from ...kitchen_qkv import (
     producer_api_available,
     resolve_kitchen,
 )
+from ...native import threshold_route as native_threshold_route
+from ...native.int8_attention import carrier_kv_tile
 from ...qkv.formats import describe_linear
 from ...qkv.fused_q import HeldExactH3FusedQ, fused_h3_q_supported
 from ...qkv.streamed import (
@@ -83,6 +85,18 @@ class StreamedSparseKitchenQKV:
         self.fused_q = False
 
 
+# Route selection mode, read per request from transformer_options (so a
+# benchmark or experiment can set it on a patched model). 'topk' keeps exactly
+# the budget's tiles per row; 'threshold' keeps tiles scoring above the row's
+# mean + tau * std, tau from the budget (native/threshold_route.py), and falls
+# back to top-k where the native router is unavailable.
+ROUTE_MODE_KEY = "h3_sparse_route_mode"
+ROUTE_MODE_TOPK = "topk"
+ROUTE_MODE_THRESHOLD = "threshold"
+DEFAULT_ROUTE_MODE = ROUTE_MODE_THRESHOLD
+DENSE_QUERY_KEY = "h3_dense_query_dispatch"
+
+
 @dataclass
 class _StreamedRoutePlan:
     geometry: object
@@ -90,9 +104,15 @@ class _StreamedRoutePlan:
     k_summary: torch.Tensor | None
     batch: int
     heads: int
+    mode: str = ROUTE_MODE_TOPK
+    k_mean: torch.Tensor | None = None
+    k_cov: torch.Tensor | None = None
+    tau: float = 0.0
 
     def release(self):
         self.k_summary = None
+        self.k_mean = None
+        self.k_cov = None
 
 
 @dataclass
@@ -100,6 +120,7 @@ class PreparedStreamedSparseKitchen:
     projected: StreamedSparseKitchenQKV
     route_plan: _StreamedRoutePlan | None
     metadata: dict
+    dense_query_rows: int = 0
 
     def release(self):
         if self.projected is not None:
@@ -188,9 +209,11 @@ def _run_streamed_sparse_kitchen_qkv(
         return None
 
     q_tile = int(projector.q_tile or 64)
+    # kv_tile is the route tile; a 32-token route walks the 64-token carrier.
     kv_tile = int(projector.kv_tile or 64)
+    carrier_tile = carrier_kv_tile(kv_tile)
     chunk_rows = int(projector.chunk_rows)
-    alignment = math.lcm(q_tile, kv_tile)
+    alignment = math.lcm(q_tile, carrier_tile)
     if chunk_rows <= 0 or chunk_rows % alignment:
         return None
 
@@ -208,7 +231,7 @@ def _run_streamed_sparse_kitchen_qkv(
             shape,
             dtype=x.dtype,
             device=x.device,
-            cta_k=kv_tile,
+            cta_k=carrier_tile,
         )
     except kitchen.Int8AttentionProducerUnavailableError:
         return None
@@ -299,7 +322,7 @@ def _run_streamed_sparse_kitchen_qkv(
     )
 
 
-def _prepare_route_plan(router, k_summary, layout, video_budget):
+def _prepare_route_plan(router, k_summary, layout, video_budget, mode=ROUTE_MODE_TOPK):
     geometry = router.geometry(layout)
     if tuple(k_summary.shape[-2:]) != (
         geometry.kv_tiles,
@@ -308,15 +331,39 @@ def _prepare_route_plan(router, k_summary, layout, video_budget):
         raise SparseRouterError("K router summary shape does not match layout")
     retained = router._retained(video_budget, geometry)
     metadata = router._metadata(geometry, video_budget, retained)
-    return (
-        _StreamedRoutePlan(
-            geometry=geometry,
-            retained=retained,
-            k_summary=k_summary,
-            batch=int(k_summary.shape[0]),
-            heads=int(k_summary.shape[1]),
-        ),
-        metadata,
+    plan = _StreamedRoutePlan(
+        geometry=geometry,
+        retained=retained,
+        k_summary=k_summary,
+        batch=int(k_summary.shape[0]),
+        heads=int(k_summary.shape[1]),
+    )
+    if (
+        mode == ROUTE_MODE_THRESHOLD
+        and 0 < retained < geometry.pure_video_kv_tiles
+        and k_summary.dtype == torch.bfloat16
+        and native_threshold_route.threshold_route_is_available(k_summary.device)
+    ):
+        plan.mode = ROUTE_MODE_THRESHOLD
+        plan.k_mean, plan.k_cov = native_threshold_route.video_statistics(
+            k_summary[..., geometry.pure_video_kv_start :, :]
+        )
+        plan.tau = native_threshold_route.budget_tau(
+            retained / geometry.pure_video_kv_tiles
+        )
+    return plan, metadata
+
+
+def _build_threshold_route_chunk(plan, q_summary, *, tile_start):
+    geometry = plan.geometry
+    return native_threshold_route.threshold_route(
+        q_summary,
+        plan.k_summary,
+        plan.k_mean,
+        plan.k_cov,
+        pure_video_kv_start=geometry.pure_video_kv_start,
+        dense_rows=geometry.pure_video_q_start - tile_start,
+        tau=plan.tau,
     )
 
 
@@ -335,6 +382,8 @@ def _build_route_chunk(router, plan, q_summary, *, tile_start):
         or not 0 <= tile_start < tile_end <= geometry.q_tiles
     ):
         raise SparseRouterError("Q router summary chunk does not match route plan")
+    if plan.mode == ROUTE_MODE_THRESHOLD:
+        return _build_threshold_route_chunk(plan, q_summary, tile_start=tile_start)
 
     dense = torch.arange(
         geometry.kv_tiles, device=q_summary.device, dtype=torch.int32
@@ -375,6 +424,15 @@ def _quantize_q_chunk(kitchen, global_carrier, q):
     return _pack_q_chunk(kitchen, global_carrier, q)
 
 
+def _query_spans(sequence, chunk_rows, dense_rows):
+    for start in range(0, sequence, chunk_rows):
+        stop = min(start + chunk_rows, sequence)
+        if start < dense_rows < stop:
+            yield start, dense_rows
+            start = dense_rows
+        yield start, stop
+
+
 class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
     """Sparse Kitchen with the same lazy-Q route lifecycle as other backends."""
 
@@ -407,12 +465,30 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                     projected.k_summary,
                     snapshot.layout,
                     video_budget,
+                    mode=(transformer_options or {}).get(
+                        ROUTE_MODE_KEY, DEFAULT_ROUTE_MODE
+                    ),
                 )
         except SparseRouterError as exc:
             projected.release()
             raise SparseKitchenError("sparse routing failed: %s" % exc) from exc
 
         projected.k_summary = None
+        dense_query_rows = 0
+        dense_available = getattr(projected.producer_module, "packed_dense_attention_is_available", None)
+        if (
+            (transformer_options or {}).get(DENSE_QUERY_KEY, False)
+            and self.executor.q_tile == 64
+            and projected.carrier.cta_k == 64
+            and projected.carrier.k.shape[-1] == 128
+            and dense_available is not None
+            and dense_available(projected.carrier.k.device)
+        ):
+            geometry = route_plan.geometry
+            dense_query_rows = (
+                sequence if route_plan.retained == geometry.pure_video_kv_tiles
+                else min(sequence, geometry.pure_video_q_start * 64)
+            )
         metadata = route_metadata(
             mask_metadata,
             layer_index,
@@ -421,6 +497,8 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
         metadata.update(
             {
                 "qkv_lifetime": "streamed_q_global_kitchen_kv",
+                "route_mode": route_plan.mode,
+                "dense_query_rows": dense_query_rows,
                 "router_lifetime": "k_summary_q_slab_selection_lazy_kitchen_lut",
                 "attention_output": "chunked_out_proj_inplace",
                 "q_producer": (
@@ -434,6 +512,7 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
             projected=projected,
             route_plan=route_plan,
             metadata=metadata,
+            dense_query_rows=dense_query_rows,
         )
 
     def execute_projected(self, module, prepared):
@@ -453,8 +532,18 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
         producer_module = projected.producer_module
         if producer_module is None:
             raise SparseKitchenError("streamed Sparse Kitchen producer was released")
-        output = attention_output_buffer(projected.output_buffer)
-        if output is None:
+        residual_source = projected.output_buffer
+        project_residual = getattr(module, "_h3_out_proj_residual", None)
+        in_place_residual = bool(
+            callable(project_residual)
+            and getattr(residual_source, "attention_residual_pending", False)
+        )
+        output = (
+            None
+            if in_place_residual
+            else attention_output_buffer(residual_source)
+        )
+        if output is None and not in_place_residual:
             raise SparseKitchenError(
                 "streamed Sparse Kitchen requires an output-capturing projector"
             )
@@ -480,8 +569,8 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
             full_k_length = (
                 int(projected.carrier.k.shape[-2]) if fused is not None else None
             )
-            for start in range(0, sequence, query_rows):
-                stop = min(start + query_rows, sequence)
+            for start, stop in _query_spans(sequence, query_rows, prepared.dense_query_rows):
+                dense_query = stop <= prepared.dense_query_rows
                 q_x = projected.x
                 q_rope = projected.rope_freqs
                 q_start = start
@@ -503,8 +592,9 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                         )
                     finally:
                         held.__exit__(None, None, None)
-                    with diagnostics.stage("sparse_route"):
-                        q_summary = _tile_mean(q, q_tile)
+                    if not dense_query:
+                        with diagnostics.stage("sparse_route"):
+                            q_summary = _tile_mean(q, q_tile)
                     chunk_carrier = _quantize_q_chunk(
                         producer_module,
                         projected.carrier,
@@ -525,31 +615,39 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                         q_scale=q_scale,
                     )
                     del packed_q, q_scale
-                tile_start = start // q_tile
-                with diagnostics.stage("sparse_route"):
-                    lut, counts = _build_route_chunk(
-                        self.router,
-                        prepared.route_plan,
-                        q_summary,
-                        tile_start=tile_start,
+                if dense_query:
+                    if fused is not None:
+                        del q_summary
+                    with diagnostics.stage('dense_attention_kernel'):
+                        raw = producer_module.packed_int8_attention_from_prequantized(
+                            chunk_carrier, output_layout=OUTPUT_NHD,
+                        )
+                else:
+                    tile_start = start // q_tile
+                    with diagnostics.stage("sparse_route"):
+                        lut, counts = _build_route_chunk(
+                            self.router,
+                            prepared.route_plan,
+                            q_summary,
+                            tile_start=tile_start,
+                        )
+                        del q_summary
+                    route = kitchen.BlockSparseRoute(
+                        indices=lut,
+                        counts=counts,
+                        q_tile=q_tile,
+                        kv_tile=int(self.executor.kv_tile),
+                        encoding="delta",
                     )
-                    del q_summary
-                route = kitchen.BlockSparseRoute(
-                    indices=lut,
-                    counts=counts,
-                    q_tile=q_tile,
-                    kv_tile=int(self.executor.kv_tile),
-                    encoding="delta",
-                )
-                del lut, counts
+                    del lut, counts
 
-                with diagnostics.stage("sparse_attention_kernel"):
-                    raw = kitchen.block_sparse_int8_attention_from_prequantized(
-                        chunk_carrier,
-                        route,
-                        output_layout=OUTPUT_NHD,
-                    )
-                del route, chunk_carrier
+                    with diagnostics.stage("sparse_attention_kernel"):
+                        raw = kitchen.block_sparse_int8_attention_from_prequantized(
+                            chunk_carrier, route, output_layout=OUTPUT_NHD,
+                        )
+                    del route
+
+                del chunk_carrier
 
                 if stop == sequence:
                     projected.carrier = None
@@ -563,11 +661,25 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 )
                 del raw
                 with diagnostics.stage("attention_out"):
-                    projected_rows = module.out_proj(flat.squeeze(0))
-                    output[start:stop].copy_(projected_rows)
-                    del projected_rows
+                    projection_input = flat.squeeze(0)
+                    if in_place_residual:
+                        residual_source.write_attention_residual(
+                            projection_input,
+                            start,
+                            stop,
+                            module.out_proj,
+                            project_residual,
+                        )
+                    else:
+                        projected_rows = module.out_proj(projection_input)
+                        output[start:stop].copy_(projected_rows)
+                        del projected_rows
                 del flat
-            return output
+            return (
+                residual_source.finish_attention_residual()
+                if in_place_residual
+                else output
+            )
         finally:
             if fused is not None:
                 fused.__exit__(None, None, None)

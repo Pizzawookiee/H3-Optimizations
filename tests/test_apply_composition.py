@@ -462,7 +462,7 @@ class ApplyCompositionTests(unittest.TestCase):
             'synthetic',
         )
 
-        def resolve(plan, *_args):
+        def resolve(plan, *_args, **_kwargs):
             return resolved_attention(plan), qkv
 
         with mock.patch.object(

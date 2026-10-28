@@ -3,15 +3,14 @@
 from dataclasses import dataclass
 
 from ..plan import (
+    FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     FUSED_QKV_REQUIRED,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_BF16,
+    MLP_MEMORY_CONVROT_2SLICE,
     MLP_MEMORY_FORCE_QUANT,
-    MLP_MEMORY_LEGACY_BF16,
-    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
-    MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_OFF,
     MLP_MEMORY_PRESERVE,
 )
@@ -44,6 +43,7 @@ MLP_FLOAT_CHUNKED = 'float_chunked'
 MLP_FP8_CHUNKED = 'fp8_chunked'
 MLP_RUNTIME_CONVROT_INT8_CHUNKED = 'runtime_convrot_int8_chunked'
 MLP_W4A8_CHUNKED = 'w4a8_chunked'
+MLP_CONVROT_INT8_CHUNKED = 'convrot_int8_chunked'
 MLP_CONVROT_INT8_TWO_SLICE = 'convrot_int8_two_slice'
 
 # These backends already consume the package's Kitchen INT8 carrier. A native
@@ -187,6 +187,12 @@ def resolve_qkv_provider(
         return _required_or_standard(
             request, 'H3 QKV layers use mixed weight formats'
         )
+    if (
+        request == FUSED_QKV_AUTO
+        and memory_optimize
+        and inventory.qkv_plain_float
+    ):
+        request = FUSED_QKV_PRESERVE_BF16
     if backend_kind == 'dense_sage_sm89':
         if not inventory.qkv_convrot_int8_256:
             return _required_or_standard(
@@ -356,11 +362,11 @@ def _resolve_preserve_precision_mlp(inventory, fp8_available):
     """Use bounded MLP execution without introducing new quantization."""
     if _convrot_compatible(inventory):
         return MLPProviderResolution(
-            MLP_CONVROT_INT8_TWO_SLICE,
-            'mlp_chunked_convrot_2slice',
+            MLP_CONVROT_INT8_CHUNKED,
+            'mlp_chunked_native',
             (
-                'checkpoint-native ConvRot-256 TensorWise INT8 MLP uses token '
-                'chunks and two feature slices without requantization'
+                'checkpoint-native ConvRot-256 TensorWise INT8 MLP uses bounded '
+                'token chunks without requantization'
             ),
         )
     if inventory.mlp_w4a8:
@@ -422,11 +428,6 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
             'MLP memory optimization was disabled',
         )
     if not inventory.fc1 or not inventory.fc2:
-        if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
-            raise RuntimeError(
-                'required ConvRot two-slice MLP is unavailable: '
-                'the H3 model has no MLP inventory'
-            )
         return MLPProviderResolution(
             MLP_OFF,
             'off',
@@ -439,6 +440,20 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
             MLP_FLOAT_CHUNKED,
             'mlp_chunked_bf16',
             'MLP weights are materialized as BF16 for bounded BF16 execution',
+        )
+    if request == MLP_MEMORY_CONVROT_2SLICE:
+        if not _convrot_compatible(inventory):
+            labels = sorted(
+                set(inventory.labels('fc1')) | set(inventory.labels('fc2'))
+            )
+            raise RuntimeError(
+                'experimental ConvRot two-slice MLP is unavailable for %s'
+                % (', '.join(labels) or 'unknown formats')
+            )
+        return MLPProviderResolution(
+            MLP_CONVROT_INT8_TWO_SLICE,
+            'mlp_chunked_convrot_2slice',
+            'experimental ConvRot two-slice MLP was explicitly selected',
         )
     if request == MLP_MEMORY_FORCE_QUANT:
         if inventory.mlp_plain_float:
@@ -457,49 +472,14 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
             )
         return resolved
     if _convrot_compatible(inventory):
-        if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
-            return MLPProviderResolution(
-                MLP_CONVROT_INT8_TWO_SLICE,
-                'mlp_chunked_convrot_2slice',
-                'deprecated compatibility request requires ConvRot two-slice execution',
-            )
-        if request in (MLP_MEMORY_LEGACY_BF16, MLP_MEMORY_LEGACY_NATIVE):
-            return MLPProviderResolution(
-                MLP_FLOAT_CHUNKED,
-                (
-                    'mlp_chunked_bf16'
-                    if request == MLP_MEMORY_LEGACY_BF16
-                    else 'mlp_chunked_native'
-                ),
-                'deprecated compatibility request preserves explicit chunked MLP math',
-            )
         if request != MLP_MEMORY_AUTO:
             raise ValueError('unknown MLP memory request %r' % request)
         return MLPProviderResolution(
-            MLP_CONVROT_INT8_TWO_SLICE,
-            'mlp_chunked_convrot_2slice',
+            MLP_CONVROT_INT8_CHUNKED,
+            'mlp_chunked_native',
             (
-                'ConvRot-256 TensorWise INT8 MLP uses token chunks and two '
-                'feature slices'
+                'ConvRot-256 TensorWise INT8 MLP uses bounded token chunks'
             ),
-        )
-    if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
-        labels = sorted(
-            set(inventory.labels('fc1')) | set(inventory.labels('fc2'))
-        )
-        raise RuntimeError(
-            'required ConvRot two-slice MLP is unavailable for %s'
-            % (', '.join(labels) or 'unknown formats')
-        )
-    if request in (MLP_MEMORY_LEGACY_BF16, MLP_MEMORY_LEGACY_NATIVE):
-        return MLPProviderResolution(
-            MLP_FLOAT_CHUNKED,
-            (
-                'mlp_chunked_bf16'
-                if request == MLP_MEMORY_LEGACY_BF16
-                else 'mlp_chunked_native'
-            ),
-            'deprecated compatibility request preserves explicit chunked MLP math',
         )
     if request != MLP_MEMORY_AUTO:
         raise ValueError('unknown MLP memory request %r' % request)
@@ -522,17 +502,7 @@ def resolve_mlp_provider(inventory, *, request, fp8_available=False):
             'FP8 checkpoint detected but accelerated FP8 execution is unavailable',
         )
     if inventory.mlp_plain_float:
-        if fp8_available:
-            return MLPProviderResolution(
-                MLP_FP8_CHUNKED,
-                'mlp_chunked_fp8',
-                'floating H3 MLP weights are converted to FP8 E4M3 for Memory auto',
-            )
-        return MLPProviderResolution(
-            MLP_FLOAT_CHUNKED,
-            'mlp_chunked_native',
-            'floating H3 MLP uses bounded held-weight token chunking',
-        )
+        return _resolve_preserve_precision_mlp(inventory, fp8_available)
 
     labels = sorted(
         set(inventory.labels('fc1')) | set(inventory.labels('fc2'))

@@ -19,15 +19,22 @@ bound, so this is close to even on time and removes one full-sequence BF16
 tensor from the block's peak.
 
 Consumers that need a real tensor can call ``materialize()``. Streamed
-attention consumers call ``attention_output_buffer()`` when they are ready to
-overwrite the disposable normalized input. For lazy rows that allocates a
-distinct output tensor at that late point, because the wrapped tensor is still
-the block residual.
+attention consumers normally call ``attention_output_buffer()`` when they are
+ready to write the projected result. A compatible INT8 output projection can
+instead consume each slab through ``write_attention_residual()`` and update the
+wrapped block residual directly.
 '''
 
 from __future__ import annotations
 
 import torch
+
+import comfy.ops
+
+from .native import (
+    RMS_ADALN_BF16_STAGED,
+    quantize_rms_adaln_int8_rowwise_convrot256,
+)
 
 
 NORM1_SOURCE_KEY = 'h3_optimizations_norm1_source'
@@ -53,6 +60,9 @@ class NormalizedRows:
         '_scale',
         '_apply',
         '_output',
+        '_attention_gate',
+        '_attention_next',
+        '_fused_convrot_quantize',
         'shape',
         'dtype',
         'device',
@@ -69,6 +79,9 @@ class NormalizedRows:
         self._scale = scale
         self._apply = apply_modulation
         self._output = None
+        self._attention_gate = None
+        self._attention_next = 0
+        self._fused_convrot_quantize = False
         self.shape = x.shape
         self.dtype = x.dtype
         self.device = x.device
@@ -173,6 +186,117 @@ class NormalizedRows:
     def materialize(self):
         '''Full ``[sequence, hidden]`` tensor, for consumers that need one.'''
         return self[0:int(self._x.shape[0])]
+
+    def enable_fused_convrot_quantization(self):
+        self._fused_convrot_quantize = True
+
+    def quantize_convrot256(self, start, stop):
+        '''Produce the staged Norm1 + AdaLN ConvRot carrier, or decline.'''
+        if not self._fused_convrot_quantize:
+            return None
+        start = int(start)
+        stop = int(stop)
+        pieces = []
+        norm_weight = comfy.ops.cast_to_input(self._norm.weight, self._x).contiguous()
+        for seg_start, seg_stop, selector in self._segments:
+            lo = max(start, seg_start)
+            hi = min(stop, seg_stop)
+            if lo >= hi:
+                continue
+            if torch.is_tensor(selector):
+                return None
+            pieces.append(
+                quantize_rms_adaln_int8_rowwise_convrot256(
+                    self._x[lo:hi],
+                    norm_weight,
+                    self._shift[selector].contiguous(),
+                    self._scale[selector].contiguous(),
+                    self._norm.eps,
+                    mode=RMS_ADALN_BF16_STAGED,
+                )
+            )
+        if not pieces:
+            raise RuntimeError('fused Norm1 quantizer received an empty row range')
+        if len(pieces) == 1:
+            return pieces[0]
+        return (
+            torch.cat([piece[0] for piece in pieces], dim=0),
+            torch.cat([piece[1] for piece in pieces], dim=0),
+        )
+
+    def enable_attention_residual(self, gate):
+        '''Offer the wrapped residual to a compatible streamed out projection.'''
+        self._attention_gate = gate
+        self._attention_next = 0
+
+    @property
+    def attention_residual_pending(self):
+        return (
+            self._attention_gate is not None
+            and self._attention_next < int(self._x.shape[0])
+        )
+
+    @property
+    def attention_residual_complete(self):
+        return (
+            self._attention_gate is not None
+            and self._attention_next == int(self._x.shape[0])
+        )
+
+    def write_attention_residual(
+        self,
+        rows,
+        start,
+        stop,
+        project,
+        project_residual,
+    ):
+        '''Project one ordered attention slab straight into the block residual.'''
+        start = int(start)
+        stop = int(stop)
+        if self._attention_gate is None:
+            raise RuntimeError('attention residual output was not enabled')
+        if start != self._attention_next or stop <= start:
+            raise RuntimeError(
+                'attention residual slabs must cover rows in order; got [%d, %d) after %d'
+                % (start, stop, self._attention_next)
+            )
+        if tuple(rows.shape[:1]) != (stop - start,):
+            raise RuntimeError('attention residual slab row count does not match its range')
+
+        pieces = []
+        for seg_start, seg_stop, selector in self._segments:
+            lo = max(seg_start, start)
+            hi = min(seg_stop, stop)
+            if lo >= hi:
+                continue
+            pieces.append((lo, hi, seg_start, selector))
+
+        if len(pieces) == 1 and not torch.is_tensor(pieces[0][3]):
+            lo, hi, _seg_start, selector = pieces[0]
+            gate = self._attention_gate[selector].to(dtype=self._x.dtype)
+            if project_residual(rows, self._x[lo:hi], gate):
+                self._attention_next = stop
+                return
+
+        projected = project(rows)
+        for lo, hi, seg_start, selector in pieces:
+            residual = self._x[lo:hi]
+            if torch.is_tensor(selector):
+                sub = selector[lo - seg_start:hi - seg_start]
+                if sub.device != self._attention_gate.device:
+                    sub = sub.to(device=self._attention_gate.device)
+                gate = self._attention_gate[sub].to(dtype=residual.dtype)
+            else:
+                gate = self._attention_gate[selector].to(dtype=residual.dtype)
+            residual.addcmul_(projected[lo - start:hi - start], gate)
+
+        self._attention_next = stop
+
+    def finish_attention_residual(self):
+        if not self.attention_residual_complete:
+            raise RuntimeError('attention residual output did not cover the full sequence')
+        return self._x
 
     def output_buffer(self):
         '''Allocate the full attention output only after input projection.'''

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import comfy.model_management
 import comfy.ops
 import comfy.quant_ops
-from comfy.quant_ops import QuantizedTensor
+from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
 from .. import diagnostics
 from .formats import describe_linear, describe_weight
@@ -146,6 +146,78 @@ class HeldConvRotINT8Linear:
         comfy.ops.run_every_op()
         return self._linear(x, self.weight)
 
+    @staticmethod
+    def prequantized_is_available():
+        try:
+            from comfy_kitchen.backends import cuda
+        except ImportError:
+            return False
+        return callable(getattr(cuda, '_int4_linear_via_int8_values', None))
+
+    @staticmethod
+    def _prequantized_values(
+        qdata,
+        scale,
+        weight_qdata,
+        weight_scale,
+        out_dtype,
+    ):
+        from comfy_kitchen.backends import cuda
+
+        function = getattr(cuda, '_int4_linear_via_int8_values', None)
+        if function is None:
+            raise ConvRotINT8BindingError(
+                'Comfy Kitchen has no prequantized INT8 GEMM entry point'
+            )
+        return function(
+            qdata,
+            weight_qdata,
+            scale,
+            weight_scale,
+            None,
+            out_dtype,
+        )
+
+    @classmethod
+    def _prequantized_linear(cls, qdata, scale, weight, out_dtype):
+        weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+        return cls._prequantized_values(
+            qdata,
+            scale,
+            weight_qdata,
+            weight_scale,
+            out_dtype,
+        )
+
+    def linear_prequantized(self, qdata, scale, out_dtype):
+        if self.weight is None:
+            raise RuntimeError("ConvRot INT8 binding is not active")
+        comfy.ops.run_every_op()
+        return self._prequantized_linear(qdata, scale, self.weight, out_dtype)
+
+    def residual_(self, x, residual, gate):
+        """``residual += gate * linear(x)`` in place, or False."""
+        if (
+            self.weight is None
+            or self.bias is not None
+            or getattr(self.module, "_h3_benchmark_convrot_linear", None) is not None
+        ):
+            return False
+        from ..memory import fused_residual
+
+        comfy.ops.run_every_op()
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(self.weight)
+        return fused_residual.linear_residual_(
+            x,
+            qdata,
+            scale,
+            None,
+            residual,
+            gate,
+            convrot=True,
+            convrot_groupsize=GROUP_SIZE,
+        )
+
     def linear_range(self, x, start, end):
         if self.weight is None:
             raise RuntimeError("ConvRot INT8 binding is not active")
@@ -172,6 +244,33 @@ class HeldConvRotINT8Linear:
         )
         comfy.ops.run_every_op()
         return self._linear(x, sliced)
+
+    def linear_range_prequantized(self, qdata, scale, start, end, out_dtype):
+        if self.weight is None:
+            raise RuntimeError("ConvRot INT8 binding is not active")
+        if self.bias is not None:
+            raise ConvRotINT8BindingError(
+                "ConvRot INT8 output slicing requires a bias-free linear"
+            )
+        start = int(start)
+        end = int(end)
+        if not 0 <= start < end <= int(self.weight.shape[0]):
+            raise ConvRotINT8BindingError("ConvRot INT8 output slice is invalid")
+        params = self.weight._params
+        weight_scale = params.scale
+        if weight_scale.numel() != 1:
+            weight_scale = weight_scale[start:end]
+        sliced = QuantizedTensor(
+            self.weight._qdata[start:end],
+            self.weight._layout_cls,
+            replace(
+                params,
+                scale=weight_scale,
+                orig_shape=(end - start, int(self.weight.shape[1])),
+            ),
+        )
+        comfy.ops.run_every_op()
+        return self._prequantized_linear(qdata, scale, sliced, out_dtype)
 
 
 class HeldConvRotINT8QKV:
@@ -202,6 +301,11 @@ class HeldConvRotINT8QKV:
                 *finish_qkv_projection(self.attention, projected, rope)
             )
 
+    @staticmethod
+    def _carrier(rows, start, end):
+        producer = getattr(rows, 'quantize_convrot256', None)
+        return None if producer is None else producer(start, end)
+
     def _finish_single_qk(self, projected, rope, norm):
         seq = int(projected.shape[0])
         projected = projected.view(
@@ -231,13 +335,32 @@ class HeldConvRotINT8QKV:
 
     def project_hnd(self, x, rope_freqs, start, end):
         rope = None if rope_freqs is None else rope_freqs[:, start:end]
+        carrier = self._carrier(x, start, end)
+        if carrier is not None:
+            from ..attention_forward import finish_qkv_projection, to_hnd
+
+            with diagnostics.stage("qkv_linear"):
+                projected = self.binding.linear_prequantized(
+                    *carrier, out_dtype=x.dtype
+                )
+            with diagnostics.stage("qk_norm_rope"):
+                return to_hnd(
+                    *finish_qkv_projection(self.attention, projected, rope)
+                )
         return self._finish(x[start:end], rope)
 
     def project_q_hnd(self, x, rope_freqs, start, end):
         inner = int(self.attention.heads) * int(self.attention.head_dim)
         rope = None if rope_freqs is None else rope_freqs[:, start:end]
         with diagnostics.stage("qkv_linear"):
-            q = self.binding.linear_range(x[start:end], 0, inner)
+            carrier = self._carrier(x, start, end)
+            q = (
+                self.binding.linear_range(x[start:end], 0, inner)
+                if carrier is None
+                else self.binding.linear_range_prequantized(
+                    *carrier, 0, inner, x.dtype
+                )
+            )
         with diagnostics.stage("qk_norm_rope"):
             q = self._finish_single_qk(q, rope, self.attention.q_norm)
         return q.transpose(0, 1).unsqueeze(0)
@@ -246,10 +369,13 @@ class HeldConvRotINT8QKV:
         inner = int(self.attention.heads) * int(self.attention.head_dim)
         rope = None if rope_freqs is None else rope_freqs[:, start:end]
         with diagnostics.stage("qkv_linear"):
-            projected = self.binding.linear_range(
-                x[start:end],
-                inner,
-                inner * 3,
+            carrier = self._carrier(x, start, end)
+            projected = (
+                self.binding.linear_range(x[start:end], inner, inner * 3)
+                if carrier is None
+                else self.binding.linear_range_prequantized(
+                    *carrier, inner, inner * 3, x.dtype
+                )
             )
         k, v = projected.split(inner, dim=-1)
         with diagnostics.stage("qk_norm_rope"):
@@ -268,7 +394,14 @@ class HeldConvRotINT8QKV:
         del rope_freqs
         inner = int(self.attention.heads) * int(self.attention.head_dim)
         with diagnostics.stage("qkv_linear"):
-            v = self.binding.linear_range(x[start:end], inner * 2, inner * 3)
+            carrier = self._carrier(x, start, end)
+            v = (
+                self.binding.linear_range(x[start:end], inner * 2, inner * 3)
+                if carrier is None
+                else self.binding.linear_range_prequantized(
+                    *carrier, inner * 2, inner * 3, x.dtype
+                )
+            )
         v = v.view(end - start, self.attention.heads, self.attention.head_dim)
         return v.transpose(0, 1).unsqueeze(0)
 
@@ -327,24 +460,85 @@ class HeldConvRotINT8MLP:
         out = self.fc2_binding.linear(activated)
         return out, "held_convrot_int8"
 
+    def fc1(self, x):
+        return self.fc1_binding.linear(x)
+
+    def _fc2_plain(self):
+        if getattr(self.fc2_binding.module, "_h3_benchmark_convrot_linear", None) is not None:
+            return None
+        weight = self.fc2_binding.weight
+        if weight is None or self.fc2_binding.bias is not None:
+            return None
+        return TensorWiseINT8Layout.get_plain_tensors(weight)
+
+    def fc2_swiglu(self, expanded, native=True):
+        """fc2 with SwiGLU folded into Kitchen's ConvRot activation quantizer."""
+        del native
+        plain = self._fc2_plain()
+        if plain is None:
+            from ..memory.linear import swiglu_eager  # memory imports this module
+
+            return self.fc2_binding.linear(swiglu_eager(expanded)), "held_convrot_int8"
+        comfy.ops.run_every_op()
+        qdata, scale = plain
+        out = comfy.quant_ops.ck.int8_linear(
+            expanded,
+            qdata,
+            scale,
+            None,
+            expanded.dtype,
+            convrot=True,
+            convrot_groupsize=GROUP_SIZE,
+            input_act="swiglu",
+        )
+        return out, "held_convrot_int8_fused_swiglu"
+
+    def fc2_swiglu_residual_(self, expanded, residual, gate):
+        """``residual += gate * fc2(swiglu(expanded))`` in place, or False."""
+        plain = self._fc2_plain()
+        if plain is None:
+            return False
+        from ..memory import fused_residual  # memory imports this module
+
+        qdata, scale = plain
+        return fused_residual.gated_swiglu_residual_(
+            expanded,
+            qdata,
+            scale,
+            None,
+            residual,
+            gate,
+            convrot=True,
+            convrot_groupsize=GROUP_SIZE,
+        )
+
 
 class LazyConvRotINT8Linear:
     """Delay runtime quantization until the first output-projection slab."""
 
-    def __init__(self, module):
+    def __init__(self, module, *, allow_float_conversion=True):
         self.module = module
+        self.allow_float_conversion = bool(allow_float_conversion)
         self.binding = None
 
-    def linear(self, x):
+    def _binding(self, x):
         if self.binding is None:
             sample = x.reshape(-1, x.shape[-1])[:1]
             self.binding = HeldConvRotINT8Linear(
                 self.module,
                 sample,
-                allow_float_conversion=True,
+                allow_float_conversion=self.allow_float_conversion,
             )
             self.binding.__enter__()
+        return self.binding
+
+    def linear(self, x):
+        self._binding(x)
         return self.binding.linear(x)
+
+    def residual_(self, x, residual, gate):
+        self._binding(x)
+        return self.binding.residual_(x, residual, gate)
 
     def release(self):
         if self.binding is not None:

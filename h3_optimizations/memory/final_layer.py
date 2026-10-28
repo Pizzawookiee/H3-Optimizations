@@ -8,7 +8,7 @@ import torch
 import comfy.ops
 from comfy.ldm.minimax.model import time_shift_sigma
 
-from ..model import get_minimax_h3_model
+from ..model import get_minimax_h3_model, unpatched_model_object
 
 
 FINAL_LAYER_KEY = 'diffusion_model.final_layer.forward'
@@ -280,13 +280,18 @@ def _set_preserved_flag(model_patcher, value):
     options['h3_optimizations_preserved_final_layer_patch'] = bool(value)
 
 
+def _stock_forward(model_patcher, layer):
+    return unpatched_model_object(model_patcher, FINAL_LAYER_KEY, layer.forward)
+
+
 def _restore_original(model_patcher, layer, original_forward):
     patches = model_patcher.object_patches
+    stock = _stock_forward(model_patcher, layer)
     if (
         getattr(original_forward, '__self__', None) is layer
         and getattr(original_forward, '__func__', None)
-        is getattr(layer.forward, '__func__', None)
-    ) or original_forward is layer.forward:
+        is getattr(stock, '__func__', None)
+    ) or original_forward is stock:
         patches.pop(FINAL_LAYER_KEY, None)
     else:
         patches[FINAL_LAYER_KEY] = original_forward
@@ -318,7 +323,7 @@ def install(
         raise H3FinalLayerPatchError('MiniMax H3 has no final layer')
 
     existing = getattr(model_patcher, 'object_patches', {}).get(FINAL_LAYER_KEY)
-    original_forward = layer.forward
+    original_forward = _stock_forward(model_patcher, layer)
     if existing is not None:
         if not getattr(existing, OWNER_MARKER, False):
             _set_preserved_flag(model_patcher, True)

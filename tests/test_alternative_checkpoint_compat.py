@@ -12,9 +12,11 @@ sys.path.insert(0, str(PACK))
 
 from h3_optimizations.qkv.formats import inspect_h3_linears  # noqa: E402
 from h3_optimizations.qkv.providers import (  # noqa: E402
+    MLP_FLOAT_CHUNKED,
     MLP_FP8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
     MLP_W4A8_CHUNKED,
+    QKV_BF16_CHUNKED,
     QKV_DENSE_W4A8_CHUNKED,
     QKV_SPARSE_FP8_CHUNKED,
     QKV_SPARSE_W4A8_CHUNKED,
@@ -98,8 +100,12 @@ class AlternativeCheckpointCompatibilityTests(unittest.TestCase):
             )
             self.assertEqual(resolved.provider_id, QKV_STANDARD)
 
-    def test_memory_plus_sparse_uses_fp8_chunked_qkv_for_float_and_fp8(self):
-        for weight in (self.bf16, self.fp8):
+    def test_memory_plus_sparse_uses_checkpoint_compatible_providers(self):
+        # Native FP8 stays native; floating MLP weights preserve checkpoint precision.
+        for weight, expected_qkv, expected_mlp in (
+            (self.bf16, QKV_BF16_CHUNKED, MLP_FLOAT_CHUNKED),
+            (self.fp8, QKV_SPARSE_FP8_CHUNKED, MLP_FP8_CHUNKED),
+        ):
             inventory = inspect_h3_linears([block(weight)])
             resolved = resolve_qkv_provider(
                 inventory,
@@ -110,14 +116,14 @@ class AlternativeCheckpointCompatibilityTests(unittest.TestCase):
                 memory_optimize=True,
                 fp8_available=True,
             )
-            self.assertEqual(resolved.provider_id, QKV_SPARSE_FP8_CHUNKED)
+            self.assertEqual(resolved.provider_id, expected_qkv)
             self.assertEqual(
                 resolve_mlp_provider(
                     inventory,
                     request='auto',
                     fp8_available=True,
                 ).provider_id,
-                MLP_FP8_CHUNKED,
+                expected_mlp,
             )
 
     def test_w4a8_uses_native_chunked_providers(self):

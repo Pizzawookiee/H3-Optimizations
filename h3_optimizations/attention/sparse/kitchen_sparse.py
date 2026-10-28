@@ -7,9 +7,9 @@ to be retired in favour of.
 
 Two things differ from the Sparse Sage backend and both are deliberate.
 
-The production default is 64Q x 64KV. It preserves substantially more useful
-route geometry at very low attention budgets than the larger tiles without
-changing the carrier format or the router's density policy.
+Automatic production selection prefers 64Q x 32KV over a 64-token carrier.
+The low-level default remains 64Q x 64KV for explicit callers and compatible
+fallbacks.
 
 Q/K/V are quantized by Kitchen rather than by the Triton per-tile quantizer.
 Kitchen's carrier is four transforms -- K-anchor detection, anchor subtraction,
@@ -85,7 +85,7 @@ def _kitchen():
 
 def preflight_sparse_kitchen(
     *, cuda_available, capability_getter, backend=None, kitchen=None,
-    q_tile=None, kv_tile=None
+    q_tile=None, kv_tile=None, device=None
 ):
     '''Resolve the Kitchen sparse kernel, or say exactly why it is unavailable.'''
     module = _kitchen() if kitchen is None else kitchen
@@ -134,6 +134,12 @@ def preflight_sparse_kitchen(
         if geometry not in supported:
             raise SparseKitchenError(
                 'Kitchen sparse attention does not support %dQ x %dKV'
+                % geometry
+            )
+        geometry_available = getattr(module, 'sparse_geometry_is_available', None)
+        if geometry_available is not None and not geometry_available(*geometry, device):
+            raise SparseKitchenError(
+                'Kitchen sparse geometry %dQ x %dKV failed its device self-test'
                 % geometry
             )
     return module
@@ -215,7 +221,9 @@ class SparseKitchenExecutor:
     ):
         self.kitchen = kitchen
         self.q_tile = int(q_tile)
+        # kv_tile is the route tile; a 32-token route walks the 64-token carrier.
         self.kv_tile = int(kv_tile)
+        self.carrier_tile = 64 if self.kv_tile == 32 else self.kv_tile
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
         if output_layout not in OUTPUT_LAYOUTS:
             raise SparseKitchenError(
@@ -237,7 +245,7 @@ class SparseKitchenExecutor:
 
         with diagnostics.stage('full_carrier_pack'):
             quantized = self.kitchen.prequantize_int8_attention(
-                q, k, v, cta_k=self.kv_tile
+                q, k, v, cta_k=self.carrier_tile
             )
         # The router emits Sparge's delta encoding. Declaring it rather than
         # converting keeps this a zero-conversion path: the route knows how to
@@ -276,10 +284,10 @@ class SparseKitchenExecutor:
                 'Kitchen sparse attention is built for head_dim %d, got %d'
                 % (HEAD_DIM, quantized.original_head_dim)
             )
-        if int(quantized.cta_k) != self.kv_tile:
+        if int(quantized.cta_k) != self.carrier_tile:
             raise SparseKitchenError(
                 'Kitchen QKV carrier uses KV tile %d, expected %d'
-                % (quantized.cta_k, self.kv_tile)
+                % (quantized.cta_k, self.carrier_tile)
             )
         with diagnostics.stage('sparse_carrier_prepare'):
             route = self.kitchen.BlockSparseRoute(

@@ -11,7 +11,7 @@ import comfy.model_management
 import comfy.model_prefetch
 from comfy.ldm.minimax import model as minimax
 
-from ..model import get_minimax_h3_model
+from ..model import get_minimax_h3_model, unpatched_model_object
 
 
 FORWARD_KEY = 'diffusion_model._forward'
@@ -37,6 +37,21 @@ def _source_digest(forward):
     return hashlib.sha256(inspect.getsource(forward).encode()).hexdigest()
 
 
+def _upstream_releases_embedding(forward):
+    '''True when ComfyUI's own H3 forward already frees the embedding temporaries.
+
+    ComfyUI 0.39.2 moved embedding assembly into ``_embed_and_pack``, whose
+    locals die when it returns, before block 0. Patching that forward would
+    gain nothing.
+    '''
+    if not callable(getattr(minimax.MiniMaxH3Model, '_embed_and_pack', None)):
+        return False
+    try:
+        return 'self._embed_and_pack(' in inspect.getsource(forward)
+    except (OSError, TypeError):
+        return False
+
+
 def _validate_upstream_forward(forward):
     '''Return the known upstream generation that ``forward`` reproduces.'''
     try:
@@ -48,7 +63,7 @@ def _validate_upstream_forward(forward):
     generation = UPSTREAM_FORWARDS.get(digest)
     if generation is None:
         raise H3EmbeddingMemoryPatchError(
-            'MiniMax H3 _forward changed; refusing the experimental embedding-memory patch'
+            'MiniMax H3 _forward changed; refusing the embedding-memory patch'
         )
     return generation
 
@@ -279,13 +294,22 @@ def install(model_patcher, *, force_rebuild=False, strict=False):
                 'installed embedding-memory patch has no recoverable original'
             )
     else:
-        original = model._forward
+        original = unpatched_model_object(model_patcher, FORWARD_KEY, model._forward)
         if getattr(original, OWNER_MARKER, False):
             original = getattr(original, ORIGINAL_MARKER, None)
             if original is None:
                 raise H3EmbeddingMemoryPatchError(
                     'installed embedding-memory patch has no recoverable original'
                 )
+    if _upstream_releases_embedding(original):
+        if existing is not None:
+            model_patcher.object_patches.pop(FORWARD_KEY)
+        options = model_patcher.model_options['transformer_options'] = (
+            model_patcher.model_options.get('transformer_options', {}).copy()
+        )
+        options.pop(FALLBACK_REASON_KEY, None)
+        options['h3_optimizations_preserved_embedding_patch'] = False
+        return False
     try:
         generation = _validate_upstream_forward(original)
     except H3EmbeddingMemoryPatchError as exc:
@@ -318,6 +342,17 @@ def install(model_patcher, *, force_rebuild=False, strict=False):
 def is_installed(model_patcher):
     current = getattr(model_patcher, 'object_patches', {}).get(FORWARD_KEY)
     return bool(current is not None and getattr(current, OWNER_MARKER, False))
+
+
+def released_by_comfy(model_patcher):
+    '''True when ComfyUI's own H3 forward already releases early.'''
+    model = get_minimax_h3_model(model_patcher)
+    if model is None:
+        return False
+    original = unpatched_model_object(model_patcher, FORWARD_KEY, model._forward)
+    if getattr(original, OWNER_MARKER, False):
+        original = getattr(original, ORIGINAL_MARKER, None)
+    return original is not None and _upstream_releases_embedding(original)
 
 
 def clear(model_patcher):

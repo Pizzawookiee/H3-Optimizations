@@ -11,6 +11,7 @@ import comfy.quant_ops
 
 from . import diagnostics
 from .attention_forward import project_qkv
+from .native.int8_attention import carrier_kv_tile
 from .normalized_rows import attention_output_buffer
 from .qkv.bf16 import HeldBF16QKV
 from .qkv.chunked import project_chunk_hnd
@@ -567,7 +568,8 @@ class ChunkedKitchenQKVProjector:
         try:
             spec_kwargs = {}
             if self.kv_tile is not None:
-                spec_kwargs['cta_k'] = self.kv_tile
+                # kv_tile is the route tile; its carrier may be wider.
+                spec_kwargs['cta_k'] = carrier_kv_tile(self.kv_tile)
             spec = kitchen.int8_attention_producer_spec(
                 q_shape,
                 shape,

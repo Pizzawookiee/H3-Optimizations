@@ -4,7 +4,7 @@ import logging
 
 from .config import ActivationMemoryConfig
 from .forward import make_forward
-from ..model import get_h3_blocks, is_minimax_h3
+from ..model import get_h3_blocks, is_minimax_h3, unpatched_model_object
 
 BLOCKS_ATTR = 'diffusion_model.blocks'
 OWNER_MARKER = '_h3_optimizations_memory'
@@ -79,7 +79,7 @@ def install(model_patcher, config=None, *, force_rebuild=False):
                     % key
                 )
         else:
-            original = block.forward
+            original = unpatched_model_object(model_patcher, key, block.forward)
         model_patcher.add_object_patch(
             key,
             make_forward(

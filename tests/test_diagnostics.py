@@ -74,12 +74,72 @@ class DiagnosticsHookTests(unittest.TestCase):
                 self.assertIs(diagnostics.active(), inner)
             self.assertIs(diagnostics.active(), outer)
 
+    def test_same_name_reentry_counts_once_but_sequential_calls_remain(self):
+        recorder = RecordingStages()
+        with diagnostics.installed(recorder):
+            with diagnostics.stage('kernel'):
+                with diagnostics.stage('child'):
+                    with diagnostics.stage('kernel'):
+                        pass
+            with diagnostics.stage('kernel'):
+                pass
+        self.assertEqual(recorder.entered, ['kernel', 'child', 'kernel'])
+        self.assertEqual(recorder.closed, ['child', 'kernel', 'kernel'])
+
+    def test_failed_region_does_not_suppress_later_calls(self):
+        recorder = RecordingStages()
+        with diagnostics.installed(recorder):
+            with self.assertRaises(ValueError):
+                with diagnostics.stage('kernel'):
+                    with diagnostics.stage('kernel'):
+                        raise ValueError('boom')
+            with diagnostics.stage('kernel'):
+                pass
+        self.assertEqual(recorder.entered, ['kernel', 'kernel'])
+        self.assertEqual(recorder.closed, ['kernel', 'kernel'])
+
+    def test_failed_recorder_entry_restores_active_names(self):
+        recorder = RecordingStages()
+        original_stage = recorder.stage
+        recorder.stage = lambda name: (_ for _ in ()).throw(ValueError('boom'))
+        with diagnostics.installed(recorder):
+            with self.assertRaises(ValueError):
+                with diagnostics.stage('kernel'):
+                    pass
+            recorder.stage = original_stage
+            with diagnostics.stage('kernel'):
+                pass
+        self.assertEqual(recorder.entered, ['kernel'])
+
+    def test_nested_recorders_keep_independent_active_names(self):
+        outer, inner = RecordingStages(), RecordingStages()
+        with diagnostics.installed(outer):
+            with diagnostics.stage('kernel'):
+                with diagnostics.installed(inner):
+                    with diagnostics.stage('kernel'):
+                        pass
+                with diagnostics.installed(outer):
+                    with diagnostics.stage('kernel'):
+                        pass
+        self.assertEqual(outer.entered, ['kernel'])
+        self.assertEqual(inner.entered, ['kernel'])
+
 
 class StageCoverageTests(unittest.TestCase):
     '''Every stage the attribution needs has to exist in production source.'''
 
     REQUIRED = {
+        'block_total': 'memory/forward.py',
+        'adaln_proj': 'memory/forward.py',
         'attention_total': 'attention_forward.py',
+        'attention_residual_gate': 'memory/forward.py',
+        'norm2_modulation': 'memory/forward.py',
+        'norm2_modulation_quantize': 'memory/forward.py',
+        'mlp_fc1': 'memory/forward.py',
+        'mlp_fc1_fc2': 'memory/forward.py',
+        'mlp_swiglu_fc2': 'memory/forward.py',
+        'mlp_swiglu_fc2_gated': 'memory/forward.py',
+        'final_mlp_gate': 'memory/forward.py',
         'attention_out': 'attention_forward.py',
         'qkv_linear': 'attention_forward.py',
         'qk_norm_rope': 'attention_forward.py',
@@ -98,6 +158,7 @@ class StageCoverageTests(unittest.TestCase):
         'qk_carrier_pack': 'native/producer.py',
         'v_carrier_pack': 'native/producer.py',
         'sparse_attention_kernel': 'native/int8_attention.py',
+        'dense_attention_kernel': 'attention/sparse/kitchen_streamed_q.py',
         'full_carrier_pack': 'attention/sparse/kitchen_sparse.py',
         'sparse_route': 'attention/sparse/kitchen_sparse.py',
         'sparse_carrier_prepare': 'attention/sparse/kitchen_sparse.py',

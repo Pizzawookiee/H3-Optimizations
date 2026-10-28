@@ -11,6 +11,8 @@ import comfy.ops
 import comfy.quant_ops
 from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
+from . import fused_residual
+
 
 _CONVROT_MLPS = weakref.WeakValueDictionary()
 _CONVROT_MLP_IDS = itertools.count(1)
@@ -23,6 +25,18 @@ class UnsafeHeldWeights(RuntimeError):
 def swiglu_eager(x):
     gate, up = x.chunk(2, dim=-1)
     return torch.nn.functional.silu(gate).mul_(up)
+
+
+def swiglu_inplace_(x):
+    """SwiGLU written into the gate half of ``x``; returns that half as a view.
+
+    Bit-identical to :func:`swiglu_eager` without allocating a second
+    activation-width tensor. ``x`` is consumed: only the returned view is valid.
+    """
+    width = int(x.shape[-1]) // 2
+    gate = x[..., :width]
+    torch.nn.functional.silu(gate, inplace=True).mul_(x[..., width:])
+    return gate
 
 
 def _stream_from_handle(handle):
@@ -125,6 +139,25 @@ class HeldMLP:
         comfy.ops.run_every_op()
         return self.fc1_weight.linear(x)
 
+    def fc1_prequantized(self, qdata, scale, out_dtype):
+        weight = self.fc1_weight.weight
+        if self.fc1_weight.bias is not None:
+            return None
+        try:
+            weight_qdata, weight_scale = _convrot_parts(weight, "fc1")
+        except (TypeError, ValueError):
+            return None
+        from ..qkv.int8 import HeldConvRotINT8Linear
+
+        comfy.ops.run_every_op()
+        return HeldConvRotINT8Linear._prequantized_values(
+            qdata,
+            scale,
+            weight_qdata,
+            weight_scale,
+            out_dtype,
+        )
+
     def fc2_swiglu(self, expanded, native):
         weight = self.fc2_weight.weight
         bias = self.fc2_weight.bias
@@ -149,8 +182,34 @@ class HeldMLP:
             )
             return out, "held_tensorwise_int8_native"
 
-        activated = swiglu_eager(expanded)
+        activated = swiglu_inplace_(expanded)
         return F.linear(activated, weight, bias), "held_bf16_swiglu"
+
+    def fc2_swiglu_residual_(self, expanded, residual, gate):
+        """Fold ``residual += gate * fc2(swiglu(expanded))`` into the fc2 kernel.
+
+        Returns False, with ``residual`` untouched, unless fc2 is a TensorWise
+        INT8 weight and Comfy Kitchen's fused residual kernel is usable; the
+        caller then uses :meth:`fc2_swiglu` and ``addcmul_`` as before.
+        """
+        weight = self.fc2_weight.weight
+        if (
+            not isinstance(weight, QuantizedTensor)
+            or getattr(weight, "_layout_cls", None) != "TensorWiseINT8Layout"
+            or getattr(weight._params, "transposed", False)
+        ):
+            return False
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+        return fused_residual.gated_swiglu_residual_(
+            expanded,
+            qdata,
+            scale,
+            self.fc2_weight.bias,
+            residual,
+            gate,
+            convrot=getattr(weight._params, "convrot", False),
+            convrot_groupsize=getattr(weight._params, "convrot_groupsize", 256),
+        )
 
 
 def _convrot_parts(weight, name):
@@ -548,6 +607,31 @@ class ConvRotTwoSliceMLP:
             del expanded, partial
         return output, "held_convrot_2slice"
 
+    def fc1_fc2_prequantized(self, qdata, scale, out_dtype):
+        if self.tiles is None:
+            raise RuntimeError("ConvRot two-slice session is not active")
+        from ..qkv.int8 import HeldConvRotINT8Linear
+
+        comfy.ops.run_every_op()
+        output = None
+        for tile in self.tiles:
+            expanded = HeldConvRotINT8Linear._prequantized_values(
+                qdata,
+                scale,
+                tile["fc1_weight"],
+                tile["fc1_scale"],
+                out_dtype,
+            )
+            partial = self.convrot_linear(
+                expanded,
+                tile["fc2_weight"],
+                tile["fc2_scale"],
+                input_act="swiglu",
+            )
+            output = partial if output is None else output.add_(partial)
+            del expanded, partial
+        return output, "held_convrot_2slice_fused_norm_quantize"
+
 
 def module_fc1(mlp, h):
     """Run the fallback module fc1 call for one bounded slab."""
@@ -561,4 +645,4 @@ def module_swiglu_fc2(mlp, expanded, native):
             comfy.ops.linear_input_act(mlp.fc2, expanded, "swiglu"),
             "module_native",
         )
-    return mlp.fc2(swiglu_eager(expanded)), "module_bf16_swiglu"
+    return mlp.fc2(swiglu_inplace_(expanded)), "module_bf16_swiglu"

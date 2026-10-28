@@ -3,14 +3,15 @@
 Streaming is an activation-memory policy, not a request to quantize QKV
 weights. Whenever a compatible consumer exists we keep the checkpoint's weight
 format for the linear, produce post-projection Q/K/V as BF16 chunks, and feed
-those chunks directly into the consumer carrier. BF16/FP16 -> FP8 weight
-conversion is only a fallback after streaming and native/bounded execution have
-both been ruled out. Explicit BF16 and Force quant requests bypass that Auto
-priority and require their requested weight representation.
+those chunks directly into the consumer carrier. Auto does not introduce a new
+weight conversion for floating checkpoints. Explicit BF16 and Force quant
+requests bypass that Auto priority and require their requested weight
+representation.
 '''
 
 from . import providers as base
 from ..plan import (
+    FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_BF16,
     FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
@@ -221,6 +222,12 @@ def resolve_qkv_provider(
     fp8_available=False,
 ):
     '''Resolve QKV with streamed BF16 activations as the first preference.'''
+    if (
+        request == FUSED_QKV_AUTO
+        and memory_optimize
+        and inventory.qkv_plain_float
+    ):
+        request = FUSED_QKV_PRESERVE_BF16
     if request == FUSED_QKV_OFF:
         return base._standard_qkv('QKV streaming was disabled')
     if not inventory.qkv:

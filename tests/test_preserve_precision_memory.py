@@ -11,7 +11,7 @@ sys.path.insert(0, str(PACK))
 from h3_optimizations.plan import MLP_MEMORY_PRESERVE  # noqa: E402
 from h3_optimizations.qkv.formats import inspect_h3_linears  # noqa: E402
 from h3_optimizations.qkv.providers import (  # noqa: E402
-    MLP_CONVROT_INT8_TWO_SLICE,
+    MLP_CONVROT_INT8_CHUNKED,
     MLP_FLOAT_CHUNKED,
     MLP_FP8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
@@ -102,7 +102,8 @@ class PreservePrecisionMemoryTests(unittest.TestCase):
             convrot=True,
             convrot_groupsize=256,
         ))
-        self.assertEqual(resolved.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
+        self.assertEqual(resolved.provider_id, MLP_CONVROT_INT8_CHUNKED)
+        self.assertEqual(resolved.activation_mode, 'mlp_chunked_native')
         self.assertIn('without requantization', resolved.reason)
 
     def test_unsupported_quantized_format_preserves_upstream(self):

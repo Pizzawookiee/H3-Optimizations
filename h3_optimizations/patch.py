@@ -4,7 +4,7 @@ import logging
 
 import comfy.quant_ops
 
-from .model import get_h3_blocks, is_minimax_h3
+from .model import get_h3_blocks, is_minimax_h3, unpatched_model_object
 
 OWNER_MARKER = '_h3_optimizations_attention'
 SIGNATURE_MARKER = '_h3_optimizations_attention_signature'
@@ -134,7 +134,7 @@ def configure_backend(
                     % key
                 )
         else:
-            original = module.forward
+            original = unpatched_model_object(model_patcher, key, module.forward)
         forward = make_forward(
             module,
             index,

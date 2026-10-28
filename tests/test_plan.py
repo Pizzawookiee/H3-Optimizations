@@ -16,11 +16,14 @@ from h3_optimizations.plan import (  # noqa: E402
     EARLY_SCHEDULE_RAMP,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
-    FUSED_QKV_REQUIRED,
     H3OptimizationPlan,
     KITCHEN_V_MEMORY_RETAIN,
     KITCHEN_V_MEMORY_TWO_PASS,
+    MLP_MEMORY_BF16,
+    MLP_MEMORY_CONVROT_2SLICE,
+    MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_PRESERVE,
     MemoryRequest,
     SPARSE_BACKEND_AUTO,
@@ -62,6 +65,14 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.mlp_memory, MLP_MEMORY_PRESERVE)
         self.assertIn(MLP_MEMORY_PRESERVE, request.signature)
 
+    def test_transitional_mlp_exports_use_canonical_values(self):
+        self.assertEqual(MLP_MEMORY_LEGACY_BF16, MLP_MEMORY_BF16)
+        self.assertEqual(MLP_MEMORY_LEGACY_NATIVE, MLP_MEMORY_PRESERVE)
+        self.assertEqual(
+            MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+            MLP_MEMORY_CONVROT_2SLICE,
+        )
+
     def test_existing_attention_plus_qkv_off_normalizes_to_preserved_bf16(self):
         request = MemoryRequest(
             attention=ATTENTION_EXISTING,
@@ -70,20 +81,6 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.fused_qkv, FUSED_QKV_PRESERVE_BF16)
         self.assertIn(FUSED_QKV_PRESERVE_BF16, request.signature)
         self.assertEqual(MemoryRequest(fused_qkv=FUSED_QKV_OFF).fused_qkv, FUSED_QKV_OFF)
-
-    def test_legacy_adapter_options_are_part_of_memory_identity(self):
-        request = MemoryRequest(
-            attention=ATTENTION_EXISTING,
-            fused_qkv=FUSED_QKV_REQUIRED,
-            mlp_memory=MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
-            chunk_rows=2048,
-            prefer_held_weights=False,
-            mlp_strict=True,
-        )
-        self.assertEqual(request.signature[0], ATTENTION_EXISTING)
-        self.assertEqual(request.signature[1], FUSED_QKV_REQUIRED)
-        self.assertFalse(request.prefer_held_weights)
-        self.assertTrue(request.mlp_strict)
 
     def test_sparse_request_defaults_to_fifteen_percent_video_budget(self):
         request = SparseRequest()

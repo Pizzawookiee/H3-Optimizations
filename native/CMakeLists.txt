@@ -34,9 +34,9 @@ if(NOT DEFINED H3_CUDA_ARCHS)
     # synchronous shared-memory copies in place of cp.async. Runtime use stays
     # fail-closed behind the same per-GPU numerical self-test as newer parts.
     if(WIN32)
-        set(H3_CUDA_ARCHS "75-real;80-real;89-real;120f-real;89-virtual")
+        set(H3_CUDA_ARCHS "75-real;80-real;86-real;89-real;120f-real;89-virtual")
     else()
-        set(H3_CUDA_ARCHS "75-real;80-real;89-real;90a-real;120f-real;89-virtual")
+        set(H3_CUDA_ARCHS "75-real;80-real;86-real;89-real;90a-real;120f-real;89-virtual")
     endif()
 endif()
 message(STATUS "H3 INT8 attention architectures: ${H3_CUDA_ARCHS}")
@@ -79,6 +79,7 @@ add_library(h3_int8_attention SHARED
     src/h3_int8_attention_api.cu
     src/convrot_quantize.cu
     src/h3_fused_q_cutlass.cu
+    src/h3_threshold_route.cu
     src/sage_attention/sage_attn_launcher.cu
     src/sage_attention/sage_attn_sparse_launcher.cu
     src/sage_attention/quant_qk_int8.cu

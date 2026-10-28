@@ -11,6 +11,7 @@ sys.path.insert(0, str(PACK))
 
 from h3_optimizations.plan import STATUS_KEY  # noqa: E402
 from h3_optimizations.status import (  # noqa: E402
+    format_memory_status,
     format_qkv_execution,
     format_sparse_status,
 )
@@ -54,6 +55,25 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             text,
         )
         self.assertNotIn('streamed_bf16_kitchen_qkv', text)
+
+    def test_memory_preview_reports_canonical_weight_replacement(self):
+        self.status['canonical_quantization'] = {
+            'converted_count': 208,
+            'released_bytes': 20 * 2**30,
+        }
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: self.status},
+            }
+        )
+
+        text = format_memory_status(model)
+
+        self.assertIn(
+            'Weights: canonical ConvRot-256 INT8 '
+            '(208 converted; 20.00 GiB released from this model branch)',
+            text,
+        )
 
     def _status_with_v_memory(self, requested, effective):
         status = dict(self.status)

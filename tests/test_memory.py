@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -46,6 +47,10 @@ class MemoryTests(unittest.TestCase):
         config = ActivationMemoryConfig()
         self.assertEqual(config.mode, MODE_NATIVE)
         self.assertEqual(config.chunk_rows, 4096)
+        self.assertTrue(config.fused_norm_quantize)
+        self.assertFalse(
+            ActivationMemoryConfig(fused_norm_quantize=False).fused_norm_quantize
+        )
         self.assertTrue(
             ActivationMemoryConfig(
                 mode=MODE_CONVROT_2SLICE
@@ -68,6 +73,42 @@ class MemoryTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, 'positive integer'):
             ActivationMemoryConfig(chunk_rows=0)
+
+    def test_held_convrot_fc1_accepts_a_prequantized_carrier(self):
+        held = linear_module.HeldMLP.__new__(linear_module.HeldMLP)
+        held.fc1_weight = SimpleNamespace(weight=object(), bias=None)
+        activation_q = torch.zeros(3, 256, dtype=torch.int8)
+        activation_scale = torch.ones(3, 1)
+        weight_q = torch.zeros(512, 256, dtype=torch.int8)
+        weight_scale = torch.ones(512)
+        expected = torch.zeros(3, 512, dtype=torch.bfloat16)
+
+        with (
+            patch.object(
+                linear_module,
+                '_convrot_parts',
+                return_value=(weight_q, weight_scale),
+            ),
+            patch(
+                'h3_optimizations.qkv.int8.HeldConvRotINT8Linear._prequantized_values',
+                return_value=expected,
+            ) as linear,
+            patch.object(comfy.ops, 'run_every_op'),
+        ):
+            actual = held.fc1_prequantized(
+                activation_q,
+                activation_scale,
+                torch.bfloat16,
+            )
+
+        self.assertIs(actual, expected)
+        linear.assert_called_once_with(
+            activation_q,
+            activation_scale,
+            weight_q,
+            weight_scale,
+            torch.bfloat16,
+        )
 
     def test_chunk_planner_preserves_modulation_boundaries(self):
         result = list(
@@ -564,6 +605,48 @@ class MemoryTests(unittest.TestCase):
         self.assertIsInstance(source, NormalizedRows)
         self.assertEqual(source.shape, value.shape)
         self.assertTrue(options['owned'])
+
+    def test_owned_attention_may_finish_the_gated_residual_in_place(self):
+        torch.manual_seed(36)
+        block = self._make_block()
+        x = torch.randn(8, 32) * 0.1
+        t_emb = torch.randn(1, 24) * 0.1
+        segments = [(0, 8, 0)]
+        config = ActivationMemoryConfig(
+            mode=MODE_NATIVE,
+            chunk_rows=256,
+            alignment=256,
+        )
+
+        def ordinary(_value, **kwargs):
+            return kwargs['transformer_options'][NORM1_SOURCE_KEY].materialize()
+
+        ordinary._h3_optimizations_lazy_norm_source = True
+        block.attn.forward = ordinary
+        expected = make_forward(block, 9, config)(
+            x.clone(), t_emb, segments, rope_freqs=None, transformer_options={}
+        )
+
+        def in_place(_value, **kwargs):
+            source = kwargs['transformer_options'][NORM1_SOURCE_KEY]
+            rows = source.materialize()
+
+            def residual(projected, target, gate):
+                target.addcmul_(projected, gate)
+                return True
+
+            source.write_attention_residual(
+                rows, 0, len(source), lambda value: value, residual
+            )
+            return source.finish_attention_residual()
+
+        in_place._h3_optimizations_lazy_norm_source = True
+        block.attn.forward = in_place
+        actual = make_forward(block, 9, config)(
+            x.clone(), t_emb, segments, rope_freqs=None, transformer_options={}
+        )
+
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == '__main__':

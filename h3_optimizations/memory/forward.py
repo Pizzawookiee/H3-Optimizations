@@ -5,7 +5,9 @@ import logging
 import torch
 
 import comfy.model_management
+import comfy.ops
 
+from .. import diagnostics
 from .chunks import (
     iter_mod_chunks,
     iter_modulation_chunks,
@@ -24,7 +26,13 @@ from ..normalized_rows import NORM1_SOURCE_KEY, NormalizedRows
 from ..qkv.fp8 import FP8BindingError, HeldFP8MLP
 from ..qkv.int8 import (
     ConvRotINT8BindingError,
+    HeldConvRotINT8Linear,
     HeldConvRotINT8MLP,
+)
+from ..native import (
+    RMS_ADALN_BF16_STAGED,
+    quantize_rms_adaln_int8_rowwise_convrot256,
+    rms_adaln_int8_rowwise_convrot256_is_available,
 )
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -169,23 +177,89 @@ def _log_mlp_fallback(layer_index, reason):
 def _run_mlp(block, h, held, mlp_path, config):
     expanded = None
     if mlp_path == 'convrot':
-        out, path = held.fc1_fc2(h)
-    elif mlp_path in ('fp8', 'int8'):
-        out, path = held.fc1_fc2(h, swiglu_eager)
+        with diagnostics.stage('mlp_fc1_fc2'):
+            out, path = held.fc1_fc2(h)
+    elif mlp_path == 'fp8':
+        with diagnostics.stage('mlp_fc1_fc2'):
+            out, path = held.fc1_fc2(h, swiglu_eager)
+    elif mlp_path == 'int8':
+        with diagnostics.stage('mlp_fc1'):
+            expanded = held.fc1(h)
+        with diagnostics.stage('mlp_swiglu_fc2'):
+            out, path = held.fc2_swiglu(expanded)
     elif mlp_path == 'held':
-        expanded = held.fc1(h)
-        out, path = held.fc2_swiglu(
-            expanded,
-            native=config.native_swiglu,
-        )
+        with diagnostics.stage('mlp_fc1'):
+            expanded = held.fc1(h)
+        with diagnostics.stage('mlp_swiglu_fc2'):
+            out, path = held.fc2_swiglu(
+                expanded,
+                native=config.native_swiglu,
+            )
     else:
-        expanded = module_fc1(block.mlp, h)
-        out, path = module_swiglu_fc2(
-            block.mlp,
-            expanded,
-            native=config.native_swiglu,
-        )
+        with diagnostics.stage('mlp_fc1'):
+            expanded = module_fc1(block.mlp, h)
+        with diagnostics.stage('mlp_swiglu_fc2'):
+            out, path = module_swiglu_fc2(
+                block.mlp,
+                expanded,
+                native=config.native_swiglu,
+            )
     return out, expanded, path
+
+
+def _gated_path(mlp_path, config):
+    '''Sessions whose fc2 can fold the gated residual (see fused_residual).'''
+    return mlp_path == 'int8' or (mlp_path == 'held' and config.native_swiglu)
+
+
+def _short_sequence_uses_held(config):
+    '''Whether a sequence no longer than one chunk should still use the held path.
+
+    Runtime ConvRot INT8 must: the upstream single-call MLP would run the
+    unconverted floating weights (measured on a 4455-token BF16 H3 block: held
+    INT8 with one slab per modulation segment 18.5 ms / 81 MiB, upstream BF16
+    40.8 ms / 458 MiB). Checkpoint-native paths keep the upstream call: splitting
+    per modulation segment re-reads the full MLP weights once per segment, which
+    cost more than the fused residual saved (16.3 vs 14.3 ms on INT8 ConvRot).
+    '''
+    return config.runtime_convrot_int8
+
+
+def _run_held_native_gated(held, h, x_rows, gate, selector, expanded=None):
+    '''Held MLP plus gated residual for one scalar-modulation slab.
+
+    Prefers Kitchen's fused INT8 residual kernel, which writes
+    ``x_rows + gate * fc2(swiglu(fc1(h)))`` straight into ``x_rows``; otherwise
+    runs the ordinary fc2 and ``addcmul_``. Both give bit-identical results.
+    '''
+    if expanded is None:
+        with diagnostics.stage('mlp_fc1'):
+            expanded = held.fc1(h)
+    gate_row = _mod_row(gate, selector, x_rows.dtype)
+    with diagnostics.stage('mlp_swiglu_fc2_gated'):
+        if held.fc2_swiglu_residual_(expanded, x_rows, gate_row):
+            return 'held_int8_fused_residual'
+    del gate_row
+    with diagnostics.stage('mlp_swiglu_fc2'):
+        out, path = held.fc2_swiglu(expanded, native=True)
+    del expanded
+    with diagnostics.stage('final_mlp_gate'):
+        _gate_add(x_rows, out, gate, selector)
+    return path
+
+
+def _quantize_norm_modulation(x, norm, shift, scale, selector):
+    if torch.is_tensor(selector):
+        return None
+    norm_weight = comfy.ops.cast_to_input(norm.weight, x).contiguous()
+    return quantize_rms_adaln_int8_rowwise_convrot256(
+        x,
+        norm_weight,
+        shift[selector].contiguous(),
+        scale[selector].contiguous(),
+        norm.eps,
+        mode=RMS_ADALN_BF16_STAGED,
+    )
 
 
 def _run_fc1_swiglu(block, h, held, mlp_path):
@@ -217,7 +291,7 @@ def make_forward(block, layer_index, config, original_forward=None):
     if config.convrot_2slice and isinstance(block.mlp, torch.nn.Module):
         bind_convrot_mlp(block.mlp)
 
-    def forward(
+    def _forward(
         x,
         t_emb,
         mod_segments,
@@ -234,14 +308,15 @@ def make_forward(block, layer_index, config, original_forward=None):
         # may substitute the attention callable for this block.
         attention = block.attn if attention is None else attention
 
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = block.adaln_proj(t_emb)
+        with diagnostics.stage('adaln_proj'):
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = block.adaln_proj(t_emb)
         segments = validate_mod_segments(
             mod_segments,
             x.shape[0],
@@ -260,7 +335,19 @@ def make_forward(block, layer_index, config, original_forward=None):
             scale_msa,
             _scale_shift,
         )
+        use_fused_norm_quantize = (
+            config.fused_norm_quantize
+            and not torch.compiler.is_compiling()
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and int(x.shape[1]) % 256 == 0
+            and HeldConvRotINT8Linear.prequantized_is_available()
+            and rms_adaln_int8_rowwise_convrot256_is_available()
+        )
+        if use_fused_norm_quantize:
+            h.enable_fused_convrot_quantization()
         if _attention_supports_lazy_norm(attention):
+            h.enable_attention_residual(gate_msa)
             attention_options = dict(transformer_options or {})
             attention_options[NORM1_SOURCE_KEY] = h
             attn_out = attention(
@@ -268,6 +355,7 @@ def make_forward(block, layer_index, config, original_forward=None):
                 rope_freqs=rope_freqs,
                 transformer_options=attention_options,
             )
+            attention_residual_complete = h.attention_residual_complete
         else:
             h = h.materialize()
             attn_out = attention(
@@ -275,35 +363,44 @@ def make_forward(block, layer_index, config, original_forward=None):
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,
             )
-        for start, stop, selector in iter_modulation_chunks(
-            segments,
-            config.chunk_rows,
-        ):
-            _gate_add(
-                x[start:stop],
-                attn_out[start:stop],
-                gate_msa,
-                selector,
-            )
+            attention_residual_complete = False
+        if not attention_residual_complete:
+            with diagnostics.stage('attention_residual_gate'):
+                for start, stop, selector in iter_modulation_chunks(
+                    segments,
+                    config.chunk_rows,
+                ):
+                    _gate_add(
+                        x[start:stop],
+                        attn_out[start:stop],
+                        gate_msa,
+                        selector,
+                    )
         del h, attn_out
 
-        if int(config.chunk_rows) >= int(x.shape[0]):
-            h = block.norm2(x)
-            for start, stop, selector in segments:
-                _scale_shift(
-                    h[start:stop],
-                    shift_mlp,
-                    scale_mlp,
-                    selector,
-                )
-            out = block.mlp(h)
-            for start, stop, selector in segments:
-                _gate_add(
-                    x[start:stop],
-                    out[start:stop],
-                    gate_mlp,
-                    selector,
-                )
+        if (
+            int(config.chunk_rows) >= int(x.shape[0])
+            and not _short_sequence_uses_held(config)
+        ):
+            with diagnostics.stage('norm2_modulation'):
+                h = block.norm2(x)
+                for start, stop, selector in segments:
+                    _scale_shift(
+                        h[start:stop],
+                        shift_mlp,
+                        scale_mlp,
+                        selector,
+                    )
+            with diagnostics.stage('mlp_fc1_fc2'):
+                out = block.mlp(h)
+            with diagnostics.stage('final_mlp_gate'):
+                for start, stop, selector in segments:
+                    _gate_add(
+                        x[start:stop],
+                        out[start:stop],
+                        gate_mlp,
+                        selector,
+                    )
             del h, out
             return x
 
@@ -323,13 +420,68 @@ def make_forward(block, layer_index, config, original_forward=None):
 
         try:
             for chunk in chunks:
-                h = block.norm2(x[chunk.start:chunk.stop])
-                _scale_shift(
-                    h,
-                    shift_mlp,
-                    scale_mlp,
-                    chunk.mod_row,
-                )
+                if use_fused_norm_quantize and mlp_path in ('convrot', 'held'):
+                    with diagnostics.stage('norm2_modulation_quantize'):
+                        carrier = _quantize_norm_modulation(
+                            x[chunk.start:chunk.stop],
+                            block.norm2,
+                            shift_mlp,
+                            scale_mlp,
+                            chunk.mod_row,
+                        )
+                    if carrier is not None:
+                        if mlp_path == 'convrot':
+                            with diagnostics.stage('mlp_fc1_fc2'):
+                                out, _path = held.fc1_fc2_prequantized(
+                                    *carrier,
+                                    x.dtype,
+                                )
+                            with diagnostics.stage('final_mlp_gate'):
+                                _gate_add(
+                                    x[chunk.start:chunk.stop],
+                                    out,
+                                    gate_mlp,
+                                    chunk.mod_row,
+                                )
+                            del carrier, out
+                            continue
+                        with diagnostics.stage('mlp_fc1'):
+                            expanded = held.fc1_prequantized(*carrier, x.dtype)
+                        if expanded is not None:
+                            _run_held_native_gated(
+                                held,
+                                None,
+                                x[chunk.start:chunk.stop],
+                                gate_mlp,
+                                chunk.mod_row,
+                                expanded=expanded,
+                            )
+                            del carrier, expanded
+                            continue
+                with diagnostics.stage('norm2_modulation'):
+                    h = block.norm2(x[chunk.start:chunk.stop])
+                    _scale_shift(
+                        h,
+                        shift_mlp,
+                        scale_mlp,
+                        chunk.mod_row,
+                    )
+
+                if (
+                    _gated_path(mlp_path, config)
+                    and not torch.is_tensor(chunk.mod_row)
+                ):
+                    # The fused kernel takes one gate per output channel, so
+                    # only scalar modulation segments qualify.
+                    _run_held_native_gated(
+                        held,
+                        h,
+                        x[chunk.start:chunk.stop],
+                        gate_mlp,
+                        chunk.mod_row,
+                    )
+                    del h
+                    continue
 
                 out, expanded, _path = _run_mlp(
                     block,
@@ -338,17 +490,36 @@ def make_forward(block, layer_index, config, original_forward=None):
                     mlp_path,
                     config,
                 )
-                _gate_add(
-                    x[chunk.start:chunk.stop],
-                    out,
-                    gate_mlp,
-                    chunk.mod_row,
-                )
+                with diagnostics.stage('final_mlp_gate'):
+                    _gate_add(
+                        x[chunk.start:chunk.stop],
+                        out,
+                        gate_mlp,
+                        chunk.mod_row,
+                    )
                 del h, expanded, out
         finally:
             if held is not None:
                 held.__exit__(None, None, None)
         return x
+
+    def forward(
+        x,
+        t_emb,
+        mod_segments,
+        rope_freqs,
+        transformer_options={},
+        attention=None,
+    ):
+        with diagnostics.stage('block_total'):
+            return _forward(
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options=transformer_options,
+                attention=attention,
+            )
 
     forward._h3_optimizations_memory = True
     forward._h3_optimizations_memory_signature = config.signature

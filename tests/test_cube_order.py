@@ -40,9 +40,11 @@ from h3_optimizations.cube_order import (  # noqa: E402
     install,
     make_forward,
     pad_mask,
+    patch_grid_shape,
     reorder_video_patches,
     tile_aligned_cube_major_indices,
 )
+from comfy.model_patcher import ModelPatcher  # noqa: E402
 from h3_optimizations.memory import final_layer  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     VIDEO_TOKEN_ORDER_1X16X4,
@@ -108,6 +110,41 @@ def _model():
     model._forward = lambda *args, **kwargs: None
     model.final_layer = _PassthroughFinalLayer()
     return model
+
+
+def _loadable_model():
+    """A real ModelPatcher root whose stock _forward calls the FinalLayer."""
+    model = _model()
+    patch_size = tuple(model.patch_size)
+
+    def stock_forward(x, timestep, context, transformer_options={}, **kwargs):
+        rows = patchify_video(x[0], patch_size)
+        projected, _audio = model.final_layer.forward(
+            rows,
+            None,
+            (0, rows.shape[0], 0),
+            (0, 0, 0),
+        )
+        grid = patch_grid_shape(x[0], patch_size)
+        return [unpatchify_video(projected, *grid, 1, patch_size), x[1]]
+
+    model._forward = stock_forward
+    root = torch.nn.Module()
+    root.diffusion_model = model
+    cpu = torch.device("cpu")
+    return ModelPatcher(root, cpu, cpu), model
+
+
+def _sample(model):
+    video = _raster_video(5, 10, 14)
+    output = model._forward(
+        [video, torch.zeros(1, 2, 2, 4)],
+        torch.tensor([500.0]),
+        torch.zeros(1, 3, 8),
+        {},
+        minimax_payload={},
+    )
+    return video, output[0]
 
 
 class CubeOrderTests(unittest.TestCase):
@@ -521,6 +558,53 @@ class CubeOrderTests(unittest.TestCase):
         )
         self.assertNotIn(FORWARD_KEY, child.object_patches)
         self.assertNotIn(final_layer.FINAL_LAYER_KEY, child.object_patches)
+
+    def test_rebuilt_plan_does_not_wrap_the_loaded_runs_patches(self):
+        # Issue #85: Comfy keeps the previous run's patcher loaded with its
+        # object patches applied, so the live attributes are that run's H3
+        # wrappers. Rebuilding the node then nested the old FinalLayer
+        # wrapper inside the new one and the second run raised.
+        base, model = _loadable_model()
+        first = base.clone()
+        self.assertTrue(install(first))
+        first.patch_model(load_weights=False)
+        try:
+            video, output = _sample(model)
+            torch.testing.assert_close(output, video)
+
+            rebuilt = base.clone()
+            self.assertTrue(install(rebuilt))
+            sampled = rebuilt.clone()
+            self.assertTrue(clear(sampled))
+            self.assertTrue(install(sampled))
+        finally:
+            first.unpatch_model(unpatch_weights=False)
+
+        sampled.patch_model(load_weights=False)
+        try:
+            video, output = _sample(model)
+        finally:
+            sampled.unpatch_model(unpatch_weights=False)
+        torch.testing.assert_close(output, video)
+        self.assertEqual(model._forward.__name__, "stock_forward")
+
+    def test_replanning_the_loaded_patcher_keeps_cube_order(self):
+        # A cached model chain re-plans the same patcher while it is still
+        # loaded. Clearing must not pin the stock FinalLayer as an object
+        # patch, which the next install would mistake for a foreign patch.
+        patcher, model = _loadable_model()
+        self.assertTrue(install(patcher))
+        patcher.patch_model(load_weights=False)
+        try:
+            self.assertTrue(clear(patcher))
+            self.assertNotIn(FORWARD_KEY, patcher.object_patches)
+            self.assertNotIn(final_layer.FINAL_LAYER_KEY, patcher.object_patches)
+            self.assertTrue(install(patcher))
+            patcher.patch_model(load_weights=False)
+            video, output = _sample(model)
+        finally:
+            patcher.unpatch_model(unpatch_weights=False)
+        torch.testing.assert_close(output, video)
 
 
 if __name__ == "__main__":

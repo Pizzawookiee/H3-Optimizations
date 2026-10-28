@@ -486,10 +486,28 @@ class SparseBackendSelectionTests(unittest.TestCase):
                 self.environment,
             )
         self.assertIs(actual, target)
-        kitchen.assert_called_once_with(plan, self.environment, self.inventory)
+        kitchen.assert_called_once_with(
+            plan, self.environment, self.inventory, q_tile=64, kv_tile=32,
+        )
         sage.assert_not_called()
         triton.assert_not_called()
         flex.assert_not_called()
+
+    def test_auto_keeps_kitchen64_when_packed32_is_unavailable(self):
+        plan = H3OptimizationPlan(sparse=SparseRequest())
+        target = (resolved(apply_module.ATTENTION_KITCHEN_SPARSE), self.qkv)
+        with mock.patch.object(apply_module, '_resolve_dense',
+                               return_value=(resolved('dense'), self.qkv)), \
+             mock.patch.object(apply_module, '_resolve_kitchen_sparse',
+                               side_effect=[SparseKitchenError('packed32 failed'), target]) as kitchen:
+            actual = apply_module._resolve_attention(
+                plan, self.model, self.inventory, self.environment,
+            )
+        self.assertIs(actual, target)
+        self.assertEqual(kitchen.call_args_list, [
+            mock.call(plan, self.environment, self.inventory, q_tile=64, kv_tile=32),
+            mock.call(plan, self.environment, self.inventory),
+        ])
 
     def test_auto_uses_sparse_sage_after_kitchen_failure(self):
         plan = H3OptimizationPlan(sparse=SparseRequest())

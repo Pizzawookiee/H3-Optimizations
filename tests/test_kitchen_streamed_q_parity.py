@@ -162,11 +162,21 @@ class KitchenStreamedQParityTests(unittest.TestCase):
                     _full_route(sequence, sequence, q_tile, kv_tile),
                     validate_geometry=False,
                 )
-                self.assertTrue(
-                    torch.equal(expected, dense),
-                    'whole-carrier 100%% route differs for %dQx%dKV'
-                    % (q_tile, kv_tile),
-                )
+                if (q_tile, kv_tile) in selftest._PACKED_GEOMETRIES:
+                    # SM86/89/12x run 64x64 routes on the packed kernel, which
+                    # is held to the self-test's packed tolerance, not bits.
+                    passed, health = selftest._packed_output_health(expected, dense)
+                    self.assertTrue(
+                        passed,
+                        'whole-carrier 100%% route unhealthy for %dQx%dKV: %s'
+                        % (q_tile, kv_tile, health),
+                    )
+                else:
+                    self.assertTrue(
+                        torch.equal(expected, dense),
+                        'whole-carrier 100%% route differs for %dQx%dKV'
+                        % (q_tile, kv_tile),
+                    )
                 chunks = []
                 for start in range(0, sequence, 128):
                     stop = min(start + 128, sequence)

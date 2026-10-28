@@ -11,6 +11,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.quant_ops
 
+from .canonical_quant import CANONICAL_QUANT_KEY, clone_with_force_quant
 from .attention.sparse import (
     FP8FlexBackend,
     FP8FlexError,
@@ -71,10 +72,14 @@ from .kitchen_qkv import (
     producer_api_available,
 )
 from .memory.config import ActivationMemoryConfig
+from .memory.fused_residual import (
+    unavailable_reason as fused_residual_unavailable_reason,
+)
 from .memory.final_layer import install as install_final_layer
 from .memory.embedding import clear as clear_embedding_memory
 from .memory.embedding import install as install_embedding_memory
 from .memory.embedding import is_installed as is_embedding_memory_installed
+from .memory.embedding import released_by_comfy as embedding_released_by_comfy
 from .memory.patch import install as install_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import clear_backend, configure_backend
@@ -96,6 +101,7 @@ from .plan import (
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_KITCHEN_64X128,
+    SPARSE_BACKEND_KITCHEN_64X32,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
@@ -114,7 +120,9 @@ from .qkv.streamed import (
     PROJECTION_NATIVE,
 )
 from .qkv.providers import (
+    MLP_CONVROT_INT8_CHUNKED,
     MLP_OFF,
+    MLP_RUNTIME_CONVROT_INT8_CHUNKED,
     MLP_PRESERVE_UPSTREAM,
     QKV_BF16_CHUNKED,
     QKV_DENSE_CONVROT_INT8,
@@ -869,6 +877,7 @@ def _resolve_kitchen_sparse(
         backend=getattr(environment, 'backend', None),
         q_tile=q_tile,
         kv_tile=kv_tile,
+        device=getattr(environment, 'device_index', None),
     )
     qkv = resolve_qkv_provider(
         inventory,
@@ -1051,6 +1060,14 @@ def _resolve_attention(plan, model, inventory, environment):
                 q_tile=64,
                 kv_tile=128,
             )
+        if backend_request == SPARSE_BACKEND_KITCHEN_64X32:
+            return _resolve_kitchen_sparse(
+                plan,
+                environment,
+                inventory,
+                q_tile=64,
+                kv_tile=32,
+            )
         if backend_request == SPARSE_BACKEND_FLEX:
             return _resolve_fp8_flex(
                 plan,
@@ -1073,6 +1090,12 @@ def _resolve_attention(plan, model, inventory, environment):
     if plan.sparse is None:
         return dense_attention, dense_qkv
 
+    try:
+        return _resolve_kitchen_sparse(
+            plan, environment, inventory, q_tile=64, kv_tile=32,
+        )
+    except SparseKitchenError:
+        pass
     try:
         return _resolve_kitchen_sparse(plan, environment, inventory)
     except SparseKitchenError as kitchen_exc:
@@ -1197,6 +1220,25 @@ def _inventory_status(inventory):
     }
 
 
+def _fused_residual_status(mlp, environment):
+    '''Whether the held INT8 MLP can fold its gated residual into fc2.
+
+    Static only: the kernel's bit-identity self-test runs on first use, and a
+    failure there silently keeps the ordinary addcmul_ path.
+    '''
+    if mlp.provider_id not in (
+        MLP_CONVROT_INT8_CHUNKED,
+        MLP_RUNTIME_CONVROT_INT8_CHUNKED,
+    ):
+        return 'not applicable'
+    index = getattr(environment, 'device_index', None)
+    device = None if index is None else torch.device('cuda', int(index))
+    reason = fused_residual_unavailable_reason(device)
+    if reason is None:
+        return 'eligible (verified on first use)'
+    return 'unavailable: %s' % reason
+
+
 def _status(
     plan,
     environment,
@@ -1209,6 +1251,7 @@ def _status(
     runtime_installed,
     inventory,
     embedding_memory_selected,
+    canonical_quantization,
 ):
     return {
         'plan_version': int(plan.version),
@@ -1294,6 +1337,7 @@ def _status(
                 None if plan.memory is None else int(plan.memory.chunk_rows)
             ),
             'patched_blocks': int(mlp_blocks),
+            'fused_residual': _fused_residual_status(mlp, environment),
         },
         'final_layer': (
             None
@@ -1312,6 +1356,7 @@ def _status(
             }
         ),
         'weight_formats': _inventory_status(inventory),
+        'canonical_quantization': canonical_quantization,
         'runtime_installed': bool(runtime_installed),
         'device': {
             'name': environment.device_name,
@@ -1525,9 +1570,12 @@ def _reconcile_plan(
         environment,
         **rebuild_kwargs,
     )
-    embedding_memory_selected = (
-        'release' if is_embedding_memory_installed(patched) else 'stock'
-    )
+    if is_embedding_memory_installed(patched):
+        embedding_memory_selected = 'release'
+    elif embedding_released_by_comfy(patched):
+        embedding_memory_selected = 'comfy_release'
+    else:
+        embedding_memory_selected = 'stock'
     if plan.sparse is not None:
         cube_shape = TOKEN_ORDER_SHAPES[plan.sparse.video_token_order]
         if cube_shape is not None:
@@ -1558,6 +1606,7 @@ def _reconcile_plan(
         runtime_installed=runtime_installed,
         inventory=inventory,
         embedding_memory_selected=embedding_memory_selected,
+        canonical_quantization=patched.model_options.get(CANONICAL_QUANT_KEY),
     )
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
     session = options.get(RUNTIME_SESSION_KEY)
@@ -1692,6 +1741,6 @@ def apply_plan(model, plan: H3OptimizationPlan):
         raise TypeError('plan must be H3OptimizationPlan')
     if not is_minimax_h3(model):
         return model
-    patched = model.clone()
+    patched = clone_with_force_quant(model, plan)
     patched.model_options[PLAN_KEY] = plan
     return _reconcile_plan(patched, plan)

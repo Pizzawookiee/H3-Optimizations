@@ -96,10 +96,11 @@ class NodeTests(unittest.TestCase):
             ],
         )
         backend = input_by_id(advanced, 'backend')
-        self.assertEqual(backend.default, 'Kitchen INT8 64Q x 64KV (Quality)')
+        self.assertEqual(backend.default, 'Kitchen INT8 64Q x 32KV (Quality)')
         self.assertEqual(
             backend.options,
             [
+                'Kitchen INT8 64Q x 32KV (Quality)',
                 'Kitchen INT8 64Q x 64KV (Quality)',
                 'Kitchen INT8 64Q x 128KV (Faster)',
                 'FROST BF16 64Q x 64KV (SM89)',
@@ -109,7 +110,7 @@ class NodeTests(unittest.TestCase):
             ],
         )
         self.assertIn(
-            'Kitchen INT8 64Q x 64KV (Quality) is the default',
+            'Kitchen INT8 64Q x 32KV (Quality) is the default',
             advanced.description,
         )
         self.assertIn('Bypass this node', backend.tooltip)
@@ -153,6 +154,7 @@ class NodeTests(unittest.TestCase):
             )
         )
         for legacy_backend in (
+            'Kitchen INT8 64Q x 32KV (Experimental)',
             'Sparse Sage',
             'BF16 Triton',
             'INT8 Triton',

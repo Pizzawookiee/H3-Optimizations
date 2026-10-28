@@ -67,7 +67,16 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           bool use_pv_fp16_accu = false,
           bool fuse_fp32_probabilities = true,
           bool per_tile_kv_len = false>
-__global__ void qk_int_sv_i8_sparse_attn_kernel(
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || \
+     __CUDA_ARCH__ == 1200)
+__global__ __launch_bounds__(
+    (CTA_Q / WARP_Q) * (CTA_K / WARP_K) * WARP_SIZE,
+    (CTA_Q == 64 && CTA_K == 64) ? 3 : 1)
+#else
+__global__
+#endif
+void qk_int_sv_i8_sparse_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
     float *__restrict__ Q_scale, float *__restrict__ K_scale,
@@ -480,6 +489,24 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
                      QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
           smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
+
+    // K is dead in shared memory once every warp has finished QK. Start the
+    // next routed K transfer before updating softmax so its latency overlaps
+    // both the scalar probability work and the current P x V tensor-core MMA.
+    __syncthreads();
+    {
+      const uint32_t next_load_block =
+          load_block + static_cast<uint32_t>(lut_row[iter]);
+      seek_kv_block(next_load_block);
+      load_global_to_share<global_to_shared_line_lanes_QK,
+                           global_to_shared_copy_lines_per_warp_QK,
+                           QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
+                           QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
+          &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K,
+          K_load_idx_lane_base, kv_len);
+      cp_async::commit_group();
+    }
+
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
     if (use_fused_fp32_probabilities && mask_mode == MaskMode::kNone &&
         !kv_tile_is_partial(load_block)) {
@@ -530,19 +557,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
       }
     }
 
-    __syncthreads();
-
-    // step to the next routed KV tile and load K with predicate
+    // The pointer seek and K transfer above already target this routed tile.
     load_block += static_cast<uint32_t>(lut_row[iter]);
-    seek_kv_block(load_block);
-    load_global_to_share<global_to_shared_line_lanes_QK,
-                         global_to_shared_copy_lines_per_warp_QK,
-                         QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
-                         QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
-        &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K,
-        K_load_idx_lane_base, kv_len);
-    cp_async::commit_group();
-
     dequant_scale =
         q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
     sm_scale = original_sm_scale * dequant_scale;
@@ -582,6 +598,20 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
                      num_tiles_qk_inner, swizzle_mode_QK,
                      QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
           smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
+    }
+
+    __syncthreads();
+    {
+      const uint32_t next_load_block =
+          load_block + static_cast<uint32_t>(lut_row[num_iterations - 1]);
+      seek_kv_block(next_load_block);
+      load_global_to_share<global_to_shared_line_lanes_QK,
+                           global_to_shared_copy_lines_per_warp_QK,
+                           QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
+                           QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
+          &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K,
+          K_load_idx_lane_base, kv_len);
+      cp_async::commit_group();
     }
 
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
@@ -638,19 +668,8 @@ __global__ void qk_int_sv_i8_sparse_attn_kernel(
       }
     }
 
-    __syncthreads();
-
-    // step to the final routed KV tile and load K with predicate
+    // The pointer seek and K transfer above already target the final tile.
     load_block += static_cast<uint32_t>(lut_row[num_iterations - 1]);
-    seek_kv_block(load_block);
-    load_global_to_share<global_to_shared_line_lanes_QK,
-                         global_to_shared_copy_lines_per_warp_QK,
-                         QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
-                         QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
-        &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K,
-        K_load_idx_lane_base, kv_len);
-    cp_async::commit_group();
-
     dequant_scale =
         q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
     sm_scale = original_sm_scale * dequant_scale;

@@ -27,6 +27,7 @@ class ActivationMemoryConfig:
     alignment: int = DEFAULT_ALIGNMENT
     strict: bool = True
     prefer_held_weights: bool = True
+    fused_norm_quantize: bool = True
 
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
@@ -72,4 +73,5 @@ class ActivationMemoryConfig:
             int(self.alignment),
             bool(self.strict),
             bool(self.prefer_held_weights),
+            bool(self.fused_norm_quantize),
         )

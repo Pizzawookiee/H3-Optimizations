@@ -37,7 +37,7 @@ from h3_optimizations.plan import (  # noqa: E402
     SparseRequest,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
-    MLP_CONVROT_INT8_TWO_SLICE,
+    MLP_CONVROT_INT8_CHUNKED,
     QKV_BF16_CHUNKED,
     QKV_STANDARD,
     QKV_TRITON_SPARSE_CHUNKED,
@@ -129,8 +129,8 @@ class RocmConvRotAutoTests(unittest.TestCase):
         self.assertEqual(qkv.provider_id, QKV_TRITON_SPARSE_CHUNKED)
         self.assertTrue(qkv.fused)
         self.assertIn('checkpoint-native ConvRot-256 INT8', qkv.reason)
-        self.assertEqual(mlp.provider_id, MLP_CONVROT_INT8_TWO_SLICE)
-        self.assertEqual(mlp.activation_mode, 'mlp_chunked_convrot_2slice')
+        self.assertEqual(mlp.provider_id, MLP_CONVROT_INT8_CHUNKED)
+        self.assertEqual(mlp.activation_mode, 'mlp_chunked_native')
 
     def test_memory_only_auto_streams_convrot_without_requantizing(self):
         environment = rocm_environment()

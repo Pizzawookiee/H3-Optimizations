@@ -14,6 +14,8 @@ synchronizes, so installing a recorder cannot introduce a stall by itself.
 Regions nest. ``qkv_producer_total`` contains ``qkv_linear``, and
 ``attention_total`` contains all of it. Outer regions are authoritative:
 a sum of children silently omits whatever sits between them.
+Reentering an active name records only its outer scope; sequential calls
+with the same name remain separate samples.
 '''
 
 from __future__ import annotations
@@ -49,31 +51,80 @@ def active():
 
 def stage(name):
     '''Span one attribution region by name.'''
-    return active().stage(name)
+    recorder = active()
+    if recorder is NULL_STAGES:
+        return NULL_STAGES
+    return _RecordedStage(recorder, _STATE.names, name)
+
+
+class _RecordedStage:
+    __slots__ = ('recorder', 'names', 'name', 'context')
+
+    def __init__(self, recorder, names, name):
+        self.recorder = recorder
+        self.names = names
+        self.name = name
+        self.context = None
+
+    def __enter__(self):
+        if self.name in self.names:
+            return None
+        self.names.add(self.name)
+        try:
+            self.context = self.recorder.stage(self.name)
+            return self.context.__enter__()
+        except BaseException:
+            self.context = None
+            self.names.remove(self.name)
+            raise
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.context is None:
+            return False
+        try:
+            return self.context.__exit__(exc_type, exc, traceback)
+        finally:
+            self.context = None
+            self.names.remove(self.name)
 
 
 class installed:
     '''Install a recorder for the calling thread, then restore the previous.'''
 
-    __slots__ = ('_recorder', '_previous')
+    __slots__ = ('_recorder', '_previous', '_previous_names')
 
     def __init__(self, recorder):
         self._recorder = NULL_STAGES if recorder is None else recorder
         self._previous = None
+        self._previous_names = None
 
     def __enter__(self):
         self._previous = active()
+        self._previous_names = getattr(_STATE, 'names', None)
         _STATE.recorder = self._recorder
+        _STATE.names = self._previous_names if self._previous is self._recorder else set()
         return self._recorder
 
     def __exit__(self, exc_type, exc, traceback):
         _STATE.recorder = self._previous
+        _STATE.names = self._previous_names
         self._previous = None
+        self._previous_names = None
         return False
 
 
 STAGE_NAMES = (
+    'block_total',
+    'adaln_proj',
     'attention_total',
+    'attention_residual_gate',
+    'norm2_modulation',
+    'norm2_modulation_quantize',
+    'mlp_fc1',
+    'mlp_fc1_fc2',
+    'mlp_swiglu_fc2',
+    'mlp_swiglu_fc2_gated',
+    'final_mlp_gate',
     'qkv_producer_total',
     'qkv_linear',
     'qk_norm_rope',
@@ -94,5 +145,6 @@ STAGE_NAMES = (
     'sparse_route',
     'sparse_carrier_prepare',
     'sparse_attention_kernel',
+    'dense_attention_kernel',
     'attention_out',
 )

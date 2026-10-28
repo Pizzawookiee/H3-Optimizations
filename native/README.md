@@ -74,6 +74,35 @@ the established Q projection and packing path. The fixed exact 128x256 fused-Q
 kernel is selected only on SM80 or newer; this does not change the SM75 support
 of the existing attention kernels.
 
+ABI 4 also accepts the additive `h3_int8_threshold_route` symbol. It selects
+video KV tiles whose score exceeds the row's mean plus tau standard deviations,
+computed from the K-summary mean and covariance, so no score matrix, top-k, or
+sort is needed. It requires SM80 or newer and is optional when loading an older
+binary; the Python side then keeps top-k routing.
+
+64Q x 64KV routes run on the packed 64Q x 128KV kernel on SM86, SM89, and SM12x,
+where the card is usually power-limited and the packed kernel's lower energy
+per call becomes clock. Other targets keep the 64Q x 64KV kernel. 64Q x 32KV
+routes walk 32-token subtiles of the same 64-token carrier with the packed
+fine-route kernel on every target.
+
+ABI 4 also accepts the additive
+`h3_int8_quantize_bf16_rms_adaln_rowwise_convrot256` producer. The H3 ConvRot
+path uses its explicit-BF16-staging mode to fold RMSNorm and scalar AdaLN into
+the rowwise activation quantizer and feed the carrier directly to fc1. The
+explicit two-slice path reuses one carrier for both fc1 slices. Per-token
+modulation selectors, non-BF16 execution, compile
+tracing, and older binaries keep the eager path. The FP32-through mode remains
+available for numerical experiments. Compare both modes against the eager
+producer with:
+
+```text
+python benchmarks/bench_fused_norm_adaln_quantize.py `
+  --library native/build-vsa/h3_int8_attention.dll `
+  --checkpoint path/to/minimax_h3_ref2va_pruned_int8_convrot.safetensors `
+  --block-index 24 --rows 4096 --hidden 5376
+```
+
 ## Building
 
 ```
@@ -99,11 +128,13 @@ pack owns. It is ignored by both Git and `.comfyignore`, so it never exists in
 a published install.
 
 Architectures default to
-`75-real;80-real;89-real;120f-real;89-virtual` on Windows and add `90a-real`
-on Linux. Every shipped target has real SASS, while one `compute_89` PTX
-payload provides the forward-compatible fallback without duplicating the
-family-limited `compute_120f` PTX. Override with `-DH3_CUDA_ARCHS=89` to build
-just one while iterating.
+`75-real;80-real;86-real;89-real;120f-real;89-virtual` on Windows and add
+`90a-real` on Linux. Every shipped target has real SASS, while one `compute_89`
+PTX payload provides the forward-compatible fallback without duplicating the
+family-limited `compute_120f` PTX. The 64Q x 64KV specialization requests three
+resident blocks only on the SM86, SM89, and SM120 consumer architectures;
+datacenter targets retain their unconstrained register allocation. Override
+with `-DH3_CUDA_ARCHS=89` to build just one while iterating.
 
 SM75 composes the Ampere-shaped INT8 MMA fragments from Turing's m8n8k16
 instructions and uses synchronous shared-memory copies where newer GPUs use

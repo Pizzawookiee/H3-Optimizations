@@ -27,7 +27,17 @@ OUTPUT_LAYOUTS = (OUTPUT_HND, OUTPUT_NHD)
 Q_TILE = 128
 CTA_K = 64
 LARGE_CTA_K = 128
-SPARSE_GEOMETRIES = ((128, 128), (128, 64), (64, 128), (64, 64))
+SPARSE_GEOMETRIES = ((128, 128), (128, 64), (64, 128), (64, 64), (64, 32))
+# A 32-token route walks the ordinary 64-token carrier (packed fine-route
+# kernel); every other route tile equals its carrier tile.
+_ROUTE_CARRIER_TILE = {32: 64}
+
+
+def carrier_kv_tile(route_kv_tile):
+    """The carrier CTA_K a route of this KV tile walks."""
+    route_kv_tile = int(route_kv_tile)
+    return _ROUTE_CARRIER_TILE.get(route_kv_tile, route_kv_tile)
+
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 # Matches the CUDA backend's conventions; do not renumber.
@@ -255,7 +265,7 @@ def _validate_sparse_route(quantized, route):
             'native block-sparse attention does not support %dQ x %dKV'
             % geometry
         )
-    if route.kv_tile != quantized.cta_k:
+    if carrier_kv_tile(route.kv_tile) != quantized.cta_k:
         raise ValueError(
             'the route was built for KV tile %d but the carriers are packed '
             'for %d; walking one at the other width attends to the wrong keys'
@@ -458,6 +468,35 @@ def int8_attention_from_prequantized(quantized, *, output_layout=OUTPUT_HND):
     return _finish(quantized, output)
 
 
+def packed_dense_attention_is_available(device=None):
+    major, minor = torch.cuda.get_device_capability(device)
+    if not (major == 8 and minor in (6, 9) or major == 12):
+        return False
+    if not hasattr(loader.load(), 'h3_int8_packed_dense_attention'):
+        return False
+    from . import selftest
+
+    return selftest.packed_dense_check(device)
+
+
+def packed_int8_attention_from_prequantized(quantized, *, output_layout=OUTPUT_HND):
+    """64Q x 128KV dense traversal over the 64-token carrier, without a LUT."""
+    if quantized.cta_k != 64 or quantized.q.shape[-1] != 128:
+        raise ValueError('packed dense attention requires a 64KV carrier and head_dim 128')
+    library = loader.load()
+    output, output_dtype, geometry, strides = _attention_geometry(quantized, output_layout)
+    loader.check(
+        library.h3_int8_packed_dense_attention(
+            _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
+            _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
+            _ptr(quantized.v_scale), quantized.cta_k, *geometry, *strides,
+            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype], _stream(),
+        ),
+        'packed dense attention',
+    )
+    return _finish(quantized, output)
+
+
 def block_sparse_int8_attention_from_prequantized(
     quantized,
     route,
@@ -482,7 +521,7 @@ def block_sparse_int8_attention_from_prequantized(
             _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
             _ptr(quantized.v_scale), _ptr(kernel_route.indices),
             _ptr(kernel_route.counts), kv_tiles, route.q_tile,
-            quantized.cta_k,
+            route.kv_tile,
             *geometry, *strides,
             quantized.q_scale.stride(0), quantized.q_scale.stride(1),
             quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
@@ -518,7 +557,7 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
             _ptr(output), _ptr(lse), _ptr(quantized.q_scale),
             _ptr(quantized.k_scale), _ptr(quantized.v_scale),
             _ptr(kernel_route.indices), _ptr(kernel_route.counts),
-            kv_tiles, route.q_tile, quantized.cta_k, *geometry, *strides,
+            kv_tiles, route.q_tile, route.kv_tile, *geometry, *strides,
             quantized.q_scale.stride(0), quantized.q_scale.stride(1),
             quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
             _stream(),
@@ -581,6 +620,19 @@ def block_sparse_int8_attention_tiles_from_prequantized(
             'sparse attention over padded tiles',
         )
     return _finish(quantized, output)
+
+
+def sparse_geometry_is_available(q_tile, kv_tile, device=None):
+    """Whether this route has a validated native consumer on the device."""
+    if not int8_attention_is_available(device):
+        return False
+    from . import selftest
+
+    if selftest.sparse_geometry_check(q_tile, kv_tile, device):
+        return True
+    return (q_tile, kv_tile) == (64, 64) and selftest.sparse_geometry_check(
+        128, 64, device,
+    )
 
 
 def int8_attention_is_available(device=None):

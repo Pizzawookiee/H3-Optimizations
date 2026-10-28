@@ -301,6 +301,17 @@ def format_memory_status(model):
         'QKV: %s' % format_qkv_execution(status),
         'MLP: %s' % _provider_text(mlp, 'off'),
     ]
+    canonical = status.get('canonical_quantization') or {}
+    if canonical.get('converted_count'):
+        lines.insert(
+            0,
+            'Weights: canonical ConvRot-256 INT8 (%d converted; %.2f GiB '
+            'released from this model branch)'
+            % (
+                int(canonical['converted_count']),
+                int(canonical.get('released_bytes') or 0) / 2**30,
+            ),
+        )
     if qkv.get('out_proj_runtime_convrot_int8'):
         lines.insert(2, 'Attention output: runtime ConvRot-256 INT8')
     if final_layer.get('chunked'):
@@ -321,6 +332,8 @@ def format_memory_status(model):
         lines[mlp_index] += ' (%d-row chunks)' % int(chunk_rows)
     if embedding_memory.get('selected') == 'release':
         lines.append('Embedding memory: released before block 0')
+    elif embedding_memory.get('selected') == 'comfy_release':
+        lines.append('Embedding memory: released before block 0 by ComfyUI')
     elif embedding_memory.get('selected') == 'stock':
         lines.append('Embedding memory: stock lifetime')
     v_memory_notice = _v_memory_notice(qkv)

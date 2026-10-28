@@ -112,6 +112,64 @@ class NormalizedRowsTests(unittest.TestCase):
         self.assertTrue(torch.equal(source.materialize(), expected))
         self.assertIs(attention_output_buffer(x), x)
 
+    def test_attention_residual_projects_mixed_gate_slabs_once(self):
+        x, source, _expected = self._case()
+        residual = x.clone()
+        source._x = residual
+        gate = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 50
+        source.enable_attention_residual(gate)
+        rows = torch.arange(80, dtype=torch.float32).reshape(10, 8) / 10
+        fused_ranges = []
+        projected_ranges = []
+
+        def project(value):
+            projected_ranges.append(int(value.shape[0]))
+            return value * 2
+
+        def project_residual(value, target, scale):
+            fused_ranges.append(int(value.shape[0]))
+            target.addcmul_(value * 2, scale)
+            return True
+
+        expected = residual.clone()
+        expected[0:2].addcmul_(rows[0:2] * 2, gate[1])
+        expected[2:7].addcmul_(rows[2:7] * 2, gate[source._segments[1][2]])
+        expected[7:10].addcmul_(rows[7:10] * 2, gate[2])
+
+        source.write_attention_residual(
+            rows[:6], 0, 6, project, project_residual
+        )
+        source.write_attention_residual(
+            rows[6:], 6, 10, project, project_residual
+        )
+
+        self.assertEqual(fused_ranges, [])
+        self.assertEqual(projected_ranges, [6, 4])
+        self.assertTrue(source.attention_residual_complete)
+        self.assertIs(source.finish_attention_residual(), residual)
+        self.assertIsNone(source._output)
+        torch.testing.assert_close(residual, expected)
+
+    def test_attention_residual_fuses_a_scalar_gate_slab(self):
+        x, source, _expected = self._case()
+        residual = x.clone()
+        source._x = residual
+        gate = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 50
+        source.enable_attention_residual(gate)
+        rows = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 10
+
+        def project(_value):
+            self.fail('the local projection fallback should not run')
+
+        def project_residual(value, target, scale):
+            target.addcmul_(value * 2, scale)
+            return True
+
+        expected = residual.clone()
+        expected[:2].addcmul_(rows * 2, gate[1])
+        source.write_attention_residual(rows, 0, 2, project, project_residual)
+        torch.testing.assert_close(residual, expected)
+
     def test_unsupported_tensor_operations_request_materialization(self):
         _x, source, _expected = self._case()
         with self.assertRaises(NormalizedRowsUnsupported):

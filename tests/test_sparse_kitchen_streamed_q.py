@@ -35,6 +35,7 @@ from h3_optimizations.attention.sparse.kitchen_streamed_q import (
 from h3_optimizations.attention.sparse import kitchen_streamed_q
 from h3_optimizations.attention.sparse.router import SparseTileRouter
 from h3_optimizations.attention.sparse import kitchen_sparse
+from h3_optimizations.attention.sparse.config import HybridSparseConfig
 from h3_optimizations.kitchen_qkv import ChunkedKitchenQKVProjector
 from h3_optimizations.kitchen_qkv import V_MODE_RETAIN, V_MODE_TWO_PASS
 from h3_optimizations.normalized_rows import NormalizedRows
@@ -56,6 +57,89 @@ class _Layout:
 
 
 class StreamedSparseKitchenRoutingTests(unittest.TestCase):
+    def test_dense_query_preparation_protects_mixed_tile_and_old_libraries(self):
+        for budget, available, enabled, expected in ((.3, True, True, 192), (1., True, True, 320), (.3, False, True, 0), (.3, True, False, 0), (.3, True, None, 0)):
+            with self.subTest(budget=budget, available=available, enabled=enabled):
+                source = torch.zeros(320, 128)
+                producer = SimpleNamespace(packed_dense_attention_is_available=mock.Mock(return_value=available))
+                carrier = SimpleNamespace(k=torch.zeros(1, 1, 320, 128), cta_k=64)
+                projected = StreamedSparseKitchenQKV(object(), producer, source, None, carrier,
+                                                     torch.zeros(1, 1, 10, 128), 'native', source)
+                backend = StreamedSparseKitchenBackend.__new__(StreamedSparseKitchenBackend)
+                backend.executor = SimpleNamespace(q_tile=64, kv_tile=32)
+                backend.config = HybridSparseConfig(video_budget=budget)
+                backend.router = SparseTileRouter(q_tile=64, kv_tile=32)
+                snapshot = SimpleNamespace(layout=_Layout(320, 130), step_index=10, total_steps=20)
+                with mock.patch.object(kitchen_streamed_q, 'snapshot_for', return_value=snapshot):
+                    prepared = backend.prepare_projected(projected, layer_index=24,
+                        transformer_options={} if enabled is None else {kitchen_streamed_q.DENSE_QUERY_KEY: enabled})
+                self.assertEqual(prepared.dense_query_rows, expected)
+                self.assertEqual(prepared.metadata['dense_query_rows'], expected)
+                prepared.release()
+
+    def test_dense_query_spans_keep_original_chunk_boundaries(self):
+        self.assertEqual(list(kitchen_streamed_q._query_spans(5313, 4096, 5313)), [(0, 4096), (4096, 5313)])
+        self.assertEqual(list(kitchen_streamed_q._query_spans(9001, 4096, 5312)), [(0, 4096), (4096, 5312), (5312, 8192), (8192, 9001)])
+        self.assertEqual(list(kitchen_streamed_q._query_spans(9001, 4096, 0)), [(0, 4096), (4096, 8192), (8192, 9001)])
+
+    def test_dense_query_dispatch_skips_lut_and_retains_all_kv(self):
+        @dataclass
+        class Carrier:
+            q: object
+            k: torch.Tensor
+            q_scale: object
+
+        for fused_q, dense_rows in ((False, 192), (True, 192), (False, 320), (True, 320)):
+            with self.subTest(fused_q=fused_q, dense_rows=dense_rows):
+                source = torch.arange(320, dtype=torch.float32).reshape(320, 1)
+                output = torch.empty_like(source)
+                module = SimpleNamespace(heads=1, head_dim=1, out_proj=lambda rows: rows)
+                global_k = torch.ones(1, 1, 320, 1)
+                carrier = Carrier(None, global_k, None)
+                producer = SimpleNamespace(packed_int8_attention_from_prequantized=mock.Mock())
+                dense_calls, route_starts = [], []
+
+                def consume(chunk, *args, **kwargs):
+                    self.assertIs(chunk.k, global_k)
+                    self.assertEqual(kwargs['output_layout'], 'nhd')
+                    return chunk.q
+
+                def dense(chunk, **kwargs):
+                    dense_calls.append(int(chunk.q.shape[-2]))
+                    return consume(chunk, **kwargs)
+
+                def route(_router, _plan, summary, *, tile_start):
+                    route_starts.append(tile_start)
+                    self.assertGreaterEqual(tile_start, 3)
+                    return torch.zeros(1, 1, 1, 1), torch.ones(1, 1, 1)
+
+                producer.packed_int8_attention_from_prequantized.side_effect = dense
+                kitchen = SimpleNamespace(BlockSparseRoute=lambda **kw: SimpleNamespace(**kw),
+                                          block_sparse_int8_attention_from_prequantized=consume)
+                plan = SimpleNamespace(release=mock.Mock())
+                projected = StreamedSparseKitchenQKV(module, producer, source, None, carrier,
+                                                     None, 'native', output, fused_q=fused_q)
+                prepared = PreparedStreamedSparseKitchen(projected, plan, {}, dense_query_rows=dense_rows)
+                backend = StreamedSparseKitchenBackend.__new__(StreamedSparseKitchenBackend)
+                backend.executor = SimpleNamespace(kitchen=kitchen, q_tile=64, kv_tile=32)
+                backend.query_chunk_rows = 256
+                backend.router = object()
+                fused = mock.MagicMock()
+                fused.project.side_effect = lambda x, rope, a, b, length: (x[a:b].reshape(1, 1, b-a, 1), None, torch.zeros(1, 1, (b-a)//64, 1))
+                with (
+                    mock.patch.object(kitchen_streamed_q, 'HeldExactH3FusedQ', return_value=fused),
+                    mock.patch.object(kitchen_streamed_q, 'create_held_qkv', return_value=mock.MagicMock()),
+                    mock.patch.object(kitchen_streamed_q, 'project_q_hnd', side_effect=lambda held, x, rope, a, b: x[a:b].reshape(1, 1, b-a, 1)),
+                    mock.patch.object(kitchen_streamed_q, '_quantize_q_chunk', side_effect=lambda producer, global_carrier, q: replace(global_carrier, q=q)),
+                    mock.patch.object(kitchen_streamed_q, '_build_route_chunk', side_effect=route),
+                ):
+                    actual = backend.execute_projected(module, prepared)
+                torch.testing.assert_close(actual, source)
+                self.assertEqual(dense_calls, [192] if dense_rows == 192 else [256, 64])
+                self.assertEqual(route_starts, [3, 4] if dense_rows == 192 else [])
+                self.assertIsNone(projected.carrier)
+                self.assertIsNone(prepared.route_plan)
+
     def test_short_video_route_plan_stays_dense(self):
         class NoSelectionRouter(SparseTileRouter):
             def _select_indices(self, *_args, **_kwargs):
